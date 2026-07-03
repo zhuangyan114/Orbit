@@ -69,40 +69,63 @@ export class DapSession extends EventEmitter {
 
   private startPolling() {
     this.stopPolling();
-    daLog('startPolling: started');
+    daLog(`startPolling: started, ${this.watchExpressions.length} watch expressions`);
     const pollLoop = async () => {
       if (this.pollTimer === null) return;
       try {
+        if (this.pollTimer === null) return;
         const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
+        daLog(`pollLoop: state=${stateResult.ok ? stateResult.data : 'error'}`);
         if (stateResult.ok && stateResult.data === 'halted') {
-          this.stopPolling();
+          daLog('pollLoop: CPU is halted, stopping polling');
           if (this.watchExpressions.length > 0) {
             const results: any[] = [];
             for (const expr of this.watchExpressions) {
               const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+              daLog(`pollLoop halted read: ${expr} ok=${r.ok} val=${r.ok ? (r.data as any).value : r.error}`);
               if (r.ok) results.push(r.data);
               else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
             }
             this.sendWatchUpdate(results);
           }
           this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
+          this.stopPolling();
           return;
         }
 
         if (this.watchExpressions.length > 0) {
+          if (this.pollTimer === null) return;
           this._watchPollCycle++;
+          daLog(`pollLoop: halting CPU for watch read (cycle ${this._watchPollCycle})`);
           await this.backend.execute({ cmd: 'halt' });
-          await new Promise<void>(q => setTimeout(q, 10));
+          if (this.pollTimer === null) return;
+          let haltedAfter = false;
+          for (let i = 0; i < 10; i++) {
+            if (this.pollTimer === null) return;
+            const s = await this.backend.execute({ cmd: 'getTargetState' });
+            if (s.ok && s.data === 'halted') { haltedAfter = true; break; }
+            await new Promise<void>(q => setTimeout(q, 50));
+          }
+          if (this.pollTimer === null) return;
+          daLog(`pollLoop: halted=${haltedAfter}, waiting 100ms for DLL`);
+          await new Promise<void>(q => setTimeout(q, 100));
 
+          if (this.pollTimer === null) return;
           const results: any[] = [];
           for (const expr of this.watchExpressions) {
+            if (this.pollTimer === null) return;
             const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+            daLog(`pollLoop read: ${expr} ok=${r.ok} val=${r.ok ? (r.data as any).value : r.error}`);
             if (r.ok) results.push(r.data);
             else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
           }
 
-          await this.backend.execute({ cmd: 'run' });
+          if (this.pollTimer === null) return;
+          const runResult = await this.backend.execute({ cmd: 'run' });
+          daLog(`pollLoop: run result ok=${runResult.ok}, sending ${results.length} results`);
           this.sendWatchUpdate(results);
+        } else {
+          daLog('pollLoop: no watch expressions, skipping');
         }
       } catch (err) {
         daLog(`startPolling: error ${err}`);
@@ -118,6 +141,10 @@ export class DapSession extends EventEmitter {
     this.sendEvent('output', {
       category: 'ozoneWatch',
       output: JSON.stringify({ results }),
+    });
+    this.sendEvent('output', {
+      category: 'console',
+      output: '\n',
     });
   }
 
@@ -197,7 +224,7 @@ export class DapSession extends EventEmitter {
           return this.handleWatchEvaluate(msg);
         case 'setWatches':
           this.watchExpressions = msg.arguments?.expressions || [];
-          daLog(`setWatches: ${this.watchExpressions.length} expressions`);
+          daLog(`setWatches: ${this.watchExpressions.length} expressions: [${this.watchExpressions.join(', ')}]`);
           return this.sendResponse(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
@@ -396,12 +423,6 @@ export class DapSession extends EventEmitter {
         return;
       }
       await new Promise<void>(r => setTimeout(r, 300));
-      const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
-      if (stateResult.ok && stateResult.data === 'halted') {
-        daLog('handleContinue: already halted after run, sending stopped');
-        this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
-        return;
-      }
       this.startPolling();
     });
   }
@@ -489,6 +510,8 @@ export class DapSession extends EventEmitter {
       this.stopPolling();
       await this.backend.execute({ cmd: 'reset' });
       await this.backend.execute({ cmd: 'halt' });
+      await this.backend.execute({ cmd: 'clearAllBreakpoints' });
+      this.breakpoints.clear();
       this.lastHaltReason = 'entry';
       this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
       this.sendResponse(msg);

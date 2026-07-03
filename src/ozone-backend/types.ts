@@ -43,6 +43,8 @@ export interface WatchValue {
   hex: string;
   address?: number;
   error?: string;
+  typeName?: string;
+  children?: WatchValue[];
 }
 
 export interface Breakpoint {
@@ -88,6 +90,7 @@ export type OzoneCommand =
   | { cmd: 'reset' }
   | { cmd: 'setBreakpoint'; file: string; line: number; type?: string; condition?: string }
   | { cmd: 'clearBreakpoint'; id: number }
+  | { cmd: 'clearAllBreakpoints' }
   | { cmd: 'getRegisters' }
   | { cmd: 'getVariable'; name: string; frame?: number }
   | { cmd: 'getLocals'; frame?: number }

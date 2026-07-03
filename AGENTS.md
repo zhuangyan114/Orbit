@@ -99,6 +99,7 @@ F5 in VS Code: "Run Extension" (build first) or "Extension + Watch" (esbuild wat
 - Ghost breakpoint cleanup: `doConnect()` calls `halt()` + `clearAllBreakpoints()` (all 6 slots)
 - `bpSlots` is `(number | null)[]` — stores breakpoint address per slot
 - Breakpoint cancel: `handleSetBreakpoints` tracks `file:line → bpIndex`, clears old before setting new
+- Restart clears breakpoints: `handleRestart` calls `clearAllBreakpoints()` + `this.breakpoints.clear()`
 - `handleContinue`: reads PC, clears BP at PC, steps, re-sets BP (only if clear succeeded)
 - ELF symbol loading + DWARF line/address pre-computation
 - DAP: launch → flash → connect → clearAllBreakpoints → loadSymbols → halt → initialized (no crash)
@@ -150,6 +151,8 @@ F5 in VS Code: "Run Extension" (build first) or "Extension + Watch" (esbuild wat
 - **`evaluateExpression` command** (`src/ozone-backend/commander.ts:652-717`): Reads memory at symbol address. `force: true` skips halt check for polling reads. Caller manages halt/resume.
 - **DAP evaluate** (`src/debug/dap-session.ts:464-480`): Returns real values to VS Code WATCH section when stopped. Auto-captures `context === 'watch'` expressions.
 - **Watch polling** (`src/debug/dap-session.ts:70-130`): Combined 5Hz timer — checks breakpoints, then halts → batch reads all watch expressions → resumes. Uses `setTimeout` recursion (no overlap).
+- **Polling halt+delay quirk**: After `halt()`, poll `isHalted()` up to 500ms then wait 100ms for DLL stabilization. Without this, `doEvaluateExpression` may return `{ error: 'running' }` because Jlink_Halt is async.
+- **Polling race guard**: Every `await` in `pollLoop` checks `this.pollTimer === null` to abort if `stopPolling()` was called externally (e.g., Restart). `stopPolling()` in the halted path is called AFTER `sendEvent('stopped')` to avoid swallowing the stopped event.
 - **WatchProvider** (`src/debug-providers/watch-provider.ts`): TreeDataProvider for `ozoneWatch` view. Tracks previous values for change highlighting (`debug-stackframe-dot` icon). Preserves last-known values when CPU is running.
 - **Communication**: DAP adapter sends watch values via `output` event (`category: 'ozoneWatch'`). Extension's `DebugAdapterTracker` intercepts and updates WatchProvider.
 - **Persistence**: Watch expressions saved to `workspaceState` via `saveWatchExpressions()` in extension.ts, restored on activation.
@@ -161,6 +164,9 @@ Ozone Watch tree view (running)  → combined poll → halt → batch read → r
 Auto-capture                     → handleEvaluate adds expr to watchExpressions → next poll picks it up
 ```
 
+### F5 watch sync fix
+`DebugAdapterTracker` in `extension.ts` catches `stopped` event → calls `syncWatchesToDap()` (NOT `watchEvaluate` directly). `syncWatchesToDap()` sends `setWatches` (populates DAP session's `this.watchExpressions`) then `watchEvaluate` (one-shot read). This ensures polling loop has expressions to read when user clicks Continue. Without this, `this.watchExpressions` stays empty → polling skips (`pollLoop: no watch expressions, skipping`).
+
 ### Key files
 - `src/ozone-backend/types.ts:65-73` — WatchValue interface, evaluateExpression command
 - `src/ozone-backend/commander.ts:652-717` — doEvaluateExpression implementation
@@ -170,10 +176,19 @@ Auto-capture                     → handleEvaluate adds expr to watchExpression
 - `src/debug-providers/watch-provider.ts` — WatchProvider tree data provider
 - `src/extension.ts:100-114,163-165` — WatchProvider setup, persistence, syncWatchesToDap
 
+### Struct / DWARF support
+- **DWARF parsing** (`src/ozone-backend/jlink-symbols.ts:109-296`): `parseDwarfTypeInfo()` runs `arm-none-eabi-objdump --dwarf=info` and parses DIEs recursively (depth 0/1/2+). Extracts `DW_TAG_structure_type` (including anonymous/unnamed structs from `typedef struct {} name`), `DW_TAG_member`, `DW_TAG_typedef`, `DW_TAG_base_type`, `DW_TAG_variable`.
+- **DWARF 5**: Offsets use lowercase normalization (`0xb4` not `0xB4`). Attribute names with `(indirect string, offset: 0x...)` prefix are extracted to get the actual name.
+- **Struct evaluation** (`commander.ts:819-863`): `evaluateSingleField()` uses `resolveDwarfType()` to resolve typedef chains and get correct `byteSize` per field. Nested structs are recursively parsed.
+- **Tree view** (`watch-provider.ts:24-41`): `getChildren(element?)` returns struct field children. `CollapsibleState.Collapsed` for struct rows. Field labels show short name (e.g., `b` not `ab.b`).
+- **Change highlighting**: Always shows `circle-outline` icon (maintains consistent spacing). Changes to `circle-filled` + `debugIcon.startForeground` green when value changes.
+
 ### Known limitations
 - VS Code native WATCH section only updates when debuggee is stopped (DAP protocol limit)
 - Ozone Watch tree view updates at both running and stopped states
 - `doGetLocals()` now reads actual memory values (fixed from showing addresses only)
+- Struct display only works for global/static variables with DWARF debug info (compiled with `-g`)
+- Pointer dereferencing not yet supported (shows address only)
 
 ## UI contributions
 

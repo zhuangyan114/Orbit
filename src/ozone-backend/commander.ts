@@ -5,7 +5,8 @@ import {
 } from './types';
 import { flashElf } from './flasher';
 import { JLinkDLL } from './jlink-dll';
-import { readElfSymbols, SymbolInfo, resolveLineToAddress, preloadLineMappings, preloadAddressMappings } from './jlink-symbols';
+import { readElfSymbols, SymbolInfo, resolveLineToAddress, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE } from './jlink-symbols';
+import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -31,6 +32,7 @@ export class OzoneBackend {
   private lineEntries: { address: number; file: string; line: number }[] = [];
   private tempBreakpoint: { index: number; addr: number } | null = null;
   private stepOverClearedBps: { index: number; addr: number }[] = [];
+  private dwarfInfo: DwarfInfo = { varToType: new Map(), typeDefs: new Map() };
 
   get currentState(): TargetState {
     return this.state;
@@ -65,6 +67,9 @@ export class OzoneBackend {
           return await this.doSetBreakpoint(command.file, command.line, command.condition);
         case 'clearBreakpoint':
           return await this.doClearBreakpoint(command.id);
+        case 'clearAllBreakpoints':
+          this.jlink.clearAllBreakpoints();
+          return { ok: true, data: 'All breakpoints cleared' };
         case 'getRegisters':
           return await this.doGetRegisters();
         case 'getLocals':
@@ -141,6 +146,8 @@ case 'readVariableRuntime':
     }
     this.lineEntries.sort((a, b) => a.address - b.address);
     daLog(`loadSymbols lineEntries (filtered): ${this.lineEntries.length}`);
+    this.dwarfInfo = await parseDwarfTypeInfo(command.elfPath);
+    daLog(`loadSymbols dwarf: ${this.dwarfInfo.varToType.size} vars, ${this.dwarfInfo.typeDefs.size} types`);
     return { ok: true, data: `Loaded ${this.symbols.length} symbols` };
         default:
           return { ok: false, error: `Unsupported command: ${(command as any).cmd}` };
@@ -622,6 +629,25 @@ case 'readVariableRuntime':
         }
       }
       this.lineEntries.sort((a, b) => a.address - b.address);
+      this.dwarfInfo = await parseDwarfTypeInfo(elfPath);
+      daLog(`doFlash dwarf: ${this.dwarfInfo.varToType.size} vars, ${this.dwarfInfo.typeDefs.size} types, diag=${this.dwarfInfo._diag || ''}`);
+      if (this.dwarfInfo.typeDefs.size === 0) {
+        try {
+          const out = await new Promise<string>(r => {
+            execFile(OBJDUMP_EXE, ['--dwarf=info', elfPath], { maxBuffer: 50 * 1024 * 1024, timeout: 30000, windowsHide: true }, (e, o) => r(o || ''));
+          });
+          const tagSet = new Set<string>();
+          const tagRe = /\(DW_TAG_\w+\)/g;
+          let tagM: RegExpExecArray | null;
+          while ((tagM = tagRe.exec(out)) !== null) tagSet.add(tagM[0]);
+          daLog(`doFlash dwarf tags (${tagSet.size} unique, ${(out.match(/\(DW_TAG_\w+\)/g) || []).length} total): ${[...tagSet].join(', ')}`);
+          const lines = out.split('\n').filter(l => l.includes('DW_TAG'));
+          const trimmed = lines.slice(0, 60).join(' ||| ');
+          daLog(`doFlash dwarf lines (${lines.length}): ${trimmed}`);
+        } catch (e: any) {
+          daLog(`doFlash dwarf raw error: ${e.message}`);
+        }
+      }
       return { ok: true, data: result };
     }
     return { ok: false, error: result.message };
@@ -697,6 +723,42 @@ case 'readVariableRuntime':
       await new Promise<void>(r => setTimeout(r, 100));
     }
 
+    const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
+    daLog(`doEvaluateExpression: varTypeOffset for "${sym.name}" = ${varTypeOffset || 'none'}`);
+    if (varTypeOffset) {
+      const resolvedType = this.resolveDwarfType(varTypeOffset);
+      daLog(`doEvaluateExpression: resolvedType kind=${resolvedType?.kind} name=${resolvedType?.name} fields=${resolvedType?.fields?.length || 0}`);
+      if (resolvedType && resolvedType.kind === 'struct' && resolvedType.fields && resolvedType.fields.length > 0) {
+        const readLen = resolvedType.byteSize || sym.size || 4;
+        daLog(`doEvaluateExpression: reading struct memory at 0x${sym.address.toString(16)} len=${readLen}`);
+        const raw = this.jlink.readMemory(sym.address, readLen);
+        if (raw) {
+          daLog(`doEvaluateExpression: raw bytes length=${raw.length}`);
+          const children = this.evaluateStructFields(raw, resolvedType.fields, resolvedType.typeDefs || this.dwarfInfo.typeDefs, sym.address);
+          daLog(`doEvaluateExpression: struct children count=${children.length}`);
+          const summary = `${resolvedType.name} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
+          return {
+            ok: true,
+            data: {
+              expression,
+              value: children[0]?.value ?? 0,
+              display: summary,
+              hex: '',
+              address: sym.address,
+              typeName: resolvedType.name,
+              children,
+            } as WatchValue,
+          };
+        } else {
+          daLog('doEvaluateExpression: raw read returned null, falling back to flat read');
+        }
+      } else {
+        daLog(`doEvaluateExpression: not a struct (kind=${resolvedType?.kind}), reading as flat value`);
+      }
+    } else {
+      daLog('doEvaluateExpression: no DWARF type info, reading as flat value');
+    }
+
     const readSize = Math.min(Math.max(sym.size || 4, 4), 4);
     const raw = this.jlink.readMemory(sym.address, readSize);
 
@@ -714,13 +776,92 @@ case 'readVariableRuntime':
     else if (sym.size <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
     else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')}`;
 
+    let typeName = '';
+    if (varTypeOffset) {
+      const tn = this.getDwarfTypeName(varTypeOffset);
+      if (tn) typeName = tn;
+    }
+
     return {
       ok: true,
       data: {
         expression, value, display,
         hex: `0x${value.toString(16).toUpperCase().padStart(8, '0')}`,
         address: sym.address,
+        typeName,
       } as WatchValue,
+    };
+  }
+
+  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string } | null {
+    if (!visited) visited = new Set();
+    if (visited.has(offset)) return null;
+    visited.add(offset);
+    const info = this.dwarfInfo.typeDefs.get(offset);
+    if (!info) return null;
+    if (info.kind === 'typedef' && info.typeOffset) {
+      const resolved = this.resolveDwarfType(info.typeOffset, visited);
+      if (resolved) return { ...resolved, typeName: info.name };
+      return { kind: 'typedef', name: info.name, byteSize: 0, typeName: info.name };
+    }
+    if (info.kind === 'struct') {
+      return { kind: 'struct', name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
+    }
+    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name };
+  }
+
+  private getDwarfTypeName(offset: string): string {
+    const resolved = this.resolveDwarfType(offset);
+    return resolved?.typeName || resolved?.name || '';
+  }
+
+  private evaluateStructFields(raw: Uint8Array, fields: DwarfField[], typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number): WatchValue[] {
+    return fields.map(f => this.evaluateSingleField(raw, f, typeDefs, baseAddress));
+  }
+
+  private evaluateSingleField(raw: Uint8Array, field: DwarfField, typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number): WatchValue {
+    const addr = baseAddress + field.byteOffset;
+    const resolved = this.resolveDwarfType(field.typeOffset);
+    const resolvedKind = resolved?.kind || '';
+    const resolvedName = resolved?.name || '';
+    const resolvedByteSize = resolved?.byteSize || 0;
+
+    if (resolvedKind === 'struct' && resolved?.fields) {
+      const childRaw = resolvedByteSize > 0
+        ? raw.slice(field.byteOffset, field.byteOffset + resolvedByteSize)
+        : raw;
+      const children = this.evaluateStructFields(childRaw, resolved.fields, typeDefs, addr);
+      const summary = `${resolvedName} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
+      return {
+        expression: field.name,
+        value: children[0]?.value ?? 0,
+        display: summary,
+        hex: '',
+        address: addr,
+        typeName: resolvedName,
+        children,
+      };
+    }
+
+    const fieldSize = resolvedByteSize || 4;
+    let value = 0;
+    const end = Math.min(field.byteOffset + fieldSize, raw.length);
+    for (let i = end - 1; i >= field.byteOffset; i--) {
+      value = (value << 8) | raw[i];
+    }
+
+    let display: string;
+    if (fieldSize <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+    else if (fieldSize <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+    else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+
+    return {
+      expression: field.name,
+      value,
+      display,
+      hex: `0x${value.toString(16).toUpperCase().padStart(fieldSize * 2, '0')}`,
+      address: addr,
+      typeName: resolvedName,
     };
   }
 

@@ -31,9 +31,9 @@ function findArmTool(toolName: string): string {
   return toolName;
 }
 
-const NM_EXE = findArmTool('arm-none-eabi-nm.exe');
-const OBJDUMP_EXE = findArmTool('arm-none-eabi-objdump.exe');
-const ADDR2LINE_EXE = findArmTool('arm-none-eabi-addr2line.exe');
+export const NM_EXE = findArmTool('arm-none-eabi-nm.exe');
+export const OBJDUMP_EXE = findArmTool('arm-none-eabi-objdump.exe');
+export const ADDR2LINE_EXE = findArmTool('arm-none-eabi-addr2line.exe');
 
 try {
   const logFile = path.join(__dirname, '..', 'debugadapter.log');
@@ -97,8 +97,86 @@ export function findSymbolsByPrefix(symbols: SymbolInfo[], prefix: string): Symb
 
 
 
-export async function readDwarfTypes(elfPath: string): Promise<Map<string, { type: string; size: number }>> {
-  const typeMap = new Map<string, { type: string; size: number }>();
+export interface DwarfField {
+  name: string;
+  typeOffset: string;
+  byteOffset: number;
+}
+
+export interface DwarfTypeInfo {
+  name: string;
+  byteSize: number;
+  kind: 'struct' | 'typedef' | 'base' | 'pointer' | 'array' | 'enum' | 'unspecified';
+  fields?: DwarfField[];
+  typeOffset?: string;
+}
+
+export interface DwarfInfo {
+  varToType: Map<string, string>;
+  typeDefs: Map<string, DwarfTypeInfo>;
+  _diag?: string;
+}
+
+function parseDwarfOutput(stdout: string): { dies: any[]; errors: string[] } {
+  const dies: any[] = [];
+  const errors: string[] = [];
+  const stack: any[] = [];
+
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trimEnd();
+    const depthMatch = line.match(/^\s*<(\d+)><([0-9a-fA-F]+)>:\s+Abbrev Number:\s+\d+\s+\((.+)\)/);
+    if (depthMatch) {
+      const depth = parseInt(depthMatch[1]);
+      const offset = depthMatch[2];
+      const tag = depthMatch[3];
+      const die: any = { offset: `0x${offset.toLowerCase()}`, tag, depth, attrs: {}, children: [] };
+      while (stack.length > 0 && stack[stack.length - 1].depth >= depth) stack.pop();
+      if (stack.length > 0) stack[stack.length - 1].children.push(die);
+      else dies.push(die);
+      stack.push(die);
+      continue;
+    }
+
+    if (stack.length === 0) continue;
+
+    const current = stack[stack.length - 1];
+    const attrMatch = line.match(/^\s+<[0-9a-fA-F]+>\s+(DW_AT_\w+)\s*:\s*(.+)/);
+    if (attrMatch) {
+      const attrName = attrMatch[1];
+      let attrValue = attrMatch[2].trim();
+      const indirectMatch = attrValue.match(/^\(indirect string, offset: 0x[0-9a-fA-F]+\):\s*(.+)$/);
+      if (indirectMatch) {
+        attrValue = indirectMatch[1];
+      } else if (attrValue.startsWith('<') && attrValue.includes('>')) {
+        const refMatch = attrValue.match(/<0x([0-9a-fA-F]+)>/);
+        if (refMatch) attrValue = `0x${refMatch[1].toLowerCase()}`;
+      } else {
+        const quoteMatch = attrValue.match(/^"(.+)"\s*(?:\(.+\))?$/);
+        if (quoteMatch) attrValue = quoteMatch[1];
+      }
+      current.attrs[attrName] = attrValue;
+    }
+  }
+  return { dies, errors };
+}
+
+function resolveType(offset: string, typeDefs: Map<string, DwarfTypeInfo>, visited: Set<string> = new Set()): DwarfTypeInfo | null {
+  if (visited.has(offset)) return null;
+  visited.add(offset);
+  const info = typeDefs.get(offset);
+  if (!info) return null;
+  if (info.kind === 'typedef' && info.typeOffset) {
+    return resolveType(info.typeOffset, typeDefs, visited) || info;
+  }
+  if (info.kind === 'pointer') return info;
+  return info;
+}
+
+export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
+  const varToType = new Map<string, string>();
+  const typeDefs = new Map<string, DwarfTypeInfo>();
+  const dwarfErrors: string[] = [];
+  const diagParts: string[] = [];
 
   try {
     const stdout = await new Promise<string>((resolve) => {
@@ -109,30 +187,127 @@ export async function readDwarfTypes(elfPath: string): Promise<Map<string, { typ
         timeout: 30000,
         windowsHide: true,
       }, (error, stdout) => {
-        if (error) {
-          console.error('[JLinkSymbols] readDwarfTypes error:', error);
-          resolve('');
-        } else {
-          resolve(stdout);
-        }
+        if (error) { console.error('[Dwarf] readDwarfTypes error:', error); resolve(''); }
+        else { resolve(stdout); }
       });
     });
 
-    let currentName = '';
-    for (const line of stdout.split('\n')) {
-      const nameMatch = line.match(/DW_AT_name\s*:\s*(\w+)/);
-      if (nameMatch) currentName = nameMatch[1];
+    if (!stdout) {
+      diagParts.push('stdout empty');
+      return { varToType, typeDefs, _diag: diagParts.join(' | ') };
+    }
+    
+    diagParts.push(`len=${stdout.length}, dwTagCount=${(stdout.match(/\(DW_TAG_\w+\)/g) || []).length}`);
 
-      const typeMatch = line.match(/DW_AT_type\s*:\s*<0x[0-9a-f]+>/);
-      const sizeMatch = line.match(/DW_AT_byte_size\s*:\s*(\d+)/);
+    const { dies } = parseDwarfOutput(stdout);
+    diagParts.push(`dies=${dies.length}`);
+    if (dies.length > 0) {
+      const topLevel = dies.filter((d: any) => d.depth === 0 || d.depth === 1);
+      diagParts.push(`topDies=${topLevel.length}`);
+    }
+    function visitDie(die: any, collect: (d: any) => void) {
+      collect(die);
+      for (const child of (die.children || [])) visitDie(child, collect);
+    }
 
-      if (currentName && sizeMatch) {
-        typeMap.set(currentName, { type: '', size: parseInt(sizeMatch[1]) });
+    const allDies: any[] = [];
+    for (const d of dies) visitDie(d, d2 => allDies.push(d2));
+
+    let nStruct = 0, nTypedef = 0, nBase = 0, nVar = 0;
+    for (const d of allDies) {
+      if (d.tag === 'DW_TAG_structure_type') nStruct++;
+      else if (d.tag === 'DW_TAG_typedef') nTypedef++;
+      else if (d.tag === 'DW_TAG_base_type') nBase++;
+      else if (d.tag === 'DW_TAG_variable') nVar++;
+    }
+    diagParts.push(`struct=${nStruct}, typedef=${nTypedef}, base=${nBase}, var=${nVar}`);
+
+    for (const die of allDies) {
+      if (die.tag === 'DW_TAG_variable' && die.attrs.DW_AT_name && die.attrs.DW_AT_type) {
+        varToType.set(die.attrs.DW_AT_name, die.attrs.DW_AT_type);
+      }
+
+      if (die.tag === 'DW_TAG_structure_type') {
+        const fields: DwarfField[] = [];
+        for (const child of die.children) {
+          if (child.tag === 'DW_TAG_member' && child.attrs.DW_AT_name) {
+            let offset = 0;
+            if (child.attrs.DW_AT_data_member_location) {
+              offset = parseInt(child.attrs.DW_AT_data_member_location, 10);
+              if (isNaN(offset)) offset = 0;
+            }
+            fields.push({
+              name: child.attrs.DW_AT_name,
+              typeOffset: child.attrs.DW_AT_type || '',
+              byteOffset: offset,
+            });
+          }
+        }
+        typeDefs.set(die.offset, {
+          name: die.attrs.DW_AT_name || '',
+          byteSize: parseInt(die.attrs.DW_AT_byte_size) || 0,
+          kind: 'struct',
+          fields,
+        });
+      }
+
+      if (die.tag === 'DW_TAG_typedef' && die.attrs.DW_AT_name) {
+        typeDefs.set(die.offset, {
+          name: die.attrs.DW_AT_name,
+          byteSize: 0,
+          kind: 'typedef',
+          typeOffset: die.attrs.DW_AT_type,
+        });
+      }
+
+      if (die.tag === 'DW_TAG_base_type' && die.attrs.DW_AT_name) {
+        typeDefs.set(die.offset, {
+          name: die.attrs.DW_AT_name,
+          byteSize: parseInt(die.attrs.DW_AT_byte_size) || 0,
+          kind: 'base',
+        });
+      }
+
+      if (die.tag === 'DW_TAG_pointer_type') {
+        typeDefs.set(die.offset, {
+          name: '',
+          byteSize: parseInt(die.attrs.DW_AT_byte_size) || 4,
+          kind: 'pointer',
+          typeOffset: die.attrs.DW_AT_type,
+        });
+      }
+
+      if (die.tag === 'DW_TAG_array_type') {
+        let arraySize = 0;
+        for (const child of die.children) {
+          if (child.tag === 'DW_TAG_subrange_type' && child.attrs.DW_AT_upper_bound) {
+            const ub = parseInt(child.attrs.DW_AT_upper_bound, 10);
+            arraySize = Math.max(arraySize, ub + 1);
+          }
+        }
+        typeDefs.set(die.offset, {
+          name: '',
+          byteSize: arraySize,
+          kind: 'array',
+          typeOffset: die.attrs.DW_AT_type,
+        });
       }
     }
-  } catch { }
+  } catch (e: any) {
+    diagParts.push(`ERROR: ${e.message}`);
+  }
 
-  return typeMap;
+  return { varToType, typeDefs, _diag: diagParts.join(' | ') };
+}
+
+export function getStructTypeName(typeDefs: Map<string, DwarfTypeInfo>, offset: string): string {
+  const info = typeDefs.get(offset);
+  if (!info) return '';
+  if (info.kind === 'typedef' && info.typeOffset) {
+    const resolved = resolveType(info.typeOffset, typeDefs);
+    return resolved?.name || info.name;
+  }
+  return info.name;
 }
 
 export interface LineMapping {

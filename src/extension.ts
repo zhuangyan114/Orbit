@@ -36,15 +36,22 @@ function saveWatchExpressions(ctx: vscode.ExtensionContext) {
 
 async function syncWatchesToDap() {
   const session = vscode.debug.activeDebugSession;
-  if (!session || session.type !== 'ozone') return;
+  if (!session || session.type !== 'ozone') {
+    console.log(`[Ozone] syncWatchesToDap: no ozone session (session=${!!session}, type=${session?.type})`);
+    return;
+  }
   try {
     const exprs = watchProvider.watches.map(w => w.expression);
+    console.log(`[Ozone] syncWatchesToDap: setting ${exprs.length} watches: [${exprs.join(', ')}]`);
     await session.customRequest('setWatches', { expressions: exprs });
     if (exprs.length > 0) {
       const r = await session.customRequest('watchEvaluate', { expressions: exprs });
+      console.log(`[Ozone] syncWatchesToDap: watchEvaluate got ${r?.results?.length || 0} results`);
       if (r && r.results) watchProvider.updateResults(r.results);
     }
-  } catch { }
+  } catch (e: any) {
+    console.log(`[Ozone] syncWatchesToDap: error ${e.message}`);
+  }
 }
 
 async function openTopFrameFromFile(file?: string, line?: number) {
@@ -306,22 +313,30 @@ vscode.commands.registerCommand('ozone.stopSession', async () => {
     vscode.debug.registerDebugAdapterTrackerFactory('ozone', {
       createDebugAdapterTracker(session) {
         let waitingForStackTrace = false;
+        let initialized = false;
 
         return {
           onDidSendMessage(message: any) {
+            if (message.type === 'event' && message.event === 'initialized' && !initialized) {
+              initialized = true;
+              const exprs = watchProvider?.watches.map(w => w.expression) || [];
+              console.log(`[Ozone] initialized: syncing ${exprs.length} watches via session ${session.id}`);
+              (async () => {
+                try {
+                  await session.customRequest('setWatches', { expressions: exprs });
+                  console.log(`[Ozone] initialized: setWatches ok`);
+                  if (exprs.length > 0) {
+                    const r: any = await session.customRequest('watchEvaluate', { expressions: exprs });
+                    if (r && r.results) watchProvider?.updateResults(r.results);
+                  }
+                } catch (e: any) {
+                  console.log(`[Ozone] initialized: error ${e.message}`);
+                }
+              })();
+            }
             if (message.type === 'event' && message.event === 'stopped') {
               waitingForStackTrace = true;
-              if (watchProvider) {
-                const sess = vscode.debug.activeDebugSession;
-                if (sess && sess.type === 'ozone') {
-                  const exprs = watchProvider.watches.map(w => w.expression);
-                  if (exprs.length > 0) {
-                    sess.customRequest('watchEvaluate', { expressions: exprs }).then(r => {
-                      if (r && r.results) watchProvider.updateResults(r.results);
-                    }, () => {});
-                  }
-                }
-              }
+              syncWatchesToDap();
             }
 
             if (message.type === 'event' && message.event === 'output' && 

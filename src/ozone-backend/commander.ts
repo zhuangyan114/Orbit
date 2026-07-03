@@ -752,6 +752,65 @@ case 'readVariableRuntime':
         } else {
           daLog('doEvaluateExpression: raw read returned null, falling back to flat read');
         }
+      } else if (resolvedType && resolvedType.kind === 'array') {
+        const arrayInfo = this.dwarfInfo.typeDefs.get(varTypeOffset);
+        const count = arrayInfo?.arrayCount || 0;
+        const elemType = arrayInfo?.typeOffset ? this.resolveDwarfType(arrayInfo.typeOffset) : null;
+        const elemSize = elemType?.byteSize || 4;
+        const totalBytes = count * elemSize;
+        const readLen = Math.max(totalBytes, sym.size || 4);
+        daLog(`doEvaluateExpression: reading array memory at 0x${sym.address.toString(16)} count=${count} elemSize=${elemSize} len=${readLen}`);
+        const raw = this.jlink.readMemory(sym.address, readLen);
+        if (raw) {
+          const children: WatchValue[] = [];
+          for (let i = 0; i < count; i++) {
+            const elemAddr = sym.address + i * elemSize;
+            const elemRawOffset = i * elemSize;
+            if (elemType?.kind === 'struct' && elemType.fields) {
+              const childRaw = raw.slice(elemRawOffset, elemRawOffset + elemSize);
+              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr);
+              children.push({
+                expression: `[${i}]`,
+                value: structChildren[0]?.value ?? 0,
+                display: `${elemType.name || 'struct'} { ${structChildren.map(c => `${c.expression}=${c.display}`).join(', ')} }`,
+                hex: '',
+                address: elemAddr,
+                typeName: elemType.name || '',
+                children: structChildren,
+              });
+            } else {
+              let value = 0;
+              const end = Math.min(elemRawOffset + elemSize, raw.length);
+              for (let j = end - 1; j >= elemRawOffset; j--) {
+                value = (value << 8) | raw[j];
+              }
+              children.push({
+                expression: `[${i}]`,
+                value,
+                display: elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`,
+                hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`,
+                address: elemAddr,
+                typeName: elemType?.name || '',
+              });
+            }
+          }
+          return {
+            ok: true,
+            data: {
+              expression,
+              value: children[0]?.value ?? 0,
+              display: children.length > 0
+                ? `${count} elems [${children.slice(0, 3).map(c => c.display).join(', ')}${children.length > 3 ? ', ...' : ''}]`
+                : `${count} elems`,
+              hex: '',
+              address: sym.address,
+              typeName: `${resolvedType.name || ''}[${count}]`,
+              children,
+            } as WatchValue,
+          };
+        } else {
+          daLog('doEvaluateExpression: array raw read returned null, falling back to flat read');
+        }
       } else {
         daLog(`doEvaluateExpression: not a struct (kind=${resolvedType?.kind}), reading as flat value`);
       }
@@ -793,7 +852,7 @@ case 'readVariableRuntime':
     };
   }
 
-  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string } | null {
+  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number } | null {
     if (!visited) visited = new Set();
     if (visited.has(offset)) return null;
     visited.add(offset);
@@ -807,7 +866,7 @@ case 'readVariableRuntime':
     if (info.kind === 'struct') {
       return { kind: 'struct', name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
     }
-    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name };
+    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount };
   }
 
   private getDwarfTypeName(offset: string): string {
@@ -839,6 +898,62 @@ case 'readVariableRuntime':
         hex: '',
         address: addr,
         typeName: resolvedName,
+        children,
+      };
+    }
+
+    if (resolvedKind === 'array') {
+      const arrayInfo = this.dwarfInfo.typeDefs.get(field.typeOffset);
+      const count = arrayInfo?.arrayCount || 0;
+      const elemType = arrayInfo?.typeOffset ? this.resolveDwarfType(arrayInfo.typeOffset) : null;
+      const elemSize = elemType?.byteSize || 4;
+      const totalBytes = count * elemSize;
+      const arrRaw = raw.length >= field.byteOffset + totalBytes
+        ? raw.slice(field.byteOffset, field.byteOffset + totalBytes)
+        : new Uint8Array(0);
+
+      const children: WatchValue[] = [];
+      for (let i = 0; i < count; i++) {
+        const elemAddr = addr + i * elemSize;
+        const elemRawOffset = i * elemSize;
+        if (elemType?.kind === 'struct' && elemType.fields) {
+          const childRaw = arrRaw.slice(elemRawOffset, elemRawOffset + elemSize);
+          const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr);
+          children.push({
+            expression: `[${i}]`,
+            value: structChildren[0]?.value ?? 0,
+            display: `${elemType.name || 'struct'} { ${structChildren.map(c => `${c.expression}=${c.display}`).join(', ')} }`,
+            hex: '',
+            address: elemAddr,
+            typeName: elemType.name || '',
+            children: structChildren,
+          });
+        } else {
+          let value = 0;
+          const end = Math.min(elemRawOffset + elemSize, arrRaw.length);
+          for (let j = end - 1; j >= elemRawOffset; j--) {
+            value = (value << 8) | arrRaw[j];
+          }
+          children.push({
+            expression: `[${i}]`,
+            value,
+            display: elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`,
+            hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`,
+            address: elemAddr,
+            typeName: elemType?.name || '',
+          });
+        }
+      }
+
+      return {
+        expression: field.name,
+        value: children[0]?.value ?? 0,
+        display: children.length > 0
+          ? `${count} elems [${children.slice(0, 3).map(c => c.display).join(', ')}${children.length > 3 ? ', ...' : ''}]`
+          : `${count} elems`,
+        hex: '',
+        address: addr,
+        typeName: `${resolvedName || ''}[${count}]`,
         children,
       };
     }

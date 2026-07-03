@@ -109,6 +109,7 @@ export interface DwarfTypeInfo {
   kind: 'struct' | 'typedef' | 'base' | 'pointer' | 'array' | 'enum' | 'unspecified';
   fields?: DwarfField[];
   typeOffset?: string;
+  arrayCount?: number;
 }
 
 export interface DwarfInfo {
@@ -287,9 +288,10 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
         }
         typeDefs.set(die.offset, {
           name: '',
-          byteSize: arraySize,
+          byteSize: 0,
           kind: 'array',
           typeOffset: die.attrs.DW_AT_type,
+          arrayCount: arraySize,
         });
       }
     }

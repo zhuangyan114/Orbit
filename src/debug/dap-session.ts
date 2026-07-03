@@ -96,33 +96,16 @@ export class DapSession extends EventEmitter {
         if (this.watchExpressions.length > 0) {
           if (this.pollTimer === null) return;
           this._watchPollCycle++;
-          daLog(`pollLoop: halting CPU for watch read (cycle ${this._watchPollCycle})`);
-          await this.backend.execute({ cmd: 'halt' });
-          if (this.pollTimer === null) return;
-          let haltedAfter = false;
-          for (let i = 0; i < 10; i++) {
-            if (this.pollTimer === null) return;
-            const s = await this.backend.execute({ cmd: 'getTargetState' });
-            if (s.ok && s.data === 'halted') { haltedAfter = true; break; }
-            await new Promise<void>(q => setTimeout(q, 50));
-          }
-          if (this.pollTimer === null) return;
-          daLog(`pollLoop: halted=${haltedAfter}, waiting 100ms for DLL`);
-          await new Promise<void>(q => setTimeout(q, 100));
-
-          if (this.pollTimer === null) return;
+          daLog(`pollLoop: reading watches without halt (cycle ${this._watchPollCycle})`);
           const results: any[] = [];
           for (const expr of this.watchExpressions) {
             if (this.pollTimer === null) return;
-            const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+            const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
             daLog(`pollLoop read: ${expr} ok=${r.ok} val=${r.ok ? (r.data as any).value : r.error}`);
             if (r.ok) results.push(r.data);
             else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
           }
-
-          if (this.pollTimer === null) return;
-          const runResult = await this.backend.execute({ cmd: 'run' });
-          daLog(`pollLoop: run result ok=${runResult.ok}, sending ${results.length} results`);
+          daLog(`pollLoop: sending ${results.length} results`);
           this.sendWatchUpdate(results);
         } else {
           daLog('pollLoop: no watch expressions, skipping');

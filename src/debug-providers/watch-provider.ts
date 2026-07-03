@@ -1,13 +1,34 @@
 import * as vscode from 'vscode';
 import { WatchValue } from '../ozone-backend/types';
 
+const MIN_CHANGE_DISPLAY_MS = 500;
+
 export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
   private _watches: WatchValue[] = [];
   private _prevValues = new Map<string, string>();
-  private _changedExprs = new Set<string>();
+  private _changedTimes = new Map<string, number>();
   private _onDidChangeTreeData = new vscode.EventEmitter<WatchItem | undefined>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
   onExpressionsChanged: ((exprs: string[]) => void) | null = null;
+
+  private _getChangedSet(): Set<string> {
+    const now = Date.now();
+    const active = new Set<string>();
+    for (const [expr, time] of this._changedTimes) {
+      if (now - time < MIN_CHANGE_DISPLAY_MS) {
+        active.add(expr);
+      }
+    }
+    return active;
+  }
+
+  private _pruneChangedTimes(now: number) {
+    for (const [expr, time] of this._changedTimes) {
+      if (now - time >= MIN_CHANGE_DISPLAY_MS) {
+        this._changedTimes.delete(expr);
+      }
+    }
+  }
 
   get watches(): ReadonlyArray<WatchValue> {
     return this._watches;
@@ -26,23 +47,26 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
       const w = element.watch;
       if (w.children && w.children.length > 0) {
         const parentPath = w.expression;
+        const changedSet = this._getChangedSet();
         return w.children.map(c => {
-          const fullExpr = `${parentPath}.${c.expression}`;
+          const sep = c.expression.startsWith('[') ? '' : '.';
+          const fullExpr = `${parentPath}${sep}${c.expression}`;
           const childWatch = { ...c, expression: fullExpr };
-          const childChanged = this._changedExprs.has(fullExpr);
+          const childChanged = changedSet.has(fullExpr);
           return new WatchItem(childWatch, this._prevValues.get(fullExpr), childChanged, c.expression);
         });
       }
       return [];
     }
+    const changedSet = this._getChangedSet();
     return this._watches.map(w => {
-      const changed = this._changedExprs.has(w.expression);
+      const changed = changedSet.has(w.expression);
       return new WatchItem(w, this._prevValues.get(w.expression), changed);
     });
   }
 
   updateResults(results: WatchValue[]) {
-    this._changedExprs.clear();
+    const now = Date.now();
     const allResults: WatchValue[] = [];
     for (const r of results) {
       allResults.push(r);
@@ -61,11 +85,13 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
       if (r.display && !r.error) {
         const prev = this._prevValues.get(r.expression);
         if (prev !== undefined && prev !== r.display) {
-          this._changedExprs.add(r.expression);
+          this._changedTimes.set(r.expression, now);
         }
         this._prevValues.set(r.expression, r.display);
       }
     }
+
+    this._pruneChangedTimes(now);
     let changed = false;
     const existing = new Set(this._watches.map(w => w.expression));
     for (const r of results) {
@@ -87,7 +113,8 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
       if (r.children) {
         for (const c of r.children) {
           if (c.expression === child) {
-            return `${r.expression}.${child}`;
+            const sep = child.startsWith('[') ? '' : '.';
+            return `${r.expression}${sep}${child}`;
           }
         }
       }

@@ -150,10 +150,10 @@ F5 in VS Code: "Run Extension" (build first) or "Extension + Watch" (esbuild wat
 ### Architecture
 - **`evaluateExpression` command** (`src/ozone-backend/commander.ts:652-717`): Reads memory at symbol address. `force: true` skips halt check for polling reads. Caller manages halt/resume.
 - **DAP evaluate** (`src/debug/dap-session.ts:464-480`): Returns real values to VS Code WATCH section when stopped. Auto-captures `context === 'watch'` expressions.
-- **Watch polling** (`src/debug/dap-session.ts:70-130`): Combined 5Hz timer — checks breakpoints, then halts → batch reads all watch expressions → resumes. Uses `setTimeout` recursion (no overlap).
+- **Watch polling** (`src/debug/dap-session.ts:70-130`): Combined 5Hz timer — reads watch expressions with `force: true` (no halt), uses `setTimeout` recursion (no overlap).
 - **Polling halt+delay quirk**: After `halt()`, poll `isHalted()` up to 500ms then wait 100ms for DLL stabilization. Without this, `doEvaluateExpression` may return `{ error: 'running' }` because Jlink_Halt is async.
 - **Polling race guard**: Every `await` in `pollLoop` checks `this.pollTimer === null` to abort if `stopPolling()` was called externally (e.g., Restart). `stopPolling()` in the halted path is called AFTER `sendEvent('stopped')` to avoid swallowing the stopped event.
-- **WatchProvider** (`src/debug-providers/watch-provider.ts`): TreeDataProvider for `ozoneWatch` view. Tracks previous values for change highlighting (`debug-stackframe-dot` icon). Preserves last-known values when CPU is running.
+- **WatchProvider** (`src/debug-providers/watch-provider.ts`): TreeDataProvider for `ozoneWatch` view, also implements `FileDecorationProvider` for font color change on value change. Tracks previous values and timestamps for MIN_CHANGE_DISPLAY_MS (500ms) change highlighting. Uses custom `ozone-watch:` URI scheme via `resourceUri` for file decorations. Preserves last-known values when CPU is running.
 - **Communication**: DAP adapter sends watch values via `output` event (`category: 'ozoneWatch'`). Extension's `DebugAdapterTracker` intercepts and updates WatchProvider.
 - **Persistence**: Watch expressions saved to `workspaceState` via `saveWatchExpressions()` in extension.ts, restored on activation.
 
@@ -181,13 +181,14 @@ Auto-capture                     → handleEvaluate adds expr to watchExpression
 - **DWARF 5**: Offsets use lowercase normalization (`0xb4` not `0xB4`). Attribute names with `(indirect string, offset: 0x...)` prefix are extracted to get the actual name.
 - **Struct evaluation** (`commander.ts:819-863`): `evaluateSingleField()` uses `resolveDwarfType()` to resolve typedef chains and get correct `byteSize` per field. Nested structs are recursively parsed.
 - **Tree view** (`watch-provider.ts:24-41`): `getChildren(element?)` returns struct field children. `CollapsibleState.Collapsed` for struct rows. Field labels show short name (e.g., `b` not `ab.b`).
-- **Change highlighting**: Always shows `circle-outline` icon (maintains consistent spacing). Changes to `circle-filled` + `debugIcon.startForeground` green when value changes.
+- **Change highlighting**: Uses `FileDecorationProvider` + `resourceUri` to change entire row font color (via `charts.green` or configurable `ThemeColor`) when value changes. Change state persists for MIN_CHANGE_DISPLAY_MS (500ms) via timestamp-based tracking in `_changedTimes`.
 
 ### Known limitations
 - VS Code native WATCH section only updates when debuggee is stopped (DAP protocol limit)
 - Ozone Watch tree view updates at both running and stopped states
 - `doGetLocals()` now reads actual memory values (fixed from showing addresses only)
 - Struct display only works for global/static variables with DWARF debug info (compiled with `-g`)
+- Array display now supported: element-by-element expansion with `[0]`, `[1]`, ... children. Nested struct arrays supported. Configured via `arrayCount` in `DwarfTypeInfo`.
 - Pointer dereferencing not yet supported (shows address only)
 
 ## UI contributions

@@ -3,12 +3,24 @@ import { WatchValue } from '../ozone-backend/types';
 
 const MIN_CHANGE_DISPLAY_MS = 500;
 
-export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
+function exprToUri(expr: string): vscode.Uri {
+  return vscode.Uri.parse(`ozone-watch:/watch/${encodeURIComponent(expr)}`);
+}
+
+function uriToExpr(uri: vscode.Uri): string | null {
+  if (uri.scheme !== 'ozone-watch') return null;
+  const m = uri.path.match(/^\/watch\/(.+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+export class WatchProvider implements vscode.TreeDataProvider<WatchItem>, vscode.FileDecorationProvider {
   private _watches: WatchValue[] = [];
   private _prevValues = new Map<string, string>();
   private _changedTimes = new Map<string, number>();
   private _onDidChangeTreeData = new vscode.EventEmitter<WatchItem | undefined>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+  private _onDidChangeFileDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
+  readonly onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
   onExpressionsChanged: ((exprs: string[]) => void) | null = null;
 
   private _getChangedSet(): Set<string> {
@@ -23,11 +35,33 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
   }
 
   private _pruneChangedTimes(now: number) {
+    const pruned: string[] = [];
     for (const [expr, time] of this._changedTimes) {
       if (now - time >= MIN_CHANGE_DISPLAY_MS) {
         this._changedTimes.delete(expr);
+        pruned.push(expr);
       }
     }
+    if (pruned.length > 0) {
+      this._fireDecorationChangeForExprs(pruned);
+    }
+  }
+
+  private _fireDecorationChangeForExprs(exprs: string[]) {
+    if (exprs.length === 0) return;
+    const uris = exprs.map(e => exprToUri(e));
+    this._onDidChangeFileDecorations.fire(uris);
+  }
+
+  provideFileDecoration(uri: vscode.Uri): vscode.ProviderResult<vscode.FileDecoration> {
+    const expr = uriToExpr(uri);
+    if (!expr) return undefined;
+    const now = Date.now();
+    const t = this._changedTimes.get(expr);
+    if (t !== undefined && now - t < MIN_CHANGE_DISPLAY_MS) {
+      return { color: new vscode.ThemeColor('charts.green') };
+    }
+    return undefined;
   }
 
   get watches(): ReadonlyArray<WatchValue> {
@@ -81,14 +115,19 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
       }
     }
 
+    const changedUris: vscode.Uri[] = [];
     for (const r of allResults) {
       if (r.display && !r.error) {
         const prev = this._prevValues.get(r.expression);
         if (prev !== undefined && prev !== r.display) {
           this._changedTimes.set(r.expression, now);
+          changedUris.push(exprToUri(r.expression));
         }
         this._prevValues.set(r.expression, r.display);
       }
+    }
+    if (changedUris.length > 0) {
+      this._onDidChangeFileDecorations.fire(changedUris);
     }
 
     this._pruneChangedTimes(now);
@@ -126,7 +165,10 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem> {
     this._watches = expressions.map(expr => ({
       expression: expr, value: 0, display: '', hex: '',
     }));
+    this._prevValues.clear();
+    this._changedTimes.clear();
     this._onDidChangeTreeData.fire(undefined);
+    this._onDidChangeFileDecorations.fire(undefined);
     if (this.onExpressionsChanged) {
       this.onExpressionsChanged(expressions);
     }
@@ -141,7 +183,10 @@ class WatchItem extends vscode.TreeItem {
   constructor(public watch: WatchValue, prevValue?: string, changed?: boolean, displayLabel?: string) {
     const label = displayLabel || watch.expression;
     const hasChildren = !!(watch.children && watch.children.length > 0);
+
     super(label, hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+
+    this.resourceUri = exprToUri(watch.expression);
 
     const typePart = watch.typeName ? ` (${watch.typeName})` : '';
 
@@ -160,11 +205,6 @@ class WatchItem extends vscode.TreeItem {
     }
 
     this.contextValue = 'watchItem';
-
-    if (changed) {
-      this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('debugIcon.startForeground'));
-    } else {
-      this.iconPath = new vscode.ThemeIcon('circle-outline');
-    }
+    this.iconPath = undefined;
   }
 }

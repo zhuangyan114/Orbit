@@ -120,6 +120,7 @@ export function activate(context: vscode.ExtensionContext) {
       wp.setExpressions(saved);
     }
     console.log('[Ozone] watchProvider ok');
+    context.subscriptions.push(vscode.window.registerFileDecorationProvider(wp));
 
     const doFlash = async (b: OzoneBackend, elfPath: string, device: string, interface_: 'SWD' | 'JTAG', speedKHz: number, restart: boolean) => {
       await vscode.window.withProgress({

@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/dist/**/*.js"
+      ],
+      "preLaunchTask": "npm: build",
+      "env": {
+        "NODE_ENV": "development"
+      }
+    },
+    {
+      "name": "Extension + Watch",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/dist/**/*.js"
+      ],
+      "preLaunchTask": "npm: watch",
+      "env": {
+        "NODE_ENV": "development"
+      }
+    },
+    {
+      "type": "ozone",
+      "request": "launch",
+      "name": "Ozone: Debug STM32",
+      "program": "D:\\STM32\\RoboMaster\\26Lao_ShaoBin\\Down-cmake\\build\\Debug\\frame.elf",
+      "device": "STM32F407IG",
+      "interface": "SWD",
+      "speedKHz": 4000
+    }
+  ]
+}

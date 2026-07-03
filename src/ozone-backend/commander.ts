@@ -1,0 +1,680 @@
+import {
+  OzoneCommand, OzoneCommandResult,
+  DebugSessionConfig, RegisterValue, Variable,
+  StackFrame, MemoryBlock, TargetState,
+} from './types';
+import { flashElf } from './flasher';
+import { JLinkDLL } from './jlink-dll';
+import { readElfSymbols, SymbolInfo, resolveLineToAddress, preloadLineMappings, preloadAddressMappings } from './jlink-symbols';
+import * as fs from 'fs';
+import * as path from 'path';
+
+function daLog(msg: string) {
+  try {
+    fs.appendFileSync(path.join(__dirname, '..', 'debugadapter.log'), `[${new Date().toISOString()}] DA: ${msg}\n`);
+  } catch { }
+}
+
+const REG_INDEXES: Record<string, number> = {
+  R0: 0, R1: 1, R2: 2, R3: 3, R4: 4, R5: 5, R6: 6, R7: 7,
+  R8: 8, R9: 9, R10: 10, R11: 11, R12: 12,
+  SP: 13, LR: 14, PC: 15, xPSR: 16,
+};
+
+export class OzoneBackend {
+  private jlink: JLinkDLL = new JLinkDLL();
+  private state: TargetState = TargetState.Disconnected;
+  private symbols: SymbolInfo[] = [];
+  private elfPath = '';
+  private lineMapCache = new Map<string, Array<{ line: number; address: number }>>();
+  private addressLocCache = new Map<number, { file: string; line: number; func: string }>();
+  private lineEntries: { address: number; file: string; line: number }[] = [];
+  private tempBreakpoint: { index: number; addr: number } | null = null;
+  private stepOverClearedBps: { index: number; addr: number }[] = [];
+
+  get currentState(): TargetState {
+    return this.state;
+  }
+
+  async execute(command: OzoneCommand): Promise<OzoneCommandResult> {
+    try {
+      switch (command.cmd) {
+        case 'connect':
+          return await this.doConnect(command.config);
+        case 'disconnect':
+          return this.doDisconnect();
+        case 'halt':
+          return this.jlink.halt()
+            ? (this.state = TargetState.Halted, { ok: true, data: 'Halted' })
+            : { ok: false, error: 'Halt failed' };
+        case 'run':
+          return this.jlink.run()
+            ? (this.state = TargetState.Running, { ok: true, data: 'Running' })
+            : { ok: false, error: 'Run failed' };
+        case 'stepOver':
+          return await this.doStepOver();
+        case 'stepInto':
+          return await this.doStepInto();
+        case 'stepOut':
+          return await this.doStepOut();
+        case 'reset':
+          return this.jlink.reset()
+            ? { ok: true, data: 'Reset' }
+            : { ok: false, error: 'Reset failed' };
+        case 'setBreakpoint':
+          return await this.doSetBreakpoint(command.file, command.line, command.condition);
+        case 'clearBreakpoint':
+          return await this.doClearBreakpoint(command.id);
+        case 'getRegisters':
+          return await this.doGetRegisters();
+        case 'getLocals':
+          return await this.doGetLocals();
+        case 'getCallStack':
+          return await this.doGetCallStack();
+        case 'readMemory':
+          return await this.doReadMemory(command.address, command.size);
+        case 'readRegister':
+          return await this.doReadRegister(command.name);
+        case 'getTargetState': {
+          const halted = this.jlink.isHalted();
+          const result = halted ? TargetState.Halted : this.state;
+          return { ok: true, data: result };
+        }
+        case 'flash':
+          return await this.doFlash(command.elfPath, command.device, command.interface, command.speedKHz);
+case 'readVariableRuntime':
+          return await this.readVariableAtRuntime(command.name);
+        case 'clearBreakpointAtAddr':
+          return this.doClearBreakpointAtAddr(command.addr);
+        case 'setBreakpointAtAddr':
+          return this.doSetBreakpointAtAddr(command.addr);
+        case 'loadSymbols':
+    if (this.elfPath === command.elfPath && this.symbols.length > 0) {
+      return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };
+    }
+    daLog(`loadSymbols start: ${command.elfPath}`);
+    this.elfPath = command.elfPath;
+    this.symbols = await readElfSymbols(command.elfPath);
+    daLog(`loadSymbols symbols: ${this.symbols.length}`);
+    this.lineMapCache = await preloadLineMappings(command.elfPath);
+    daLog(`loadSymbols lineMapCache: ${this.lineMapCache.size} files`);
+    const funcAddrs = this.symbols
+      .filter(s => s.type === 'T' || s.type === 't')
+      .map(s => s.address);
+    this.addressLocCache = await preloadAddressMappings(command.elfPath, funcAddrs);
+    daLog(`loadSymbols addressLocCache: ${this.addressLocCache.size}`);
+
+    const fnameToAbs = new Map<string, string>();
+    for (const loc of this.addressLocCache.values()) {
+      const base = path.basename(loc.file);
+      if (base && !fnameToAbs.has(base)) fnameToAbs.set(base, loc.file);
+    }
+    for (const [addr, loc] of this.addressLocCache) {
+      const base = path.basename(loc.file);
+      if (base) fnameToAbs.set(base, loc.file);
+    }
+    daLog(`loadSymbols fnameToAbs: ${fnameToAbs.size}, entries: ${JSON.stringify([...fnameToAbs].slice(0, 5))}`);
+
+    this.lineEntries = [];
+    for (const [fName, entries] of this.lineMapCache) {
+      let resolvedFile: string;
+      if (path.isAbsolute(fName) && fs.existsSync(fName)) {
+        resolvedFile = fName;
+      } else if (fnameToAbs.has(fName)) {
+        resolvedFile = fnameToAbs.get(fName)!;
+      } else {
+        const base = path.basename(fName);
+        if (fnameToAbs.has(base)) {
+          resolvedFile = fnameToAbs.get(base)!;
+        } else {
+          const elfDir = path.dirname(command.elfPath);
+          resolvedFile = path.resolve(elfDir, fName);
+        }
+      }
+      for (const entry of entries) {
+        if (entry.address >= 0x08000000 && entry.address < 0x20100000) {
+          this.lineEntries.push({ address: entry.address, file: resolvedFile, line: entry.line });
+        }
+      }
+    }
+    this.lineEntries.sort((a, b) => a.address - b.address);
+    daLog(`loadSymbols lineEntries (filtered): ${this.lineEntries.length}`);
+    return { ok: true, data: `Loaded ${this.symbols.length} symbols` };
+        default:
+          return { ok: false, error: `Unsupported command: ${(command as any).cmd}` };
+      }
+    } catch (err: any) {
+      this.state = TargetState.Error;
+      return { ok: false, error: err.message ?? String(err) };
+    }
+  }
+
+  private async doConnect(config: DebugSessionConfig): Promise<OzoneCommandResult> {
+    if (this.state === TargetState.Connected) {
+      return { ok: true, data: { state: TargetState.Connected } };
+    }
+    if (!this.jlink.open()) {
+      return { ok: false, error: 'Failed to load JLink DLL' };
+    }
+
+    const connected = this.jlink.connect(config.device, config.speedKHz);
+    if (!connected) {
+      this.jlink.close();
+      return { ok: false, error: `Failed to connect to ${config.device}` };
+    }
+
+    this.jlink.halt();
+    this.jlink.clearAllBreakpoints();
+
+    this.state = TargetState.Connected;
+
+    return { ok: true, data: { state: TargetState.Connected } };
+  }
+
+  private doDisconnect(): OzoneCommandResult {
+    if (this.state === TargetState.Disconnected) {
+      return { ok: true, data: null };
+    }
+    this.jlink.disconnect();
+    this.state = TargetState.Disconnected;
+    this.symbols = [];
+    this.lineMapCache.clear();
+    this.addressLocCache.clear();
+    this.lineEntries = [];
+    return { ok: true, data: null };
+  }
+
+  private async doSetBreakpoint(file: string, line: number, condition?: string): Promise<OzoneCommandResult> {
+    daLog(`setBreakpoint ${file}:${line} elfPath=${this.elfPath} cacheSize=${this.lineMapCache.size}`);
+    const addr = await this.resolveLineAddress(file, line);
+    daLog(`setBreakpoint resolved addr=${addr}`);
+    if (addr === null) return { ok: false, error: `Cannot resolve ${file}:${line}` };
+    console.log(`[Ozone] SetBreakpoint ${file}:${line} → 0x${addr.toString(16).toUpperCase()}`);
+    daLog(`setBreakpoint calling jlink.setBreakpoint(${addr.toString(16)})`);
+    const bpIndex = this.jlink.setBreakpoint(addr);
+    daLog(`setBreakpoint jlink result=${bpIndex}`);
+    if (bpIndex === null) return { ok: false, error: `Failed to set breakpoint at 0x${addr.toString(16)}` };
+    console.log(`[Ozone] Breakpoint set, index=${bpIndex}`);
+    return { ok: true, data: { id: bpIndex, address: addr } };
+  }
+
+  private async doClearBreakpoint(id: number): Promise<OzoneCommandResult> {
+    daLog(`doClearBreakpoint id=${id}`);
+    const result = this.jlink.clearBreakpoint(id);
+    daLog(`doClearBreakpoint result=${result}`);
+    return result
+      ? { ok: true, data: null }
+      : { ok: false, error: 'Failed to clear breakpoint' };
+  }
+
+  private doClearBreakpointAtAddr(addr: number): OzoneCommandResult {
+    const index = this.jlink.clearBreakpointAtAddr(addr);
+    if (index !== null) {
+      return { ok: true, data: { index } };
+    }
+    return { ok: false, error: `No breakpoint at 0x${addr.toString(16)}` };
+  }
+
+  private doSetBreakpointAtAddr(addr: number): OzoneCommandResult {
+    const index = this.jlink.setBreakpoint(addr);
+    if (index !== null) {
+      return { ok: true, data: { id: index, address: addr } };
+    }
+    return { ok: false, error: `Failed to set breakpoint at 0x${addr.toString(16)}` };
+  }
+
+  private async doGetRegisters(): Promise<OzoneCommandResult> {
+    const isHalted = this.jlink.isHalted();
+    daLog(`doGetRegisters: isHalted=${isHalted}`);
+    if (!isHalted) {
+      return { ok: true, data: [] };
+    }
+    const registers: RegisterValue[] = [];
+
+    for (const [name, idx] of Object.entries(REG_INDEXES)) {
+      const val = this.jlink.readRegister(idx);
+      if (val !== null) {
+        registers.push({
+          name,
+          value: val,
+          hex: `0x${val.toString(16).toUpperCase().padStart(8, '0')}`,
+        });
+      }
+    }
+
+    return { ok: true, data: registers };
+  }
+
+  private async doReadRegister(name: string): Promise<OzoneCommandResult> {
+    const halted = await this.ensureHalted();
+    if (!halted) return { ok: false, error: 'Failed to halt CPU for register read' };
+    await new Promise<void>(r => setTimeout(r, 100));
+    const idx = REG_INDEXES[name.toUpperCase()];
+    if (idx === undefined) return { ok: false, error: `Unknown register: ${name}` };
+    const val = this.jlink.readRegister(idx);
+    if (val === null) return { ok: false, error: `Failed to read ${name}` };
+    return { ok: true, data: { name, value: val, hex: `0x${val.toString(16).toUpperCase().padStart(8, '0')}` } };
+  }
+
+  private async doGetLocals(): Promise<OzoneCommandResult> {
+    const isHalted = this.jlink.isHalted();
+    daLog(`doGetLocals: isHalted=${isHalted}`);
+    if (!isHalted) {
+      return { ok: true, data: [] };
+    }
+    const variables: Variable[] = [];
+    const localSymbols = this.symbols.filter(s =>
+      s.type === 'd' || s.type === 'D' || s.type === 'B' || s.type === 'b'
+    );
+
+    for (const sym of localSymbols.slice(0, 50)) {
+      variables.push({
+        name: sym.name,
+        type: sym.type,
+        value: `0x${sym.address.toString(16).toUpperCase()}`,
+        address: sym.address,
+      });
+    }
+
+    return { ok: true, data: variables };
+  }
+
+  private async doGetCallStack(): Promise<OzoneCommandResult> {
+    const isHalted = this.jlink.isHalted();
+    daLog(`doGetCallStack: isHalted=${isHalted}`);
+    if (!isHalted) {
+      return { ok: true, data: [] };
+    }
+    await new Promise<void>(r => setTimeout(r, 100));
+
+    const pc = this.jlink.readRegister(REG_INDEXES.PC);
+    const lr = this.jlink.readRegister(REG_INDEXES.LR);
+    daLog(`doGetCallStack pc=${pc !== null ? '0x' + pc.toString(16) : 'null'} lr=${lr !== null ? '0x' + lr.toString(16) : 'null'}`);
+
+    if (pc === null || lr === null) {
+      daLog('doGetCallStack readReg failed');
+      return { ok: false, error: 'Cannot read core registers' };
+    }
+
+    const frames: StackFrame[] = [];
+
+    const pcLoc = this.resolveAddressLoc(pc);
+    daLog(`doGetCallStack pcLoc=${JSON.stringify(pcLoc)}`);
+    frames.push({
+      id: 0, level: 0,
+      function: pcLoc?.func || this.resolveSymbolName(pc) || `0x${pc.toString(16)}`,
+      file: pcLoc?.file || '',
+      line: pcLoc?.line || 0,
+      address: pc,
+    });
+
+    if (lr !== 0xFFFFFFFF) {
+      const lrLoc = this.resolveAddressLoc(lr);
+      frames.push({
+        id: 1, level: 1,
+        function: lrLoc?.func || this.resolveSymbolName(lr) || `0x${lr.toString(16)}`,
+        file: lrLoc?.file || '',
+        line: lrLoc?.line || 0,
+        address: lr,
+      });
+    }
+
+    return { ok: true, data: frames };
+  }
+
+  private async ensureHalted(): Promise<boolean> {
+    this.jlink.halt();
+    const immediate = this.jlink.isHalted();
+    daLog(`ensureHalted: immediate=${immediate}`);
+    if (immediate) return true;
+    for (let i = 0; i < 10; i++) {
+      await new Promise<void>(r => setTimeout(r, 50));
+      const check = this.jlink.isHalted();
+      daLog(`ensureHalted: poll ${i + 1} isHalted=${check}`);
+      if (check) return true;
+    }
+    daLog('ensureHalted: timeout waiting for halt');
+    return false;
+  }
+
+  private cleanupStepBreakpoints(): void {
+    daLog(`cleanupStepBreakpoints: tempBp=${this.tempBreakpoint ? `${this.tempBreakpoint.index}@0x${this.tempBreakpoint.addr.toString(16)}` : 'null'} clearedBps=${this.stepOverClearedBps.length}`);
+    if (this.tempBreakpoint) {
+      this.jlink.clearBreakpoint(this.tempBreakpoint.index);
+      this.tempBreakpoint = null;
+    }
+    this.restoreClearedBps();
+  }
+
+  private restoreClearedBps(): void {
+    if (this.stepOverClearedBps.length > 0) {
+      daLog(`restoreClearedBps: restoring ${this.stepOverClearedBps.length} breakpoints`);
+    }
+    for (const bp of this.stepOverClearedBps) {
+      const setOk = this.jlink.setBreakpoint(bp.addr);
+      daLog(`restoreClearedBps: addr=0x${bp.addr.toString(16)} origSlot=${bp.index} newSlot=${setOk}`);
+    }
+    this.stepOverClearedBps = [];
+  }
+
+  private clearCurrentBpAndTrack(pc: number): void {
+    const slots = this.jlink.breakpointSlots;
+    let cleared = 0;
+    for (let i = 0; i < slots.length; i++) {
+      if (slots[i] === pc) {
+        if (this.jlink.clearBreakpoint(i)) {
+          this.stepOverClearedBps.push({ index: i, addr: pc });
+          cleared++;
+        }
+      }
+    }
+    daLog(`clearCurrentBpAndTrack: pc=0x${pc.toString(16)} cleared=${cleared} tracked=${this.stepOverClearedBps.length}`);
+  }
+
+  private async doStepInto(): Promise<OzoneCommandResult> {
+    const haltedBefore = await this.ensureHalted();
+    daLog(`doStepInto: ensureHalted=${haltedBefore}`);
+    await new Promise<void>(r => setTimeout(r, 100));
+    this.cleanupStepBreakpoints();
+    const pc = this.jlink.readRegister(REG_INDEXES.PC);
+    daLog(`doStepInto: pc=0x${pc !== null ? pc.toString(16) : 'null'}`);
+    if (pc !== null) {
+      this.clearCurrentBpAndTrack(pc);
+    }
+    return await this.doSingleStep();
+  }
+
+  private async doStepOut(): Promise<OzoneCommandResult> {
+    const haltedBefore = await this.ensureHalted();
+    daLog(`doStepOut: ensureHalted=${haltedBefore}`);
+    if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step out' };
+    await new Promise<void>(r => setTimeout(r, 100));
+    this.cleanupStepBreakpoints();
+    const pc = this.jlink.readRegister(REG_INDEXES.PC);
+    const lr = this.jlink.readRegister(REG_INDEXES.LR);
+    daLog(`doStepOut: pc=0x${pc !== null ? pc.toString(16) : 'null'} lr=0x${lr !== null ? lr.toString(16) : 'null'}`);
+    if (pc === null || lr === null) return { ok: false, error: 'Cannot read PC/LR' };
+    if (lr === 0xFFFFFFFF || lr < 0x08000000 || lr >= 0xE0000000) {
+      daLog('doStepOut: LR is not a valid return address, falling back to single step');
+      this.clearCurrentBpAndTrack(pc);
+      return await this.doSingleStep();
+    }
+    const returnAddr = (lr & ~1) >>> 0;
+    daLog(`doStepOut: setting temp bp at return addr 0x${returnAddr.toString(16)}`);
+    this.clearCurrentBpAndTrack(pc);
+    return this.setTempBpAndRun(returnAddr);
+  }
+
+  private async doStepOver(): Promise<OzoneCommandResult> {
+    const haltedBefore = await this.ensureHalted();
+    daLog(`doStepOver: ensureHalted=${haltedBefore}`);
+    await new Promise<void>(r => setTimeout(r, 100));
+    this.cleanupStepBreakpoints();
+    const pc = this.jlink.readRegister(REG_INDEXES.PC);
+    daLog(`doStepOver: pc=0x${pc !== null ? pc.toString(16) : 'null'}`);
+    if (pc === null) return { ok: false, error: 'Cannot read PC' };
+
+    const raw = this.jlink.readMemory(pc, 4);
+    if (!raw || raw.length < 4) {
+      daLog('doStepOver: readMemory failed, using step');
+      return await this.doSingleStep();
+    }
+
+    const hw1 = (raw[1] << 8) | raw[0];
+    const hw2 = (raw[3] << 8) | raw[2];
+
+    const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
+    const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xC000;
+    const isBLXReg = (hw1 & 0xFF87) === 0x4780;
+    daLog(`doStepOver: hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg}`);
+
+    if (isBLXReg) {
+      const nextAddr = (pc + 2) >>> 0;
+      daLog(`doStepOver: BLX Rm at 0x${pc.toString(16)}, setting temp bp at 0x${nextAddr.toString(16)}`);
+      this.clearCurrentBpAndTrack(pc);
+      return this.setTempBpAndRun(nextAddr);
+    }
+
+    if (isBL || isBLX) {
+      const nextAddr = (pc + 4) >>> 0;
+      daLog(`doStepOver: ${isBL ? 'BL' : 'BLX'} at 0x${pc.toString(16)}, setting temp bp at 0x${nextAddr.toString(16)}`);
+      this.clearCurrentBpAndTrack(pc);
+      return this.setTempBpAndRun(nextAddr);
+    }
+
+    this.clearCurrentBpAndTrack(pc);
+    const startLoc = this.resolveAddressLoc(pc);
+    daLog(`doStepOver: smart step start line=${startLoc?.line} file=${startLoc?.file}`);
+    for (let smartIdx = 0; smartIdx < 20; smartIdx++) {
+      const stepResult = await this.doSingleStep();
+      if (!stepResult.ok) return stepResult;
+      await new Promise<void>(r => setTimeout(r, 100));
+      const newPc = this.jlink.readRegister(REG_INDEXES.PC);
+      if (newPc === null) return { ok: false, error: 'Failed to read PC after smart step' };
+      const newLoc = this.resolveAddressLoc(newPc);
+      daLog(`doStepOver: smart step ${smartIdx + 1} pc=0x${newPc.toString(16)} line=${newLoc?.line ?? '?'}`);
+      if (newLoc && startLoc && (newLoc.file !== startLoc.file || newLoc.line !== startLoc.line)) {
+        daLog(`doStepOver: line changed ${startLoc.line}->${newLoc.line}, done`);
+        break;
+      }
+      const newRaw = this.jlink.readMemory(newPc, 4);
+      if (newRaw && newRaw.length >= 4) {
+        const nhw1 = (newRaw[1] << 8) | newRaw[0];
+        const nhw2 = (newRaw[3] << 8) | newRaw[2];
+        const isNewBL = (nhw1 & 0xF800) === 0xF000 && (nhw2 & 0xD000) === 0xD000;
+        const isNewBLX = (nhw1 & 0xF800) === 0xF000 && (nhw2 & 0xD000) === 0xC000;
+        const isNewBLXReg = (nhw1 & 0xFF87) === 0x4780;
+        if (isNewBLXReg) {
+          daLog(`doStepOver: smart step hit BLX Rm at 0x${newPc.toString(16)}, handling with temp bp`);
+          this.clearCurrentBpAndTrack(newPc);
+          return this.setTempBpAndRun((newPc + 2) >>> 0);
+        }
+        if (isNewBL || isNewBLX) {
+          daLog(`doStepOver: smart step hit BL at 0x${newPc.toString(16)}, handling with temp bp`);
+          this.clearCurrentBpAndTrack(newPc);
+          return this.setTempBpAndRun((newPc + 4) >>> 0);
+        }
+      }
+    }
+    return { ok: true, data: 'Stepped' };
+  }
+
+  private async doSingleStep(): Promise<OzoneCommandResult> {
+    for (let retry = 0; retry < 5; retry++) {
+      const stepOk = this.jlink.step();
+      daLog(`doSingleStep: retry=${retry} step()=${stepOk}`);
+      if (stepOk) {
+        this.jlink.halt();
+        await new Promise<void>(r => setTimeout(r, 10));
+        const haltedNow = this.jlink.isHalted();
+        daLog(`doSingleStep: after halt+10ms isHalted=${haltedNow}`);
+        this.state = TargetState.Halted;
+        return { ok: true, data: 'Stepped' };
+      }
+      this.jlink.halt();
+      await new Promise<void>(r => setTimeout(r, 10));
+    }
+    return { ok: false, error: 'Step failed after retries' };
+  }
+
+  private async setTempBpAndRun(nextAddr: number): Promise<OzoneCommandResult> {
+    const bpIndex = this.jlink.setBreakpoint(nextAddr);
+    daLog(`setTempBpAndRun: addr=0x${nextAddr.toString(16)} bpIndex=${bpIndex}`);
+    if (bpIndex === null) {
+      daLog('setTempBpAndRun: setBreakpoint failed, re-setting cleared bp and using step');
+      this.restoreClearedBps();
+      return await this.doSingleStep();
+    }
+    this.tempBreakpoint = { index: bpIndex, addr: nextAddr };
+    const runOk = this.jlink.run();
+    daLog(`setTempBpAndRun: run=${runOk}`);
+    if (runOk) {
+      this.state = TargetState.Running;
+      return { ok: true, data: 'Stepped' };
+    }
+    return { ok: false, error: 'Run failed' };
+  }
+
+  private resolveAddressToLine(address: number): { file: string; line: number } | null {
+    if (this.lineEntries.length === 0) return null;
+    let lo = 0, hi = this.lineEntries.length - 1;
+    if (address < this.lineEntries[0].address) return null;
+    if (address >= this.lineEntries[hi].address) {
+      if (this.lineEntries[hi].address === address) return this.lineEntries[hi];
+      return this.lineEntries[hi];
+    }
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (this.lineEntries[mid].address <= address) lo = mid;
+      else hi = mid - 1;
+    }
+    if (lo >= 0 && this.lineEntries[lo].address <= address) {
+      return this.lineEntries[lo];
+    }
+    return null;
+  }
+
+  private resolveAddressLoc(address: number): { file: string; line: number; func: string } | null {
+    const floor = this.resolveAddressToLine(address);
+    const cached = this.addressLocCache.get(address);
+    const funcName = cached?.func || this.resolveSymbolName(address);
+
+    if (floor) {
+      return {
+        file: floor.file,
+        line: floor.line,
+        func: funcName || `0x${address.toString(16)}`,
+      };
+    }
+    if (cached) return cached;
+
+    const symName = this.resolveSymbolName(address);
+    if (symName) {
+      const sym = this.symbols.find(s => s.name === symName);
+      if (sym) {
+        const cachedBySym = this.addressLocCache.get(sym.address);
+        if (cachedBySym) return cachedBySym;
+      }
+    }
+
+    return null;
+  }
+
+  private async doReadMemory(address: number, size: number): Promise<OzoneCommandResult> {
+    const raw = this.jlink.readMemory(address, size);
+    this.jlink.halt();
+    if (!raw) return { ok: false, error: 'Failed to read memory' };
+
+    const data = Array.from(raw);
+    const ascii = data.map(b => (b >= 0x20 && b <= 0x7E) ? String.fromCharCode(b) : '.').join('');
+    const block: MemoryBlock = { address, data, ascii };
+    return { ok: true, data: block };
+  }
+
+  private async doFlash(elfPath: string, device: string, interface_: string, speedKHz: number): Promise<OzoneCommandResult> {
+    const result = await flashElf(elfPath, device, interface_, speedKHz);
+    if (result.success) {
+      this.elfPath = elfPath;
+      this.symbols = await readElfSymbols(elfPath);
+      this.lineMapCache = await preloadLineMappings(elfPath);
+      const funcAddrs = this.symbols
+        .filter(s => s.type === 'T' || s.type === 't')
+        .map(s => s.address);
+      this.addressLocCache = await preloadAddressMappings(elfPath, funcAddrs);
+      this.lineEntries = [];
+      const fnameToAbs2 = new Map<string, string>();
+      for (const loc of this.addressLocCache.values()) {
+        const base = path.basename(loc.file);
+        if (base && !fnameToAbs2.has(base)) fnameToAbs2.set(base, loc.file);
+      }
+      for (const [fName, entries] of this.lineMapCache) {
+        let resolvedFile: string;
+        if (path.isAbsolute(fName) && fs.existsSync(fName)) {
+          resolvedFile = fName;
+        } else if (fnameToAbs2.has(fName)) {
+          resolvedFile = fnameToAbs2.get(fName)!;
+        } else {
+          const base = path.basename(fName);
+          if (fnameToAbs2.has(base)) {
+            resolvedFile = fnameToAbs2.get(base)!;
+          } else {
+            resolvedFile = path.resolve(path.dirname(elfPath), fName);
+          }
+        }
+        for (const entry of entries) {
+          if (entry.address >= 0x08000000 && entry.address < 0x20100000) {
+            this.lineEntries.push({ address: entry.address, file: resolvedFile, line: entry.line });
+          }
+        }
+      }
+      this.lineEntries.sort((a, b) => a.address - b.address);
+      return { ok: true, data: result };
+    }
+    return { ok: false, error: result.message };
+  }
+
+  private resolveSymbolName(address: number): string | null {
+    let best: SymbolInfo | null = null;
+    for (const sym of this.symbols) {
+      if (sym.type === 'T' || sym.type === 't') {
+        if (address >= sym.address && address < sym.address + Math.max(sym.size, 1)) {
+          if (!best || address - sym.address < address - best.address) {
+            best = sym;
+          }
+        }
+      }
+    }
+    return best?.name || null;
+  }
+
+  private async resolveLineAddress(file: string, line: number): Promise<number | null> {
+    if (!this.elfPath) return null;
+
+    const fileName = file.split(/[/\\]/).pop() || file;
+    for (const [fName, entries] of this.lineMapCache) {
+      if (fName === fileName || file.includes(fName)) {
+        let bestAddress: number | null = null;
+        let bestLine = 0;
+        for (const entry of entries) {
+          if (entry.line <= line && entry.line > bestLine) {
+            bestAddress = entry.address;
+            bestLine = entry.line;
+          }
+        }
+        if (bestAddress !== null) return bestAddress;
+      }
+    }
+    return null;
+  }
+
+  async readVariableAtRuntime(variableName: string): Promise<OzoneCommandResult> {
+    const sym = this.symbols.find(s => s.name === variableName);
+    if (!sym) return { ok: false, error: `Symbol not found: ${variableName}` };
+
+    this.jlink.halt();
+    await new Promise<void>(r => setTimeout(r, 50));
+    const raw = this.jlink.readMemoryU32(sym.address, 1);
+    if (!raw) return { ok: false, error: `Failed to read ${variableName}` };
+
+    const value = raw[0];
+    let display: string;
+    if (sym.size <= 1) display = `0x${value.toString(16)} (${value})`;
+    else if (sym.size <= 2) display = `0x${value.toString(16)} (${value})`;
+    else display = `0x${value.toString(16)}`;
+
+    return {
+      ok: true,
+      data: {
+        name: variableName,
+        address: sym.address,
+        value,
+        display,
+        hex: `0x${value.toString(16).toUpperCase().padStart(8, '0')}`,
+      },
+    };
+  }
+
+  dispose() {
+    this.jlink.disconnect();
+  }
+}

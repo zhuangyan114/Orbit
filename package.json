@@ -1,0 +1,336 @@
+{
+  "name": "ozone-for-vscode",
+  "displayName": "Ozone for VS Code",
+  "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
+  "version": "0.1.0",
+  "publisher": "ozone-debug",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ozone-debug/ozone-for-vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "stm32",
+    "arm",
+    "cortex-m",
+    "j-link",
+    "ozone",
+    "segger",
+    "embedded",
+    "debug"
+  ],
+  "icon": "resources/icon.png",
+  "activationEvents": [
+    "onDebug",
+    "onDebugDynamicConfigurations:ozone",
+    "onCommand:ozone.startSession",
+    "onCommand:ozone.halt",
+    "onCommand:ozone.run",
+    "onView:ozoneDebugSession"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ozone.startSession",
+        "title": "Ozone: Start Debug Session"
+      },
+      {
+        "command": "ozone.stopSession",
+        "title": "Ozone: Stop Debug Session"
+      },
+      {
+        "command": "ozone.restartSession",
+        "title": "Ozone: Restart Debug Session"
+      },
+      {
+        "command": "ozone.toggleBreakpoint",
+        "title": "Ozone: Toggle Breakpoint"
+      },
+      {
+        "command": "ozone.openAIChat",
+        "title": "Ozone: Open AI Assistant"
+      },
+      {
+        "command": "ozone.openMemoryBrowser",
+        "title": "Ozone: Open Memory Browser"
+      },
+      {
+        "command": "ozone.flash",
+        "title": "Ozone: Flash ELF to Target"
+      },
+      {
+        "command": "ozone.debug",
+        "title": "Ozone: Debug (Connect + Halt)"
+      },
+      {
+        "command": "ozone.halt",
+        "title": "Ozone: Halt Target"
+      },
+      {
+        "command": "ozone.run",
+        "title": "Ozone: Run Target"
+      },
+      {
+        "command": "ozone.stepInto",
+        "title": "Ozone: Step Into"
+      },
+      {
+        "command": "ozone.stepOver",
+        "title": "Ozone: Step Over"
+      },
+      {
+        "command": "ozone.stepOut",
+        "title": "Ozone: Step Out"
+      },
+      {
+        "command": "ozone.reset",
+        "title": "Ozone: Reset Target"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "ozone.toggleBreakpoint",
+          "when": "editorLangId == 'c' || editorLangId == 'cpp' || editorLangId == 'asm'"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "ozone.toggleBreakpoint",
+        "key": "ctrl+shift+b",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "ozone.flash",
+        "key": "ctrl+shift+p",
+        "when": "!editorTextFocus"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ozone-debug",
+          "title": "Ozone Debug",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ozone-debug": [
+        {
+          "type": "webview",
+          "id": "ozoneDebugSession",
+          "name": "Debug Session"
+        },
+        {
+          "type": "tree",
+          "id": "ozoneBreakpoints",
+          "name": "Breakpoints"
+        },
+        {
+          "type": "tree",
+          "id": "ozoneCallStack",
+          "name": "Call Stack"
+        },
+        {
+          "type": "tree",
+          "id": "ozoneVariables",
+          "name": "Variables"
+        },
+        {
+          "type": "tree",
+          "id": "ozoneRegisters",
+          "name": "Registers"
+        }
+      ]
+    },
+    "debuggers": [
+      {
+        "type": "ozone",
+        "label": "Ozone Debug (J-Link)",
+        "runtime": "node",
+        "program": "./dist/debugadapter.js",
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to ELF file",
+                "default": "${workspaceFolder}/build/Debug/frame.elf"
+              },
+              "device": {
+                "type": "string",
+                "description": "Target device name",
+                "default": "STM32F407VG"
+              },
+              "interface": {
+                "type": "string",
+                "description": "Debug interface (SWD or JTAG)",
+                "enum": ["SWD", "JTAG"],
+                "default": "SWD"
+              },
+              "speedKHz": {
+                "type": "number",
+                "description": "Interface speed in kHz",
+                "default": 4000
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "ozone",
+            "request": "launch",
+            "name": "Ozone: Debug STM32",
+            "program": "${workspaceFolder}/build/Debug/frame.elf",
+            "device": "STM32F407VG",
+            "interface": "SWD",
+            "speedKHz": 4000
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Ozone: Debug STM32",
+            "body": {
+              "type": "ozone",
+              "request": "launch",
+              "name": "Ozone: Debug STM32",
+              "program": "^\"\\${workspaceFolder}/build/Debug/frame.elf\"",
+              "device": "STM32F407VG",
+              "interface": "SWD",
+              "speedKHz": 4000
+            }
+          }
+        ]
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "c"
+      },
+      {
+        "language": "cpp"
+      }
+    ],
+    "configuration": {
+      "title": "Ozone Debug",
+      "properties": {
+        "ozone.ozonePath": {
+          "type": "string",
+          "default": "C:\\Program Files\\SEGGER\\Ozone\\Ozone.exe",
+          "description": "Path to Ozone executable (Ozone.exe)"
+        },
+        "ozone.jlinkPath": {
+          "type": "string",
+          "default": "C:\\Program Files\\SEGGER\\JLink\\JLink.exe",
+          "description": "Path to J-Link Commander executable (fallback)"
+        },
+        "ozone.jlinkDllPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to JLink_x64.dll (auto-detected if empty)"
+        },
+        "ozone.defaultDevice": {
+          "type": "string",
+          "default": "STM32F407VG",
+          "description": "Default target device name"
+        },
+        "ozone.defaultInterface": {
+          "type": "string",
+          "default": "SWD",
+          "enum": [
+            "SWD",
+            "JTAG"
+          ],
+          "description": "Default debug interface"
+        },
+        "ozone.defaultSpeed": {
+          "type": "number",
+          "default": 4000,
+          "description": "Default interface speed (kHz)"
+        },
+        "ozone.recentSessions": {
+          "type": "number",
+          "default": 10,
+          "description": "Number of recent sessions to remember"
+        },
+        "ozone.ai.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable AI assistant features"
+        },
+        "ozone.ai.provider": {
+          "type": "string",
+          "default": "ollama",
+          "enum": [
+            "ollama",
+            "openai-compatible"
+          ],
+          "description": "AI provider backend"
+        },
+        "ozone.ai.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama server URL"
+        },
+        "ozone.ai.ollamaModel": {
+          "type": "string",
+          "default": "llama3.2",
+          "description": "Ollama model name"
+        },
+        "ozone.ai.openaiUrl": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI-compatible API URL (e.g., https://api.openai.com/v1)"
+        },
+        "ozone.ai.openaiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for OpenAI-compatible service"
+        },
+        "ozone.ai.openaiModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Model name for OpenAI-compatible service"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.config.js",
+    "watch": "node esbuild.config.js --watch",
+    "lint": "eslint src --ext ts,tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "npm run build && code --extensionDevelopmentPath=."
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/codicons": "^0.0.36",
+    "@vscode/test-electron": "^2.4.1",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.7.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "koffi": "^3.1.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "zustand": "^5.0.0"
+  }
+}

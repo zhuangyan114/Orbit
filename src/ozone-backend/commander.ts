@@ -32,6 +32,7 @@ export class OzoneBackend {
   private lineEntries: { address: number; file: string; line: number }[] = [];
   private tempBreakpoint: { index: number; addr: number } | null = null;
   private stepOverClearedBps: { index: number; addr: number }[] = [];
+  private _lastTempBpAddr = -1;
   private dwarfInfo: DwarfInfo = { varToType: new Map(), typeDefs: new Map() };
 
   get currentState(): TargetState {
@@ -69,6 +70,8 @@ export class OzoneBackend {
           return await this.doClearBreakpoint(command.id);
         case 'clearAllBreakpoints':
           this.jlink.clearAllBreakpoints();
+          this.tempBreakpoint = null;
+          this.stepOverClearedBps = [];
           return { ok: true, data: 'All breakpoints cleared' };
         case 'getRegisters':
           return await this.doGetRegisters();
@@ -255,8 +258,10 @@ case 'readVariableRuntime':
   }
 
   private async doReadRegister(name: string): Promise<OzoneCommandResult> {
-    const halted = await this.ensureHalted();
-    if (!halted) return { ok: false, error: 'Failed to halt CPU for register read' };
+    if (!this.jlink.isHalted()) {
+      const halted = await this.ensureHalted();
+      if (!halted) return { ok: false, error: 'Failed to halt CPU for register read' };
+    }
     await new Promise<void>(r => setTimeout(r, 100));
     const idx = REG_INDEXES[name.toUpperCase()];
     if (idx === undefined) return { ok: false, error: `Unknown register: ${name}` };
@@ -361,6 +366,7 @@ case 'readVariableRuntime':
   private cleanupStepBreakpoints(): void {
     daLog(`cleanupStepBreakpoints: tempBp=${this.tempBreakpoint ? `${this.tempBreakpoint.index}@0x${this.tempBreakpoint.addr.toString(16)}` : 'null'} clearedBps=${this.stepOverClearedBps.length}`);
     if (this.tempBreakpoint) {
+      this._lastTempBpAddr = this.tempBreakpoint.addr;
       this.jlink.clearBreakpoint(this.tempBreakpoint.index);
       this.tempBreakpoint = null;
     }
@@ -395,13 +401,118 @@ case 'readVariableRuntime':
   private async doStepInto(): Promise<OzoneCommandResult> {
     const haltedBefore = await this.ensureHalted();
     daLog(`doStepInto: ensureHalted=${haltedBefore}`);
-    await new Promise<void>(r => setTimeout(r, 100));
+    if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step into' };
+    await new Promise<void>(r => setTimeout(r, 20));
     this.cleanupStepBreakpoints();
     const pc = this.jlink.readRegister(REG_INDEXES.PC);
     daLog(`doStepInto: pc=0x${pc !== null ? pc.toString(16) : 'null'}`);
-    if (pc !== null) {
-      this.clearCurrentBpAndTrack(pc);
+    if (pc === null) return { ok: false, error: 'Cannot read PC' };
+
+    let raw = this.jlink.readMemory(pc, 4);
+    if (!raw || raw.length < 4) {
+      daLog('doStepInto: readMemory failed, retrying after 10ms');
+      await new Promise<void>(r => setTimeout(r, 10));
+      raw = this.jlink.readMemory(pc, 4);
     }
+
+    let hw1 = 0, hw2 = 0;
+    if (raw && raw.length >= 2) {
+      hw1 = (raw[1] << 8) | raw[0];
+      if (raw.length >= 4) hw2 = (raw[3] << 8) | raw[2];
+    }
+
+    const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
+    const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0x8000;
+    const isBLXReg = (hw1 & 0xFF87) === 0x4780;
+    daLog(`doStepInto: hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg}`);
+
+    this.clearCurrentBpAndTrack(pc);
+
+    if (isBL || isBLX) {
+      const S = (hw1 >> 10) & 1;
+      const J1 = (hw2 >> 14) & 1;
+      const J2 = (hw2 >> 12) & 1;
+      const I1 = (~(J1 ^ S)) & 1;
+      const I2 = (~(J2 ^ S)) & 1;
+      const imm10 = hw1 & 0x3FF;
+      const imm11 = hw2 & 0x7FF;
+      let imm32 = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1);
+      if (imm32 & 0x01000000) imm32 |= 0xFE000000;
+      let target = ((pc + 4) + imm32) >>> 0;
+      if (isBLX) target = (target & ~3) >>> 0;
+      daLog(`doStepInto: BL target=0x${target.toString(16)}`);
+      return this.setTempBpAndRun(target);
+    }
+
+    if (isBLXReg) {
+      const rmIndex = (hw1 >> 3) & 0xF;
+      const rmVal = this.jlink.readRegister(rmIndex);
+      daLog(`doStepInto: BLX Rm r${rmIndex}=0x${rmVal !== null ? rmVal.toString(16) : 'null'}`);
+      if (rmVal === null) {
+        daLog('doStepInto: BLX Rm read failed, single step');
+        return await this.doSingleStep();
+      }
+      const target = (rmVal & ~1) >>> 0;
+      daLog(`doStepInto: BLX Rm target=0x${target.toString(16)}`);
+      return this.setTempBpAndRun(target);
+    }
+
+    const startLoc = this.resolveAddressLoc(pc);
+    daLog(`doStepInto: not a call instruction, smart step on line ${startLoc?.line} file=${startLoc?.file}`);
+    if (startLoc) {
+      for (let i = 0; i < 20; i++) {
+        const stepResult = await this.doSingleStep();
+        if (!stepResult.ok) return stepResult;
+
+        const newPc = this.jlink.readRegister(REG_INDEXES.PC);
+        if (newPc === null) return { ok: false, error: 'Cannot read PC after single step' };
+
+        const newLoc = this.resolveAddressLoc(newPc);
+        if (!newLoc || newLoc.file !== startLoc.file || newLoc.line !== startLoc.line) {
+          daLog(`doStepInto: smart step reached diff line at 0x${newPc.toString(16)}`);
+          this.restoreClearedBps();
+          return { ok: true, data: 'Stepped' };
+        }
+
+        const raw = this.jlink.readMemory(newPc, 4);
+        if (!raw || raw.length < 4) continue;
+
+        const hw1 = (raw[1] << 8) | raw[0];
+        const hw2 = (raw[3] << 8) | raw[2];
+
+        const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
+        const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0x8000;
+        const isBLXReg = (hw1 & 0xFF87) === 0x4780;
+        daLog(`doStepInto: smart step ${i + 1} pc=0x${newPc.toString(16)} hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg}`);
+
+        if (isBL || isBLX) {
+          const S = (hw1 >> 10) & 1;
+          const J1 = (hw2 >> 14) & 1;
+          const J2 = (hw2 >> 12) & 1;
+          const I1 = (~(J1 ^ S)) & 1;
+          const I2 = (~(J2 ^ S)) & 1;
+          const imm10 = hw1 & 0x3FF;
+          const imm11 = hw2 & 0x7FF;
+          let imm32 = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1);
+          if (imm32 & 0x01000000) imm32 |= 0xFE000000;
+          let target = ((newPc + 4) + imm32) >>> 0;
+          if (isBLX) target = (target & ~3) >>> 0;
+          daLog(`doStepInto: smart step found call target=0x${target.toString(16)}`);
+          return this.setTempBpAndRun(target);
+        }
+
+        if (isBLXReg) {
+          const rmIndex = (hw1 >> 3) & 0xF;
+          const rmVal = this.jlink.readRegister(rmIndex);
+          if (rmVal === null) continue;
+          const target = (rmVal & ~1) >>> 0;
+          daLog(`doStepInto: smart step BLX Rm target=0x${target.toString(16)}`);
+          return this.setTempBpAndRun(target);
+        }
+      }
+    }
+    daLog('doStepInto: smart step exhausted, single step fallback');
+    this.restoreClearedBps();
     return await this.doSingleStep();
   }
 
@@ -409,13 +520,13 @@ case 'readVariableRuntime':
     const haltedBefore = await this.ensureHalted();
     daLog(`doStepOut: ensureHalted=${haltedBefore}`);
     if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step out' };
-    await new Promise<void>(r => setTimeout(r, 100));
+    await new Promise<void>(r => setTimeout(r, 20));
     this.cleanupStepBreakpoints();
     const pc = this.jlink.readRegister(REG_INDEXES.PC);
     const lr = this.jlink.readRegister(REG_INDEXES.LR);
     daLog(`doStepOut: pc=0x${pc !== null ? pc.toString(16) : 'null'} lr=0x${lr !== null ? lr.toString(16) : 'null'}`);
     if (pc === null || lr === null) return { ok: false, error: 'Cannot read PC/LR' };
-    if (lr === 0xFFFFFFFF || lr < 0x08000000 || lr >= 0xE0000000) {
+    if (lr === 0xFFFFFFFF || (lr & 0xF0000000) === 0xF0000000) {
       daLog('doStepOut: LR is not a valid return address, falling back to single step');
       this.clearCurrentBpAndTrack(pc);
       return await this.doSingleStep();
@@ -423,81 +534,86 @@ case 'readVariableRuntime':
     const returnAddr = (lr & ~1) >>> 0;
     daLog(`doStepOut: setting temp bp at return addr 0x${returnAddr.toString(16)}`);
     this.clearCurrentBpAndTrack(pc);
-    return this.setTempBpAndRun(returnAddr);
+    const result = await this.setTempBpAndRun(returnAddr);
+    if (!this.jlink.isHalted()) {
+      daLog('doStepOut: BP did not fire, falling back to single step');
+      this.jlink.halt();
+      await new Promise<void>(r => setTimeout(r, 100));
+      if (this.jlink.isHalted()) {
+        return { ok: true, data: 'Stepped' };
+      }
+      return await this.doSingleStep();
+    }
+    return result;
   }
 
   private async doStepOver(): Promise<OzoneCommandResult> {
     const haltedBefore = await this.ensureHalted();
     daLog(`doStepOver: ensureHalted=${haltedBefore}`);
-    await new Promise<void>(r => setTimeout(r, 100));
+    if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step over' };
+    await new Promise<void>(r => setTimeout(r, 20));
     this.cleanupStepBreakpoints();
     const pc = this.jlink.readRegister(REG_INDEXES.PC);
     daLog(`doStepOver: pc=0x${pc !== null ? pc.toString(16) : 'null'}`);
     if (pc === null) return { ok: false, error: 'Cannot read PC' };
 
-    const raw = this.jlink.readMemory(pc, 4);
+    let raw = this.jlink.readMemory(pc, 4);
     if (!raw || raw.length < 4) {
-      daLog('doStepOver: readMemory failed, using step');
-      return await this.doSingleStep();
+      daLog('doStepOver: readMemory failed, retrying after 10ms');
+      await new Promise<void>(r => setTimeout(r, 10));
+      raw = this.jlink.readMemory(pc, 4);
     }
 
-    const hw1 = (raw[1] << 8) | raw[0];
-    const hw2 = (raw[3] << 8) | raw[2];
+    let hw1 = 0, hw2 = 0;
+    if (raw && raw.length >= 2) {
+      hw1 = (raw[1] << 8) | raw[0];
+      if (raw.length >= 4) hw2 = (raw[3] << 8) | raw[2];
+    }
 
     const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
-    const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xC000;
+    const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0x8000;
     const isBLXReg = (hw1 & 0xFF87) === 0x4780;
-    daLog(`doStepOver: hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg}`);
+    const instrIs32 = (hw1 >> 11) >= 0x1D;
+    daLog(`doStepOver: hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg} is32=${instrIs32}`);
+
+    this.clearCurrentBpAndTrack(pc);
 
     if (isBLXReg) {
       const nextAddr = (pc + 2) >>> 0;
       daLog(`doStepOver: BLX Rm at 0x${pc.toString(16)}, setting temp bp at 0x${nextAddr.toString(16)}`);
-      this.clearCurrentBpAndTrack(pc);
       return this.setTempBpAndRun(nextAddr);
     }
 
     if (isBL || isBLX) {
       const nextAddr = (pc + 4) >>> 0;
       daLog(`doStepOver: ${isBL ? 'BL' : 'BLX'} at 0x${pc.toString(16)}, setting temp bp at 0x${nextAddr.toString(16)}`);
-      this.clearCurrentBpAndTrack(pc);
       return this.setTempBpAndRun(nextAddr);
     }
-
-    this.clearCurrentBpAndTrack(pc);
     const startLoc = this.resolveAddressLoc(pc);
-    daLog(`doStepOver: smart step start line=${startLoc?.line} file=${startLoc?.file}`);
-    for (let smartIdx = 0; smartIdx < 20; smartIdx++) {
-      const stepResult = await this.doSingleStep();
-      if (!stepResult.ok) return stepResult;
-      await new Promise<void>(r => setTimeout(r, 100));
-      const newPc = this.jlink.readRegister(REG_INDEXES.PC);
-      if (newPc === null) return { ok: false, error: 'Failed to read PC after smart step' };
-      const newLoc = this.resolveAddressLoc(newPc);
-      daLog(`doStepOver: smart step ${smartIdx + 1} pc=0x${newPc.toString(16)} line=${newLoc?.line ?? '?'}`);
-      if (newLoc && startLoc && (newLoc.file !== startLoc.file || newLoc.line !== startLoc.line)) {
-        daLog(`doStepOver: line changed ${startLoc.line}->${newLoc.line}, done`);
-        break;
+    daLog(`doStepOver: find next source line line=${startLoc?.line} file=${startLoc?.file}`);
+    if (this.lineEntries.length > 0 && startLoc) {
+      let nextAddr: number | null = null;
+      for (const entry of this.lineEntries) {
+        if (entry.address > pc && entry.file === startLoc.file && entry.line !== startLoc.line) {
+          nextAddr = entry.address;
+          break;
+        }
       }
-      const newRaw = this.jlink.readMemory(newPc, 4);
-      if (newRaw && newRaw.length >= 4) {
-        const nhw1 = (newRaw[1] << 8) | newRaw[0];
-        const nhw2 = (newRaw[3] << 8) | newRaw[2];
-        const isNewBL = (nhw1 & 0xF800) === 0xF000 && (nhw2 & 0xD000) === 0xD000;
-        const isNewBLX = (nhw1 & 0xF800) === 0xF000 && (nhw2 & 0xD000) === 0xC000;
-        const isNewBLXReg = (nhw1 & 0xFF87) === 0x4780;
-        if (isNewBLXReg) {
-          daLog(`doStepOver: smart step hit BLX Rm at 0x${newPc.toString(16)}, handling with temp bp`);
-          this.clearCurrentBpAndTrack(newPc);
-          return this.setTempBpAndRun((newPc + 2) >>> 0);
+      if (nextAddr === null) {
+        for (const entry of this.lineEntries) {
+          if (entry.file === startLoc.file && entry.line !== startLoc.line) {
+            nextAddr = entry.address;
+            break;
+          }
         }
-        if (isNewBL || isNewBLX) {
-          daLog(`doStepOver: smart step hit BL at 0x${newPc.toString(16)}, handling with temp bp`);
-          this.clearCurrentBpAndTrack(newPc);
-          return this.setTempBpAndRun((newPc + 4) >>> 0);
-        }
+      }
+      if (nextAddr !== null) {
+        daLog(`doStepOver: next source line at 0x${nextAddr.toString(16)}`);
+        return this.setTempBpAndRun(nextAddr);
       }
     }
-    return { ok: true, data: 'Stepped' };
+    daLog('doStepOver: no next source line found, single step');
+    return await this.doSingleStep();
   }
 
   private async doSingleStep(): Promise<OzoneCommandResult> {
@@ -506,16 +622,34 @@ case 'readVariableRuntime':
       daLog(`doSingleStep: retry=${retry} step()=${stepOk}`);
       if (stepOk) {
         this.jlink.halt();
-        await new Promise<void>(r => setTimeout(r, 10));
+        await new Promise<void>(r => setTimeout(r, 50));
         const haltedNow = this.jlink.isHalted();
-        daLog(`doSingleStep: after halt+10ms isHalted=${haltedNow}`);
+        daLog(`doSingleStep: after halt+50ms isHalted=${haltedNow}`);
         this.state = TargetState.Halted;
         return { ok: true, data: 'Stepped' };
       }
       this.jlink.halt();
-      await new Promise<void>(r => setTimeout(r, 10));
+      await new Promise<void>(r => setTimeout(r, 50));
     }
     return { ok: false, error: 'Step failed after retries' };
+  }
+
+  private async waitForHalt(): Promise<boolean> {
+    for (let i = 0; i < 500; i++) {
+      await new Promise<void>(r => setTimeout(r, 10));
+      if (this.jlink.isHalted()) {
+        this.state = TargetState.Halted;
+        return true;
+      }
+    }
+    daLog('waitForHalt: timeout, one final soft settle');
+    this.jlink.halt();
+    await new Promise<void>(r => setTimeout(r, 50));
+    if (this.jlink.isHalted()) {
+      this.state = TargetState.Halted;
+      return true;
+    }
+    return false;
   }
 
   private async setTempBpAndRun(nextAddr: number): Promise<OzoneCommandResult> {
@@ -527,13 +661,40 @@ case 'readVariableRuntime':
       return await this.doSingleStep();
     }
     this.tempBreakpoint = { index: bpIndex, addr: nextAddr };
+
+    const curPc = this.jlink.readRegister(REG_INDEXES.PC);
+    if (curPc !== null && curPc === this._lastTempBpAddr) {
+      const raw = this.jlink.readMemory(curPc, 4);
+      let isCall = false;
+      if (raw && raw.length >= 4) {
+        const hw1 = (raw[1] << 8) | raw[0];
+        const hw2 = (raw[3] << 8) | raw[2];
+        isCall = ((hw1 & 0xF800) === 0xF000 && ((hw2 & 0xD000) === 0xD000 || (hw2 & 0xD000) === 0x8000))
+               || (hw1 & 0xFF87) === 0x4780;
+      }
+      if (isCall) {
+        daLog(`setTempBpAndRun: at stale BP 0x${curPc.toString(16)}, call instr, skipping step`);
+      } else {
+        daLog(`setTempBpAndRun: at stale BP 0x${curPc.toString(16)}, non-call, single-stepping first`);
+        const stepResult = await this.doSingleStep();
+        if (!stepResult.ok) return stepResult;
+      }
+    }
+
     const runOk = this.jlink.run();
     daLog(`setTempBpAndRun: run=${runOk}`);
-    if (runOk) {
-      this.state = TargetState.Running;
-      return { ok: true, data: 'Stepped' };
+    if (!runOk) return { ok: false, error: 'Run failed' };
+    this.state = TargetState.Running;
+    const halted = await this.waitForHalt();
+    daLog(`setTempBpAndRun: waitForHalt=${halted}`);
+    if (!halted) {
+      this.jlink.halt();
+      await new Promise<void>(r => setTimeout(r, 50));
     }
-    return { ok: false, error: 'Run failed' };
+    this.jlink.halt();
+    await new Promise<void>(r => setTimeout(r, 50));
+    this.cleanupStepBreakpoints();
+    return { ok: true, data: 'Stepped' };
   }
 
   private resolveAddressToLine(address: number): { file: string; line: number } | null {

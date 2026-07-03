@@ -111,27 +111,28 @@ F5 in VS Code: "Run Extension" (build first) or "Extension + Watch" (esbuild wat
 - `addr2line` path → `objdump decodedline` filename resolution
 - Multiple debug sessions: `disconnect()` no longer calls `JLINK_Close()`, `connect()` skips `JLINK_Open()` on reconnect via `_wasOpened` flag
 
-### Step-over (逐过程) implementation
-- `doStepOver()` detects BL/BLX/BLX Rm instructions via `readMemory(pc, 4)`:
+### Step-over/Step-into (逐过程/逐语句) implementation
+- `doStepOver()` / `doStepInto()` detect BL/BLX/BLX Rm instructions via `readMemory(pc, 4)`:
   - BL (Thumb2): `hw1 & 0xF800 == 0xF000 && hw2 & 0xD000 == 0xD000`
   - BLX label (Thumb2): `hw1 & 0xF800 == 0xF000 && hw2 & 0xD000 == 0xC000`
   - BLX Rm (Thumb 16-bit): `hw1 & 0xFF87 == 0x4780`
-- For call instructions: `clearCurrentBpAndTrack(pc)` then `setTempBpAndRun(returnAddr)`
+- For call instructions: `clearCurrentBpAndTrack(pc)` then `setTempBpAndRun(target)`. Step-over uses PC+4 (skip over), step-into uses function entry (enter).
 - For non-call instructions: **smart step** — `doSingleStep()` repeatedly (up to 20×) until source line changes or a BL/BLX is hit. This handles multiple-instruction-per-line cases (e.g., function argument setup before BL).
-- `doStepInto()`: hardware single step (`JLINK_Step()`) after `clearCurrentBpAndTrack(pc)`.
 - `doStepOut()`: reads LR, sets temp BP at `(LR & ~1)` (clear Thumb bit), runs until hit. Falls back to single step if LR is invalid (0xFFFFFFFF, exception handler range, etc.).
-- `handleStep` response: sent immediately after step command returns, then polls `isHalted()` every 10ms × 50 (500ms), falls back to background polling (200ms). This is necessary because `JLINK_Step()`/`JLINK_Go()` don't reliably sync DLL state — `isHalted()` may return false even after step succeeds. Background polling eventually catches up.
-- `doSingleStep()`: after `JLINK_Step()` succeeds, calls `JLINK_Halt()` + 10ms wait to force DLL state sync. Retries up to 5× on failure.
+- `handleStep` response: sent immediately after step command returns, then polls `isHalted()` every 10ms × 200 (2000ms), falls back to background polling (200ms). This is necessary because `JLINK_Step()`/`JLINK_Go()` don't reliably sync DLL state — `isHalted()` may return false even after step succeeds. Background polling eventually catches up.
+- `doSingleStep()`: after `JLINK_Step()` succeeds, calls `JLINK_Halt()` + 50ms wait to force DLL state sync. Retries up to 5× on failure.
 
 ### Fixed race conditions / bugs
 - **`currentCommand` race (`dap-session.ts:30`)**: Removed shared mutable `this.currentCommand`. `sendResponse` now accepts `msg: DebugProtocolMessage` and reads `msg.command` directly. Eliminates concurrent `variables`/`scopes` requests overwriting the command name in step responses.
 - **`restoreClearedBps` concurrent interference (`commander.ts:325`)**: Extracted bp cleanup from `ensureHalted()` into `cleanupStepBreakpoints()`. Only step operations (`doStepOver`, `doStepInto`, `doStepOut`) call it. `doGetCallStack`/`doGetRegisters`/`doGetLocals` no longer restore breakpoints while a step is in progress.
 - **Concurrent `JLINK_Halt()` during step (`commander.ts:222,253,274`)**: `doGetCallStack`, `doGetRegisters`, `doGetLocals` changed to soft-check `jlink.isHalted()` instead of calling `ensureHalted()` (which calls `JLINK_Halt()`). Returns empty data if CPU is running — prevents halting the CPU inside a function's loop (e.g., `HAL_Delay` while-loop) during a concurrent stack trace.
+- **`clearCurrentBpAndTrack` order in `doStepInto` (`commander.ts:410`)**: `clearCurrentBpAndTrack(pc)` was called BEFORE `readMemory(pc, 4)`. `JLINK_ClrBP` corrupts DLL state for subsequent `JLINK_ReadMem`, causing BL detection to misidentify call instructions. Fixed by reordering to read memory first (matching `doStepOver`), with 10ms retry on failure.
+- **`setTempBpAndRun` missing DLL sync after `waitForHalt()` (`commander.ts:651`)**: After `JLINK_Go()` + breakpoint hit, `waitForHalt()` returns early when `isHalted()` returns true — but `JLINK_Halt()` is never called, leaving DLL state unsynced. Subsequent `readRegister` returns stale data or hangs. Fixed by calling `halt()` + 50ms delay unconditionally after `waitForHalt()`, matching the pattern in `doSingleStep()`.
+- **Step-into smart step (`commander.ts:460-517`)**: When current instruction is not BL/BLX (e.g., argument setup MOV before a function call), `doStepInto` used to find the next source line and behave like step-over. Fixed by replacing with smart step: `doSingleStep()` repeatedly (up to 20×) on the same source line until a BL/BLX is found (enter function) or the line changes (stop).
 
 ### Partially working / unstable
-- **Step-over (逐过程)**: Reliable after smart-step fix. Single-instruction lines (BL, simple ALU) complete in ~10ms. Multi-instruction lines (function arg setup) may take 110ms per instruction × N. No longer requires repeated clicks — smart step auto-advances until line changes.
-- **`readMemory`/`readRegister` after `step()`**: DLL returns wrong/stale data after `JLINK_Step()`. Workaround: `ensureHalted()` + 10ms delay before reads in `doStepOver`, 100ms delay in `doGetCallStack`/`doGetRegisters`/`doReadRegister`.
-- **`readMemory` in `doStepOver` not reliable**: after `step()`, `readMemory` may return wrong instruction bytes, causing BL detection to misidentify instructions. Falls back to `step()` on failure. Smart step re-reads at each new PC — safer.
+- **Step-over/Step-into**: Reliable after smart-step fix. Single-instruction lines (BL, simple ALU) complete in ~10ms. Multi-instruction lines (function arg setup) may take 110ms per instruction × N. No longer requires repeated clicks — smart step auto-advances until line changes.
+- **`readMemory`/`readRegister` after `step()`**: DLL returns wrong/stale data after `JLINK_Step()`. Workaround: `ensureHalted()` + 10ms delay before reads in `doStepOver`/`doStepInto`, 100ms delay in `doGetCallStack`/`doGetRegisters`/`doReadRegister`.
 - **`evaluate` (hover/watch)**: returns `?` without DLL calls to avoid `readMemoryU32` hangs.
 - **`doGetLocals`**: returns symbol names/addresses only, no memory reads (avoids DLL corruption).
 - **`doGetCallStack`**: returns PC + LR frames only, no stack scanning (avoids `readMemoryU32` DLL corruption).
@@ -140,7 +141,7 @@ F5 in VS Code: "Run Extension" (build first) or "Extension + Watch" (esbuild wat
 - `ExecCommand("SetBP ...")` hangs on JLink V956 — not used, using `JLINK_SetBP` instead
 - `readRegisterDAP` (DCRSR/DCRDR) returns null for all registers on V956
 - `JLINK_Go()` on V956 doesn't auto-step-over breakpoint instructions — workaround: `handleContinue` clears BP at PC, steps, re-sets BP
-- `JLINK_ReadReg()` hangs after `JLINK_Step()` or `JLINK_Go()` — DLL-level bug, workaround: `halt()` + delay before reads. `doSingleStep()` mitigates by calling `JLINK_Halt()` + 10ms after each step.
+- `JLINK_ReadReg()` hangs after `JLINK_Step()` or `JLINK_Go()` — DLL-level bug, workaround: `halt()` + delay before reads. `doSingleStep()` mitigates by calling `JLINK_Halt()` + 50ms after each step. `setTempBpAndRun()` also calls `halt()` + 50ms after `waitForHalt()` to sync DLL state.
 - `JLINK_Close()` before `JLINK_Open()` causes access violation — workaround: `disconnect()` doesn't call `JLINK_Close()`, `connect()` skips `JLINK_Open()` on reconnect
 - `readMemoryU32` corrupts DLL state for subsequent `readRegister` calls — removed from `doGetCallStack`/`doGetLocals`
 - `objdump --dwarf=decodedline` has duplicate entries with invalid addresses — filtered out
@@ -207,6 +208,7 @@ Auto-capture                     → handleEvaluate adds expr to watchExpression
 
 ### Working
 - All features from previous version (connect/disconnect/halt/run/step/reset, breakpoints, registers, memory, step-over)
+- **Step-into (逐语句)** — enters function bodies via smart step (single-steps through same-line non-call instructions looking for BL/BLX)
 - **DAP evaluate** returns real expression values (fixed)
 - **doGetLocals** reads actual memory values (fixed)
 - **Ozone Watch tree view** with 5Hz polling while running
@@ -214,9 +216,6 @@ Auto-capture                     → handleEvaluate adds expr to watchExpression
 - **Persistence** of watch expressions across sessions
 - **Change highlighting** when variable value changes
 - **Flash → reset → halt** on F5 launch
-
-### Partially working / unstable
-- Step-over (逐过程) — see previous notes
 
 ## Resources
 

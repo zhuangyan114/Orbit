@@ -33,6 +33,12 @@ export class DapSession extends EventEmitter {
   private breakpoints = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
 
+  private _elfPath = '';
+  private _device = '';
+  private _interface = 'SWD';
+  private _speedKHz = 4000;
+  private _flashEnabled = true;
+
   constructor(backend: OzoneBackend) {
     super();
     this.backend = backend;
@@ -224,8 +230,14 @@ export class DapSession extends EventEmitter {
       const interface_ = args.interface || 'SWD';
       const speedKHz = args.speedKHz || 4000;
       const elfPath = args.program || args.elfPath || '';
+      const flashEnabled = args.flashBeforeDebug !== false;
+      this._elfPath = elfPath;
+      this._device = device;
+      this._interface = interface_;
+      this._speedKHz = speedKHz;
+      this._flashEnabled = flashEnabled;
 
-      if (elfPath && args.flashBeforeDebug !== false) {
+      if (elfPath && this._flashEnabled) {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashResult = await this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
@@ -253,7 +265,7 @@ export class DapSession extends EventEmitter {
         await this.backend.execute({ cmd: 'loadSymbols', elfPath });
       }
 
-      if (elfPath && args.flashBeforeDebug !== false) {
+      if (elfPath && this._flashEnabled) {
         this.sendEvent('output', { category: 'console', output: 'Resetting target after flash...\n' });
         await this.backend.execute({ cmd: 'reset' });
         await new Promise<void>(r => setTimeout(r, 200));
@@ -440,12 +452,15 @@ export class DapSession extends EventEmitter {
           daLog(`handleStep: ${cmd} response sent, starting poll`);
         }
         this.lastHaltReason = 'step';
+
+        await new Promise<void>(r => setTimeout(r, 100));
+
         let pcStuck = false;
-        for (let i = 0; i < 50; i++) {
+        for (let i = 0; i < 200; i++) {
           await new Promise<void>(r => setTimeout(r, 10));
           const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
-          if (i === 0 || (i + 1) % 10 === 0 || i === 49) {
-            daLog(`handleStep: poll ${i + 1}/50 state=${stateResult.ok ? JSON.stringify((stateResult as any).data) : 'err'} ok=${stateResult.ok}`);
+          if (i === 0 || (i + 1) % 20 === 0 || i === 199) {
+            daLog(`handleStep: poll ${i + 1}/200 state=${stateResult.ok ? JSON.stringify((stateResult as any).data) : 'err'} ok=${stateResult.ok}`);
           }
           if (stateResult.ok && stateResult.data === 'halted') {
             if (pcBeforeVal !== null) {
@@ -453,7 +468,24 @@ export class DapSession extends EventEmitter {
               const pcAfterVal = pcAfter.ok ? (pcAfter.data as any).value as number : null;
               daLog(`handleStep: halted after ${(i + 1) * 10}ms, pcBefore=0x${pcBeforeVal.toString(16)} pcAfter=0x${pcAfterVal !== null ? pcAfterVal.toString(16) : 'null'}`);
               if (pcAfterVal !== null && pcAfterVal === pcBeforeVal) {
-                daLog(`handleStep: PC unchanged after attempt ${attempt + 1}, will retry`);
+                daLog(`handleStep: PC same, re-reading to rule out stale DLL state`);
+                let reReadOk = false;
+                for (let r = 0; r < 5; r++) {
+                  await new Promise<void>(r2 => setTimeout(r2, 50));
+                  const reRead = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+                  const reReadVal = reRead.ok ? (reRead.data as any).value as number : null;
+                  if (reReadVal !== null && reReadVal !== pcBeforeVal) {
+                    daLog(`handleStep: re-read ${r + 1}/5 PC changed to 0x${reReadVal.toString(16)}, step OK`);
+                    reReadOk = true;
+                    break;
+                  }
+                }
+                if (reReadOk) {
+                  daLog(`handleStep: ${cmd} complete after re-read`);
+                  this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+                  return;
+                }
+                daLog(`handleStep: PC unchanged after 5 re-reads (250ms), will retry`);
                 pcStuck = true;
                 break;
               }
@@ -462,12 +494,16 @@ export class DapSession extends EventEmitter {
             this.sendEvent('stopped', { reason: 'step', threadId: 1 });
             return;
           }
+          if (i > 50 && (i % 25 === 0)) {
+            const settleResult = await this.backend.execute({ cmd: 'halt' });
+            daLog(`handleStep: soft settle at poll ${i + 1} halt=${settleResult.ok}`);
+          }
         }
         if (pcStuck) {
           await new Promise<void>(r => setTimeout(r, 50));
           continue;
         }
-        daLog(`handleStep: not halted after 500ms, starting polling`);
+        daLog(`handleStep: not halted after 2000ms, starting polling`);
         this.startPolling();
         return;
       }
@@ -491,10 +527,43 @@ export class DapSession extends EventEmitter {
   private async handleRestart(msg: DebugProtocolMessage) {
     await this.withStepLock(async () => {
       this.stopPolling();
+
+      const savedBps: Array<{ file: string; line: number }> = [];
+      for (const [key] of this.breakpoints) {
+        const colonIdx = key.lastIndexOf(':');
+        if (colonIdx > 0) {
+          savedBps.push({ file: key.substring(0, colonIdx), line: parseInt(key.substring(colonIdx + 1)) });
+        }
+      }
+
+      if (this._elfPath && this._flashEnabled) {
+        this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
+        const flashResult = await this.backend.execute({
+          cmd: 'flash', elfPath: this._elfPath, device: this._device,
+          interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
+        });
+        if (flashResult.ok) {
+          this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
+        } else {
+          this.sendEvent('output', { category: 'stderr', output: `Restart: flash failed: ${flashResult.error}\n` });
+          this.sendResponse(msg, undefined, false, flashResult.error);
+          return;
+        }
+        await new Promise<void>(r => setTimeout(r, 500));
+      }
       await this.backend.execute({ cmd: 'reset' });
       await this.backend.execute({ cmd: 'halt' });
       await this.backend.execute({ cmd: 'clearAllBreakpoints' });
       this.breakpoints.clear();
+
+      for (const bp of savedBps) {
+        const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
+        if (result.ok) {
+          const data = result.data as any;
+          this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+        }
+      }
+
       this.lastHaltReason = 'entry';
       this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
       this.sendResponse(msg);

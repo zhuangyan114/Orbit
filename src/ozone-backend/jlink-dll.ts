@@ -287,11 +287,11 @@ export class JLinkDLL {
   clearAllBreakpoints(): void {
     for (let i = 0; i < 6; i++) {
       try {
-        const ret = this.lib?.func('int JLINK_ClrBP(uint32_t)')(i);
-        if (typeof ret === 'number' && ret >= 0 && i < this.bpSlots.length) {
-          this.bpSlots[i] = null;
-        }
+        this.lib?.func('int JLINK_ClrBP(uint32_t)')(i);
       } catch { }
+      if (i < this.bpSlots.length) {
+        this.bpSlots[i] = null;
+      }
     }
   }
 

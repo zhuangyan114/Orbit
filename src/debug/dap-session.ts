@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { OzoneBackend } from '../ozone-backend/commander';
-import { Variable, StackFrame } from '../ozone-backend/types';
+import { Variable, StackFrame, WatchValue } from '../ozone-backend/types';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -26,6 +26,8 @@ export class DapSession extends EventEmitter {
   private backend: OzoneBackend;
   private seq = 1;
   private pollTimer: NodeJS.Timeout | null = null;
+  private watchExpressions: string[] = [];
+  private _watchPollCycle = 0;
   private lastHaltReason: 'entry' | 'breakpoint' | 'step' | 'pause' = 'entry';
 
   private breakpoints = new Map<string, number>();
@@ -67,16 +69,56 @@ export class DapSession extends EventEmitter {
 
   private startPolling() {
     this.stopPolling();
-    daLog('startPolling: starting background poll');
-    this.pollTimer = setInterval(() => {
-      this.backend.execute({ cmd: 'getTargetState' }).then(result => {
-        if (result.ok && result.data === 'halted') {
-          daLog('startPolling: halted detected, sending stopped');
+    daLog('startPolling: started');
+    const pollLoop = async () => {
+      if (this.pollTimer === null) return;
+      try {
+        const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
+        if (stateResult.ok && stateResult.data === 'halted') {
           this.stopPolling();
+          if (this.watchExpressions.length > 0) {
+            const results: any[] = [];
+            for (const expr of this.watchExpressions) {
+              const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+              if (r.ok) results.push(r.data);
+              else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
+            }
+            this.sendWatchUpdate(results);
+          }
           this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
+          return;
         }
-      });
-    }, 200);
+
+        if (this.watchExpressions.length > 0) {
+          this._watchPollCycle++;
+          await this.backend.execute({ cmd: 'halt' });
+          await new Promise<void>(q => setTimeout(q, 10));
+
+          const results: any[] = [];
+          for (const expr of this.watchExpressions) {
+            const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+            if (r.ok) results.push(r.data);
+            else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
+          }
+
+          await this.backend.execute({ cmd: 'run' });
+          this.sendWatchUpdate(results);
+        }
+      } catch (err) {
+        daLog(`startPolling: error ${err}`);
+      }
+      if (this.pollTimer !== null) {
+        this.pollTimer = setTimeout(pollLoop, 200);
+      }
+    };
+    this.pollTimer = setTimeout(pollLoop, 200);
+  }
+
+  private sendWatchUpdate(results: any[]) {
+    this.sendEvent('output', {
+      category: 'ozoneWatch',
+      output: JSON.stringify({ results }),
+    });
   }
 
   private stopPolling() {
@@ -95,7 +137,7 @@ export class DapSession extends EventEmitter {
             supportsConfigurationDoneRequest: true,
             supportsConditionalBreakpoints: false,
             supportsHitConditionalBreakpoints: false,
-            supportsEvaluateForHovers: false,
+            supportsEvaluateForHovers: true,
             supportsStepBack: false,
             supportsSetVariable: false,
             supportsRestartFrame: false,
@@ -151,6 +193,12 @@ export class DapSession extends EventEmitter {
           return this.handleRestart(msg);
         case 'evaluate':
           return this.handleEvaluate(msg);
+        case 'watchEvaluate':
+          return this.handleWatchEvaluate(msg);
+        case 'setWatches':
+          this.watchExpressions = msg.arguments?.expressions || [];
+          daLog(`setWatches: ${this.watchExpressions.length} expressions`);
+          return this.sendResponse(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
       }
@@ -195,6 +243,11 @@ export class DapSession extends EventEmitter {
         await this.backend.execute({ cmd: 'loadSymbols', elfPath });
       }
 
+      if (elfPath && args.flashBeforeDebug !== false) {
+        this.sendEvent('output', { category: 'console', output: 'Resetting target after flash...\n' });
+        await this.backend.execute({ cmd: 'reset' });
+        await new Promise<void>(r => setTimeout(r, 200));
+      }
       await this.backend.execute({ cmd: 'halt' });
 
       this.sendEvent('initialized', {});
@@ -451,7 +504,47 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, { result: '', variablesReference: 0 });
       return;
     }
-    this.sendResponse(msg, { result: '?', variablesReference: 0 });
+
+    if (context === 'watch' && !this.watchExpressions.includes(expr)) {
+      this.watchExpressions.push(expr);
+      daLog(`handleEvaluate: auto-captured watch expression "${expr}"`);
+      const session = this.listeners('send').length > 0 ? this : null;
+    }
+
+    const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+    if (result.ok) {
+      const wv = result.data as WatchValue;
+      daLog(`handleEvaluate: result="${wv.display}"`);
+      this.sendResponse(msg, { result: wv.display, variablesReference: 0 });
+    } else {
+      daLog(`handleEvaluate: error="${result.error}"`);
+      this.sendResponse(msg, { result: result.error, variablesReference: 0 });
+    }
+  }
+
+  private async handleWatchEvaluate(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    const expressions: string[] = args.expressions || [];
+    daLog(`handleWatchEvaluate: ${expressions.length} expressions`);
+    const wasHalted = await this.backend.execute({ cmd: 'getTargetState' });
+    const needResume = wasHalted.ok && wasHalted.data !== 'halted';
+    if (needResume) {
+      await this.backend.execute({ cmd: 'halt' });
+      await new Promise<void>(r => setTimeout(r, 100));
+    }
+    const results: any[] = [];
+    for (const expr of expressions) {
+      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+      if (result.ok) {
+        results.push(result.data);
+      } else {
+        results.push({ expression: expr, value: 0, display: '', hex: '', error: result.error });
+      }
+    }
+    if (needResume) {
+      await this.backend.execute({ cmd: 'run' });
+    }
+    this.sendResponse(msg, { results });
   }
 
   dispose() {

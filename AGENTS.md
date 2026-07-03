@@ -144,6 +144,64 @@ F5 in VS Code: "Run Extension" (build first) or "Extension + Watch" (esbuild wat
 - `readMemoryU32` corrupts DLL state for subsequent `readRegister` calls — removed from `doGetCallStack`/`doGetLocals`
 - `objdump --dwarf=decodedline` has duplicate entries with invalid addresses — filtered out
 
+## Watch system
+
+### Architecture
+- **`evaluateExpression` command** (`src/ozone-backend/commander.ts:652-717`): Reads memory at symbol address. `force: true` skips halt check for polling reads. Caller manages halt/resume.
+- **DAP evaluate** (`src/debug/dap-session.ts:464-480`): Returns real values to VS Code WATCH section when stopped. Auto-captures `context === 'watch'` expressions.
+- **Watch polling** (`src/debug/dap-session.ts:70-130`): Combined 5Hz timer — checks breakpoints, then halts → batch reads all watch expressions → resumes. Uses `setTimeout` recursion (no overlap).
+- **WatchProvider** (`src/debug-providers/watch-provider.ts`): TreeDataProvider for `ozoneWatch` view. Tracks previous values for change highlighting (`debug-stackframe-dot` icon). Preserves last-known values when CPU is running.
+- **Communication**: DAP adapter sends watch values via `output` event (`category: 'ozoneWatch'`). Extension's `DebugAdapterTracker` intercepts and updates WatchProvider.
+- **Persistence**: Watch expressions saved to `workspaceState` via `saveWatchExpressions()` in extension.ts, restored on activation.
+
+### Flow
+```
+VS Code WATCH section (stopped) → handleEvaluate → evaluateExpression → return value
+Ozone Watch tree view (running)  → combined poll → halt → batch read → resume → output event → WatchProvider → tree view
+Auto-capture                     → handleEvaluate adds expr to watchExpressions → next poll picks it up
+```
+
+### Key files
+- `src/ozone-backend/types.ts:65-73` — WatchValue interface, evaluateExpression command
+- `src/ozone-backend/commander.ts:652-717` — doEvaluateExpression implementation
+- `src/debug/dap-session.ts:70-130` — combined polling loop
+- `src/debug/dap-session.ts:464-480` — handleEvaluate (VS Code WATCH)
+- `src/debug/dap-session.ts:482-510` — handleWatchEvaluate (batch custom request)
+- `src/debug-providers/watch-provider.ts` — WatchProvider tree data provider
+- `src/extension.ts:100-114,163-165` — WatchProvider setup, persistence, syncWatchesToDap
+
+### Known limitations
+- VS Code native WATCH section only updates when debuggee is stopped (DAP protocol limit)
+- Ozone Watch tree view updates at both running and stopped states
+- `doGetLocals()` now reads actual memory values (fixed from showing addresses only)
+
+## UI contributions
+
+### Commands
+| command | keybinding | description |
+|---|---|---|
+| `ozone.flashAndRestart` | `Ctrl+Shift+F5` | Flash → reset → run |
+| `ozone.addWatch` | — | Add expression to Ozone Watch |
+| `ozone.removeWatch` | — | Remove from Ozone Watch |
+
+### Views
+- `ozoneWatch` — Ozone Watch tree view with + button in title, inline delete on hover
+
+## Current state & scope
+
+### Working
+- All features from previous version (connect/disconnect/halt/run/step/reset, breakpoints, registers, memory, step-over)
+- **DAP evaluate** returns real expression values (fixed)
+- **doGetLocals** reads actual memory values (fixed)
+- **Ozone Watch tree view** with 5Hz polling while running
+- **Auto-capture** VS Code WATCH expressions into polling
+- **Persistence** of watch expressions across sessions
+- **Change highlighting** when variable value changes
+- **Flash → reset → halt** on F5 launch
+
+### Partially working / unstable
+- Step-over (逐过程) — see previous notes
+
 ## Resources
 
 - `resources/breakpoint.svg` — gutter icon for breakpoints (created)

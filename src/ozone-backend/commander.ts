@@ -1,7 +1,7 @@
 import {
   OzoneCommand, OzoneCommandResult,
   DebugSessionConfig, RegisterValue, Variable,
-  StackFrame, MemoryBlock, TargetState,
+  StackFrame, MemoryBlock, TargetState, WatchValue,
 } from './types';
 import { flashElf } from './flasher';
 import { JLinkDLL } from './jlink-dll';
@@ -88,6 +88,8 @@ case 'readVariableRuntime':
           return this.doClearBreakpointAtAddr(command.addr);
         case 'setBreakpointAtAddr':
           return this.doSetBreakpointAtAddr(command.addr);
+        case 'evaluateExpression':
+          return await this.doEvaluateExpression(command.expression, command.force);
         case 'loadSymbols':
     if (this.elfPath === command.elfPath && this.symbols.length > 0) {
       return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };
@@ -268,10 +270,22 @@ case 'readVariableRuntime':
     );
 
     for (const sym of localSymbols.slice(0, 50)) {
+      const readSize = Math.min(Math.max(sym.size || 4, 4), 4);
+      const raw = this.jlink.readMemory(sym.address, readSize);
+      let value: string;
+      if (raw) {
+        let v = 0;
+        for (let i = raw.length - 1; i >= 0; i--) v = (v << 8) | raw[i];
+        if (sym.size <= 1) value = `0x${v.toString(16).toUpperCase()} (${v})`;
+        else if (sym.size <= 2) value = `0x${v.toString(16).toUpperCase()} (${v})`;
+        else value = `0x${v.toString(16).toUpperCase().padStart(8, '0')}`;
+      } else {
+        value = `0x${sym.address.toString(16).toUpperCase()}`;
+      }
       variables.push({
         name: sym.name,
         type: sym.type,
-        value: `0x${sym.address.toString(16).toUpperCase()}`,
+        value,
         address: sym.address,
       });
     }
@@ -647,31 +661,83 @@ case 'readVariableRuntime':
     return null;
   }
 
-  async readVariableAtRuntime(variableName: string): Promise<OzoneCommandResult> {
-    const sym = this.symbols.find(s => s.name === variableName);
-    if (!sym) return { ok: false, error: `Symbol not found: ${variableName}` };
+  private async doEvaluateExpression(expression: string, force: boolean = false): Promise<OzoneCommandResult> {
+    daLog(`doEvaluateExpression: "${expression}" force=${force}`);
+    let sym = this.symbols.find(s => s.name === expression);
+    if (!sym) {
+      sym = this.symbols.find(s => s.name.toLowerCase() === expression.toLowerCase());
+    }
+    if (!sym) {
+      const regIdx = REG_INDEXES[expression.toUpperCase()];
+      if (regIdx !== undefined) {
+        const val = this.jlink.readRegister(regIdx);
+        if (val !== null) {
+          return {
+            ok: true,
+            data: {
+              expression, value: val,
+              display: val.toString(10),
+              hex: `0x${val.toString(16).toUpperCase().padStart(8, '0')}`,
+            } as WatchValue,
+          };
+        }
+        return { ok: false, error: `Cannot read register ${expression}` };
+      }
+      return { ok: false, error: `Symbol not found: ${expression}` };
+    }
 
-    this.jlink.halt();
-    await new Promise<void>(r => setTimeout(r, 50));
-    const raw = this.jlink.readMemoryU32(sym.address, 1);
-    if (!raw) return { ok: false, error: `Failed to read ${variableName}` };
+    daLog(`doEvaluateExpression: sym=${sym.name} addr=0x${sym.address.toString(16)}`);
 
-    const value = raw[0];
+    if (!force && !this.jlink.isHalted()) {
+      daLog(`doEvaluateExpression: CPU is running, returning running`);
+      return { ok: false, error: 'running' };
+    }
+
+    if (!force) {
+      await new Promise<void>(r => setTimeout(r, 100));
+    }
+
+    const readSize = Math.min(Math.max(sym.size || 4, 4), 4);
+    const raw = this.jlink.readMemory(sym.address, readSize);
+
+    if (!raw) {
+      return { ok: false, error: `read failed at 0x${sym.address.toString(16)}` };
+    }
+
+    let value = 0;
+    for (let i = raw.length - 1; i >= 0; i--) {
+      value = (value << 8) | raw[i];
+    }
+
     let display: string;
-    if (sym.size <= 1) display = `0x${value.toString(16)} (${value})`;
-    else if (sym.size <= 2) display = `0x${value.toString(16)} (${value})`;
-    else display = `0x${value.toString(16)}`;
+    if (sym.size <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+    else if (sym.size <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+    else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')}`;
 
     return {
       ok: true,
       data: {
-        name: variableName,
-        address: sym.address,
-        value,
-        display,
+        expression, value, display,
         hex: `0x${value.toString(16).toUpperCase().padStart(8, '0')}`,
-      },
+        address: sym.address,
+      } as WatchValue,
     };
+  }
+
+  async readVariableAtRuntime(variableName: string): Promise<OzoneCommandResult> {
+    const wasRunning = !this.jlink.isHalted();
+    daLog(`readVariableAtRuntime: "${variableName}" wasRunning=${wasRunning}`);
+    if (wasRunning) {
+      const halted = await this.ensureHalted();
+      if (!halted) return { ok: false, error: 'halt failed' };
+    } else {
+      await new Promise<void>(r => setTimeout(r, 100));
+    }
+    const result = await this.doEvaluateExpression(variableName, false);
+    if (wasRunning) {
+      this.jlink.run();
+    }
+    return result;
   }
 
   dispose() {

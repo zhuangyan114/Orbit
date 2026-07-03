@@ -94,6 +94,20 @@
       {
         "command": "ozone.reset",
         "title": "Ozone: Reset Target"
+      },
+      {
+        "command": "ozone.flashAndRestart",
+        "title": "Ozone: Flash and Restart"
+      },
+      {
+        "command": "ozone.addWatch",
+        "title": "Ozone: Add to Watch",
+        "icon": "$(add)"
+      },
+      {
+        "command": "ozone.removeWatch",
+        "title": "Ozone: Remove from Watch",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
@@ -101,6 +115,20 @@
         {
           "command": "ozone.toggleBreakpoint",
           "when": "editorLangId == 'c' || editorLangId == 'cpp' || editorLangId == 'asm'"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "ozone.addWatch",
+          "when": "view == ozoneWatch",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "ozone.removeWatch",
+          "when": "view == ozoneWatch && viewItem == watchItem",
+          "group": "inline"
         }
       ]
     },
@@ -113,6 +141,11 @@
       {
         "command": "ozone.flash",
         "key": "ctrl+shift+p",
+        "when": "!editorTextFocus"
+      },
+      {
+        "command": "ozone.flashAndRestart",
+        "key": "ctrl+shift+f5",
         "when": "!editorTextFocus"
       }
     ],
@@ -151,9 +184,20 @@
           "type": "tree",
           "id": "ozoneRegisters",
           "name": "Registers"
+        },
+        {
+          "type": "tree",
+          "id": "ozoneWatch",
+          "name": "Watch"
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "ozoneWatch",
+        "contents": "点击标题栏 + 按钮添加变量\n运行时自动 5Hz 刷新 · 变化时高亮"
+      }
+    ],
     "debuggers": [
       {
         "type": "ozone",

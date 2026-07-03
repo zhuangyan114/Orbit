@@ -42,6 +42,21 @@ interface VariableValue {
   hex: string;
 }
 
+interface WatchEntry {
+  expression: string;
+  value?: string;
+  error?: string;
+}
+
+interface WatchValue {
+  expression: string;
+  value: number;
+  display: string;
+  hex: string;
+  address?: number;
+  error?: string;
+}
+
 export function App() {
   console.log('[Ozone] App rendering');
   const [state, setState] = useState<DebugState>('disconnected');
@@ -49,6 +64,7 @@ export function App() {
   const [config, setConfig] = useState<FlashConfig>({ device: '', elfPath: '', jlinkPath: '', workspaceRoot: '' });
   const [registers, setRegisters] = useState<RegisterValue[]>([]);
   const [memoryBlock, setMemoryBlock] = useState<MemoryBlock | null>(null);
+  const [watches, setWatches] = useState<WatchEntry[]>([]);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -75,6 +91,19 @@ export function App() {
         case 'elfSelected':
           setConfig(prev => ({ ...prev, elfPath: msg.elfPath }));
           break;
+        case 'watchResults':
+          setWatches(prev => prev.map((w, i) => {
+            const r = msg.results?.[i];
+            if (!r) return w;
+            if (r.error === 'running') {
+              return { ...w, value: w.value || 'Running...' };
+            }
+            if (r.error) {
+              return { expression: w.expression, error: r.error, value: undefined };
+            }
+            return { expression: w.expression, value: r.display, error: undefined };
+          }));
+          break;
       }
     };
     window.addEventListener('message', handler);
@@ -85,10 +114,17 @@ export function App() {
     vscode.postMessage({ command: 'getConfig' });
   }, []);
 
+  useEffect(() => {
+    if (watches.length === 0 || state !== 'halted') return;
+    const exprs = watches.map(w => w.expression);
+    vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
+  }, [state, watches.length]);
+
   const send = useCallback((command: string) => vscode.postMessage({ command }), []);
 
   const tabs = [
     { id: 'control', label: 'Control' },
+    { id: 'watch', label: 'Watch' },
     { id: 'registers', label: 'Registers' },
     { id: 'memory', label: 'Memory' },
     { id: 'ai', label: 'AI' },
@@ -141,6 +177,7 @@ export function App() {
       {/* Panels */}
       <div style={{ flex: 1, overflow: 'auto' }}>
         {activePanel === 'control' && <ControlPanel send={send} state={state} config={config} />}
+        {activePanel === 'watch' && <WatchPanel watches={watches} setWatches={setWatches} />}
         {activePanel === 'registers' && <RegistersPanel registers={registers} />}
         {activePanel === 'memory' && <MemoryPanel send={send} block={memoryBlock} />}
         {activePanel === 'ai' && <AIPanel />}
@@ -317,6 +354,93 @@ function MemoryPanel({ send, block }: { send: (cmd: string) => void; block: Memo
             Enter an address and click Read
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function WatchPanel({ watches, setWatches }: {
+  watches: WatchEntry[];
+  setWatches: React.Dispatch<React.SetStateAction<WatchEntry[]>>;
+}) {
+  const [newExpr, setNewExpr] = useState('');
+  const [polling, setPolling] = useState(false);
+
+  const addWatch = () => {
+    const expr = newExpr.trim();
+    if (!expr) return;
+    setWatches(prev => [...prev, { expression: expr }]);
+    setNewExpr('');
+  };
+
+  const removeWatch = (index: number) => {
+    setWatches(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const refreshAll = () => {
+    const exprs = watches.map(w => w.expression);
+    if (exprs.length > 0) {
+      vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
+    }
+  };
+
+  useEffect(() => {
+    if (watches.length === 0 || polling === false) return;
+    const interval = setInterval(() => {
+      const exprs = watches.map(w => w.expression);
+      vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
+    }, 200);
+    return () => clearInterval(interval);
+  }, [polling, watches.length]);
+
+  return (
+    <div style={{ fontSize: '12px' }}>
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
+        <input value={newExpr} onChange={e => setNewExpr(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') addWatch(); }}
+          placeholder="变量名或表达式"
+          style={{ flex: 1, ...inputStyle }} />
+        <button onClick={addWatch} style={btnStyle}>+</button>
+        <button onClick={refreshAll} style={btnStyle}>⟳</button>
+        <button onClick={() => setPolling(!polling)} style={{
+          ...btnStyle,
+          background: polling ? 'var(--vscode-button-secondaryBackground)' : 'var(--vscode-button-background)',
+        }}>
+          {polling ? '⏹' : '▶'}
+        </button>
+      </div>
+      {watches.length === 0 ? (
+        <div style={{ opacity: 0.5, textAlign: 'center', padding: '20px' }}>
+          输入变量名后点击 + 添加监视
+        </div>
+      ) : (
+        watches.map((w, i) => (
+          <div key={i} style={{
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            padding: '3px 4px', borderBottom: '1px solid var(--border)',
+          }}>
+            <span style={{ color: 'var(--vscode-symbolIcon-variableForeground)', fontWeight: 500 }}>
+              {w.expression}
+            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{
+                color: w.value === 'Running...' ? 'var(--vscode-descriptionForeground)' :
+                       w.error ? 'var(--vscode-errorForeground)' : 'var(--vscode-editor-foreground)',
+                fontFamily: 'monospace',
+              }}>
+                {w.value || '...'}
+              </span>
+              <button onClick={() => removeWatch(i)}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: 'var(--vscode-errorForeground)', fontSize: '12px', padding: '0 2px',
+                }}>✕</button>
+            </div>
+          </div>
+        ))
+      )}
+      <div style={{ fontSize: '10px', color: 'var(--vscode-descriptionForeground)', marginTop: '8px', textAlign: 'center' }}>
+        按 ▶ 开启 5Hz 运行中轮询 · 暂停时自动更新
       </div>
     </div>
   );

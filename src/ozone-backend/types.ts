@@ -36,6 +36,15 @@ export interface StackFrame {
   address: number;
 }
 
+export interface WatchValue {
+  expression: string;
+  value: number;
+  display: string;
+  hex: string;
+  address?: number;
+  error?: string;
+}
+
 export interface Breakpoint {
   id: number;
   file: string;
@@ -91,7 +100,8 @@ export type OzoneCommand =
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
-  | { cmd: 'setBreakpointAtAddr'; addr: number };
+  | { cmd: 'setBreakpointAtAddr'; addr: number }
+  | { cmd: 'evaluateExpression'; expression: string; force?: boolean };
 
 export type OzoneCommandResult =
   | { ok: true; data: unknown }

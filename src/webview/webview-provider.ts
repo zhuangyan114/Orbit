@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
-import { TargetState, RegisterValue } from '../ozone-backend/types';
+import { TargetState, RegisterValue, WatchValue } from '../ozone-backend/types';
 
 export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -86,6 +86,9 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
         case 'readVariableRuntime':
           this.readVariableRuntime(message.name);
           break;
+        case 'evaluateWatches':
+          this.evaluateWatches(message.expressions);
+          break;
       }
     });
   }
@@ -120,6 +123,42 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
     } else {
       this.view?.webview.postMessage({ command: 'variableError', error: result.error });
     }
+  }
+
+  async evaluateWatches(expressions: string[]) {
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'ozone') {
+      try {
+        const result = await session.customRequest('watchEvaluate', { expressions });
+        if (result && result.results) {
+          this.view?.webview.postMessage({ command: 'watchResults', results: result.results });
+        }
+        return;
+      } catch { }
+    }
+    const isRunning = await this.ensureHalted();
+    const results: WatchValue[] = [];
+    for (const expr of expressions) {
+      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+      if (result.ok) {
+        results.push(result.data as WatchValue);
+      } else {
+        results.push({ expression: expr, value: 0, display: '', hex: '', error: result.error });
+      }
+    }
+    if (isRunning) {
+      await this.backend.execute({ cmd: 'run' });
+    }
+    this.view?.webview.postMessage({ command: 'watchResults', results });
+  }
+
+  private async ensureHalted(): Promise<boolean> {
+    const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
+    const wasAlreadyHalted = stateResult.ok && stateResult.data === 'halted';
+    if (wasAlreadyHalted) return false;
+    await this.backend.execute({ cmd: 'halt' });
+    await new Promise<void>(r => setTimeout(r, 100));
+    return true;
   }
 
   refresh() {

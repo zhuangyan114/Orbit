@@ -986,15 +986,24 @@ case 'readVariableRuntime':
       return { ok: false, error: `read failed at 0x${sym.address.toString(16)}` };
     }
 
-    let value = 0;
-    for (let i = raw.length - 1; i >= 0; i--) {
-      value = (value << 8) | raw[i];
-    }
+    const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
+    const isFloat = this.isFloatType(resolvedType);
 
+    let value: number;
     let display: string;
-    if (sym.size <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-    else if (sym.size <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-    else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')}`;
+    if (isFloat && raw.length >= (resolvedType?.byteSize || 4)) {
+      value = this.readBytesAsFloat(raw, resolvedType!.byteSize);
+      if (resolvedType!.byteSize === 8) display = `${value.toExponential(6)}`;
+      else display = `${value.toFixed(6)}`;
+    } else {
+      value = 0;
+      for (let i = raw.length - 1; i >= 0; i--) {
+        value = (value << 8) | raw[i];
+      }
+      if (sym.size <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+      else if (sym.size <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+      else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+    }
 
     let typeName = '';
     if (varTypeOffset) {
@@ -1002,18 +1011,37 @@ case 'readVariableRuntime':
       if (tn) typeName = tn;
     }
 
+    const hexValue = isFloat
+      ? `0x${Array.from(raw.slice(0, Math.max(readSize, 4))).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
+      : `0x${value.toString(16).toUpperCase().padStart(8, '0')}`;
+
     return {
       ok: true,
       data: {
         expression, value, display,
-        hex: `0x${value.toString(16).toUpperCase().padStart(8, '0')}`,
+        hex: hexValue,
         address: sym.address,
         typeName,
       } as WatchValue,
     };
   }
 
-  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number } | null {
+  private isFloatType(info: { kind?: string; encoding?: string; name?: string } | null): boolean {
+    if (!info) return false;
+    if (info.kind !== 'base') return false;
+    const enc = (info.encoding || '').toLowerCase();
+    return enc.includes('float') || enc === '4' || enc === '0x4';
+  }
+
+  private readBytesAsFloat(raw: Uint8Array, byteSize: number): number {
+    if (raw.length < byteSize) return 0;
+    const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + byteSize);
+    const dv = new DataView(buf);
+    if (byteSize === 8) return dv.getFloat64(0, true);
+    return dv.getFloat32(0, true);
+  }
+
+  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number; encoding?: string } | null {
     if (!visited) visited = new Set();
     if (visited.has(offset)) return null;
     visited.add(offset);
@@ -1027,7 +1055,7 @@ case 'readVariableRuntime':
     if (info.kind === 'struct') {
       return { kind: 'struct', name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
     }
-    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount };
+    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount, encoding: info.encoding };
   }
 
   private getDwarfTypeName(offset: string): string {
@@ -1090,16 +1118,26 @@ case 'readVariableRuntime':
             children: structChildren,
           });
         } else {
-          let value = 0;
           const end = Math.min(elemRawOffset + elemSize, arrRaw.length);
-          for (let j = end - 1; j >= elemRawOffset; j--) {
-            value = (value << 8) | arrRaw[j];
+          const elemRaw = arrRaw.slice(elemRawOffset, end);
+          const isFloatArrElem = this.isFloatType(elemType);
+          let value: number;
+          let display: string;
+          if (isFloatArrElem && elemRaw.length >= elemSize) {
+            value = this.readBytesAsFloat(elemRaw, elemSize);
+            display = elemSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+          } else {
+            value = 0;
+            for (let j = end - 1; j >= elemRawOffset; j--) {
+              value = (value << 8) | arrRaw[j];
+            }
+            display = elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
           }
           children.push({
             expression: `[${i}]`,
             value,
-            display: elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`,
-            hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`,
+            display,
+            hex: `0x${Array.from(elemRaw).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`,
             address: elemAddr,
             typeName: elemType?.name || '',
           });
@@ -1120,16 +1158,25 @@ case 'readVariableRuntime':
     }
 
     const fieldSize = resolvedByteSize || 4;
-    let value = 0;
-    const end = Math.min(field.byteOffset + fieldSize, raw.length);
-    for (let i = end - 1; i >= field.byteOffset; i--) {
-      value = (value << 8) | raw[i];
-    }
+    const fieldEnd = Math.min(field.byteOffset + fieldSize, raw.length);
+    const fieldRaw = raw.slice(field.byteOffset, fieldEnd);
 
+    const isFloat = this.isFloatType(resolved);
+
+    let value: number;
     let display: string;
-    if (fieldSize <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-    else if (fieldSize <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-    else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+    if (isFloat && fieldRaw.length >= fieldSize) {
+      value = this.readBytesAsFloat(fieldRaw, fieldSize);
+      display = fieldSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+    } else {
+      value = 0;
+      for (let i = fieldEnd - 1; i >= field.byteOffset; i--) {
+        value = (value << 8) | raw[i];
+      }
+      if (fieldSize <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+      else if (fieldSize <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
+      else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+    }
 
     return {
       expression: field.name,

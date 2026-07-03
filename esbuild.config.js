@@ -30,6 +30,18 @@ const webviewConfig = {
 };
 
 /** @type {esbuild.BuildOptions} */
+const timelineConfig = {
+  entryPoints: [path.resolve('src/webview/timeline/main.tsx')],
+  bundle: true,
+  outfile: path.resolve('dist/timeline.js'),
+  format: 'iife',
+  platform: 'browser',
+  target: 'es2022',
+  sourcemap: false,
+  minify: false,
+};
+
+/** @type {esbuild.BuildOptions} */
 const debugAdapterConfig = {
   entryPoints: [path.resolve('src/debugadapter.ts')],
   bundle: true,
@@ -48,11 +60,12 @@ async function build() {
       const extCtx = await esbuild.context(extConfig);
       const webviewCtx = await esbuild.context(webviewConfig);
       const daCtx = await esbuild.context(debugAdapterConfig);
-      await Promise.all([extCtx.watch(), webviewCtx.watch(), daCtx.watch()]);
-      console.log('[watch] extension + webview + debugadapter — waiting for changes...');
+      const tlCtx = await esbuild.context(timelineConfig);
+      await Promise.all([extCtx.watch(), webviewCtx.watch(), daCtx.watch(), tlCtx.watch()]);
+      console.log('[watch] extension + webview + debugadapter + timeline — waiting for changes...');
     } else {
-      await Promise.all([esbuild.build(extConfig), esbuild.build(webviewConfig), esbuild.build(debugAdapterConfig)]);
-      console.log('[build] extension + webview + debugadapter — done');
+      await Promise.all([esbuild.build(extConfig), esbuild.build(webviewConfig), esbuild.build(debugAdapterConfig), esbuild.build(timelineConfig)]);
+      console.log('[build] extension + webview + debugadapter + timeline — done');
     }
   } catch (err) {
     console.error(err);

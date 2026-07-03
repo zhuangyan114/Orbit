@@ -108,6 +108,16 @@
         "command": "ozone.removeWatch",
         "title": "Ozone: Remove from Watch",
         "icon": "$(trash)"
+      },
+      {
+        "command": "ozone.openTimeline",
+        "title": "Ozone: Open Timeline",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "ozone.addToDataSampling",
+        "title": "Ozone: Add to Data Sampling",
+        "icon": "$(graph)"
       }
     ],
     "menus": {
@@ -127,6 +137,11 @@
       "view/item/context": [
         {
           "command": "ozone.removeWatch",
+          "when": "view == ozoneWatch && viewItem == watchItem",
+          "group": "inline"
+        },
+        {
+          "command": "ozone.addToDataSampling",
           "when": "view == ozoneWatch && viewItem == watchItem",
           "group": "inline"
         }
@@ -154,6 +169,13 @@
         {
           "id": "ozone-debug",
           "title": "Ozone Debug",
+          "icon": "resources/icon.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "ozone-panel",
+          "title": "Ozone Timeline",
           "icon": "resources/icon.svg"
         }
       ]
@@ -189,6 +211,13 @@
           "type": "tree",
           "id": "ozoneWatch",
           "name": "Watch"
+        }
+      ],
+      "ozone-panel": [
+        {
+          "type": "webview",
+          "id": "ozoneTimeline",
+          "name": "Timeline"
         }
       ]
     },

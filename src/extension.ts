@@ -8,6 +8,8 @@ import { MemoryProvider } from './debug-providers/memory-provider';
 import { WatchProvider } from './debug-providers/watch-provider';
 import { AIProviderManager } from './ai/ai-provider-manager';
 import { DebugWebviewProvider } from './webview/webview-provider';
+import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
+import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { findElfFiles } from './ozone-backend/flasher';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import * as path from 'path';
@@ -22,6 +24,8 @@ let memoryProvider: MemoryProvider;
 let aiProviderManager: AIProviderManager;
 let webviewProvider: DebugWebviewProvider;
 let watchProvider: WatchProvider;
+let dataSamplingManager: DataSamplingManager;
+let timelineProvider: TimelineWebviewProvider;
 
 function refreshAllViews() {
   variableProvider.refresh();
@@ -121,6 +125,20 @@ export function activate(context: vscode.ExtensionContext) {
     }
     console.log('[Ozone] watchProvider ok');
     context.subscriptions.push(vscode.window.registerFileDecorationProvider(wp));
+
+    const dsm = new DataSamplingManager(b);
+    dataSamplingManager = dsm;
+    dsm.onExpressionsChanged = (exprs) => {
+      context.workspaceState.update('ozoneDataSamplingExpressions', exprs);
+    };
+    const dsSaved = context.workspaceState.get<{ expression: string; color: string }[]>('ozoneDataSamplingExpressions', []);
+    if (dsSaved.length > 0) {
+      dsm.setExpressions(dsSaved);
+    }
+    console.log('[Ozone] dataSamplingManager ok');
+    const tl = new TimelineWebviewProvider(context, dsm);
+    timelineProvider = tl;
+    console.log('[Ozone] timelineProvider ok');
 
     const doFlash = async (b: OzoneBackend, elfPath: string, device: string, interface_: 'SWD' | 'JTAG', speedKHz: number, restart: boolean) => {
       await vscode.window.withProgress({
@@ -261,6 +279,17 @@ vscode.commands.registerCommand('ozone.stopSession', async () => {
       watchProvider.setExpressions(current.filter(e => e !== expr));
     }),
 
+    vscode.commands.registerCommand('ozone.openTimeline', () => {
+      vscode.commands.executeCommand('workbench.view.extension.ozone-panel');
+    }),
+
+    vscode.commands.registerCommand('ozone.addToDataSampling', async (item) => {
+      const expr = item?.watch?.expression || item;
+      if (!expr || typeof expr !== 'string') return;
+      dataSamplingManager.addExpression(expr);
+      vscode.commands.executeCommand('workbench.view.extension.ozone-panel');
+    }),
+
     vscode.commands.registerCommand('ozone.debug', async () => {
       const config = vscode.workspace.getConfiguration('ozone');
       let elfPath = config.get<string>('_elfPath', '');
@@ -307,6 +336,7 @@ vscode.commands.registerCommand('ozone.stopSession', async () => {
     }),
 
     vscode.window.registerWebviewViewProvider('ozoneDebugSession', webviewProvider),
+    vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider),
   );
 
   context.subscriptions.push(
@@ -379,4 +409,5 @@ export function deactivate() {
   sessionManager?.dispose();
   aiProviderManager?.dispose();
   webviewProvider?.dispose();
+  dataSamplingManager?.dispose();
 }

@@ -1,4 +1,4 @@
-# Ozone for VS Code — Agent Guide
+# Ozone for VS Code — Agent Guide (V1.0)
 
 ## Build & verify order
 
@@ -200,9 +200,37 @@ Auto-capture                     → handleEvaluate adds expr to watchExpression
 | `ozone.flashAndRestart` | `Ctrl+Shift+F5` | Flash → reset → run |
 | `ozone.addWatch` | — | Add expression to Ozone Watch |
 | `ozone.removeWatch` | — | Remove from Ozone Watch |
+| `ozone.openTimeline` | — | Open Timeline (Data Sampling) |
+| `ozone.addToDataSampling` | — | Add expression to Data Sampling |
 
 ### Views
 - `ozoneWatch` — Ozone Watch tree view with + button in title, inline delete on hover
+- `ozoneTimeline` (panel) — WebView tab in bottom panel (Terminal 区域), 显示实时波形
+
+### Data Sampling / Timeline
+
+**Architecture:**
+- `DataSamplingManager` (`src/debug-providers/data-sampling-manager.ts`): 100ms 轮询 `evaluateExpression(force=true)`, 积累 `DataPoint[]` (最多 50000 点/变量), 每 100ms 通过 `onSamples` 回调推送
+- `TimelineWebviewProvider` (`src/webview/timeline/timeline-provider.ts`): `WebviewViewProvider` 注册到 `panel` container, 显示在 VS Code 底部面板
+- `timeline.js` (`src/webview/timeline/`): React + Canvas 折线图, 支持勾选/取消、时间轴缩放、清除数据
+- 构建入口已添加到 `esbuild.config.js`
+
+**数据流:**
+```
+Extension Host
+  DataSamplingManager.poll()  →  backend.execute(evaluateExpression)
+  → 每 100ms flush(onSamples callback)
+  →  TimelineWebviewProvider.postMessage('samples')
+  →  WebView Canvas 重绘
+```
+
+**添加变量方式:**
+1. Watch 视图右键 → "Add to Data Sampling"
+2. Timeline 面板内输入变量名 + 点击 +
+
+**包注册:**
+- View `ozoneTimeline` 在 `package.json` 的 `views.panel` 下
+- Provider 通过 `registerWebviewViewProvider('ozoneTimeline', ...)` 注册
 
 ## Current state & scope
 
@@ -216,6 +244,7 @@ Auto-capture                     → handleEvaluate adds expr to watchExpression
 - **Persistence** of watch expressions across sessions
 - **Change highlighting** when variable value changes
 - **Flash → reset → halt** on F5 launch
+- **Timeline Data Sampling** — 独立底部面板, 10Hz 采样, Canvas 实时折线图, 变量勾选/缩放/清除
 
 ## Resources
 

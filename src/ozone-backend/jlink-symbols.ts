@@ -110,6 +110,7 @@ export interface DwarfTypeInfo {
   fields?: DwarfField[];
   typeOffset?: string;
   arrayCount?: number;
+  encoding?: string;
 }
 
 export interface DwarfInfo {
@@ -266,6 +267,7 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
           name: die.attrs.DW_AT_name,
           byteSize: parseInt(die.attrs.DW_AT_byte_size) || 0,
           kind: 'base',
+          encoding: die.attrs.DW_AT_encoding,
         });
       }
 

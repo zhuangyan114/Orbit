@@ -47,6 +47,25 @@ export interface WatchValue {
   children?: WatchValue[];
 }
 
+export interface DataPoint {
+  timestamp: number;
+  value: number;
+  display: string;
+}
+
+export interface DataSamplingEntry {
+  expression: string;
+  enabled: boolean;
+  color: string;
+}
+
+export interface DataSampleSnapshot {
+  expression: string;
+  color: string;
+  currentValue: string;
+  data: DataPoint[];
+}
+
 export interface Breakpoint {
   id: number;
   file: string;

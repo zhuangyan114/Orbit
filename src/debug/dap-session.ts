@@ -215,6 +215,10 @@ export class DapSession extends EventEmitter {
           this.watchExpressions = msg.arguments?.expressions || [];
           daLog(`setWatches: ${this.watchExpressions.length} expressions: [${this.watchExpressions.join(', ')}]`);
           return this.sendResponse(msg);
+        case 'dataSample':
+          return this.handleDataSample(msg);
+        case 'getTargetState':
+          return this.handleGetTargetState(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
       }
@@ -620,6 +624,27 @@ export class DapSession extends EventEmitter {
       await this.backend.execute({ cmd: 'run' });
     }
     this.sendResponse(msg, { results });
+  }
+
+  private async handleDataSample(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    const expressions: string[] = args.expressions || [];
+    daLog(`handleDataSample: ${expressions.length} expressions`);
+    const results: any[] = [];
+    for (const expr of expressions) {
+      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
+      if (result.ok) {
+        results.push(result.data);
+      } else {
+        results.push({ expression: expr, value: 0, display: '', hex: '', error: result.error });
+      }
+    }
+    this.sendResponse(msg, { results });
+  }
+
+  private async handleGetTargetState(msg: DebugProtocolMessage) {
+    const r = await this.backend.execute({ cmd: 'getTargetState' });
+    this.sendResponse(msg, r.ok ? { state: r.data } : { state: 'error' });
   }
 
   dispose() {

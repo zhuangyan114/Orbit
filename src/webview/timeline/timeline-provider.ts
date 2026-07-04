@@ -2,6 +2,21 @@ import * as vscode from 'vscode';
 import { DataSamplingManager } from '../../debug-providers/data-sampling-manager';
 import { DataSampleSnapshot } from '../../ozone-backend/types';
 
+interface TimelineState {
+  autoFollow: boolean;
+  timePerDiv: number;
+  entries: {
+    expression: string;
+    enabled: boolean;
+    color: string;
+    yPerDiv: number;
+    yAutoScale: boolean;
+    yCenter: number;
+  }[];
+}
+
+const STATE_KEY = 'ozoneTimelineState';
+
 export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
   private sampleManager: DataSamplingManager;
@@ -22,15 +37,23 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage(msg => {
       switch (msg.command) {
         case 'init': {
-          const entries = this.sampleManager.entriesList.map(e => ({
-            expression: e.expression,
-            enabled: e.enabled,
-            color: e.color,
-          }));
+          const saved = this.context.workspaceState.get<TimelineState>(STATE_KEY);
+          const entries = this.sampleManager.entriesList.map(e => {
+            const s = saved?.entries?.find(se => se.expression === e.expression);
+            return {
+              expression: e.expression,
+              enabled: s?.enabled ?? e.enabled,
+              color: s?.color ?? e.color,
+              yPerDiv: s?.yPerDiv,
+              yAutoScale: s?.yAutoScale,
+              yCenter: s?.yCenter,
+            };
+          });
           this.postMessage({
             command: 'init',
             entries,
-            sampleInterval: 100,
+            autoFollow: saved?.autoFollow ?? true,
+            timePerDiv: saved?.timePerDiv ?? 100,
           });
           const allSnapshots: DataSampleSnapshot[] = [];
           for (const entry of this.sampleManager.entriesList) {
@@ -68,6 +91,11 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         case 'clearData':
           this.sampleManager.clearData();
           break;
+        case 'saveState':
+          if (msg.state) {
+            this.context.workspaceState.update(STATE_KEY, msg.state);
+          }
+          break;
         case 'setColor':
           if (msg.expression && msg.color) {
             this.sampleManager.setColor(msg.expression, msg.color);
@@ -83,11 +111,18 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private sendEntriesRefresh() {
-    const entries = this.sampleManager.entriesList.map(e => ({
-      expression: e.expression,
-      enabled: e.enabled,
-      color: e.color,
-    }));
+    const saved = this.context.workspaceState.get<TimelineState>(STATE_KEY);
+    const entries = this.sampleManager.entriesList.map(e => {
+      const s = saved?.entries?.find(se => se.expression === e.expression);
+      return {
+        expression: e.expression,
+        enabled: s?.enabled ?? e.enabled,
+        color: s?.color ?? e.color,
+        yPerDiv: s?.yPerDiv,
+        yAutoScale: s?.yAutoScale,
+        yCenter: s?.yCenter,
+      };
+    });
     this.postMessage({ command: 'entries', entries });
   }
 

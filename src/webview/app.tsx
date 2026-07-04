@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 
 interface VSCODE_API {
   postMessage(message: any): void;
@@ -45,7 +45,34 @@ interface VariableValue {
 interface WatchEntry {
   expression: string;
   value?: string;
+  typeName?: string;
+  address?: number;
   error?: string;
+  hasChildren?: boolean;
+  children?: WatchEntry[];
+}
+
+function extractValue(display: string): string {
+  const m = display.match(/^(0x[0-9A-Fa-f]+)/);
+  if (m) return m[1];
+  const d = display.match(/^\(?(-?\d+)/);
+  if (d) return d[1];
+  return display;
+}
+
+function mapChildren(children: WatchValue[], parentExpr: string): WatchEntry[] {
+  return children.map(c => {
+    const fullExpr = c.expression.startsWith('[') ? `${parentExpr}${c.expression}` : `${parentExpr}.${c.expression}`;
+    const isCompound = !!(c.children && c.children.length > 0);
+    return {
+      expression: fullExpr,
+      value: isCompound ? `0x${(c.address || 0).toString(16).toUpperCase()}` : c.display,
+      typeName: c.typeName,
+      address: c.address,
+      hasChildren: isCompound,
+      children: isCompound ? mapChildren(c.children!, fullExpr) : undefined,
+    };
+  });
 }
 
 interface WatchValue {
@@ -55,6 +82,8 @@ interface WatchValue {
   hex: string;
   address?: number;
   error?: string;
+  typeName?: string;
+  children?: WatchValue[];
 }
 
 export function App() {
@@ -65,6 +94,8 @@ export function App() {
   const [registers, setRegisters] = useState<RegisterValue[]>([]);
   const [memoryBlock, setMemoryBlock] = useState<MemoryBlock | null>(null);
   const [watches, setWatches] = useState<WatchEntry[]>([]);
+  const watchesRef = useRef(watches);
+  watchesRef.current = watches;
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -92,17 +123,37 @@ export function App() {
           setConfig(prev => ({ ...prev, elfPath: msg.elfPath }));
           break;
         case 'watchResults':
-          setWatches(prev => prev.map((w, i) => {
-            const r = msg.results?.[i];
-            if (!r) return w;
-            if (r.error === 'running') {
-              return { ...w, value: w.value || 'Running...' };
+          setWatches(prev => {
+            const next = prev.map((w, i) => {
+              const r = msg.results?.[i];
+              if (!r) return w;
+              const isCompound = !!(r.children && r.children.length > 0);
+              if (r.error === 'running') {
+                return { ...w, value: w.value || 'Running...', hasChildren: w.hasChildren };
+              }
+              if (r.error) {
+                return { expression: w.expression, error: r.error, value: undefined, typeName: w.typeName, address: w.address, hasChildren: w.hasChildren };
+              }
+              return {
+                expression: w.expression,
+                value: isCompound ? `0x${(r.address || 0).toString(16).toUpperCase()}` : r.display,
+                typeName: r.typeName,
+                address: r.address,
+                error: undefined,
+                hasChildren: isCompound,
+                children: isCompound ? mapChildren(r.children, w.expression) : undefined,
+              };
+            });
+            return next;
+          });
+          break;
+        case 'watchValueSet':
+          if (msg.ok) {
+            const exprs = watchesRef.current.map(w => w.expression);
+            if (exprs.length > 0) {
+              vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
             }
-            if (r.error) {
-              return { expression: w.expression, error: r.error, value: undefined };
-            }
-            return { expression: w.expression, value: r.display, error: undefined };
-          }));
+          }
           break;
       }
     };
@@ -359,12 +410,48 @@ function MemoryPanel({ send, block }: { send: (cmd: string) => void; block: Memo
   );
 }
 
+const CHANGE_HIGHLIGHT_MS = 500;
+
 function WatchPanel({ watches, setWatches }: {
   watches: WatchEntry[];
   setWatches: React.Dispatch<React.SetStateAction<WatchEntry[]>>;
 }) {
   const [newExpr, setNewExpr] = useState('');
   const [polling, setPolling] = useState(false);
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [changedValues, setChangedValues] = useState<Set<string>>(new Set());
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const watchesRef = useRef(watches);
+  watchesRef.current = watches;
+  const editValueRef = useRef('');
+  editValueRef.current = editValue;
+  const prevValuesRef = useRef<Map<string, string>>(new Map());
+
+  // Track value changes on each watches update
+  useEffect(() => {
+    if (watches.length === 0) { prevValuesRef.current.clear(); return; }
+    const changed = new Set<string>();
+    const walk = (entries: WatchEntry[], prefix = '') => {
+      for (let i = 0; i < entries.length; i++) {
+        const key = prefix ? `${prefix}.${i}` : String(i);
+        const e = entries[i];
+        const prev = prevValuesRef.current.get(e.expression);
+        if (prev !== undefined && prev !== e.value && !e.hasChildren) {
+          changed.add(key);
+        }
+        prevValuesRef.current.set(e.expression, e.value || '');
+        if (e.children) walk(e.children, key);
+      }
+    };
+    walk(watches);
+    if (changed.size > 0) {
+      setChangedValues(changed);
+      setTimeout(() => setChangedValues(new Set()), CHANGE_HIGHLIGHT_MS);
+    }
+  }, [watches]);
 
   const addWatch = () => {
     const expr = newExpr.trim();
@@ -373,12 +460,15 @@ function WatchPanel({ watches, setWatches }: {
     setNewExpr('');
   };
 
-  const removeWatch = (index: number) => {
-    setWatches(prev => prev.filter((_, i) => i !== index));
+  const removeWatch = (key: string) => {
+    const parts = key.split('.');
+    const idx = parseInt(parts[0], 10);
+    if (isNaN(idx)) return;
+    setWatches(prev => prev.filter((_, i) => i !== idx));
   };
 
   const refreshAll = () => {
-    const exprs = watches.map(w => w.expression);
+    const exprs = watchesRef.current.map(w => w.expression);
     if (exprs.length > 0) {
       vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
     }
@@ -387,15 +477,127 @@ function WatchPanel({ watches, setWatches }: {
   useEffect(() => {
     if (watches.length === 0 || polling === false) return;
     const interval = setInterval(() => {
-      const exprs = watches.map(w => w.expression);
+      const exprs = watchesRef.current.map(w => w.expression);
       vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
     }, 200);
     return () => clearInterval(interval);
-  }, [polling, watches.length]);
+  }, [polling]);
+
+  const startEditing = (key: string, currentValue: string) => {
+    setEditingKey(key);
+    setEditValue(extractValue(currentValue));
+  };
+
+  const commitEdit = (key: string) => {
+    setEditingKey(null);
+    const parts = key.split('.');
+    let entry: WatchEntry | undefined;
+    let cur: WatchEntry[] | undefined = watchesRef.current;
+    for (const p of parts) {
+      const idx = parseInt(p, 10);
+      if (isNaN(idx) || !cur || idx >= cur.length) { entry = undefined; break; }
+      entry = cur[idx];
+      cur = entry.children;
+    }
+    if (!entry) return;
+    const raw = editValueRef.current.trim();
+    if (raw === '') return;
+    let num: number;
+    if (raw.startsWith('0x') || raw.startsWith('0X')) num = parseInt(raw, 16);
+    else num = parseInt(raw, 10);
+    if (isNaN(num)) return;
+    vscode.postMessage({ command: 'setWatchValue', expression: entry.expression, value: num });
+  };
+
+  const cancelEdit = () => setEditingKey(null);
+
+  const toggleExpand = (key: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const renderRow = (w: WatchEntry, key: string, depth: number): React.ReactNode[] => {
+    const isExpanded = expandedRef.current.has(key);
+    const showToggle = w.hasChildren && w.children && w.children.length > 0;
+    const indent = depth * 16;
+
+    const rows: React.ReactNode[] = [
+      <div key={key} style={{
+        display: 'grid', gridTemplateColumns: `${indent + 16}px 1fr 1.5fr 1fr`,
+        borderBottom: '1px solid var(--border)',
+        alignItems: 'center',
+      }}>
+        <div style={{ textAlign: 'center', cursor: showToggle ? 'pointer' : 'default', userSelect: 'none' }}
+          onClick={() => showToggle && toggleExpand(key)}>
+          {showToggle ? (isExpanded ? '▼' : '▶') : ''}
+        </div>
+
+        <div style={{
+          padding: '2px 4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          color: 'var(--vscode-symbolIcon-variableForeground)',
+          fontSize: depth > 0 ? '11px' : '12px',
+        }}>
+          {w.expression.includes('.') ? w.expression.split('.').pop() : w.expression}
+        </div>
+
+        <div style={{
+          padding: '2px 4px', fontFamily: 'monospace', fontSize: depth > 0 ? '11px' : '12px',
+          cursor: w.hasChildren ? 'default' : 'text',
+          color: changedValues.has(key) ? 'var(--vscode-charts-green)' :
+                 w.value === 'Running...' ? 'var(--vscode-descriptionForeground)' :
+                 w.error ? 'var(--vscode-errorForeground)' : 'var(--vscode-editor-foreground)',
+        }}
+          onClick={() => {
+            if (!w.hasChildren && w.value && w.value !== 'Running...' && !w.error) startEditing(key, w.value);
+          }}>
+          {editingKey === key ? (
+            <input value={editValue}
+              onChange={e => setEditValue(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { e.preventDefault(); commitEdit(key); }
+                if (e.key === 'Escape') cancelEdit();
+              }}
+              onBlur={cancelEdit}
+              autoFocus
+              style={{
+                width: '100%', boxSizing: 'border-box', ...inputStyle,
+                padding: '1px 4px', fontSize: '12px',
+              }} />
+          ) : (
+            <span style={{
+              borderBottom: !w.hasChildren && w.value && w.value !== '...' && w.value !== 'Running...'
+                ? '1px dashed var(--vscode-input-placeholderForeground)' : 'none',
+            }}>
+              {w.value || '...'}
+            </span>
+          )}
+        </div>
+
+        <div style={{
+          padding: '2px 4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          color: 'var(--vscode-descriptionForeground)', fontSize: depth > 0 ? '10px' : '11px',
+        }}>
+          {w.typeName || ''}
+        </div>
+      </div>,
+    ];
+
+    if (showToggle && isExpanded && w.children) {
+      for (let ci = 0; ci < w.children.length; ci++) {
+        rows.push(...renderRow(w.children[ci], `${key}.${ci}`, depth + 1));
+      }
+    }
+
+    return rows;
+  };
 
   return (
-    <div style={{ fontSize: '12px' }}>
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
+    <div style={{ fontSize: '12px', display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '4px' }}>
         <input value={newExpr} onChange={e => setNewExpr(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') addWatch(); }}
           placeholder="变量名或表达式"
@@ -409,38 +611,34 @@ function WatchPanel({ watches, setWatches }: {
           {polling ? '⏹' : '▶'}
         </button>
       </div>
-      {watches.length === 0 ? (
-        <div style={{ opacity: 0.5, textAlign: 'center', padding: '20px' }}>
-          输入变量名后点击 + 添加监视
+
+      {watches.length > 0 && (
+        <div style={{
+          display: 'grid', gridTemplateColumns: '16px 1fr 1.5fr 1fr',
+          borderBottom: '2px solid var(--border)',
+          padding: '4px 16px 4px 4px', fontSize: '11px', fontWeight: 600,
+          color: 'var(--vscode-descriptionForeground)',
+          userSelect: 'none',
+        }}>
+          <span />
+          <span>Name</span>
+          <span>Value</span>
+          <span>Type</span>
         </div>
-      ) : (
-        watches.map((w, i) => (
-          <div key={i} style={{
-            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            padding: '3px 4px', borderBottom: '1px solid var(--border)',
-          }}>
-            <span style={{ color: 'var(--vscode-symbolIcon-variableForeground)', fontWeight: 500 }}>
-              {w.expression}
-            </span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <span style={{
-                color: w.value === 'Running...' ? 'var(--vscode-descriptionForeground)' :
-                       w.error ? 'var(--vscode-errorForeground)' : 'var(--vscode-editor-foreground)',
-                fontFamily: 'monospace',
-              }}>
-                {w.value || '...'}
-              </span>
-              <button onClick={() => removeWatch(i)}
-                style={{
-                  background: 'none', border: 'none', cursor: 'pointer',
-                  color: 'var(--vscode-errorForeground)', fontSize: '12px', padding: '0 2px',
-                }}>✕</button>
-            </div>
-          </div>
-        ))
       )}
-      <div style={{ fontSize: '10px', color: 'var(--vscode-descriptionForeground)', marginTop: '8px', textAlign: 'center' }}>
-        按 ▶ 开启 5Hz 运行中轮询 · 暂停时自动更新
+
+      <div style={{ flex: 1, overflow: 'auto' }}>
+        {watches.length === 0 ? (
+          <div style={{ opacity: 0.5, textAlign: 'center', padding: '20px' }}>
+            输入变量名后点击 + 添加监视
+          </div>
+        ) : (
+          watches.map((w, i) => renderRow(w, String(i), 0))
+        )}
+      </div>
+
+      <div style={{ fontSize: '10px', color: 'var(--vscode-descriptionForeground)', padding: '4px', textAlign: 'center' }}>
+        点击 ▶ 展开 · 点击数值可编辑 · Enter 确认
       </div>
     </div>
   );

@@ -89,6 +89,9 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
         case 'evaluateWatches':
           this.evaluateWatches(message.expressions);
           break;
+        case 'setWatchValue':
+          this.setWatchValue(message.expression, message.value);
+          break;
       }
     });
   }
@@ -152,6 +155,16 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage({ command: 'watchResults', results });
   }
 
+  private async setWatchValue(expression: string, value: number) {
+    const result = await this.backend.execute({ cmd: 'setWatchValue', expression, value });
+    this.view?.webview.postMessage({
+      command: 'watchValueSet',
+      expression,
+      ok: result.ok,
+      error: result.ok ? undefined : result.error,
+    });
+  }
+
   private async ensureHalted(): Promise<boolean> {
     const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
     const wasAlreadyHalted = stateResult.ok && stateResult.data === 'halted';
@@ -179,7 +192,7 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
     const wsFolders = vscode.workspace.workspaceFolders;
     const workspaceRoot = wsFolders?.[0]?.uri.fsPath || '';
     const device = config.get<string>('defaultDevice', 'STM32F407VG');
-    const elfPath = config.get<string>('_elfPath', '');
+    const elfPath = config.get<string>('defaultProgram', '');
     const jlinkPath = config.get<string>('jlinkPath', '');
 
     this.view?.webview.postMessage({
@@ -196,7 +209,7 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private setElfPath(elfPath: string) {
-    vscode.workspace.getConfiguration('ozone').update('_elfPath', elfPath, vscode.ConfigurationTarget.Workspace);
+    vscode.workspace.getConfiguration('ozone').update('defaultProgram', elfPath, vscode.ConfigurationTarget.Workspace);
   }
 
   private async browseElf() {

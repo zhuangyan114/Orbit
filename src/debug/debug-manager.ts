@@ -17,7 +17,7 @@ function getOzonePath(): string {
 
 function resolveElfPath(): string | null {
   const config = vscode.workspace.getConfiguration('ozone');
-  let elfPath = config.get<string>('_elfPath', '');
+  let elfPath = config.get<string>('defaultProgram', '');
   if (elfPath && fs.existsSync(elfPath)) return elfPath;
 
   const wsFolders = vscode.workspace.workspaceFolders;
@@ -28,7 +28,7 @@ function resolveElfPath(): string | null {
   for (const dir of buildDirs) {
     const fullDir = path.join(workspaceRoot, dir);
     if (!fs.existsSync(fullDir)) continue;
-    const files = fs.readdirSync(fullDir).filter(f => f.endsWith('.elf'));
+    const files = fs.readdirSync(fullDir).filter(f => f.endsWith('.elf') || f.endsWith('.axf'));
     if (files.length > 0) {
       return path.join(fullDir, files[0]);
     }
@@ -69,7 +69,7 @@ export async function startDebugSession(): Promise<boolean> {
 
   const elfPath = resolveElfPath();
   if (!elfPath) {
-    vscode.window.showErrorMessage('Ozone: 未找到 .elf 文件，请先在编辑面板中设置');
+    vscode.window.showErrorMessage('Ozone: 未找到 .elf/.axf 文件，请先在编辑面板中设置');
     return false;
   }
 

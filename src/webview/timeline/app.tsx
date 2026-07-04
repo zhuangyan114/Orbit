@@ -39,18 +39,16 @@ function makeEntry(expr: string, color: string): Entry {
 
 function autoCalcPerDiv(pts: DataPoint[]): { yPerDiv: number; yCenter: number } {
   if (pts.length === 0) return { yPerDiv: 1, yCenter: 0 };
-  let min = Infinity, max = -Infinity;
+  let absMax = 0;
   for (const p of pts) {
-    if (p.value < min) min = p.value;
-    if (p.value > max) max = p.value;
+    const a = Math.abs(p.value);
+    if (a > absMax) absMax = a;
   }
-  if (min === max) { min -= 1; max += 1; }
-  const range = max - min;
-  const perDiv = range / V_DIV;
+  if (absMax < 1e-10) absMax = 1;
+  const perDiv = (absMax * 2) / V_DIV;
   const magnitude = Math.pow(10, Math.floor(Math.log10(perDiv)));
   const rounded = Math.ceil(perDiv / magnitude) * magnitude;
-  const center = (max + min) / 2;
-  return { yPerDiv: Math.max(rounded, 1e-6), yCenter: center };
+  return { yPerDiv: Math.max(rounded, 1e-6), yCenter: 0 };
 }
 
 export function TimelineApp() {
@@ -69,18 +67,56 @@ export function TimelineApp() {
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
   const [hoverVals, setHoverVals] = useState<{ label: string; value: string; color: string }[] | null>(null);
   const lastHoverClientX = useRef(0);
+  const lastHoverClientY = useRef(0);
+  const initedRef = useRef(false);
+
+  const saveState = useCallback(() => {
+    vscode.postMessage({
+      command: 'saveState',
+      state: {
+        autoFollow: autoFollowRef.current,
+        timePerDiv,
+        entries: entries.map(e => ({
+          expression: e.expression,
+          enabled: e.enabled,
+          color: e.color,
+          yPerDiv: e.yPerDiv,
+          yAutoScale: e.yAutoScale,
+          yCenter: e.yCenter,
+        })),
+      },
+    });
+  }, [entries, timePerDiv]);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
       const msg = event.data;
       switch (msg.command) {
         case 'init': {
-          const eList: Entry[] = (msg.entries || []).map((e: any) => makeEntry(e.expression, e.color));
+          const eList: Entry[] = (msg.entries || []).map((e: any) => {
+            const entry = makeEntry(e.expression, e.color);
+            // Apply saved per-entry state from extension
+            if (e.yPerDiv !== undefined) entry.yPerDiv = e.yPerDiv;
+            if (e.yAutoScale !== undefined) entry.yAutoScale = e.yAutoScale;
+            if (e.enabled !== undefined) entry.enabled = e.enabled;
+            // Force yCenter=0 when auto-scaling (zero always at screen center)
+            entry.yCenter = entry.yAutoScale ? 0 : (e.yCenter ?? 0);
+            return entry;
+          });
           setEntries(eList);
+          // Apply saved global state
+          if (msg.autoFollow !== undefined) {
+            setAutoFollow(msg.autoFollow);
+            autoFollowRef.current = msg.autoFollow;
+          }
+          if (msg.timePerDiv !== undefined) {
+            setTimePerDiv(msg.timePerDiv);
+          }
           const m = new Map<string, DataPoint[]>();
           for (const e of eList) m.set(e.expression, []);
           allDataRef.current = m;
           setRenderTick(t => t + 1);
+          initedRef.current = true;
           break;
         }
         case 'entries': {
@@ -89,7 +125,10 @@ export function TimelineApp() {
             const prevMap = new Map(prev.map(e => [e.expression, e]));
             return eList.map(e => {
               const old = prevMap.get(e.expression);
-              if (old) return { ...e, yPerDiv: old.yPerDiv, yAutoScale: old.yAutoScale, yCenter: old.yCenter };
+              if (old) {
+                const yAutoScale = old.yAutoScale;
+                return { ...e, yPerDiv: old.yPerDiv, yAutoScale, yCenter: yAutoScale ? 0 : old.yCenter };
+              }
               return e;
             });
           });
@@ -107,17 +146,22 @@ export function TimelineApp() {
           }
           // auto-scale entries that have yAutoScale (only when auto-following)
           if (autoFollowRef.current) {
-            setEntries(prev => prev.map(e => {
-              if (!e.yAutoScale) return e;
-              const pts = map.get(e.expression);
-              if (!pts || pts.length < 2) return e;
-              const { yPerDiv, yCenter } = autoCalcPerDiv(pts);
-              return { ...e, yPerDiv, yCenter };
-            }));
+            setEntries(prev => {
+              let changed = false;
+              const next = prev.map(e => {
+                if (!e.yAutoScale) return e;
+                const pts = map.get(e.expression);
+                if (!pts || pts.length < 2) return e;
+                const { yPerDiv, yCenter } = autoCalcPerDiv(pts);
+                if (e.yPerDiv !== yPerDiv || e.yCenter !== yCenter) changed = true;
+                return { ...e, yPerDiv, yCenter };
+              });
+              return changed ? next : prev;
+            });
           }
           setRenderTick(t => t + 1);
           // refresh hover values if mouse is still over the canvas
-          if (lastHoverClientX.current > 0) computeHoverRef.current(lastHoverClientX.current);
+          if (lastHoverClientX.current > 0) computeHoverRef.current(lastHoverClientX.current, lastHoverClientY.current);
           break;
         }
       }
@@ -142,7 +186,7 @@ export function TimelineApp() {
     canvas.height = H * dpr;
     ctx.scale(dpr, dpr);
 
-    const margin = { top: 8, right: 120, bottom: 28, left: 12 };
+    const margin = { top: 8, right: 12, bottom: 28, left: 12 };
     const plotW = W - margin.left - margin.right;
     const plotH = H - margin.top - margin.bottom;
     if (plotW < 20 || plotH < 20) return;
@@ -151,7 +195,7 @@ export function TimelineApp() {
     const divH = plotH / V_DIV;
 
     const now = Date.now();
-    if (autoFollow) tEndRef.current = now;
+    if (autoFollowRef.current) tEndRef.current = now;
     const tEnd = tEndRef.current;
     const tStart = tEnd - timePerDiv * H_DIV;
     const map = allDataRef.current;
@@ -265,9 +309,9 @@ export function TimelineApp() {
       const cx = mousePos.x;
       if (cx >= margin.left && cx <= margin.left + plotW) {
         ctx.save();
-        ctx.strokeStyle = 'rgba(200,200,200,0.5)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
         ctx.lineWidth = 1;
-        ctx.setLineDash([3, 3]);
+        ctx.setLineDash([4, 3]);
         ctx.beginPath();
         ctx.moveTo(cx, margin.top);
         ctx.lineTo(cx, margin.top + plotH);
@@ -276,24 +320,35 @@ export function TimelineApp() {
       }
     }
 
-    // -- legend (right side) --
-    let legY = margin.top + 4;
-    for (const s of series) {
-      ctx.fillStyle = s.color;
-      ctx.font = '11px sans-serif';
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'top';
-      const yCenterVal = formatNum(s.yCenter);
-      const yRange = `${formatNum(s.yCenter - s.yPerDiv * V_DIV / 2)} ~ ${formatNum(s.yCenter + s.yPerDiv * V_DIV / 2)}`;
-      ctx.fillText(`${s.label}`, margin.left + plotW + 4, legY);
-      ctx.fillStyle = '#888';
-      ctx.font = '9px sans-serif';
-      ctx.fillText(`${formatNum(s.yPerDiv)}/div  ${yRange}`, margin.left + plotW + 4, legY + 14);
-      legY += 36;
-    }
   }, [entries, timePerDiv, renderTick, mousePos]);
 
   useEffect(() => { draw(); }, [draw]);
+
+  // Save state to extension whenever entries or timePerDiv change (after init)
+  useEffect(() => {
+    if (initedRef.current) saveState();
+  }, [entries, timePerDiv, saveState]);
+
+  // Save autoFollow changes
+  useEffect(() => {
+    if (initedRef.current) {
+      vscode.postMessage({
+        command: 'saveState',
+        state: {
+          autoFollow,
+          timePerDiv,
+          entries: entries.map(e => ({
+            expression: e.expression,
+            enabled: e.enabled,
+            color: e.color,
+            yPerDiv: e.yPerDiv,
+            yAutoScale: e.yAutoScale,
+            yCenter: e.yCenter,
+          })),
+        },
+      });
+    }
+  }, [autoFollow]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -364,12 +419,13 @@ export function TimelineApp() {
   });
 
   // hover — compute cursor time + values per variable
-  const computeHover = useCallback((clientX: number) => {
+  const computeHover = useCallback((clientX: number, clientY?: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const margin = { top: 8, right: 120, bottom: 28, left: 12 };
+    const margin = { top: 8, right: 12, bottom: 28, left: 12 };
     const plotW = rect.width - margin.left - margin.right;
+    const plotH = rect.height - margin.top - margin.bottom;
     if (plotW <= 0) return;
     const relX = clientX - rect.left - margin.left;
     if (relX < 0 || relX > plotW) { setMousePos(null); setHoverVals(null); return; }
@@ -379,23 +435,38 @@ export function TimelineApp() {
     const tStart = tEnd - timePerDiv * H_DIV;
     const cursorTime = tStart + (relX / plotW) * timePerDiv * H_DIV;
 
-    setMousePos({ x: clientX - rect.left, y: 0 });
+    const relY = clientY !== undefined ? clientY - rect.top - margin.top : undefined;
+
+    setMousePos({ x: clientX - rect.left, y: clientY !== undefined ? clientY - rect.top : 0 });
     lastHoverClientX.current = clientX;
+    lastHoverClientY.current = clientY ?? lastHoverClientY.current;
 
     const vals: { label: string; value: string; color: string }[] = [];
     const map = allDataRef.current;
-    for (const entry of entries) {
-      if (!entry.enabled) continue;
+    const active = entries.filter(e => e.enabled);
+    for (const entry of active) {
       const pts = map.get(entry.expression);
       if (!pts || pts.length === 0) continue;
-      // nearest point to cursor time
-      let best = pts[0];
-      let bestDist = Math.abs(best.timestamp - cursorTime);
-      for (let i = 1; i < pts.length; i++) {
-        const d = Math.abs(pts[i].timestamp - cursorTime);
-        if (d < bestDist) { bestDist = d; best = pts[i]; }
+      // Find the actual data value at cursor time by interpolating between nearest points
+      let display = '';
+      let lo = 0, hi = pts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (pts[mid].timestamp < cursorTime) lo = mid + 1; else hi = mid;
       }
-      vals.push({ label: entry.expression, value: best.display, color: entry.color });
+      // lo is now the first point with timestamp >= cursorTime
+      if (lo === 0) {
+        display = formatNum(pts[0].value);
+      } else if (lo >= pts.length) {
+        display = formatNum(pts[pts.length - 1].value);
+      } else {
+        // Interpolate between pts[lo-1] and pts[lo]
+        const p0 = pts[lo - 1], p1 = pts[lo];
+        const t = (cursorTime - p0.timestamp) / (p1.timestamp - p0.timestamp || 1);
+        const interpVal = p0.value + t * (p1.value - p0.value);
+        display = formatNum(interpVal);
+      }
+      vals.push({ label: entry.expression, value: display, color: entry.color });
     }
     setHoverVals(vals.length > 0 ? vals : null);
   }, [entries, timePerDiv]);
@@ -409,6 +480,7 @@ export function TimelineApp() {
     dragStartXRef.current = e.clientX;
     dragStartTEndRef.current = tEndRef.current;
     setAutoFollow(false);
+    autoFollowRef.current = false;
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -416,7 +488,7 @@ export function TimelineApp() {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
-      const margin = { top: 8, right: 120, bottom: 28, left: 12 };
+      const margin = { top: 8, right: 12, bottom: 28, left: 12 };
       const plotW = rect.width - margin.left - margin.right;
       if (plotW <= 0) return;
       const deltaX = e.clientX - dragStartXRef.current;
@@ -424,7 +496,7 @@ export function TimelineApp() {
       tEndRef.current = dragStartTEndRef.current - deltaTime;
       setRenderTick(t => t + 1);
     }
-    computeHover(e.clientX);
+    computeHover(e.clientX, e.clientY);
   };
 
   const handleMouseUp = () => {
@@ -475,7 +547,7 @@ export function TimelineApp() {
       />
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <VariableList
-          entries={entries} onToggle={toggle} onRemove={remove}
+          entries={entries} allDataRef={allDataRef} onToggle={toggle} onRemove={remove}
           onSetYPerDiv={setYPerDiv} onSetYAutoScale={setYAutoScale}
           onSetColor={setColor}
         />
@@ -487,15 +559,16 @@ export function TimelineApp() {
           />
           {mousePos && hoverVals && hoverVals.length > 0 && (
             <div style={{
-              position: 'absolute', left: mousePos.x + 12, top: mousePos.y + 12,
-              background: 'rgba(0,0,0,0.85)', border: '1px solid #555',
+              position: 'absolute', left: mousePos.x + 14, top: mousePos.y - 8,
+              background: 'rgba(30,30,30,0.92)', border: '1px solid var(--vscode-sideBar-border, #555)',
               borderRadius: 4, padding: '4px 8px', fontSize: 11,
               pointerEvents: 'none', whiteSpace: 'nowrap', zIndex: 10,
+              boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
             }}>
               {hoverVals.map(v => (
                 <div key={v.label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ color: v.color, fontWeight: 'bold' }}>{v.label}</span>
-                  <span style={{ color: '#fff' }}>{v.value}</span>
+                  <span style={{ color: '#fff', fontFamily: 'monospace' }}>{v.value}</span>
                 </div>
               ))}
             </div>
@@ -563,8 +636,9 @@ function Toolbar({ newExpr, onNewExpr, onAdd, onClear, onZoomIn, onZoomOut, time
   );
 }
 
-function VariableList({ entries, onToggle, onRemove, onSetYPerDiv, onSetYAutoScale, onSetColor }: {
+function VariableList({ entries, allDataRef, onToggle, onRemove, onSetYPerDiv, onSetYAutoScale, onSetColor }: {
   entries: Entry[];
+  allDataRef: React.MutableRefObject<Map<string, DataPoint[]>>;
   onToggle: (expr: string, en: boolean) => void;
   onRemove: (expr: string) => void;
   onSetYPerDiv: (expr: string, val: number) => void;
@@ -581,7 +655,12 @@ function VariableList({ entries, onToggle, onRemove, onSetYPerDiv, onSetYAutoSca
 
   const commitInput = (expr: string, raw: string) => {
     setPendingInputs(prev => { const n = { ...prev }; delete n[expr]; return n; });
-    const v = parseFloat(raw);
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed === '0') {
+      onSetYAutoScale(expr);
+      return;
+    }
+    const v = parseFloat(trimmed);
     if (!isNaN(v) && v > 0) onSetYPerDiv(expr, v);
   };
 
@@ -623,6 +702,21 @@ function VariableList({ entries, onToggle, onRemove, onSetYPerDiv, onSetYAutoSca
             color: e.enabled ? 'var(--vscode-sideBar-foreground, #ccc)' : 'var(--vscode-descriptionForeground, #888)',
             fontSize: 10,
           }} title={e.expression}>{e.expression}</span>
+          {(() => {
+            const pts = allDataRef.current.get(e.expression);
+            const raw = pts && pts.length > 0 ? pts[pts.length - 1].display : '';
+            if (!raw) return null;
+            // Handle "0xFF (255)" format — extract decimal from parentheses
+            const hexMatch = raw.match(/^0x[0-9a-fA-F]+\s*\((\d+)\)$/i);
+            const num = hexMatch ? Number(hexMatch[1]) : Number(raw);
+            const latest = isNaN(num) ? raw : formatNum(num);
+            return (
+              <span style={{
+                fontSize: 11, color: e.color, fontFamily: 'monospace',
+                flexShrink: 0, maxWidth: 60, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }} title={raw}>{latest}</span>
+            );
+          })()}
           <button onClick={() => onRemove(e.expression)}
             style={{
               background: 'none', border: 'none', cursor: 'pointer',

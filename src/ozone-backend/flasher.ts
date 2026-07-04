@@ -25,7 +25,7 @@ export function findElfFiles(workspaceRoot: string): ElfCandidate[] {
     try {
       const files = fs.readdirSync(fullDir);
       for (const f of files) {
-        if (f.endsWith('.elf')) {
+        if (f.endsWith('.elf') || f.endsWith('.axf')) {
           const fullPath = path.join(fullDir, f);
           const stat = fs.statSync(fullPath);
           const mtime = stat.mtime.toLocaleString();

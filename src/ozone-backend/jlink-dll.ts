@@ -212,6 +212,14 @@ export class JLinkDLL {
     } catch { return false; }
   }
 
+  writeMemoryBytes(address: number, data: Uint8Array): boolean {
+    if (!this.lib) return false;
+    try {
+      const func = this.lib.func('int JLINK_WriteMem(uint32, uint32, uint8*)');
+      return func(address, data.length, data) >= 0;
+    } catch { return false; }
+  }
+
   readRegister(regIndex: number): number | null {
     if (!this.lib) return null;
     try {

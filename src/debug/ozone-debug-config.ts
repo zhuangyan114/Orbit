@@ -26,7 +26,12 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
       config.speedKHz = cfg.get<number>('defaultSpeed', 4000);
     }
     if (!config.program) {
-      config.program = cfg.get<string>('_elfPath', '') || this.findElf();
+      let program = cfg.get<string>('defaultProgram', '');
+      if (!program) {
+        program = this.findElf();
+        cfg.update('defaultProgram', program, vscode.ConfigurationTarget.Workspace);
+      }
+      config.program = program;
     }
     if (config.flashBeforeDebug === undefined) {
       config.flashBeforeDebug = cfg.get<boolean>('flashBeforeDebug', true);
@@ -44,7 +49,7 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     for (const dir of buildDirs) {
       const fullDir = path.join(workspaceRoot, dir);
       if (!fs.existsSync(fullDir)) continue;
-      const files = fs.readdirSync(fullDir).filter(f => f.endsWith('.elf'));
+      const files = fs.readdirSync(fullDir).filter(f => f.endsWith('.elf') || f.endsWith('.axf'));
       if (files.length > 0) {
         return path.join(fullDir, files[0]);
       }

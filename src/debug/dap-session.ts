@@ -206,6 +206,8 @@ export class DapSession extends EventEmitter {
           return this.sendResponse(msg);
         case 'dataSample':
           return this.handleDataSample(msg);
+        case 'setWatchValue':
+          return this.handleSetWatchValue(msg);
         case 'getTargetState':
           return this.handleGetTargetState(msg);
         default:
@@ -629,6 +631,15 @@ export class DapSession extends EventEmitter {
       }
     }
     this.sendResponse(msg, { results });
+  }
+
+  private async handleSetWatchValue(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    const expression: string = args.expression || '';
+    const value: number = args.value ?? 0;
+    daLog(`handleSetWatchValue: "${expression}" = ${value}`);
+    const result = await this.backend.execute({ cmd: 'setWatchValue', expression, value });
+    this.sendResponse(msg, result);
   }
 
   private async handleGetTargetState(msg: DebugProtocolMessage) {

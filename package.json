@@ -2,7 +2,7 @@
   "name": "ozone-for-vscode",
   "displayName": "Ozone for VS Code",
   "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "ozone-debug",
   "license": "MIT",
   "repository": {
@@ -102,7 +102,7 @@
     "views": {
       "ozone-watch-panel": [
         {
-          "type": "tree",
+          "type": "webview",
           "id": "ozoneWatch",
           "name": "WATCH"
         }
@@ -130,15 +130,15 @@
         "configurationAttributes": {
           "launch": {
             "properties": {
-              "program": {
-                "type": "string",
-                "description": "Path to ELF file",
-                "default": "${workspaceFolder}/build/Debug/frame.elf"
-              },
               "device": {
                 "type": "string",
                 "description": "Target device name",
                 "default": "STM32F407VG"
+              },
+              "program": {
+                "type": "string",
+                "description": "Path to ELF/AXF file (烧录文件)",
+                "default": "${workspaceFolder}/build/Debug/frame.elf"
               },
               "interface": {
                 "type": "string",
@@ -187,6 +187,11 @@
           "type": "number",
           "default": 4000,
           "description": "Default interface speed (kHz)"
+        },
+        "ozone.defaultProgram": {
+          "type": "string",
+          "default": "",
+          "description": "Default ELF/AXF file path (烧录文件, 留空则自动检测 build/ 目录)"
         }
       }
     }

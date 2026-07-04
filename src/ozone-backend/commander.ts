@@ -96,6 +96,10 @@ case 'readVariableRuntime':
           return this.doSetBreakpointAtAddr(command.addr);
         case 'evaluateExpression':
           return await this.doEvaluateExpression(command.expression, command.force);
+        case 'writeMemory':
+          return await this.doWriteMemory(command.address, command.data);
+        case 'setWatchValue':
+          return await this.doSetWatchValue(command.expression, command.value);
         case 'loadSymbols':
     if (this.elfPath === command.elfPath && this.symbols.length > 0) {
       return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };
@@ -860,7 +864,9 @@ case 'readVariableRuntime':
         if (varTypeOffset) {
           const resolvedType = this.resolveDwarfType(varTypeOffset);
           if (resolvedType && resolvedType.kind === 'array' && resolvedType.arrayCount && index >= 0 && index < resolvedType.arrayCount) {
-            const elemType = resolvedType.typeOffset ? this.resolveDwarfType(resolvedType.typeOffset) : null;
+            const elemTypeOffset = resolvedType.typeOffset;
+            const elemType = elemTypeOffset ? this.resolveDwarfType(elemTypeOffset) : null;
+            const elemTypeName = elemTypeOffset ? this.getDwarfTypeName(elemTypeOffset) : (elemType?.typeName || elemType?.name || '');
             const elemSize = elemType?.byteSize || 4;
             const elemAddr = baseSym.address + index * elemSize;
 
@@ -888,7 +894,7 @@ case 'readVariableRuntime':
               }
               return {
                 ok: true,
-                data: { expression, value, display, hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`, address: elemAddr, typeName: elemType?.name || '' } as WatchValue,
+                data: { expression, value, display, hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`, address: elemAddr, typeName: elemTypeName } as WatchValue,
               };
             }
             return { ok: false, error: `read failed at 0x${elemAddr.toString(16)}` };
@@ -961,9 +967,11 @@ case 'readVariableRuntime':
           daLog('doEvaluateExpression: raw read returned null, falling back to flat read');
         }
       } else if (resolvedType && resolvedType.kind === 'array') {
-        const arrayInfo = this.dwarfInfo.typeDefs.get(varTypeOffset);
-        const count = arrayInfo?.arrayCount || 0;
-        const elemType = arrayInfo?.typeOffset ? this.resolveDwarfType(arrayInfo.typeOffset) : null;
+        const count = resolvedType.arrayCount || 0;
+        const elemTypeOffset = resolvedType.typeOffset;
+        const elemType = elemTypeOffset ? this.resolveDwarfType(elemTypeOffset) : null;
+        const elemTypeName = elemTypeOffset ? this.getDwarfTypeName(elemTypeOffset) : (elemType?.typeName || elemType?.name || '');
+        const arrayTypeName = this.getDwarfTypeName(varTypeOffset) || (elemTypeName ? `${elemTypeName}[${count}]` : `[${count}]`);
         const elemSize = elemType?.byteSize || 4;
         const totalBytes = count * elemSize;
         const readLen = Math.max(totalBytes, sym.size || 4);
@@ -983,7 +991,7 @@ case 'readVariableRuntime':
                 display: `${elemType.name || 'struct'} { ${structChildren.map(c => `${c.expression}=${c.display}`).join(', ')} }`,
                 hex: '',
                 address: elemAddr,
-                typeName: elemType.name || '',
+                typeName: elemTypeName,
                 children: structChildren,
               });
             } else {
@@ -998,7 +1006,7 @@ case 'readVariableRuntime':
                 display: elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`,
                 hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`,
                 address: elemAddr,
-                typeName: elemType?.name || '',
+                typeName: elemTypeName,
               });
             }
           }
@@ -1012,7 +1020,7 @@ case 'readVariableRuntime':
                 : `${count} elems`,
               hex: '',
               address: sym.address,
-              typeName: `${resolvedType.name || ''}[${count}]`,
+              typeName: arrayTypeName,
               children,
             } as WatchValue,
           };
@@ -1105,7 +1113,33 @@ case 'readVariableRuntime':
     return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount, encoding: info.encoding };
   }
 
+  private formatDwarfTypeName(offset?: string, visited: Set<string> = new Set()): string {
+    if (!offset || visited.has(offset)) return '';
+    visited.add(offset);
+    const info = this.dwarfInfo.typeDefs.get(offset);
+    if (!info) return '';
+
+    if (info.kind === 'typedef') {
+      return info.name || this.formatDwarfTypeName(info.typeOffset, visited);
+    }
+
+    if (info.kind === 'array') {
+      const elemName = this.formatDwarfTypeName(info.typeOffset, visited);
+      const suffix = info.arrayCount && info.arrayCount > 0 ? `[${info.arrayCount}]` : '[]';
+      return `${elemName || 'unknown'}${suffix}`;
+    }
+
+    if (info.kind === 'pointer') {
+      const pointeeName = this.formatDwarfTypeName(info.typeOffset, visited);
+      return pointeeName ? `${pointeeName}*` : 'void*';
+    }
+
+    return info.name || '';
+  }
+
   private getDwarfTypeName(offset: string): string {
+    const formatted = this.formatDwarfTypeName(offset);
+    if (formatted) return formatted;
     const resolved = this.resolveDwarfType(offset);
     return resolved?.typeName || resolved?.name || '';
   }
@@ -1139,9 +1173,11 @@ case 'readVariableRuntime':
     }
 
     if (resolvedKind === 'array') {
-      const arrayInfo = this.dwarfInfo.typeDefs.get(field.typeOffset);
-      const count = arrayInfo?.arrayCount || 0;
-      const elemType = arrayInfo?.typeOffset ? this.resolveDwarfType(arrayInfo.typeOffset) : null;
+      const count = resolved?.arrayCount || 0;
+      const elemTypeOffset = resolved?.typeOffset;
+      const elemType = elemTypeOffset ? this.resolveDwarfType(elemTypeOffset) : null;
+      const elemTypeName = elemTypeOffset ? this.getDwarfTypeName(elemTypeOffset) : (elemType?.typeName || elemType?.name || '');
+      const arrayTypeName = this.getDwarfTypeName(field.typeOffset) || (elemTypeName ? `${elemTypeName}[${count}]` : `[${count}]`);
       const elemSize = elemType?.byteSize || 4;
       const totalBytes = count * elemSize;
       const arrRaw = raw.length >= field.byteOffset + totalBytes
@@ -1161,7 +1197,7 @@ case 'readVariableRuntime':
             display: `${elemType.name || 'struct'} { ${structChildren.map(c => `${c.expression}=${c.display}`).join(', ')} }`,
             hex: '',
             address: elemAddr,
-            typeName: elemType.name || '',
+            typeName: elemTypeName,
             children: structChildren,
           });
         } else {
@@ -1186,7 +1222,7 @@ case 'readVariableRuntime':
             display,
             hex: `0x${Array.from(elemRaw).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`,
             address: elemAddr,
-            typeName: elemType?.name || '',
+            typeName: elemTypeName,
           });
         }
       }
@@ -1199,7 +1235,7 @@ case 'readVariableRuntime':
           : `${count} elems`,
         hex: '',
         address: addr,
-        typeName: `${resolvedName || ''}[${count}]`,
+        typeName: arrayTypeName,
         children,
       };
     }
@@ -1249,6 +1285,57 @@ case 'readVariableRuntime':
       this.jlink.run();
     }
     return result;
+  }
+
+  private async doWriteMemory(address: number, data: number[]): Promise<OzoneCommandResult> {
+    daLog(`doWriteMemory: addr=0x${address.toString(16)} len=${data.length}`);
+    const wasRunning = !this.jlink.isHalted();
+    if (wasRunning) {
+      const halted = this.jlink.halt();
+      if (!halted) return { ok: false, error: 'halt failed' };
+      await new Promise<void>(r => setTimeout(r, 50));
+    }
+    const ok = this.jlink.writeMemoryU32(address, data);
+    if (wasRunning) {
+      this.jlink.run();
+    }
+    return ok
+      ? { ok: true, data: `Wrote ${data.length} uint32(s)` }
+      : { ok: false, error: 'write failed' };
+  }
+
+  private async doSetWatchValue(expression: string, value: number): Promise<OzoneCommandResult> {
+    daLog(`doSetWatchValue: "${expression}" = ${value}`);
+
+    let sym = this.symbols.find(s => s.name === expression);
+    if (!sym) {
+      sym = this.symbols.find(s => s.name.toLowerCase() === expression.toLowerCase());
+    }
+    if (!sym) {
+      return { ok: false, error: `Symbol not found: ${expression}` };
+    }
+
+    const wasRunning = !this.jlink.isHalted();
+    if (wasRunning) {
+      const halted = await this.ensureHalted();
+      if (!halted) return { ok: false, error: 'halt failed' };
+    }
+
+    const writeSize = Math.max(Math.min(sym.size || 4, 4), 1);
+    const buf = new Uint8Array(writeSize);
+    let temp = value >>> 0;
+    for (let i = 0; i < writeSize; i++) {
+      buf[i] = temp & 0xFF;
+      temp >>>= 8;
+    }
+
+    const ok = this.jlink.writeMemoryBytes(sym.address, buf);
+
+    if (wasRunning) this.jlink.run();
+    await new Promise<void>(r => setTimeout(r, 50));
+    return ok
+      ? { ok: true, data: { expression, value } }
+      : { ok: false, error: 'write failed' };
   }
 
   dispose() {

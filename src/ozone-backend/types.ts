@@ -123,7 +123,8 @@ export type OzoneCommand =
   | { cmd: 'loadSymbols'; elfPath: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
-  | { cmd: 'evaluateExpression'; expression: string; force?: boolean };
+  | { cmd: 'evaluateExpression'; expression: string; force?: boolean }
+  | { cmd: 'setWatchValue'; expression: string; value: number };
 
 export type OzoneCommandResult =
   | { ok: true; data: unknown }

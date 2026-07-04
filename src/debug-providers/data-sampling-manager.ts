@@ -54,21 +54,25 @@ export class DataSamplingManager {
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
 
-  setExpressions(expressions: ({ expression: string; color?: string })[]) {
+  setExpressions(expressions: ({ expression: string; color?: string } | string)[]) {
     this.entries = [];
     this.dataMap.clear();
     this.pendingMap.clear();
     this.colorIndex = 0;
     for (const spec of expressions) {
-      const color = spec.color || COLORS[this.colorIndex % COLORS.length];
-      if (!spec.color) this.colorIndex++;
-      this.entries.push({ expression: spec.expression, enabled: true, color });
-      this.dataMap.set(spec.expression, []);
-      this.pendingMap.set(spec.expression, []);
+      if (!spec) continue;
+      const expr = typeof spec === 'string' ? spec : spec.expression;
+      if (!expr) continue;
+      const color = typeof spec === 'string' ? COLORS[this.colorIndex % COLORS.length] : (spec.color || COLORS[this.colorIndex % COLORS.length]);
+      if (typeof spec !== 'string' && !spec.color) this.colorIndex++;
+      else if (typeof spec === 'string') this.colorIndex++;
+      this.entries.push({ expression: expr, enabled: true, color });
+      this.dataMap.set(expr, []);
+      this.pendingMap.set(expr, []);
     }
     if (this.entries.length > 0 && !this.timer) this.startSampling();
     else if (this.entries.length === 0) this.stopSampling();
-    if (this.onExpressionsChanged) this.onExpressionsChanged(this.expressionList);
+    if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
 
   toggleExpression(expression: string, enabled: boolean) {
@@ -131,15 +135,14 @@ export class DataSamplingManager {
 
   private async sample() {
     if (await this.isHalted()) return;
-    const active = this.entries.filter(e => e.enabled);
-    if (active.length === 0) return;
+    if (this.entries.length === 0) return;
     const now = Date.now();
-    const exprs = active.map(e => e.expression);
+    const exprs = this.entries.map(e => e.expression);
     const values = await this.readValues(exprs);
-    for (let i = 0; i < active.length; i++) {
+    for (let i = 0; i < this.entries.length; i++) {
       const wv = values[i];
       if (!wv || wv.error) continue;
-      const entry = active[i];
+      const entry = this.entries[i];
       const pt: DataPoint = { timestamp: now, value: wv.value, display: wv.display };
       const pts = this.dataMap.get(entry.expression);
       if (pts) {

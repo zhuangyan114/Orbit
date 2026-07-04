@@ -10,10 +10,8 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
-function daLog(msg: string) {
-  try {
-    fs.appendFileSync(path.join(__dirname, '..', 'debugadapter.log'), `[${new Date().toISOString()}] DA: ${msg}\n`);
-  } catch { }
+function daLog(_msg: string) {
+  // no-op
 }
 
 const REG_INDEXES: Record<string, number> = {
@@ -850,6 +848,55 @@ case 'readVariableRuntime':
 
   private async doEvaluateExpression(expression: string, force: boolean = false): Promise<OzoneCommandResult> {
     daLog(`doEvaluateExpression: "${expression}" force=${force}`);
+
+    // Handle array element access: name[index]
+    const bracketMatch = expression.match(/^(\w+)\[(\d+)\]$/);
+    if (bracketMatch) {
+      const baseName = bracketMatch[1];
+      const index = parseInt(bracketMatch[2], 10);
+      const baseSym = this.symbols.find(s => s.name === baseName);
+      if (baseSym) {
+        const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
+        if (varTypeOffset) {
+          const resolvedType = this.resolveDwarfType(varTypeOffset);
+          if (resolvedType && resolvedType.kind === 'array' && resolvedType.arrayCount && index >= 0 && index < resolvedType.arrayCount) {
+            const elemType = resolvedType.typeOffset ? this.resolveDwarfType(resolvedType.typeOffset) : null;
+            const elemSize = elemType?.byteSize || 4;
+            const elemAddr = baseSym.address + index * elemSize;
+
+            if (!force && !this.jlink.isHalted()) {
+              return { ok: false, error: 'running' };
+            }
+            if (!force) {
+              await new Promise<void>(r => setTimeout(r, 100));
+            }
+
+            const raw = this.jlink.readMemory(elemAddr, elemSize);
+            if (raw) {
+              const isFloat = this.isFloatType(elemType);
+              let value: number;
+              let display: string;
+              if (isFloat && raw.length >= (elemType?.byteSize || 4)) {
+                value = this.readBytesAsFloat(raw, elemType!.byteSize);
+                display = elemType!.byteSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+              } else {
+                value = 0;
+                for (let i = raw.length - 1; i >= 0; i--) {
+                  value = (value << 8) | raw[i];
+                }
+                display = elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+              }
+              return {
+                ok: true,
+                data: { expression, value, display, hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`, address: elemAddr, typeName: elemType?.name || '' } as WatchValue,
+              };
+            }
+            return { ok: false, error: `read failed at 0x${elemAddr.toString(16)}` };
+          }
+        }
+      }
+    }
+
     let sym = this.symbols.find(s => s.name === expression);
     if (!sym) {
       sym = this.symbols.find(s => s.name.toLowerCase() === expression.toLowerCase());

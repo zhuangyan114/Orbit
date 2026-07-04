@@ -233,14 +233,6 @@ export function TimelineApp() {
       ctx.fillText(label, x, centerY + 3);
     }
 
-    if (series.length === 0) {
-      ctx.fillStyle = '#888';
-      ctx.font = '12px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('添加变量并勾选以开始采样', W / 2, H / 2);
-      return;
-    }
-
     // -- traces --
     const clipRegion = (cx: CanvasRenderingContext2D) => {
       cx.save();

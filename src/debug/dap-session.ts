@@ -1,13 +1,9 @@
 import { EventEmitter } from 'events';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { Variable, StackFrame, WatchValue } from '../ozone-backend/types';
-import * as fs from 'fs';
-import * as path from 'path';
 
-function daLog(msg: string) {
-  try {
-    fs.appendFileSync(path.join(__dirname, '..', 'debugadapter.log'), `[${new Date().toISOString()}] ${msg}\n`);
-  } catch { }
+function daLog(_msg: string) {
+  // no-op
 }
 
 export interface DebugProtocolMessage {
@@ -127,14 +123,7 @@ export class DapSession extends EventEmitter {
   }
 
   private sendWatchUpdate(results: any[]) {
-    this.sendEvent('output', {
-      category: 'ozoneWatch',
-      output: JSON.stringify({ results }),
-    });
-    this.sendEvent('output', {
-      category: 'console',
-      output: '\n',
-    });
+    this.sendEvent('ozoneWatchData', { results });
   }
 
   private stopPolling() {

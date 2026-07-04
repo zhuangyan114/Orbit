@@ -35,11 +35,6 @@ export const NM_EXE = findArmTool('arm-none-eabi-nm.exe');
 export const OBJDUMP_EXE = findArmTool('arm-none-eabi-objdump.exe');
 export const ADDR2LINE_EXE = findArmTool('arm-none-eabi-addr2line.exe');
 
-try {
-  const logFile = path.join(__dirname, '..', 'debugadapter.log');
-  fs.appendFileSync(logFile, `[${new Date().toISOString()}] tools: nm=${NM_EXE}, objdump=${OBJDUMP_EXE}, addr2line=${ADDR2LINE_EXE}\n`);
-} catch { }
-
 export interface SymbolInfo {
   name: string;
   address: number;

@@ -29,75 +29,15 @@
   ],
   "icon": "resources/icon.png",
   "activationEvents": [
-    "onDebug",
-    "onDebugDynamicConfigurations:ozone",
-    "onCommand:ozone.startSession",
-    "onCommand:ozone.halt",
-    "onCommand:ozone.run",
-    "onView:ozoneDebugSession"
+    "onView:ozoneTimeline",
+    "onView:ozoneWatch"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "ozone.startSession",
-        "title": "Ozone: Start Debug Session"
-      },
-      {
-        "command": "ozone.stopSession",
-        "title": "Ozone: Stop Debug Session"
-      },
-      {
-        "command": "ozone.restartSession",
-        "title": "Ozone: Restart Debug Session"
-      },
-      {
-        "command": "ozone.toggleBreakpoint",
-        "title": "Ozone: Toggle Breakpoint"
-      },
-      {
-        "command": "ozone.openAIChat",
-        "title": "Ozone: Open AI Assistant"
-      },
-      {
-        "command": "ozone.openMemoryBrowser",
-        "title": "Ozone: Open Memory Browser"
-      },
-      {
-        "command": "ozone.flash",
-        "title": "Ozone: Flash ELF to Target"
-      },
-      {
         "command": "ozone.debug",
-        "title": "Ozone: Debug (Connect + Halt)"
-      },
-      {
-        "command": "ozone.halt",
-        "title": "Ozone: Halt Target"
-      },
-      {
-        "command": "ozone.run",
-        "title": "Ozone: Run Target"
-      },
-      {
-        "command": "ozone.stepInto",
-        "title": "Ozone: Step Into"
-      },
-      {
-        "command": "ozone.stepOver",
-        "title": "Ozone: Step Over"
-      },
-      {
-        "command": "ozone.stepOut",
-        "title": "Ozone: Step Out"
-      },
-      {
-        "command": "ozone.reset",
-        "title": "Ozone: Reset Target"
-      },
-      {
-        "command": "ozone.flashAndRestart",
-        "title": "Ozone: Flash and Restart"
+        "title": "Ozone: Connect Target"
       },
       {
         "command": "ozone.addWatch",
@@ -118,15 +58,13 @@
         "command": "ozone.addToDataSampling",
         "title": "Ozone: Add to Data Sampling",
         "icon": "$(graph)"
+      },
+      {
+        "command": "ozone.openSettings",
+        "title": "Ozone: Settings"
       }
     ],
     "menus": {
-      "editor/context": [
-        {
-          "command": "ozone.toggleBreakpoint",
-          "when": "editorLangId == 'c' || editorLangId == 'cpp' || editorLangId == 'asm'"
-        }
-      ],
       "view/title": [
         {
           "command": "ozone.addWatch",
@@ -147,77 +85,33 @@
         }
       ]
     },
-    "keybindings": [
-      {
-        "command": "ozone.toggleBreakpoint",
-        "key": "ctrl+shift+b",
-        "when": "editorTextFocus"
-      },
-      {
-        "command": "ozone.flash",
-        "key": "ctrl+shift+p",
-        "when": "!editorTextFocus"
-      },
-      {
-        "command": "ozone.flashAndRestart",
-        "key": "ctrl+shift+f5",
-        "when": "!editorTextFocus"
-      }
-    ],
     "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "ozone-debug",
-          "title": "Ozone Debug",
-          "icon": "resources/icon.svg"
-        }
-      ],
       "panel": [
         {
-          "id": "ozone-panel",
-          "title": "Ozone Timeline",
+          "id": "ozone-watch-panel",
+          "title": "WATCH",
+          "icon": "resources/icon.svg"
+        },
+        {
+          "id": "ozone-timeline-panel",
+          "title": "TIMELINE",
           "icon": "resources/icon.svg"
         }
       ]
     },
     "views": {
-      "ozone-debug": [
-        {
-          "type": "webview",
-          "id": "ozoneDebugSession",
-          "name": "Debug Session"
-        },
-        {
-          "type": "tree",
-          "id": "ozoneBreakpoints",
-          "name": "Breakpoints"
-        },
-        {
-          "type": "tree",
-          "id": "ozoneCallStack",
-          "name": "Call Stack"
-        },
-        {
-          "type": "tree",
-          "id": "ozoneVariables",
-          "name": "Variables"
-        },
-        {
-          "type": "tree",
-          "id": "ozoneRegisters",
-          "name": "Registers"
-        },
+      "ozone-watch-panel": [
         {
           "type": "tree",
           "id": "ozoneWatch",
-          "name": "Watch"
+          "name": "WATCH"
         }
       ],
-      "ozone-panel": [
+      "ozone-timeline-panel": [
         {
           "type": "webview",
           "id": "ozoneTimeline",
-          "name": "Timeline"
+          "name": "TIMELINE"
         }
       ]
     },
@@ -230,7 +124,7 @@
     "debuggers": [
       {
         "type": "ozone",
-        "label": "Ozone Debug (J-Link)",
+        "label": "Ozone (J-Link)",
         "runtime": "node",
         "program": "./dist/debugadapter.js",
         "configurationAttributes": {
@@ -259,50 +153,12 @@
               }
             }
           }
-        },
-        "initialConfigurations": [
-          {
-            "type": "ozone",
-            "request": "launch",
-            "name": "Ozone: Debug STM32",
-            "program": "${workspaceFolder}/build/Debug/frame.elf",
-            "device": "STM32F407VG",
-            "interface": "SWD",
-            "speedKHz": 4000
-          }
-        ],
-        "configurationSnippets": [
-          {
-            "label": "Ozone: Debug STM32",
-            "body": {
-              "type": "ozone",
-              "request": "launch",
-              "name": "Ozone: Debug STM32",
-              "program": "^\"\\${workspaceFolder}/build/Debug/frame.elf\"",
-              "device": "STM32F407VG",
-              "interface": "SWD",
-              "speedKHz": 4000
-            }
-          }
-        ]
-      }
-    ],
-    "breakpoints": [
-      {
-        "language": "c"
-      },
-      {
-        "language": "cpp"
+        }
       }
     ],
     "configuration": {
       "title": "Ozone Debug",
       "properties": {
-        "ozone.ozonePath": {
-          "type": "string",
-          "default": "C:\\Program Files\\SEGGER\\Ozone\\Ozone.exe",
-          "description": "Path to Ozone executable (Ozone.exe)"
-        },
         "ozone.jlinkPath": {
           "type": "string",
           "default": "C:\\Program Files\\SEGGER\\JLink\\JLink.exe",
@@ -331,50 +187,6 @@
           "type": "number",
           "default": 4000,
           "description": "Default interface speed (kHz)"
-        },
-        "ozone.recentSessions": {
-          "type": "number",
-          "default": 10,
-          "description": "Number of recent sessions to remember"
-        },
-        "ozone.ai.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable AI assistant features"
-        },
-        "ozone.ai.provider": {
-          "type": "string",
-          "default": "ollama",
-          "enum": [
-            "ollama",
-            "openai-compatible"
-          ],
-          "description": "AI provider backend"
-        },
-        "ozone.ai.ollamaUrl": {
-          "type": "string",
-          "default": "http://localhost:11434",
-          "description": "Ollama server URL"
-        },
-        "ozone.ai.ollamaModel": {
-          "type": "string",
-          "default": "llama3.2",
-          "description": "Ollama model name"
-        },
-        "ozone.ai.openaiUrl": {
-          "type": "string",
-          "default": "",
-          "description": "OpenAI-compatible API URL (e.g., https://api.openai.com/v1)"
-        },
-        "ozone.ai.openaiKey": {
-          "type": "string",
-          "default": "",
-          "description": "API key for OpenAI-compatible service"
-        },
-        "ozone.ai.openaiModel": {
-          "type": "string",
-          "default": "gpt-4o-mini",
-          "description": "Model name for OpenAI-compatible service"
         }
       }
     }

@@ -1,0 +1,8 @@
+.agents/**
+.codegraph/**
+.mimocode/**
+.vscode/**
+.vscode-test/**
+mcp/node_modules/**
+*.log
+*.vsix

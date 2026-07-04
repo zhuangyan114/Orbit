@@ -2,7 +2,7 @@
   "name": "ozone-for-vscode",
   "displayName": "Ozone for VS Code",
   "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "ozone-debug",
   "license": "MIT",
   "repository": {
@@ -29,6 +29,7 @@
   ],
   "icon": "resources/icon.png",
   "activationEvents": [
+    "onStartupFinished",
     "onView:ozoneTimeline",
     "onView:ozoneWatch"
   ],
@@ -143,7 +144,10 @@
               "interface": {
                 "type": "string",
                 "description": "Debug interface (SWD or JTAG)",
-                "enum": ["SWD", "JTAG"],
+                "enum": [
+                  "SWD",
+                  "JTAG"
+                ],
                 "default": "SWD"
               },
               "speedKHz": {
@@ -200,6 +204,7 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.config.js",
     "watch": "node esbuild.config.js --watch",
+    "mcp": "node mcp/ozone-mcp-server.js",
     "lint": "eslint src --ext ts,tsx",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -216,6 +221,7 @@
     "vitest": "^2.1.0"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "koffi": "^3.1.0",

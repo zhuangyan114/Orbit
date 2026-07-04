@@ -5,6 +5,7 @@ import { WatchWebviewProvider } from './debug-providers/watch-webview-provider';
 import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
 import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { findElfFiles } from './ozone-backend/flasher';
+import { PluginApiServer } from './plugin-api/plugin-api-server';
 import * as fs from 'fs';
 
 let backend: OzoneBackend;
@@ -13,8 +14,9 @@ let watchWebviewProvider: WatchWebviewProvider;
 let dataSamplingManager: DataSamplingManager;
 let timelineProvider: TimelineWebviewProvider;
 let watchPollTimer: NodeJS.Timeout | null = null;
+let pluginApiServer: PluginApiServer;
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
   try {
     const b = new OzoneBackend();
     backend = b;
@@ -50,6 +52,11 @@ export function activate(context: vscode.ExtensionContext) {
 
     const tl = new TimelineWebviewProvider(context, dsm);
     timelineProvider = tl;
+
+    pluginApiServer = new PluginApiServer(context, backend);
+    const apiEndpoint = await pluginApiServer.start();
+    context.subscriptions.push(pluginApiServer);
+    console.log(`[Ozone] Plugin API listening on ${apiEndpoint.url}`);
 
     // 激活时自动检测 .elf/.axf，写入设置
     const ozCfg = vscode.workspace.getConfiguration('ozone');
@@ -93,6 +100,10 @@ export function activate(context: vscode.ExtensionContext) {
 
       vscode.commands.registerCommand('ozone.openSettings', () => {
         vscode.commands.executeCommand('workbench.action.openSettings', '@ext:ozone-debug.ozone-for-vscode');
+      }),
+
+      vscode.commands.registerCommand('ozone.api.getEndpoint', () => {
+        return pluginApiServer?.getEndpointInfo();
       }),
 
       vscode.commands.registerCommand('ozone.addToDataSampling', async (item) => {
@@ -205,4 +216,5 @@ function stopWatchPolling() {
 export function deactivate() {
   stopWatchPolling();
   dataSamplingManager?.dispose();
+  pluginApiServer?.dispose();
 }

@@ -1,49 +1,51 @@
 # Ozone for VS Code
 
-现代 STM32 嵌入式调试插件，基于 SEGGER J-Link DLL 直接驱动，提供 DAP (Debug Adapter Protocol) 调试体验和 AI 集成能力。
+Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展。扩展通过 SEGGER J-Link DLL 直接访问目标板，并提供 DAP 调试、Watch 变量、实时波形采样、插件 API 和 MCP 工具集成。
+
+当前版本：`0.2.0`
 
 ## 功能
 
-- **DAP 调试** — 启动/暂停/单步/复位，完整 DAP 协议支持
-- **断点** — gutter 设置行内断点，支持 6 个硬件断点
-- **变量/Watch** — 局部变量、Watch 表达式（5Hz 运行时轮询）、结构体/数组展开
-- **寄存器** — R0-R15、SP、LR、PC、xPSR 实时读取
-- **调用栈** — PC + LR 栈帧回溯，点击跳转源码
-- **Step Over/Into/Out** — 智能步过（自动识别 BL/BLX 指令）
-- **Data Sampling / Timeline** — 100Hz 变量采样，Canvas 实时波形图
-- **AI 集成** — Ollama / OpenAI 兼容 API，代码辅助分析
-- **自动 Flash** — 启动调试时自动烧录 ELF
-- **多会话** — 同时调试多个开发板
+- J-Link DLL 直连调试，支持启动、暂停、继续、单步、复位和断点。
+- VS Code Debug Adapter Protocol 集成，可使用 `.vscode/launch.json` 启动 `ozone` 调试会话。
+- Watch 视图支持表达式读取、结构体/数组展开和运行时轮询。
+- Timeline 视图支持变量实时采样和 Canvas 波形显示。
+- 符号与 DWARF 解析使用 `arm-none-eabi-nm` 和 `arm-none-eabi-objdump`。
+- 插件 API 通过本机 `127.0.0.1` HTTP RPC 暴露目标状态、表达式读写、波形记录和实验流程。
+- MCP server 可让 Codex、Claude Desktop 等 MCP 客户端读取和控制当前 Ozone 调试会话。
 
-## 要求
+## 系统要求
 
-- Windows 10/11（JLink_x64.dll 仅限 Windows）
-- [SEGGER J-Link](https://www.segger.com/downloads/jlink/) 已安装（V956+ 推荐）
-- `arm-none-eabi-nm` 和 `arm-none-eabi-objdump` 在 PATH 中（用于符号/DWARF 解析）
-- VS Code 1.90+
+- Windows 10/11。
+- VS Code `1.90.0` 或更高版本。
+- 已安装 SEGGER J-Link，并能找到 `JLink_x64.dll`。
+- `arm-none-eabi-nm` 和 `arm-none-eabi-objdump` 在 `PATH` 中，用于 ELF 符号和 DWARF 信息解析。
+- Node.js 18 或更高版本，仅源码开发和 MCP server 运行需要。
 
-## 安装
+## 安装 VSIX
 
-### 从 VSIX 安装
+生成好的扩展包为：
 
-1. 在 [Releases](https://github.com/ozone-debug/ozone-for-vscode/releases) 下载 `.vsix`
-2. VS Code → 扩展视图 → `···` → Install from VSIX...
+```powershell
+ozone-for-vscode-0.2.0.vsix
+```
 
-### 从源码打包
+在 VS Code 中安装：
 
-```bash
-git clone https://github.com/ozone-debug/ozone-for-vscode.git
-cd ozone-for-vscode
-npm install
-npm run build
-npm install -g @vscode/vsce
-vsce package
-# 安装生成的 .vsix
+1. 打开扩展面板。
+2. 点击右上角 `...`。
+3. 选择 `Install from VSIX...`。
+4. 选择 `ozone-for-vscode-0.2.0.vsix`。
+
+也可以使用命令行安装：
+
+```powershell
+code --install-extension .\ozone-for-vscode-0.2.0.vsix
 ```
 
 ## 快速开始
 
-1. 在项目根目录创建 `.vscode/launch.json`：
+在目标工程中创建 `.vscode/launch.json`：
 
 ```json
 {
@@ -62,70 +64,120 @@ vsce package
 }
 ```
 
-2. 按 `F5` 启动调试（自动 Flash → 连接 → Halt）
-3. 在 gutter 点击设置断点，按 `F5` 继续运行
-4. 使用 **Ozone Watch** 视图（活动栏）添加变量监视（运行时自动 5Hz 刷新）
-5. 使用 **Ozone Timeline** 面板（底部 Terminal 区域）查看变量实时波形
+启动调试后，可以在 Watch 面板添加变量，在 Timeline 面板查看变量波形。
 
-## 设置
+## 配置项
 
-| 设置 | 默认值 | 说明 |
-|------|--------|------|
-| `ozone.jlinkPath` | `C:\Program Files\SEGGER\JLink\JLink.exe` | J-Link Commander 路径 |
-| `ozone.jlinkDllPath` | `""` | JLink_x64.dll 路径（空则自动检测） |
-| `ozone.defaultDevice` | `STM32F407VG` | 默认设备型号 |
-| `ozone.defaultInterface` | `SWD` | 默认调试接口 |
-| `ozone.defaultSpeed` | `4000` | 默认接口速度 (kHz) |
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ozone.jlinkPath` | `C:\Program Files\SEGGER\JLink\JLink.exe` | J-Link Commander 路径，仅作为备用配置。 |
+| `ozone.jlinkDllPath` | 空 | `JLink_x64.dll` 路径，留空时自动检测。 |
+| `ozone.defaultDevice` | `STM32F407VG` | 默认目标芯片型号。 |
+| `ozone.defaultInterface` | `SWD` | 默认调试接口，可选 `SWD` 或 `JTAG`。 |
+| `ozone.defaultSpeed` | `4000` | 默认接口速度，单位 kHz。 |
+| `ozone.defaultProgram` | 空 | 默认 ELF/AXF 路径，留空时自动扫描 `build` 目录。 |
 
-## 架构
+## MCP 集成
 
-```
-WebView (React)  ←→  Extension Host (Node.js)  ←→  JLink_x64.dll (koffi FFI)
-                           ↕
-                    Debug Adapter (独立进程)
-                    (spawn → DAP protocol)
+扩展激活后会启动插件 API，并将连接信息写入 VS Code 的 global storage：
+
+```text
+%APPDATA%\Code\User\globalStorage\ozone-debug.ozone-for-vscode\plugin-api-endpoint.json
 ```
 
-- 调试引擎直接通过 [koffi](https://github.com/Koromix/rygel/tree/master/koffi) FFI 调用 JLink_x64.dll，无需 Ozone GUI 进程或 JLink.exe 子进程
-- Debug Adapter 运行在独立 Node.js 进程中，避免 child_process 调用导致 VS Code extension host 崩溃
-- 所有命令通过 `OzoneCommand`  discriminated union 类型安全分发
+MCP server 位于：
 
-## AI 配置
+```text
+mcp/ozone-mcp-server.js
+```
 
-在 VS Code 设置中配置：
+MCP 客户端配置示例：
 
 ```json
 {
-  "ozone.ai.provider": "ollama",
-  "ozone.ai.ollamaUrl": "http://localhost:11434",
-  "ozone.ai.ollamaModel": "codellama"
+  "mcpServers": {
+    "ozone": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\22690\\Desktop\\Ozone for VScode\\mcp\\ozone-mcp-server.js"
+      ],
+      "env": {
+        "OZONE_PLUGIN_API_ENDPOINT_FILE": "C:\\Users\\22690\\AppData\\Roaming\\Code\\User\\globalStorage\\ozone-debug.ozone-for-vscode\\plugin-api-endpoint.json"
+      }
+    }
+  }
 }
 ```
 
-或使用 OpenAI 兼容 API：
+MCP 工具：
 
-```json
-{
-  "ozone.ai.provider": "openai-compatible",
-  "ozone.ai.openaiUrl": "http://localhost:8000/v1",
-  "ozone.ai.openaiModel": "deepseek-coder",
-  "ozone.ai.apiKey": ""
-}
+- `ozone_status`：读取插件 API 和目标状态。
+- `ozone_read_many`：读取一个或多个调试表达式。
+- `ozone_write_many`：向一个或多个调试表达式写入数值。
+- `ozone_record`：按固定间隔记录变量波形。
+- `ozone_experiment_run`：执行 read、write、wait、record 组合实验。
+
+配套 Codex skill 已复制到：
+
+```text
+mcp/skill
 ```
 
-## 开发
+该 skill 描述了 MCP 工具的安全使用方式、表达式约定、波形记录和 PID/电机调参流程。
 
-```bash
-npm run build        # esbuild 构建
-npm run watch        # 监听模式
-npm run dev          # 构建 + 启动 Extension Host
-npm run typecheck    # TypeScript 类型检查
-npm run lint         # ESLint
-npm test             # Vitest
+## 源码开发
+
+安装依赖：
+
+```powershell
+npm install
 ```
 
-`F5` → "Extension + Watch" 启动带热重载的开发调试。
+构建扩展：
 
-## 许可
+```powershell
+npm run build
+```
+
+类型检查：
+
+```powershell
+npm run typecheck
+```
+
+打包 VSIX：
+
+```powershell
+npx vsce package
+```
+
+运行 MCP server：
+
+```powershell
+npm run mcp
+```
+
+## 目录结构
+
+```text
+src/extension.ts                 扩展主入口
+src/debugadapter.ts              Debug Adapter 入口
+src/ozone-backend/               J-Link DLL、符号和命令分发
+src/debug-providers/             Watch 与数据采样逻辑
+src/webview/                     Watch 和 Timeline 前端
+src/plugin-api/                  本机插件 API
+mcp/ozone-mcp-server.js          MCP server
+mcp/skill/                       MCP 控制 skill
+dist/                            esbuild 输出
+```
+
+## 注意事项
+
+- 该扩展当前仅支持 Windows，因为调试链路依赖 `JLink_x64.dll`。
+- 常规调试命令不启动 Ozone GUI，也不依赖 JLink.exe 子进程。
+- 当已有 `ozone` 调试会话时，Watch 和数据采样请求应通过 debug session 路由。
+- 对目标写值前建议先进行只读检查，并在 MCP 实验里设置安全范围。
+
+## 许可证
 
 MIT

@@ -284,15 +284,13 @@ case 'readVariableRuntime':
     );
 
     for (const sym of localSymbols.slice(0, 50)) {
-      const readSize = Math.min(Math.max(sym.size || 4, 4), 4);
+      const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
+      const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
+      const readSize = this.getScalarReadSize(sym.size, resolvedType);
       const raw = this.jlink.readMemory(sym.address, readSize);
       let value: string;
       if (raw) {
-        let v = 0;
-        for (let i = raw.length - 1; i >= 0; i--) v = (v << 8) | raw[i];
-        if (sym.size <= 1) value = `0x${v.toString(16).toUpperCase()} (${v})`;
-        else if (sym.size <= 2) value = `0x${v.toString(16).toUpperCase()} (${v})`;
-        else value = `0x${v.toString(16).toUpperCase().padStart(8, '0')}`;
+        value = this.formatScalarValue(raw, readSize, resolvedType).display;
       } else {
         value = `0x${sym.address.toString(16).toUpperCase()}`;
       }
@@ -886,15 +884,13 @@ case 'readVariableRuntime':
                 value = this.readBytesAsFloat(raw, elemType!.byteSize);
                 display = elemType!.byteSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
               } else {
-                value = 0;
-                for (let i = raw.length - 1; i >= 0; i--) {
-                  value = (value << 8) | raw[i];
-                }
-                display = elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+                const formatted = this.formatScalarValue(raw, elemSize, elemType);
+                value = formatted.value;
+                display = formatted.display;
               }
               return {
                 ok: true,
-                data: { expression, value, display, hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`, address: elemAddr, typeName: elemTypeName } as WatchValue,
+                data: { expression, value, display, hex: this.formatScalarValue(raw, elemSize, elemType).hex, address: elemAddr, typeName: elemTypeName } as WatchValue,
               };
             }
             return { ok: false, error: `read failed at 0x${elemAddr.toString(16)}` };
@@ -939,8 +935,8 @@ case 'readVariableRuntime':
 
     const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
     daLog(`doEvaluateExpression: varTypeOffset for "${sym.name}" = ${varTypeOffset || 'none'}`);
+    const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
     if (varTypeOffset) {
-      const resolvedType = this.resolveDwarfType(varTypeOffset);
       daLog(`doEvaluateExpression: resolvedType kind=${resolvedType?.kind} name=${resolvedType?.name} fields=${resolvedType?.fields?.length || 0}`);
       if (resolvedType && resolvedType.kind === 'struct' && resolvedType.fields && resolvedType.fields.length > 0) {
         const readLen = resolvedType.byteSize || sym.size || 4;
@@ -995,16 +991,14 @@ case 'readVariableRuntime':
                 children: structChildren,
               });
             } else {
-              let value = 0;
               const end = Math.min(elemRawOffset + elemSize, raw.length);
-              for (let j = end - 1; j >= elemRawOffset; j--) {
-                value = (value << 8) | raw[j];
-              }
+              const elemRaw = raw.slice(elemRawOffset, end);
+              const formatted = this.formatScalarValue(elemRaw, elemSize, elemType);
               children.push({
                 expression: `[${i}]`,
-                value,
-                display: elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`,
-                hex: `0x${value.toString(16).toUpperCase().padStart(elemSize * 2, '0')}`,
+                value: formatted.value,
+                display: formatted.display,
+                hex: formatted.hex,
                 address: elemAddr,
                 typeName: elemTypeName,
               });
@@ -1034,14 +1028,13 @@ case 'readVariableRuntime':
       daLog('doEvaluateExpression: no DWARF type info, reading as flat value');
     }
 
-    const readSize = Math.min(Math.max(sym.size || 4, 4), 4);
+    const readSize = this.getScalarReadSize(sym.size, resolvedType);
     const raw = this.jlink.readMemory(sym.address, readSize);
 
     if (!raw) {
       return { ok: false, error: `read failed at 0x${sym.address.toString(16)}` };
     }
 
-    const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
     const isFloat = this.isFloatType(resolvedType);
 
     let value: number;
@@ -1051,13 +1044,9 @@ case 'readVariableRuntime':
       if (resolvedType!.byteSize === 8) display = `${value.toExponential(6)}`;
       else display = `${value.toFixed(6)}`;
     } else {
-      value = 0;
-      for (let i = raw.length - 1; i >= 0; i--) {
-        value = (value << 8) | raw[i];
-      }
-      if (sym.size <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-      else if (sym.size <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-      else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+      const formatted = this.formatScalarValue(raw, readSize, resolvedType);
+      value = formatted.value;
+      display = formatted.display;
     }
 
     let typeName = '';
@@ -1067,8 +1056,8 @@ case 'readVariableRuntime':
     }
 
     const hexValue = isFloat
-      ? `0x${Array.from(raw.slice(0, Math.max(readSize, 4))).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
-      : `0x${value.toString(16).toUpperCase().padStart(8, '0')}`;
+      ? `0x${Array.from(raw.slice(0, readSize)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
+      : this.formatScalarValue(raw, readSize, resolvedType).hex;
 
     return {
       ok: true,
@@ -1086,6 +1075,45 @@ case 'readVariableRuntime':
     if (info.kind !== 'base') return false;
     const enc = (info.encoding || '').toLowerCase();
     return enc.includes('float') || enc === '4' || enc === '0x4';
+  }
+
+  private isSignedIntegerType(info: { kind?: string; encoding?: string; name?: string; typeName?: string } | null): boolean {
+    if (!info || info.kind !== 'base') return false;
+    const enc = (info.encoding || '').toLowerCase();
+    const name = `${info.typeName || ''} ${info.name || ''}`.trim().toLowerCase();
+    if (enc.includes('unsigned') || (name.startsWith('uint') && /^uint\d*_?t?\b/.test(name))) return false;
+    return enc.includes('signed') || enc === '5' || enc === '0x5' || /^int\d+_t\b/.test(name) || name.includes('short') || name === 'int';
+  }
+
+  private getScalarReadSize(symbolSize: number | undefined, info: { byteSize?: number } | null): number {
+    const typeSize = info?.byteSize || 0;
+    const size = typeSize > 0 ? typeSize : (symbolSize && symbolSize > 0 ? symbolSize : 4);
+    return Math.max(1, Math.min(size, 8));
+  }
+
+  private readUnsignedLittleEndian(raw: Uint8Array, byteSize: number): number {
+    const count = Math.min(byteSize, raw.length);
+    let value = 0;
+    let factor = 1;
+    for (let i = 0; i < count; i++) {
+      value += raw[i] * factor;
+      factor *= 256;
+    }
+    return value;
+  }
+
+  private formatScalarValue(raw: Uint8Array, byteSize: number, info: { kind?: string; encoding?: string; name?: string; typeName?: string } | null): { value: number; display: string; hex: string } {
+    const unsigned = this.readUnsignedLittleEndian(raw, byteSize);
+    let value = unsigned;
+    if (this.isSignedIntegerType(info)) {
+      const bits = byteSize * 8;
+      const signBit = 2 ** (bits - 1);
+      const range = 2 ** bits;
+      if (unsigned >= signBit) value = unsigned - range;
+    }
+
+    const hex = `0x${unsigned.toString(16).toUpperCase().padStart(byteSize * 2, '0')}`;
+    return { value, display: `${hex} (${value})`, hex };
   }
 
   private readBytesAsFloat(raw: Uint8Array, byteSize: number): number {

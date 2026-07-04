@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozone MCP Control"
+  short_description: "Use Ozone MCP for target experiments and tuning"
+  default_prompt: "Use $ozone-mcp-control to inspect the target, record signals, and run a safe tuning experiment."

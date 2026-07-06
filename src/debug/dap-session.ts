@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
+import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
-import { Variable, StackFrame, WatchValue } from '../ozone-backend/types';
+import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
 
 function daLog(_msg: string) {
   // no-op
@@ -18,10 +19,24 @@ export interface DebugProtocolMessage {
   request_seq?: number;
 }
 
+interface DapSamplingEntry {
+  expression: string;
+  color: string;
+}
+
 export class DapSession extends EventEmitter {
   private backend: OzoneBackend;
   private seq = 1;
   private pollTimer: NodeJS.Timeout | null = null;
+  private rttPollTimer: NodeJS.Timeout | null = null;
+  private rttLogEnabled = true;
+  private rttStarted = false;
+  private rttBufferIndex = 0;
+  private rttPollIntervalMs = 50;
+  private rttReadSize = 4096;
+  private rttControlBlockAddress: number | undefined;
+  private rttStripAnsi = true;
+  private rttDecoder = new StringDecoder('utf8');
   private watchExpressions: string[] = [];
   private _watchPollCycle = 0;
   private lastHaltReason: 'entry' | 'breakpoint' | 'step' | 'pause' = 'entry';
@@ -34,6 +49,18 @@ export class DapSession extends EventEmitter {
   private _interface = 'SWD';
   private _speedKHz = 4000;
   private _flashEnabled = true;
+  private dataSamplingActive = false;
+  private dataSamplingTimer: NodeJS.Immediate | null = null;
+  private dataSamplingEntries: DapSamplingEntry[] = [];
+  private dataSamplingSpecs: FastDataSampleSpec[] = [];
+  private dataSamplingPending = new Map<string, DataPoint[]>();
+  private dataSamplingLastDisplay = new Map<string, string>();
+  private dataSamplingIntervalMs = 0.2;
+  private dataSamplingSendIntervalMs = 16;
+  private dataSamplingNextSampleMs = 0;
+  private dataSamplingNextSendMs = 0;
+  private readonly highResEpochMs = Date.now();
+  private readonly highResStartNs = process.hrtime.bigint();
 
   constructor(backend: OzoneBackend) {
     super();
@@ -134,6 +161,72 @@ export class DapSession extends EventEmitter {
     }
   }
 
+  private startRttLogPolling() {
+    this.stopRttLogPolling();
+    this.rttStarted = false;
+    this.rttDecoder = new StringDecoder('utf8');
+
+    const pollLoop = async () => {
+      if (this.rttPollTimer === null) return;
+      try {
+        if (!this.rttStarted) {
+          const startResult = await this.backend.execute({
+            cmd: 'startRtt',
+            controlBlockAddress: this.rttControlBlockAddress,
+          });
+          this.rttStarted = startResult.ok;
+        }
+
+        if (this.rttStarted) {
+          const readResult = await this.backend.execute({
+            cmd: 'readRtt',
+            bufferIndex: this.rttBufferIndex,
+            size: this.rttReadSize,
+          });
+          if (readResult.ok) {
+            const bytes = (readResult.data as any)?.bytes;
+            if (Array.isArray(bytes) && bytes.length > 0) {
+              let output = this.rttDecoder.write(Buffer.from(bytes));
+              if (this.rttStripAnsi) output = this.stripAnsi(output);
+              if (output.length > 0) {
+                this.sendEvent('output', { category: 'stdout', output });
+              }
+            }
+          } else {
+            this.rttStarted = false;
+          }
+        }
+      } catch {
+        this.rttStarted = false;
+      }
+
+      if (this.rttPollTimer !== null) {
+        this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
+      }
+    };
+
+    this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
+  }
+
+  private stopRttLogPolling() {
+    if (this.rttPollTimer) {
+      clearTimeout(this.rttPollTimer);
+      this.rttPollTimer = null;
+    }
+    const trailing = this.rttDecoder.end();
+    if (trailing) {
+      const output = this.rttStripAnsi ? this.stripAnsi(trailing) : trailing;
+      if (output) this.sendEvent('output', { category: 'stdout', output });
+    }
+    this.rttDecoder = new StringDecoder('utf8');
+    this.rttStarted = false;
+    void this.backend.execute({ cmd: 'stopRtt' });
+  }
+
+  private stripAnsi(text: string): string {
+    return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+  }
+
   private async handleRequest(msg: DebugProtocolMessage) {
     try {
       switch (msg.command) {
@@ -206,6 +299,10 @@ export class DapSession extends EventEmitter {
           return this.sendResponse(msg);
         case 'dataSample':
           return this.handleDataSample(msg);
+        case 'dataSamplingStart':
+          return this.handleDataSamplingStart(msg);
+        case 'dataSamplingStop':
+          return this.handleDataSamplingStop(msg);
         case 'setWatchValue':
           return this.handleSetWatchValue(msg);
         case 'getTargetState':
@@ -226,6 +323,12 @@ export class DapSession extends EventEmitter {
       const speedKHz = args.speedKHz || 4000;
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = args.flashBeforeDebug !== false;
+      this.rttLogEnabled = args.rttLogEnabled !== false;
+      this.rttBufferIndex = Math.floor(this.clampNumber(args.rttBufferIndex, 0, 0, 15));
+      this.rttPollIntervalMs = Math.floor(this.clampNumber(args.rttPollIntervalMs, 50, 10, 5000));
+      this.rttReadSize = Math.floor(this.clampNumber(args.rttReadSize, 4096, 64, 65536));
+      this.rttControlBlockAddress = this.parseOptionalAddress(args.rttControlBlockAddress);
+      this.rttStripAnsi = args.rttStripAnsi !== false;
       this._elfPath = elfPath;
       this._device = device;
       this._interface = interface_;
@@ -266,6 +369,11 @@ export class DapSession extends EventEmitter {
         await new Promise<void>(r => setTimeout(r, 200));
       }
       await this.backend.execute({ cmd: 'halt' });
+      if (this.rttLogEnabled) {
+        this.startRttLogPolling();
+      } else {
+        this.stopRttLogPolling();
+      }
 
       this.sendEvent('initialized', {});
       this.sendResponse(msg);
@@ -275,6 +383,7 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleDisconnect(msg: DebugProtocolMessage) {
+    this.stopRttLogPolling();
     this.stopPolling();
     for (const [key, bpIndex] of this.breakpoints) {
       await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
@@ -521,6 +630,7 @@ export class DapSession extends EventEmitter {
 
   private async handleRestart(msg: DebugProtocolMessage) {
     await this.withStepLock(async () => {
+      this.stopRttLogPolling();
       this.stopPolling();
 
       const savedBps: Array<{ file: string; line: number }> = [];
@@ -560,6 +670,9 @@ export class DapSession extends EventEmitter {
       }
 
       this.lastHaltReason = 'entry';
+      if (this.rttLogEnabled) {
+        this.startRttLogPolling();
+      }
       this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
       this.sendResponse(msg);
     });
@@ -633,6 +746,159 @@ export class DapSession extends EventEmitter {
     this.sendResponse(msg, { results });
   }
 
+  private async handleDataSamplingStart(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    const entries: DapSamplingEntry[] = Array.isArray(args.entries)
+      ? args.entries
+        .map((entry: any) => ({ expression: String(entry.expression || '').trim(), color: String(entry.color || '#4EC9B0') }))
+        .filter((entry: DapSamplingEntry) => entry.expression)
+      : (Array.isArray(args.expressions) ? args.expressions.map((expression: string) => ({ expression, color: '#4EC9B0' })) : []);
+
+    this.stopDataSampling();
+    if (entries.length === 0) {
+      this.sendResponse(msg, { ok: true, planned: [] });
+      return;
+    }
+
+    const planResult = await this.backend.execute({
+      cmd: 'prepareFastDataSampling',
+      expressions: entries.map(entry => entry.expression),
+    });
+    if (!planResult.ok) {
+      this.sendResponse(msg, undefined, false, planResult.error);
+      return;
+    }
+
+    const plan = planResult.data as FastDataSamplePlanItem[];
+    const specs = plan.map(item => item.spec).filter((spec): spec is FastDataSampleSpec => !!spec);
+    if (specs.length === 0) {
+      this.sendResponse(msg, { ok: false, planned: plan }, false, 'No expressions can use fast data sampling');
+      return;
+    }
+
+    const supported = new Set(specs.map(spec => spec.expression));
+    this.dataSamplingEntries = entries.filter(entry => supported.has(entry.expression));
+    this.dataSamplingSpecs = specs;
+    this.dataSamplingPending.clear();
+    this.dataSamplingLastDisplay.clear();
+    for (const entry of this.dataSamplingEntries) {
+      this.dataSamplingPending.set(entry.expression, []);
+    }
+    this.dataSamplingIntervalMs = this.clampNumber(args.sampleIntervalMs, 0.2, 0.1, 10000);
+    this.dataSamplingSendIntervalMs = this.clampNumber(args.sendIntervalMs, 16, 1, 10000);
+    const now = this.nowMs();
+    this.dataSamplingNextSampleMs = now;
+    this.dataSamplingNextSendMs = now + this.dataSamplingSendIntervalMs;
+    this.dataSamplingActive = true;
+    this.scheduleDataSamplingLoop();
+    this.sendResponse(msg, {
+      ok: true,
+      planned: plan,
+      activeExpressions: this.dataSamplingEntries.map(entry => entry.expression),
+      intervalMs: this.dataSamplingIntervalMs,
+    });
+  }
+
+  private handleDataSamplingStop(msg: DebugProtocolMessage) {
+    this.stopDataSampling();
+    this.sendResponse(msg, { ok: true });
+  }
+
+  private scheduleDataSamplingLoop() {
+    if (!this.dataSamplingActive || this.dataSamplingTimer) return;
+    this.dataSamplingTimer = setImmediate(() => {
+      this.dataSamplingTimer = null;
+      void this.dataSamplingLoop();
+    });
+  }
+
+  private async dataSamplingLoop() {
+    if (!this.dataSamplingActive) return;
+    const budgetEndMs = this.nowMs() + 4;
+    let samplesThisTurn = 0;
+
+    while (this.dataSamplingActive && this.nowMs() >= this.dataSamplingNextSampleMs && this.nowMs() < budgetEndMs && samplesThisTurn < 512) {
+      await this.captureFastDataSample();
+      this.dataSamplingNextSampleMs += this.dataSamplingIntervalMs;
+      const now = this.nowMs();
+      if (this.dataSamplingNextSampleMs < now - this.dataSamplingIntervalMs * 256) {
+        this.dataSamplingNextSampleMs = now;
+      }
+      samplesThisTurn++;
+    }
+
+    if (this.dataSamplingActive && this.nowMs() >= this.dataSamplingNextSendMs) {
+      this.flushDataSampling();
+      this.dataSamplingNextSendMs = this.nowMs() + this.dataSamplingSendIntervalMs;
+    }
+
+    this.scheduleDataSamplingLoop();
+  }
+
+  private async captureFastDataSample() {
+    const result = await this.backend.execute({ cmd: 'readFastDataSampling', specs: this.dataSamplingSpecs });
+    if (!result.ok) return;
+    const values = result.data as WatchValue[];
+    const timestamp = this.nowMs();
+    for (const value of values) {
+      if (!value || value.error) continue;
+      const pending = this.dataSamplingPending.get(value.expression);
+      if (!pending) continue;
+      pending.push({ timestamp, value: value.value, display: value.display });
+      this.dataSamplingLastDisplay.set(value.expression, value.display);
+    }
+  }
+
+  private flushDataSampling() {
+    const snapshots = [];
+    for (const entry of this.dataSamplingEntries) {
+      const pending = this.dataSamplingPending.get(entry.expression);
+      if (!pending || pending.length === 0) continue;
+      snapshots.push({
+        expression: entry.expression,
+        color: entry.color,
+        currentValue: this.dataSamplingLastDisplay.get(entry.expression) || '',
+        data: pending.splice(0),
+      });
+    }
+    if (snapshots.length > 0) {
+      this.sendEvent('ozoneDataSamples', {
+        snapshots,
+        intervalMs: this.dataSamplingIntervalMs,
+      });
+    }
+  }
+
+  private stopDataSampling() {
+    this.dataSamplingActive = false;
+    if (this.dataSamplingTimer) {
+      clearImmediate(this.dataSamplingTimer);
+      this.dataSamplingTimer = null;
+    }
+    this.flushDataSampling();
+    this.dataSamplingEntries = [];
+    this.dataSamplingSpecs = [];
+    this.dataSamplingPending.clear();
+    this.dataSamplingLastDisplay.clear();
+  }
+
+  private nowMs(): number {
+    return this.highResEpochMs + Number(process.hrtime.bigint() - this.highResStartNs) / 1_000_000;
+  }
+
+  private clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+    const numeric = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.max(min, Math.min(max, numeric));
+  }
+
+  private parseOptionalAddress(value: unknown): number | undefined {
+    if (value === undefined || value === null || value === '') return undefined;
+    const numeric = typeof value === 'number' ? value : Number(String(value).trim());
+    if (!Number.isFinite(numeric) || numeric <= 0) return undefined;
+    return numeric >>> 0;
+  }
+
   private async handleSetWatchValue(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
     const expression: string = args.expression || '';
@@ -648,6 +914,8 @@ export class DapSession extends EventEmitter {
   }
 
   dispose() {
+    this.stopDataSampling();
+    this.stopRttLogPolling();
     this.stopPolling();
     this.backend.dispose();
   }

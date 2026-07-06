@@ -2,6 +2,7 @@ import {
   OzoneCommand, OzoneCommandResult,
   DebugSessionConfig, RegisterValue, Variable,
   StackFrame, MemoryBlock, TargetState, WatchValue,
+  FastDataSamplePlanItem, FastDataSampleSpec,
 } from './types';
 import { flashElf } from './flasher';
 import { JLinkDLL } from './jlink-dll';
@@ -96,10 +97,27 @@ case 'readVariableRuntime':
           return this.doSetBreakpointAtAddr(command.addr);
         case 'evaluateExpression':
           return await this.doEvaluateExpression(command.expression, command.force);
+        case 'prepareFastDataSampling':
+          return { ok: true, data: this.prepareFastDataSampling(command.expressions) };
+        case 'readFastDataSampling':
+          return { ok: true, data: this.readFastDataSampling(command.specs) };
         case 'writeMemory':
           return await this.doWriteMemory(command.address, command.data);
         case 'setWatchValue':
           return await this.doSetWatchValue(command.expression, command.value);
+        case 'startRtt':
+          return this.jlink.startRtt(command.controlBlockAddress)
+            ? { ok: true, data: 'RTT started' }
+            : { ok: false, error: 'RTT start failed' };
+        case 'stopRtt':
+          this.jlink.stopRtt();
+          return { ok: true, data: 'RTT stopped' };
+        case 'readRtt': {
+          const bytes = this.jlink.readRtt(command.bufferIndex, command.size);
+          return bytes
+            ? { ok: true, data: { bytes: Array.from(bytes) } }
+            : { ok: false, error: 'RTT read failed' };
+        }
         case 'loadSymbols':
     if (this.elfPath === command.elfPath && this.symbols.length > 0) {
       return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };
@@ -846,6 +864,100 @@ case 'readVariableRuntime':
       }
     }
     return null;
+  }
+
+  private prepareFastDataSampling(expressions: string[]): FastDataSamplePlanItem[] {
+    return expressions.map(expression => {
+      const spec = this.resolveFastDataSampleSpec(expression);
+      return spec ? { expression, spec } : { expression, error: 'Fast sampling supports scalar globals and scalar array elements only' };
+    });
+  }
+
+  private resolveFastDataSampleSpec(expression: string): FastDataSampleSpec | null {
+    const bracketMatch = expression.match(/^(\w+)\[(\d+)\]$/);
+    if (bracketMatch) {
+      const baseName = bracketMatch[1];
+      const index = parseInt(bracketMatch[2], 10);
+      const baseSym = this.findSymbolByName(baseName);
+      if (!baseSym) return null;
+      const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
+      const arrayType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
+      if (!arrayType || arrayType.kind !== 'array' || index < 0 || (arrayType.arrayCount !== undefined && index >= arrayType.arrayCount)) return null;
+      const elemType = arrayType.typeOffset ? this.resolveDwarfType(arrayType.typeOffset) : null;
+      if (!this.isFastScalarType(elemType)) return null;
+      const size = this.getScalarReadSize(undefined, elemType);
+      return {
+        expression,
+        address: baseSym.address + index * size,
+        size,
+        typeName: arrayType.typeOffset ? this.getDwarfTypeName(arrayType.typeOffset) : elemType?.typeName || elemType?.name || '',
+        isFloat: this.isFloatType(elemType),
+        signed: this.isSignedIntegerType(elemType),
+      };
+    }
+
+    const sym = this.findSymbolByName(expression);
+    if (!sym) return null;
+    const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
+    const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
+    if (!resolvedType && sym.size > 8) return null;
+    if (!this.isFastScalarType(resolvedType)) return null;
+    const size = this.getScalarReadSize(sym.size, resolvedType);
+    return {
+      expression,
+      address: sym.address,
+      size,
+      typeName: varTypeOffset ? this.getDwarfTypeName(varTypeOffset) : resolvedType?.typeName || resolvedType?.name || '',
+      isFloat: this.isFloatType(resolvedType),
+      signed: this.isSignedIntegerType(resolvedType),
+    };
+  }
+
+  private findSymbolByName(name: string): SymbolInfo | undefined {
+    return this.symbols.find(s => s.name === name)
+      || this.symbols.find(s => s.name.toLowerCase() === name.toLowerCase());
+  }
+
+  private isFastScalarType(info: { kind?: string; byteSize?: number } | null): boolean {
+    if (!info) return true;
+    if (info.kind === 'struct' || info.kind === 'array') return false;
+    const size = info.byteSize || 4;
+    return size > 0 && size <= 8;
+  }
+
+  private readFastDataSampling(specs: FastDataSampleSpec[]): WatchValue[] {
+    const results: WatchValue[] = [];
+    for (const spec of specs) {
+      const raw = this.jlink.readMemory(spec.address, spec.size);
+      if (!raw) {
+        results.push({ expression: spec.expression, value: 0, display: '', hex: '', error: `read failed at 0x${spec.address.toString(16)}` });
+        continue;
+      }
+
+      let value: number;
+      let display: string;
+      let hex: string;
+      if (spec.isFloat) {
+        value = this.readBytesAsFloat(raw, spec.size);
+        display = spec.size === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+        hex = `0x${Array.from(raw.slice(0, spec.size)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+      } else {
+        const formatted = this.formatScalarValue(raw, spec.size, { kind: 'base', encoding: spec.signed ? 'signed' : 'unsigned', name: spec.typeName || '' });
+        value = formatted.value;
+        display = formatted.display;
+        hex = formatted.hex;
+      }
+
+      results.push({
+        expression: spec.expression,
+        value,
+        display,
+        hex,
+        address: spec.address,
+        typeName: spec.typeName,
+      });
+    }
+    return results;
   }
 
   private async doEvaluateExpression(expression: string, force: boolean = false): Promise<OzoneCommandResult> {

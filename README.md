@@ -2,7 +2,17 @@
 
 Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展。扩展通过 SEGGER J-Link DLL 直接访问目标板，并提供 DAP 调试、Watch 变量、实时波形采样、插件 API 和 MCP 工具集成。
 
-当前版本：`0.2.0`
+当前版本：`0.3.0`
+
+## 版本更新日志
+
+### 0.3.0
+
+- 新增 SEGGER RTT 日志读取，调试启动后自动把 RTT up-buffer 0 输出到 VS Code Debug Console。
+- 新增 RTT 调试配置：`rttLogEnabled`、`rttBufferIndex`、`rttPollIntervalMs`、`rttReadSize`、`rttControlBlockAddress`、`rttStripAnsi`。
+- 注册 `ozone` debug configuration provider，使 RTT 默认配置能从 VS Code 设置自动带入调试会话。
+- Timeline 采样改为优先通过当前 `ozone` debug session 进行高速读取，并限制每个变量最多保留 50,000 个点。
+- 打包产物更新为 `ozone-for-vscode-0.3.0.vsix`。
 
 ## 功能
 
@@ -27,7 +37,7 @@ Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展�
 生成好的扩展包为：
 
 ```powershell
-ozone-for-vscode-0.2.0.vsix
+ozone-for-vscode-0.3.0.vsix
 ```
 
 在 VS Code 中安装：
@@ -35,12 +45,12 @@ ozone-for-vscode-0.2.0.vsix
 1. 打开扩展面板。
 2. 点击右上角 `...`。
 3. 选择 `Install from VSIX...`。
-4. 选择 `ozone-for-vscode-0.2.0.vsix`。
+4. 选择 `ozone-for-vscode-0.3.0.vsix`。
 
 也可以使用命令行安装：
 
 ```powershell
-code --install-extension .\ozone-for-vscode-0.2.0.vsix
+code --install-extension .\ozone-for-vscode-0.3.0.vsix
 ```
 
 ## 快速开始

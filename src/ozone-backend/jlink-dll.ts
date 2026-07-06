@@ -13,6 +13,7 @@ export class JLinkDLL {
   private _state: 'disconnected' | 'connected' | 'running' | 'halted' | 'error' = 'disconnected';
   private _device = '';
   private _wasOpened = false;
+  private _rttStarted = false;
   private bpSlots: (number | null)[] = [null, null, null, null, null, null];
 
   get connected() { return this._state !== 'disconnected'; }
@@ -59,6 +60,7 @@ export class JLinkDLL {
 
   close(): void {
     if (!this.lib) return;
+    this.stopRtt();
     try { this.lib.func('int JLINK_Close(void)')(); } catch { }
     this.lib = null;
     this._state = 'disconnected';
@@ -119,6 +121,7 @@ export class JLinkDLL {
 
   disconnect(): void {
     if (!this.lib) return;
+    this.stopRtt();
     try { this.lib.func('int JLINK_Halt(void)')(); } catch { }
     this.clearAllBreakpoints();
     this._state = 'disconnected';
@@ -308,6 +311,47 @@ export class JLinkDLL {
     if (index < 0) return null;
     if (this.clearBreakpoint(index)) return index;
     return null;
+  }
+
+  startRtt(controlBlockAddress?: number): boolean {
+    if (!this.lib) return false;
+    try {
+      const func = this.lib.func('int JLINK_RTTERMINAL_Control(uint32, void*)');
+      let config: Buffer | null = null;
+      if (controlBlockAddress !== undefined && Number.isFinite(controlBlockAddress) && controlBlockAddress > 0) {
+        config = Buffer.alloc(16);
+        config.writeUInt32LE(controlBlockAddress >>> 0, 0);
+      }
+      const ret = func(0, config);
+      if (ret >= 0) {
+        this._rttStarted = true;
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  stopRtt(): void {
+    if (!this.lib || !this._rttStarted) return;
+    try {
+      this.lib.func('int JLINK_RTTERMINAL_Control(uint32, void*)')(1, null);
+    } catch { }
+    this._rttStarted = false;
+  }
+
+  readRtt(bufferIndex: number, size: number): Uint8Array | null {
+    if (!this.lib || size <= 0) return null;
+    try {
+      const func = this.lib.func('int JLINK_RTTERMINAL_Read(uint32, uint8*, uint32)');
+      const buf = new Uint8Array(size);
+      const ret = func(bufferIndex >>> 0, buf, size >>> 0);
+      if (ret < 0) return null;
+      return buf.slice(0, ret);
+    } catch {
+      return null;
+    }
   }
 
   getVersion(): string {

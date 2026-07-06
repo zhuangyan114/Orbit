@@ -4,6 +4,7 @@ import { WatchProvider } from './debug-providers/watch-provider';
 import { WatchWebviewProvider } from './debug-providers/watch-webview-provider';
 import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
 import { DataSamplingManager } from './debug-providers/data-sampling-manager';
+import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import * as fs from 'fs';
@@ -73,6 +74,7 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
       vscode.window.registerWebviewViewProvider('ozoneWatch', wvp),
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider),
+      vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
 
       vscode.commands.registerCommand('ozone.addWatch', async () => {
         const expr = await vscode.window.showInputBox({

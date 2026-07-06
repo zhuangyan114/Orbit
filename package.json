@@ -2,7 +2,7 @@
   "name": "ozone-for-vscode",
   "displayName": "Ozone for VS Code",
   "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "ozone-debug",
   "license": "MIT",
   "repository": {
@@ -154,6 +154,43 @@
                 "type": "number",
                 "description": "Interface speed in kHz",
                 "default": 4000
+              },
+              "rttLogEnabled": {
+                "type": "boolean",
+                "description": "Read SEGGER RTT output and show it in the VS Code Debug Console",
+                "default": true
+              },
+              "rttBufferIndex": {
+                "type": "number",
+                "description": "SEGGER RTT up-buffer index to read",
+                "default": 0
+              },
+              "rttPollIntervalMs": {
+                "type": "number",
+                "description": "RTT log polling interval in milliseconds",
+                "default": 50,
+                "minimum": 10,
+                "maximum": 5000
+              },
+              "rttReadSize": {
+                "type": "number",
+                "description": "Maximum bytes to read from RTT on each poll",
+                "default": 4096,
+                "minimum": 64,
+                "maximum": 65536
+              },
+              "rttControlBlockAddress": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "Optional SEGGER RTT control block address, for example 0x20000000. Leave empty for J-Link auto-detection.",
+                "default": ""
+              },
+              "rttStripAnsi": {
+                "type": "boolean",
+                "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console",
+                "default": true
               }
             }
           }
@@ -196,6 +233,56 @@
           "type": "string",
           "default": "",
           "description": "Default ELF/AXF file path (烧录文件, 留空则自动检测 build/ 目录)"
+        },
+        "ozone.rttLogEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Read SEGGER RTT output and show it in the VS Code Debug Console"
+        },
+        "ozone.rttBufferIndex": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 15,
+          "description": "SEGGER RTT up-buffer index to read"
+        },
+        "ozone.rttPollIntervalMs": {
+          "type": "number",
+          "default": 50,
+          "minimum": 10,
+          "maximum": 5000,
+          "description": "RTT log polling interval in milliseconds"
+        },
+        "ozone.rttReadSize": {
+          "type": "number",
+          "default": 4096,
+          "minimum": 64,
+          "maximum": 65536,
+          "description": "Maximum bytes to read from RTT on each poll"
+        },
+        "ozone.rttControlBlockAddress": {
+          "type": "string",
+          "default": "",
+          "description": "Optional SEGGER RTT control block address, for example 0x20000000. Leave empty for J-Link auto-detection."
+        },
+        "ozone.rttStripAnsi": {
+          "type": "boolean",
+          "default": true,
+          "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console"
+        },
+        "ozone.timelineSampleIntervalMs": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0.1,
+          "maximum": 10000,
+          "description": "Target Timeline data sampling interval in milliseconds. 0.2 ms targets 5 kHz; actual rate depends on target read latency and expression count."
+        },
+        "ozone.timelineSendIntervalMs": {
+          "type": "number",
+          "default": 16,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Timeline webview update interval in milliseconds. Sampling can run faster than UI updates."
         }
       }
     }

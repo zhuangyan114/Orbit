@@ -66,6 +66,21 @@ export interface DataSampleSnapshot {
   data: DataPoint[];
 }
 
+export interface FastDataSampleSpec {
+  expression: string;
+  address: number;
+  size: number;
+  typeName?: string;
+  isFloat?: boolean;
+  signed?: boolean;
+}
+
+export interface FastDataSamplePlanItem {
+  expression: string;
+  spec?: FastDataSampleSpec;
+  error?: string;
+}
+
 export interface Breakpoint {
   id: number;
   file: string;
@@ -124,7 +139,12 @@ export type OzoneCommand =
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
   | { cmd: 'evaluateExpression'; expression: string; force?: boolean }
-  | { cmd: 'setWatchValue'; expression: string; value: number };
+  | { cmd: 'prepareFastDataSampling'; expressions: string[] }
+  | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[] }
+  | { cmd: 'setWatchValue'; expression: string; value: number }
+  | { cmd: 'startRtt'; controlBlockAddress?: number }
+  | { cmd: 'stopRtt' }
+  | { cmd: 'readRtt'; bufferIndex: number; size: number };
 
 export type OzoneCommandResult =
   | { ok: true; data: unknown }

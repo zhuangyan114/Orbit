@@ -4,8 +4,10 @@ import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '..
 
 const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
 const MAX_POINTS_PER_VAR = 50000;
-const SAMPLE_INTERVAL_MS = 10;
-const SEND_INTERVAL_MS = 10;
+const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
+const DEFAULT_SEND_INTERVAL_MS = 16;
+const MIN_INTERVAL_MS = 0.1;
+const MAX_INTERVAL_MS = 10000;
 
 export class DataSamplingManager {
   private entries: DataSamplingEntry[] = [];
@@ -16,11 +18,40 @@ export class DataSamplingManager {
   private colorIndex = 0;
   private onSamples: ((snapshots: DataSampleSnapshot[]) => void) | null = null;
   private backend: OzoneBackend;
+  private sampleIntervalMs = DEFAULT_SAMPLE_INTERVAL_MS;
+  private sendIntervalMs = DEFAULT_SEND_INTERVAL_MS;
+  private remoteSession: vscode.DebugSession | null = null;
+  private remoteSampling = false;
+  private readonly disposables: vscode.Disposable[] = [];
 
   onExpressionsChanged: ((exprs: { expression: string; color: string }[]) => void) | null = null;
 
   constructor(backend: OzoneBackend) {
     this.backend = backend;
+    this.refreshIntervals();
+    this.disposables.push(vscode.workspace.onDidChangeConfiguration(e => {
+      if (!e.affectsConfiguration('ozone.timelineSampleIntervalMs') && !e.affectsConfiguration('ozone.timelineSendIntervalMs')) return;
+      const previousSendInterval = this.sendIntervalMs;
+      this.refreshIntervals();
+      if (this.sendTimer && previousSendInterval !== this.sendIntervalMs) {
+        clearInterval(this.sendTimer);
+        this.sendTimer = setInterval(() => this.flush(), this.sendIntervalMs);
+      }
+      void this.syncSamplingMode();
+    }));
+    this.disposables.push(vscode.debug.onDidChangeActiveDebugSession(() => void this.syncSamplingMode()));
+    this.disposables.push(vscode.debug.onDidTerminateDebugSession(session => {
+      if (this.remoteSession === session) {
+        this.remoteSession = null;
+        this.remoteSampling = false;
+        void this.syncSamplingMode();
+      }
+    }));
+    this.disposables.push(vscode.debug.onDidReceiveDebugSessionCustomEvent(event => {
+      if (event.session === this.remoteSession && event.event === 'ozoneDataSamples') {
+        this.acceptRemoteSamples(event.body?.snapshots || []);
+      }
+    }));
   }
 
   setOnSamples(cb: ((snapshots: DataSampleSnapshot[]) => void) | null) {
@@ -42,7 +73,7 @@ export class DataSamplingManager {
     this.entries.push({ expression, enabled: true, color });
     this.dataMap.set(expression, []);
     this.pendingMap.set(expression, []);
-    if (!this.timer) this.startSampling();
+    void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
 
@@ -50,7 +81,7 @@ export class DataSamplingManager {
     this.entries = this.entries.filter(e => e.expression !== expression);
     this.dataMap.delete(expression);
     this.pendingMap.delete(expression);
-    if (this.entries.length === 0) this.stopSampling();
+    void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
 
@@ -70,8 +101,7 @@ export class DataSamplingManager {
       this.dataMap.set(expr, []);
       this.pendingMap.set(expr, []);
     }
-    if (this.entries.length > 0 && !this.timer) this.startSampling();
-    else if (this.entries.length === 0) this.stopSampling();
+    void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
 
@@ -84,6 +114,7 @@ export class DataSamplingManager {
     const entry = this.entries.find(e => e.expression === expression);
     if (entry) {
       entry.color = color;
+      void this.syncSamplingMode();
       if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
     }
   }
@@ -101,23 +132,85 @@ export class DataSamplingManager {
 
   private _stopped = false;
 
-  private startSampling() {
-    this._stopped = false;
-    this.sampleLoop();
-    this.sendTimer = setInterval(() => this.flush(), SEND_INTERVAL_MS);
+  private async syncSamplingMode() {
+    if (this.entries.length === 0) {
+      await this.stopRemoteSampling();
+      this.stopLocalSampling();
+      return;
+    }
+
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'ozone') {
+      this.stopLocalSampling();
+      await this.startRemoteSampling(session);
+      return;
+    }
+
+    await this.stopRemoteSampling();
+    if (!this.timer) this.startSampling();
   }
 
-  stopSampling() {
+  private async startRemoteSampling(session: vscode.DebugSession) {
+    try {
+      const response: any = await session.customRequest('dataSamplingStart', {
+        entries: this.entries.map(e => ({ expression: e.expression, color: e.color })),
+        sampleIntervalMs: this.sampleIntervalMs,
+        sendIntervalMs: this.sendIntervalMs,
+      });
+      if (response?.ok === false) throw new Error(response?.message || 'remote sampler rejected expressions');
+      this.remoteSession = session;
+      this.remoteSampling = true;
+    } catch {
+      this.remoteSession = null;
+      this.remoteSampling = false;
+      if (!this.timer) this.startSampling();
+    }
+  }
+
+  private async stopRemoteSampling() {
+    if (!this.remoteSampling || !this.remoteSession) return;
+    const session = this.remoteSession;
+    this.remoteSampling = false;
+    this.remoteSession = null;
+    try { await session.customRequest('dataSamplingStop', {}); } catch {}
+  }
+
+  private stopLocalSampling() {
     this._stopped = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this.sendTimer) { clearInterval(this.sendTimer); this.sendTimer = null; }
   }
 
+  private startSampling() {
+    this._stopped = false;
+    this.sampleLoop();
+    this.sendTimer = setInterval(() => this.flush(), this.sendIntervalMs);
+  }
+
+  stopSampling() {
+    void this.stopRemoteSampling();
+    this.stopLocalSampling();
+  }
+
   private async sampleLoop() {
     if (this._stopped) return;
+    const started = Date.now();
     await this.sample();
     if (this._stopped) return;
-    this.timer = setTimeout(() => this.sampleLoop(), SAMPLE_INTERVAL_MS);
+    const elapsed = Date.now() - started;
+    const delay = Math.max(MIN_INTERVAL_MS, this.sampleIntervalMs - elapsed);
+    this.timer = setTimeout(() => this.sampleLoop(), delay);
+  }
+
+  private refreshIntervals() {
+    this.sampleIntervalMs = this.getConfiguredInterval('timelineSampleIntervalMs', DEFAULT_SAMPLE_INTERVAL_MS);
+    this.sendIntervalMs = this.getConfiguredInterval('timelineSendIntervalMs', DEFAULT_SEND_INTERVAL_MS);
+  }
+
+  private getConfiguredInterval(key: string, defaultValue: number): number {
+    const value = vscode.workspace.getConfiguration('ozone').get<number>(key, defaultValue);
+    if (!Number.isFinite(value)) return defaultValue;
+    return Math.max(MIN_INTERVAL_MS, Math.min(MAX_INTERVAL_MS, value));
   }
 
   private async isHalted(): Promise<boolean> {
@@ -171,6 +264,26 @@ export class DataSamplingManager {
     return results;
   }
 
+  private acceptRemoteSamples(snapshots: DataSampleSnapshot[]) {
+    const accepted: DataSampleSnapshot[] = [];
+    const entryByExpression = new Map(this.entries.map(entry => [entry.expression, entry]));
+    for (const snapshot of snapshots) {
+      const entry = entryByExpression.get(snapshot.expression);
+      if (!entry || !Array.isArray(snapshot.data) || snapshot.data.length === 0) continue;
+      const pts = this.dataMap.get(snapshot.expression) || [];
+      pts.push(...snapshot.data);
+      if (pts.length > MAX_POINTS_PER_VAR) pts.splice(0, pts.length - MAX_POINTS_PER_VAR);
+      this.dataMap.set(snapshot.expression, pts);
+      accepted.push({
+        expression: snapshot.expression,
+        color: entry.color,
+        currentValue: snapshot.currentValue,
+        data: snapshot.data,
+      });
+    }
+    if (accepted.length > 0 && this.onSamples) this.onSamples(accepted);
+  }
+
   private flush() {
     if (this.pendingMap.size === 0) return;
     const snapshots: DataSampleSnapshot[] = [];
@@ -194,6 +307,7 @@ export class DataSamplingManager {
 
   dispose() {
     this.stopSampling();
+    for (const disposable of this.disposables) disposable.dispose();
     this.entries = [];
     this.dataMap.clear();
     this.pendingMap.clear();

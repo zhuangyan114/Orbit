@@ -31,6 +31,7 @@ catch { vscode = { postMessage: () => {} }; }
 const H_DIV = 8;
 const V_DIV = 6;
 const SUB_DIV = 5;
+const MAX_POINTS_PER_VAR = 50000;
 const TIME_PRESETS = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 30000];
 
 function makeEntry(expr: string, color: string): Entry {
@@ -141,7 +142,9 @@ export function TimelineApp() {
           for (const snap of snapshots) {
             const existing = map.get(snap.expression) || [];
             if (snap.data.length > 0) {
-              map.set(snap.expression, [...existing, ...snap.data]);
+              const next = [...existing, ...snap.data];
+              if (next.length > MAX_POINTS_PER_VAR) next.splice(0, next.length - MAX_POINTS_PER_VAR);
+              map.set(snap.expression, next);
             }
           }
           // auto-scale entries that have yAutoScale (only when auto-following)

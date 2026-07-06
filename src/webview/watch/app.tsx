@@ -8,6 +8,7 @@ catch { vscode = { postMessage: () => {} }; }
 
 interface WatchEntry {
   expression: string;
+  label?: string;
   value?: string;
   typeName?: string;
   address?: number;
@@ -26,11 +27,13 @@ function extractValue(display: string): string {
 
 function mapResult(r: any, parentExpr?: string): WatchEntry {
   const isCompound = !!(r.children && r.children.length > 0);
+  const label = String(r.expression ?? '');
   const fullExpr = parentExpr
-    ? (r.expression.startsWith('[') ? `${parentExpr}${r.expression}` : `${parentExpr}.${r.expression}`)
-    : r.expression;
+    ? (label.startsWith('[') ? `${parentExpr}${label}` : `${parentExpr}.${label}`)
+    : label;
   return {
     expression: fullExpr,
+    label,
     value: r.error
       ? (r.error === 'running' ? 'Running...' : r.error)
       : (isCompound ? `0x${(r.address || 0).toString(16).toUpperCase()}` : r.display),
@@ -195,7 +198,7 @@ export function WatchApp() {
           color: 'var(--vscode-symbolIcon-variableForeground, #569cd6)',
           fontSize: depth > 0 ? '11px' : '12px',
         }}>
-          {w.expression}
+          {w.label || w.expression}
         </div>
 
         {/* Value */}

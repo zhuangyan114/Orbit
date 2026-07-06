@@ -36,6 +36,24 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (config.flashBeforeDebug === undefined) {
       config.flashBeforeDebug = cfg.get<boolean>('flashBeforeDebug', true);
     }
+    if (config.rttLogEnabled === undefined) {
+      config.rttLogEnabled = cfg.get<boolean>('rttLogEnabled', true);
+    }
+    if (config.rttBufferIndex === undefined) {
+      config.rttBufferIndex = cfg.get<number>('rttBufferIndex', 0);
+    }
+    if (config.rttPollIntervalMs === undefined) {
+      config.rttPollIntervalMs = cfg.get<number>('rttPollIntervalMs', 50);
+    }
+    if (config.rttReadSize === undefined) {
+      config.rttReadSize = cfg.get<number>('rttReadSize', 4096);
+    }
+    if (config.rttControlBlockAddress === undefined) {
+      config.rttControlBlockAddress = cfg.get<string>('rttControlBlockAddress', '');
+    }
+    if (config.rttStripAnsi === undefined) {
+      config.rttStripAnsi = cfg.get<boolean>('rttStripAnsi', true);
+    }
 
     return config;
   }

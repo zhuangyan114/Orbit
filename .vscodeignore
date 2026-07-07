@@ -4,5 +4,14 @@
 .vscode/**
 .vscode-test/**
 mcp/node_modules/**
+AGENTS.md
 *.log
 *.vsix
+check-config.js
+verify-config.js
+debug-tracker-test.js
+rtos-fix-test.ps1
+debug-rtos.md
+rtos-debug-guide.md
+test-rtos-fix.md
+test-rtos-views.md

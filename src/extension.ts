@@ -16,6 +16,55 @@ let dataSamplingManager: DataSamplingManager;
 let timelineProvider: TimelineWebviewProvider;
 let watchPollTimer: NodeJS.Timeout | null = null;
 let pluginApiServer: PluginApiServer;
+let rttLogTerminal: vscode.Terminal | null = null;
+let rttLogPty: RttLogTerminal | null = null;
+
+class RttLogTerminal implements vscode.Pseudoterminal {
+  private readonly writeEmitter = new vscode.EventEmitter<string>();
+  readonly onDidWrite = this.writeEmitter.event;
+  private closed = false;
+
+  constructor(private readonly onClose: () => void) {}
+
+  open(): void {
+    this.closed = false;
+    this.writeEmitter.fire('\x1B[1;36mOzone RTT Log\x1B[0m\r\n');
+  }
+
+  close(): void {
+    this.closed = true;
+    this.onClose();
+  }
+
+  write(text: string): void {
+    if (!this.closed) {
+      this.writeEmitter.fire(text);
+    }
+  }
+}
+
+function ensureRttLogTerminal(): { terminal: vscode.Terminal; pty: RttLogTerminal } {
+  if (!rttLogTerminal || !rttLogPty) {
+    rttLogPty = new RttLogTerminal(() => {
+      rttLogTerminal = null;
+      rttLogPty = null;
+    });
+    rttLogTerminal = vscode.window.createTerminal({
+      name: 'Ozone RTT Log',
+      pty: rttLogPty,
+    });
+  }
+  return { terminal: rttLogTerminal, pty: rttLogPty };
+}
+
+function showRttLogTerminal() {
+  ensureRttLogTerminal().terminal.show(true);
+}
+
+function writeRttLogTerminal(text: string) {
+  if (!text) return;
+  ensureRttLogTerminal().pty.write(text);
+}
 
 export async function activate(context: vscode.ExtensionContext) {
   try {
@@ -59,6 +108,13 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(pluginApiServer);
     console.log(`[Ozone] Plugin API listening on ${apiEndpoint.url}`);
 
+    // Silently ensure ozone is tracked by mcu-debug views on activation
+    appendWorkspaceArraySetting('memory-view', 'trackDebuggers', 'ozone').catch(() => {});
+    appendWorkspaceArraySetting('mcu-debug.rtos-views', 'trackDebuggers', 'ozone').catch(() => {});
+
+    // Ensure debug-tracker-vscode tracks ozone
+    appendWorkspaceArraySetting('mcu-debug.debug-tracker-vscode', 'trackDebuggers', 'ozone').catch(() => {});
+
     // 激活时自动检测 .elf/.axf，写入设置
     const ozCfg = vscode.workspace.getConfiguration('ozone');
     if (!ozCfg.get<string>('defaultProgram') || !fs.existsSync(ozCfg.get<string>('defaultProgram', ''))) {
@@ -75,6 +131,15 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.registerWebviewViewProvider('ozoneWatch', wvp),
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider),
       vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
+      vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
+        if (event.session.type === 'ozone' && event.event === 'ozoneClearDebugConsole') {
+          vscode.commands.executeCommand('workbench.debug.action.clearRepl');
+        } else if (event.session.type === 'ozone' && event.event === 'ozoneRttStarted') {
+          showRttLogTerminal();
+        } else if (event.session.type === 'ozone' && event.event === 'ozoneRttOutput') {
+          writeRttLogTerminal(String(event.body?.text || ''));
+        }
+      }),
 
       vscode.commands.registerCommand('ozone.addWatch', async () => {
         const expr = await vscode.window.showInputBox({
@@ -84,8 +149,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!expr) return;
         const current = wvp.expressionList;
         if (current.includes(expr)) return;
-        wvp.setExpressions([...current, expr]);
-        wp.setExpressions([...current, expr]);
+        wvp.addExpression(expr);
       }),
 
       vscode.commands.registerCommand('ozone.removeWatch', async (item) => {
@@ -103,6 +167,8 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand('ozone.openSettings', () => {
         vscode.commands.executeCommand('workbench.action.openSettings', '@ext:ozone-debug.ozone-for-vscode');
       }),
+
+      vscode.commands.registerCommand('ozone.enableMcuDebugViews', enableMcuDebugViewsIntegration),
 
       vscode.commands.registerCommand('ozone.api.getEndpoint', () => {
         return pluginApiServer?.getEndpointInfo();
@@ -215,8 +281,43 @@ function stopWatchPolling() {
   if (watchPollTimer) { clearTimeout(watchPollTimer); watchPollTimer = null; }
 }
 
+async function appendWorkspaceArraySetting(section: string, key: string, value: string): Promise<boolean> {
+  const cfg = vscode.workspace.getConfiguration(section);
+  const current = cfg.get<unknown>(key);
+  const list = Array.isArray(current) ? current.filter((item): item is string => typeof item === 'string') : [];
+  if (list.includes(value)) return false;
+  await cfg.update(key, [...list, value], vscode.ConfigurationTarget.Workspace);
+  return true;
+}
+
+async function enableMcuDebugViewsIntegration() {
+  const changed: string[] = [];
+  if (await appendWorkspaceArraySetting('memory-view', 'trackDebuggers', 'ozone')) {
+    changed.push('memory-view.trackDebuggers');
+  }
+  if (await appendWorkspaceArraySetting('mcu-debug.rtos-views', 'trackDebuggers', 'ozone')) {
+    changed.push('mcu-debug.rtos-views.trackDebuggers');
+  }
+  if (await appendWorkspaceArraySetting('mcu-debug.debug-tracker-vscode', 'trackDebuggers', 'ozone')) {
+    changed.push('mcu-debug.debug-tracker-vscode.trackDebuggers');
+  }
+
+  if (changed.length > 0) {
+    const choice = await vscode.window.showInformationMessage(
+      `Ozone: MCU Debug Views integration enabled (${changed.join(', ')}). Reload window to activate.`,
+      'Reload Window',
+    );
+    if (choice === 'Reload Window') {
+      vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
+  } else {
+    vscode.window.showInformationMessage('Ozone: MCU Debug Views integration is already enabled for this workspace.');
+  }
+}
+
 export function deactivate() {
   stopWatchPolling();
+  rttLogTerminal?.dispose();
   dataSamplingManager?.dispose();
   pluginApiServer?.dispose();
 }

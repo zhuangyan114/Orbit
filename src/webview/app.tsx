@@ -523,15 +523,21 @@ function WatchPanel({ watches, setWatches }: {
   const renderRow = (w: WatchEntry, key: string, depth: number): React.ReactNode[] => {
     const isExpanded = expandedRef.current.has(key);
     const showToggle = w.hasChildren && w.children && w.children.length > 0;
-    const indent = depth * 16;
+    const indent = depth * 18;
 
     const rows: React.ReactNode[] = [
       <div key={key} style={{
-        display: 'grid', gridTemplateColumns: `${indent + 16}px 1fr 1.5fr 1fr`,
+        display: 'grid', gridTemplateColumns: `${indent + 18}px minmax(96px, 1fr) minmax(120px, 1.5fr) minmax(72px, 1fr)`,
         borderBottom: '1px solid var(--border)',
         alignItems: 'center',
+        background: depth > 0 ? 'rgba(127, 127, 127, 0.035)' : 'transparent',
       }}>
-        <div style={{ textAlign: 'center', cursor: showToggle ? 'pointer' : 'default', userSelect: 'none' }}
+        <div style={{
+          width: '100%', height: 18, display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
+          paddingRight: 3, boxSizing: 'border-box',
+          borderLeft: depth > 0 ? '1px solid var(--vscode-tree-indentGuidesStroke, rgba(128,128,128,0.35))' : 'none',
+          cursor: showToggle ? 'pointer' : 'default', userSelect: 'none',
+        }}
           onClick={() => showToggle && toggleExpand(key)}>
           {showToggle ? (isExpanded ? '▼' : '▶') : ''}
         </div>

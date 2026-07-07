@@ -80,7 +80,6 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     if (this._onExpressionsChanged) {
       this._onExpressionsChanged(this._expressions);
     }
-    this.evaluateWatches(this._expressions);
   }
 
   removeExpression(expr: string) {

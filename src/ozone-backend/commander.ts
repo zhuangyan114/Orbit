@@ -324,8 +324,16 @@ case 'readVariableRuntime':
   }
 
   private async doGetCallStack(): Promise<OzoneCommandResult> {
-    const isHalted = this.jlink.isHalted();
+    // Wait for CPU to halt if not already halted
+    let isHalted = this.jlink.isHalted();
     daLog(`doGetCallStack: isHalted=${isHalted}`);
+    if (!isHalted) {
+      for (let i = 0; i < 20; i++) {
+        await new Promise<void>(r => setTimeout(r, 50));
+        isHalted = this.jlink.isHalted();
+        if (isHalted) break;
+      }
+    }
     if (!isHalted) {
       return { ok: true, data: [] };
     }
@@ -761,14 +769,33 @@ case 'readVariableRuntime':
   }
 
   private async doReadMemory(address: number, size: number): Promise<OzoneCommandResult> {
-    const raw = this.jlink.readMemory(address, size);
-    this.jlink.halt();
-    if (!raw) return { ok: false, error: 'Failed to read memory' };
+    const wasRunning = !this.jlink.isHalted();
+    if (wasRunning) {
+      const halted = await this.ensureHalted();
+      if (!halted) return { ok: false, error: 'halt failed' };
+      await new Promise<void>(r => setTimeout(r, 50));
+    }
+
+    const raw = this.readMemoryChunked(address, size);
+    if (wasRunning) this.jlink.run();
+    if (!raw || raw.length === 0) return { ok: false, error: 'Failed to read memory' };
 
     const data = Array.from(raw);
     const ascii = data.map(b => (b >= 0x20 && b <= 0x7E) ? String.fromCharCode(b) : '.').join('');
-    const block: MemoryBlock = { address, data, ascii };
+    const block: MemoryBlock = { address, data, ascii, unreadableBytes: Math.max(0, size - data.length) };
     return { ok: true, data: block };
+  }
+
+  private readMemoryChunked(address: number, size: number): Uint8Array | null {
+    const chunkSize = 256;
+    const chunks: number[] = [];
+    for (let offset = 0; offset < size; offset += chunkSize) {
+      const count = Math.min(chunkSize, size - offset);
+      const chunk = this.jlink.readMemory(address + offset, count);
+      if (!chunk) break;
+      chunks.push(...Array.from(chunk));
+    }
+    return chunks.length > 0 ? Uint8Array.from(chunks) : null;
   }
 
   private async doFlash(elfPath: string, device: string, interface_: string, speedKHz: number): Promise<OzoneCommandResult> {
@@ -961,7 +988,44 @@ case 'readVariableRuntime':
   }
 
   private async doEvaluateExpression(expression: string, force: boolean = false): Promise<OzoneCommandResult> {
+    expression = expression.trim();
     daLog(`doEvaluateExpression: "${expression}" force=${force}`);
+
+    const sizeofValue = this.evaluateSizeofExpression(expression);
+    if (sizeofValue !== null) {
+      return { ok: true, data: this.makeNumericWatchValue(expression, sizeofValue, 'size_t', false) };
+    }
+
+    const derefValue = this.evaluatePointerDereferenceExpression(expression);
+    if (derefValue) return { ok: true, data: derefValue };
+
+    const charPointerValue = this.evaluateCharPointerExpression(expression);
+    if (charPointerValue) return { ok: true, data: charPointerValue };
+
+    const castStructValue = this.evaluateCastStructExpression(expression);
+    if (castStructValue) return { ok: true, data: castStructValue };
+
+    const fieldValue = this.evaluateFieldAccessExpression(expression);
+    if (fieldValue) return { ok: true, data: fieldValue };
+
+    const arithmeticValue = this.evaluateIntegerExpression(expression);
+    if (arithmeticValue !== null) {
+      return { ok: true, data: this.makeNumericWatchValue(expression, arithmeticValue, 'integer', false) };
+    }
+
+    const numericMatch = expression.match(/^(?:0x[0-9a-fA-F]+|\d+)$/);
+    if (numericMatch) {
+      const value = expression.toLowerCase().startsWith('0x') ? parseInt(expression, 16) : parseInt(expression, 10);
+      return { ok: true, data: this.makeNumericWatchValue(expression, value, 'address', true) };
+    }
+
+    const addressOfMatch = expression.match(/^&\s*([A-Za-z_]\w*)$/);
+    if (addressOfMatch) {
+      const name = addressOfMatch[1];
+      const sym = this.symbols.find(s => s.name === name) || this.symbols.find(s => s.name.toLowerCase() === name.toLowerCase());
+      if (!sym) return { ok: false, error: `Symbol not found: ${name}` };
+      return { ok: true, data: this.makeNumericWatchValue(expression, sym.address, 'address', true) };
+    }
 
     // Handle array element access: name[index]
     const bracketMatch = expression.match(/^(\w+)\[(\d+)\]$/);
@@ -981,7 +1045,7 @@ case 'readVariableRuntime':
             const elemAddr = baseSym.address + index * elemSize;
 
             if (!force && !this.jlink.isHalted()) {
-              return { ok: false, error: 'running' };
+              return { ok: false, error: 'process is running' };
             }
             if (!force) {
               await new Promise<void>(r => setTimeout(r, 100));
@@ -1016,7 +1080,8 @@ case 'readVariableRuntime':
       sym = this.symbols.find(s => s.name.toLowerCase() === expression.toLowerCase());
     }
     if (!sym) {
-      const regIdx = REG_INDEXES[expression.toUpperCase()];
+      const regName = expression.startsWith('$') ? expression.slice(1) : expression;
+      const regIdx = REG_INDEXES[regName.toUpperCase()];
       if (regIdx !== undefined) {
         const val = this.jlink.readRegister(regIdx);
         if (val !== null) {
@@ -1029,7 +1094,7 @@ case 'readVariableRuntime':
             } as WatchValue,
           };
         }
-        return { ok: false, error: `Cannot read register ${expression}` };
+        return { ok: false, error: `Cannot read register ${regName}` };
       }
       return { ok: false, error: `Symbol not found: ${expression}` };
     }
@@ -1038,7 +1103,7 @@ case 'readVariableRuntime':
 
     if (!force && !this.jlink.isHalted()) {
       daLog(`doEvaluateExpression: CPU is running, returning running`);
-      return { ok: false, error: 'running' };
+      return { ok: false, error: 'process is running' };
     }
 
     if (!force) {
@@ -1056,9 +1121,10 @@ case 'readVariableRuntime':
         const raw = this.jlink.readMemory(sym.address, readLen);
         if (raw) {
           daLog(`doEvaluateExpression: raw bytes length=${raw.length}`);
-          const children = this.evaluateStructFields(raw, resolvedType.fields, resolvedType.typeDefs || this.dwarfInfo.typeDefs, sym.address);
+          const children = this.evaluateStructFields(raw, resolvedType.fields, resolvedType.typeDefs || this.dwarfInfo.typeDefs, sym.address, expression);
           daLog(`doEvaluateExpression: struct children count=${children.length}`);
-          const summary = `${resolvedType.name} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
+          const structTypeName = resolvedType.typeName || resolvedType.name || 'struct';
+          const summary = `${structTypeName} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
           return {
             ok: true,
             data: {
@@ -1067,7 +1133,7 @@ case 'readVariableRuntime':
               display: summary,
               hex: '',
               address: sym.address,
-              typeName: resolvedType.name,
+              typeName: structTypeName,
               children,
             } as WatchValue,
           };
@@ -1092,7 +1158,7 @@ case 'readVariableRuntime':
             const elemRawOffset = i * elemSize;
             if (elemType?.kind === 'struct' && elemType.fields) {
               const childRaw = raw.slice(elemRawOffset, elemRawOffset + elemSize);
-              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr);
+              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr, `${expression}[${i}]`);
               children.push({
                 expression: `[${i}]`,
                 value: structChildren[0]?.value ?? 0,
@@ -1167,6 +1233,10 @@ case 'readVariableRuntime':
       if (tn) typeName = tn;
     }
 
+    const pointerChildren = resolvedType?.kind === 'pointer' && resolvedType.typeOffset && value
+      ? this.evaluatePointerChildren(value, resolvedType.typeOffset, expression)
+      : undefined;
+
     const hexValue = isFloat
       ? `0x${Array.from(raw.slice(0, readSize)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
       : this.formatScalarValue(raw, readSize, resolvedType).hex;
@@ -1178,8 +1248,197 @@ case 'readVariableRuntime':
         hex: hexValue,
         address: sym.address,
         typeName,
+        children: pointerChildren,
       } as WatchValue,
     };
+  }
+
+  private makeNumericWatchValue(expression: string, value: number, typeName: string, isAddress: boolean): WatchValue {
+    const normalized = value >>> 0;
+    const hex = this.formatAddress(normalized);
+    return {
+      expression,
+      evaluateName: expression,
+      value: normalized,
+      display: isAddress ? hex : `${normalized}`,
+      hex,
+      address: isAddress ? normalized : undefined,
+      typeName,
+    };
+  }
+
+  private formatAddress(value: number): string {
+    return `0x${(value >>> 0).toString(16).toUpperCase()}`;
+  }
+
+  private evaluateIntegerExpression(expression: string): number | null {
+    const expr = expression.trim();
+    if (!expr || !/^[\s\dxa-fA-F()+\-*/%<>&|^~]+$/.test(expr)) return null;
+    if (!/(?:0x[0-9a-fA-F]+|\d)/.test(expr)) return null;
+    try {
+      const value = Function(`"use strict"; return (${expr});`)();
+      if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+      return Math.trunc(value) >>> 0;
+    } catch {
+      return null;
+    }
+  }
+
+  private evaluateSizeofExpression(expression: string): number | null {
+    const match = expression.match(/^sizeof\s*\(\s*([^)]+?)\s*\)$/);
+    if (!match) return null;
+    const typeName = this.normalizeTypeName(match[1]);
+    const builtin: Record<string, number> = {
+      char: 1, int8_t: 1, uint8_t: 1, byte: 1,
+      short: 2, int16_t: 2, uint16_t: 2,
+      int: 4, unsigned: 4, 'unsigned int': 4, long: 4, 'unsigned long': 4,
+      int32_t: 4, uint32_t: 4, float: 4,
+      double: 8, int64_t: 8, uint64_t: 8,
+    };
+    if (builtin[typeName] !== undefined) return builtin[typeName];
+    const offset = this.findDwarfTypeOffsetByName(typeName);
+    const resolved = offset ? this.resolveDwarfType(offset) : null;
+    return resolved?.byteSize || null;
+  }
+
+  private evaluatePointerDereferenceExpression(expression: string): WatchValue | null {
+    const match = expression.match(/^\*\s*\(\s*([^)]+?)\s*\*\s*\)\s*(.+)$/);
+    if (!match) return null;
+    const typeName = this.normalizeTypeName(match[1]);
+    const address = this.resolveAddressExpression(match[2]);
+    if (address === null) return null;
+
+    const builtinSize = this.getBuiltinTypeSize(typeName);
+    const offset = this.findDwarfTypeOffsetByName(typeName);
+    const resolved = offset ? this.resolveDwarfType(offset) : null;
+    const size = builtinSize || this.getScalarReadSize(resolved?.byteSize, resolved) || 4;
+    const raw = this.jlink.readMemory(address, size);
+    if (!raw) return null;
+    const formatted = this.formatScalarValue(raw, size, resolved || { kind: 'base', name: typeName });
+    return {
+      expression,
+      evaluateName: expression,
+      value: formatted.value,
+      display: formatted.display,
+      hex: formatted.hex,
+      address,
+      typeName,
+    };
+  }
+
+  private evaluateCharPointerExpression(expression: string): WatchValue | null {
+    const match = expression.match(/^\(\s*(?:const\s+)?char\s*\*\s*\)\s*(.+)$/);
+    if (!match) return null;
+    const address = this.resolveAddressExpression(match[1]);
+    if (address === null) return null;
+    const raw = this.jlink.readMemory(address, 128);
+    if (!raw) return null;
+    const chars: string[] = [];
+    for (const b of raw) {
+      if (b === 0) break;
+      chars.push((b >= 0x20 && b <= 0x7e) ? String.fromCharCode(b) : '.');
+    }
+    const text = chars.join('');
+    return {
+      expression,
+      evaluateName: expression,
+      value: address,
+      display: `"${text}"`,
+      hex: `0x${address.toString(16).toUpperCase()}`,
+      address,
+      typeName: 'char *',
+    };
+  }
+
+  private evaluateCastStructExpression(expression: string): WatchValue | null {
+    const match = expression.match(/^\(\s*\(?\s*(?:struct\s+)?([A-Za-z_]\w*)\s*\*\s*\)?\s*\)\s*(?:\(\s*)?(.+?)(?:\s*\))?$/);
+    if (!match) return null;
+    const typeName = this.normalizeTypeName(match[1]);
+    const address = this.resolveAddressExpression(match[2]);
+    if (address === null) return null;
+    return this.evaluateStructAtAddress(expression, typeName, address);
+  }
+
+  private evaluateFieldAccessExpression(expression: string): WatchValue | null {
+    const match = expression.match(/^(.+?)(?:->|\.)\s*([A-Za-z_]\w*)$/);
+    if (!match) return null;
+    const baseExpr = match[1].trim();
+    const fieldName = match[2];
+    let base = this.evaluateCastStructExpression(baseExpr);
+    if (!base && /^[A-Za-z_]\w*$/.test(baseExpr)) {
+      const sym = this.symbols.find(s => s.name === baseExpr) || this.symbols.find(s => s.name.toLowerCase() === baseExpr.toLowerCase());
+      if (sym) {
+        const offset = this.dwarfInfo.varToType.get(sym.name);
+        const typeName = offset ? this.getDwarfTypeName(offset) : '';
+        base = this.evaluateStructAtAddress(baseExpr, typeName, sym.address);
+      }
+    }
+    const child = base?.children?.find(c => c.expression === fieldName);
+    return child || null;
+  }
+
+  private evaluateStructAtAddress(expression: string, typeName: string, address: number): WatchValue | null {
+    const offset = this.findDwarfTypeOffsetByName(typeName) || (typeName === 'TCB_t' ? this.findDwarfTypeOffsetByName('tskTaskControlBlock') : undefined);
+    const resolved = offset ? this.resolveDwarfType(offset) : null;
+    if (!resolved || resolved.kind !== 'struct' || !resolved.fields || !resolved.byteSize) return null;
+    const raw = this.jlink.readMemory(address, resolved.byteSize);
+    if (!raw) return null;
+    const children = this.evaluateStructFields(raw, resolved.fields, resolved.typeDefs || this.dwarfInfo.typeDefs, address, expression);
+    return {
+      expression,
+      evaluateName: expression,
+      value: address,
+      display: `${typeName || resolved.name} @ 0x${address.toString(16).toUpperCase()}`,
+      hex: `0x${address.toString(16).toUpperCase()}`,
+      address,
+      typeName: typeName || resolved.name,
+      children,
+    };
+  }
+
+  private resolveAddressExpression(expression: string): number | null {
+    const expr = expression.trim().replace(/^\((.*)\)$/, '$1').trim();
+    const integer = this.evaluateIntegerExpression(expr);
+    if (integer !== null) return integer;
+    const addrOf = expr.match(/^&\s*([A-Za-z_]\w*)$/);
+    if (addrOf) {
+      const sym = this.symbols.find(s => s.name === addrOf[1]) || this.symbols.find(s => s.name.toLowerCase() === addrOf[1].toLowerCase());
+      return sym?.address ?? null;
+    }
+    const sym = this.symbols.find(s => s.name === expr) || this.symbols.find(s => s.name.toLowerCase() === expr.toLowerCase());
+    if (sym) {
+      const raw = this.jlink.readMemory(sym.address, Math.max(1, Math.min(sym.size || 4, 4)));
+      return raw ? this.readUnsignedLittleEndian(raw, raw.length) >>> 0 : sym.address;
+    }
+    const field = this.evaluateFieldAccessExpression(expr);
+    return field ? field.value >>> 0 : null;
+  }
+
+  private normalizeTypeName(typeName: string): string {
+    return typeName
+      .replace(/\b(const|volatile|struct|class|enum)\b/g, '')
+      .replace(/\*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private getBuiltinTypeSize(typeName: string): number {
+    const normalized = this.normalizeTypeName(typeName);
+    if (/^(char|int8_t|uint8_t|byte)$/.test(normalized)) return 1;
+    if (/^(short|int16_t|uint16_t)$/.test(normalized)) return 2;
+    if (/^(int|unsigned|unsigned int|long|unsigned long|int32_t|uint32_t|float)$/.test(normalized)) return 4;
+    if (/^(double|int64_t|uint64_t)$/.test(normalized)) return 8;
+    return 0;
+  }
+
+  private findDwarfTypeOffsetByName(typeName: string): string | undefined {
+    const normalized = this.normalizeTypeName(typeName);
+    for (const [offset, info] of this.dwarfInfo.typeDefs) {
+      if (this.normalizeTypeName(info.name || '') === normalized) return offset;
+      const formatted = this.normalizeTypeName(this.getDwarfTypeName(offset));
+      if (formatted === normalized) return offset;
+    }
+    return undefined;
   }
 
   private isFloatType(info: { kind?: string; encoding?: string; name?: string } | null): boolean {
@@ -1242,10 +1501,10 @@ case 'readVariableRuntime':
     visited.add(offset);
     const info = this.dwarfInfo.typeDefs.get(offset);
     if (!info) return null;
-    if (info.kind === 'typedef' && info.typeOffset) {
+    if ((info.kind === 'typedef' || info.kind === 'const' || info.kind === 'volatile' || info.kind === 'restrict') && info.typeOffset) {
       const resolved = this.resolveDwarfType(info.typeOffset, visited);
-      if (resolved) return { ...resolved, typeName: info.name };
-      return { kind: 'typedef', name: info.name, byteSize: 0, typeName: info.name };
+      if (resolved) return { ...resolved, typeName: info.name || resolved.typeName || resolved.name };
+      return { kind: info.kind, name: info.name, byteSize: 0, typeName: info.name };
     }
     if (info.kind === 'struct') {
       return { kind: 'struct', name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
@@ -1261,6 +1520,10 @@ case 'readVariableRuntime':
 
     if (info.kind === 'typedef') {
       return info.name || this.formatDwarfTypeName(info.typeOffset, visited);
+    }
+
+    if (info.kind === 'const' || info.kind === 'volatile' || info.kind === 'restrict') {
+      return this.formatDwarfTypeName(info.typeOffset, visited);
     }
 
     if (info.kind === 'array') {
@@ -1284,30 +1547,41 @@ case 'readVariableRuntime':
     return resolved?.typeName || resolved?.name || '';
   }
 
-  private evaluateStructFields(raw: Uint8Array, fields: DwarfField[], typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number): WatchValue[] {
-    return fields.map(f => this.evaluateSingleField(raw, f, typeDefs, baseAddress));
+  private evaluateStructFields(raw: Uint8Array, fields: DwarfField[], typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number, parentExpr = ''): WatchValue[] {
+    return fields.map(f => this.evaluateSingleField(raw, f, typeDefs, baseAddress, parentExpr));
   }
 
-  private evaluateSingleField(raw: Uint8Array, field: DwarfField, typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number): WatchValue {
+  private evaluatePointerChildren(address: number, typeOffset: string, parentExpr = ''): WatchValue[] | undefined {
+    const pointee = this.resolveDwarfType(typeOffset);
+    if (!pointee || pointee.kind !== 'struct' || !pointee.fields || !pointee.byteSize) return undefined;
+    const raw = this.jlink.readMemory(address, pointee.byteSize);
+    if (!raw) return undefined;
+    return this.evaluateStructFields(raw, pointee.fields, pointee.typeDefs || this.dwarfInfo.typeDefs, address, parentExpr);
+  }
+
+  private evaluateSingleField(raw: Uint8Array, field: DwarfField, typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number, parentExpr = ''): WatchValue {
     const addr = baseAddress + field.byteOffset;
+    const evaluateName = parentExpr ? `${parentExpr}.${field.name}` : field.name;
     const resolved = this.resolveDwarfType(field.typeOffset);
     const resolvedKind = resolved?.kind || '';
     const resolvedName = resolved?.name || '';
     const resolvedByteSize = resolved?.byteSize || 0;
+    const resolvedTypeName = this.getDwarfTypeName(field.typeOffset) || resolvedName;
 
     if (resolvedKind === 'struct' && resolved?.fields) {
       const childRaw = resolvedByteSize > 0
         ? raw.slice(field.byteOffset, field.byteOffset + resolvedByteSize)
         : raw;
-      const children = this.evaluateStructFields(childRaw, resolved.fields, typeDefs, addr);
-      const summary = `${resolvedName} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
+      const children = this.evaluateStructFields(childRaw, resolved.fields, typeDefs, addr, evaluateName);
+      const summary = `${resolvedTypeName || 'struct'} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
       return {
         expression: field.name,
+        evaluateName,
         value: children[0]?.value ?? 0,
         display: summary,
         hex: '',
         address: addr,
-        typeName: resolvedName,
+        typeName: resolvedTypeName,
         children,
       };
     }
@@ -1330,9 +1604,10 @@ case 'readVariableRuntime':
         const elemRawOffset = i * elemSize;
         if (elemType?.kind === 'struct' && elemType.fields) {
           const childRaw = arrRaw.slice(elemRawOffset, elemRawOffset + elemSize);
-          const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr);
+              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr, `${evaluateName}[${i}]`);
           children.push({
             expression: `[${i}]`,
+            evaluateName: `${evaluateName}[${i}]`,
             value: structChildren[0]?.value ?? 0,
             display: `${elemType.name || 'struct'} { ${structChildren.map(c => `${c.expression}=${c.display}`).join(', ')} }`,
             hex: '',
@@ -1358,6 +1633,7 @@ case 'readVariableRuntime':
           }
           children.push({
             expression: `[${i}]`,
+            evaluateName: `${evaluateName}[${i}]`,
             value,
             display,
             hex: `0x${Array.from(elemRaw).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`,
@@ -1369,6 +1645,7 @@ case 'readVariableRuntime':
 
       return {
         expression: field.name,
+        evaluateName,
         value: children[0]?.value ?? 0,
         display: children.length > 0
           ? `${count} elems [${children.slice(0, 3).map(c => c.display).join(', ')}${children.length > 3 ? ', ...' : ''}]`
@@ -1401,13 +1678,19 @@ case 'readVariableRuntime':
       else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
     }
 
+    const pointerChildren = resolvedKind === 'pointer' && resolved?.typeOffset && value
+      ? this.evaluatePointerChildren(value >>> 0, resolved.typeOffset, evaluateName)
+      : undefined;
+
     return {
       expression: field.name,
+      evaluateName,
       value,
-      display,
-      hex: `0x${value.toString(16).toUpperCase().padStart(fieldSize * 2, '0')}`,
+      display: resolvedKind === 'pointer' ? this.formatAddress(value) : display,
+      hex: `0x${(value >>> 0).toString(16).toUpperCase().padStart(fieldSize * 2, '0')}`,
       address: addr,
-      typeName: resolvedName,
+      typeName: resolvedTypeName,
+      children: pointerChildren,
     };
   }
 
@@ -1435,12 +1718,12 @@ case 'readVariableRuntime':
       if (!halted) return { ok: false, error: 'halt failed' };
       await new Promise<void>(r => setTimeout(r, 50));
     }
-    const ok = this.jlink.writeMemoryU32(address, data);
+    const ok = this.jlink.writeMemoryBytes(address, Uint8Array.from(data.map(b => b & 0xFF)));
     if (wasRunning) {
       this.jlink.run();
     }
     return ok
-      ? { ok: true, data: `Wrote ${data.length} uint32(s)` }
+      ? { ok: true, data: `Wrote ${data.length} byte(s)` }
       : { ok: false, error: 'write failed' };
   }
 

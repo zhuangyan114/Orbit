@@ -101,7 +101,7 @@ export interface DwarfField {
 export interface DwarfTypeInfo {
   name: string;
   byteSize: number;
-  kind: 'struct' | 'typedef' | 'base' | 'pointer' | 'array' | 'enum' | 'unspecified';
+  kind: 'struct' | 'typedef' | 'base' | 'pointer' | 'array' | 'enum' | 'const' | 'volatile' | 'restrict' | 'unspecified';
   fields?: DwarfField[];
   typeOffset?: string;
   arrayCount?: number;
@@ -162,7 +162,7 @@ function resolveType(offset: string, typeDefs: Map<string, DwarfTypeInfo>, visit
   visited.add(offset);
   const info = typeDefs.get(offset);
   if (!info) return null;
-  if (info.kind === 'typedef' && info.typeOffset) {
+  if ((info.kind === 'typedef' || info.kind === 'const' || info.kind === 'volatile' || info.kind === 'restrict') && info.typeOffset) {
     return resolveType(info.typeOffset, typeDefs, visited) || info;
   }
   if (info.kind === 'pointer') return info;
@@ -271,6 +271,15 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
           name: '',
           byteSize: parseInt(die.attrs.DW_AT_byte_size) || 4,
           kind: 'pointer',
+          typeOffset: die.attrs.DW_AT_type,
+        });
+      }
+
+      if (die.tag === 'DW_TAG_const_type' || die.tag === 'DW_TAG_volatile_type' || die.tag === 'DW_TAG_restrict_type') {
+        typeDefs.set(die.offset, {
+          name: '',
+          byteSize: 0,
+          kind: die.tag === 'DW_TAG_const_type' ? 'const' : die.tag === 'DW_TAG_volatile_type' ? 'volatile' : 'restrict',
           typeOffset: die.attrs.DW_AT_type,
         });
       }

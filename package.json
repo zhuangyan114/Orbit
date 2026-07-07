@@ -2,7 +2,7 @@
   "name": "ozone-for-vscode",
   "displayName": "Ozone for VS Code",
   "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
-  "version": "0.3.0",
+  "version": "0.4.5",
   "publisher": "ozone-debug",
   "license": "MIT",
   "repository": {
@@ -31,7 +31,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onView:ozoneTimeline",
-    "onView:ozoneWatch"
+    "onView:ozoneWatch",
+    "onDebugResolve:ozone"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -63,6 +64,10 @@
       {
         "command": "ozone.openSettings",
         "title": "Ozone: Settings"
+      },
+      {
+        "command": "ozone.enableMcuDebugViews",
+        "title": "Ozone: Enable MCU Debug Views Integration"
       }
     ],
     "menus": {
@@ -136,10 +141,25 @@
                 "description": "Target device name",
                 "default": "STM32F407VG"
               },
+              "deviceName": {
+                "type": "string",
+                "description": "Target device name alias used by external MCU debug views",
+                "default": "STM32F407VG"
+              },
               "program": {
                 "type": "string",
                 "description": "Path to ELF/AXF file (烧录文件)",
                 "default": "${workspaceFolder}/build/Debug/frame.elf"
+              },
+              "svdFile": {
+                "type": "string",
+                "description": "Optional CMSIS-SVD file used by Peripheral Viewer",
+                "default": ""
+              },
+              "svdPath": {
+                "type": "string",
+                "description": "Optional CMSIS-SVD file alias used by some Peripheral Viewer versions",
+                "default": ""
               },
               "interface": {
                 "type": "string",
@@ -154,6 +174,11 @@
                 "type": "number",
                 "description": "Interface speed in kHz",
                 "default": 4000
+              },
+              "rtos": {
+                "type": "string",
+                "description": "Optional RTOS name for RTOS Views, for example FreeRTOS",
+                "default": ""
               },
               "rttLogEnabled": {
                 "type": "boolean",
@@ -189,8 +214,28 @@
               },
               "rttStripAnsi": {
                 "type": "boolean",
-                "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console",
+                "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console. The RTT terminal always preserves ANSI colors.",
                 "default": true
+              },
+              "rttLogTarget": {
+                "type": "string",
+                "description": "Where RTT logs are shown",
+                "enum": [
+                  "terminal",
+                  "debugConsole",
+                  "both"
+                ],
+                "default": "terminal"
+              },
+              "pRtLogEnabled": {
+                "type": "boolean",
+                "description": "Decode P-RTLog tokenized RTT frames instead of treating RTT bytes as plain text",
+                "default": false
+              },
+              "pRtLogRoot": {
+                "type": "string",
+                "description": "Path to the P-RTLog toolkit root",
+                "default": "D:\\STM32\\tool\\P-RTLog"
               }
             }
           }
@@ -234,6 +279,16 @@
           "default": "",
           "description": "Default ELF/AXF file path (烧录文件, 留空则自动检测 build/ 目录)"
         },
+        "ozone.defaultSvdFile": {
+          "type": "string",
+          "default": "",
+          "description": "Default CMSIS-SVD file path for Peripheral Viewer"
+        },
+        "ozone.defaultRtos": {
+          "type": "string",
+          "default": "",
+          "description": "Default RTOS name for RTOS Views, for example FreeRTOS"
+        },
         "ozone.rttLogEnabled": {
           "type": "boolean",
           "default": true,
@@ -268,7 +323,27 @@
         "ozone.rttStripAnsi": {
           "type": "boolean",
           "default": true,
-          "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console"
+          "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console. The RTT terminal always preserves ANSI colors."
+        },
+        "ozone.rttLogTarget": {
+          "type": "string",
+          "default": "terminal",
+          "enum": [
+            "terminal",
+            "debugConsole",
+            "both"
+          ],
+          "description": "Where RTT logs are shown"
+        },
+        "ozone.pRtLogEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Decode P-RTLog tokenized RTT frames instead of treating RTT bytes as plain text"
+        },
+        "ozone.pRtLogRoot": {
+          "type": "string",
+          "default": "D:\\STM32\\tool\\P-RTLog",
+          "description": "Path to the P-RTLog toolkit root"
         },
         "ozone.timelineSampleIntervalMs": {
           "type": "number",

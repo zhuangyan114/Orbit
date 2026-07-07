@@ -19,6 +19,9 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (!config.device) {
       config.device = cfg.get<string>('defaultDevice', 'STM32F407VG');
     }
+    if (!config.deviceName) {
+      config.deviceName = config.device;
+    }
     if (!config.interface) {
       config.interface = cfg.get<string>('defaultInterface', 'SWD');
     }
@@ -32,6 +35,15 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
         cfg.update('defaultProgram', program, vscode.ConfigurationTarget.Workspace);
       }
       config.program = program;
+    }
+    if (config.svdFile === undefined) {
+      config.svdFile = cfg.get<string>('defaultSvdFile', '');
+    }
+    if (config.svdPath === undefined) {
+      config.svdPath = config.svdFile || cfg.get<string>('defaultSvdFile', '');
+    }
+    if (config.rtos === undefined) {
+      config.rtos = cfg.get<string>('defaultRtos', '');
     }
     if (config.flashBeforeDebug === undefined) {
       config.flashBeforeDebug = cfg.get<boolean>('flashBeforeDebug', true);
@@ -53,6 +65,15 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     }
     if (config.rttStripAnsi === undefined) {
       config.rttStripAnsi = cfg.get<boolean>('rttStripAnsi', true);
+    }
+    if (config.rttLogTarget === undefined) {
+      config.rttLogTarget = cfg.get<string>('rttLogTarget', 'terminal');
+    }
+    if (config.pRtLogEnabled === undefined) {
+      config.pRtLogEnabled = cfg.get<boolean>('pRtLogEnabled', false);
+    }
+    if (config.pRtLogRoot === undefined) {
+      config.pRtLogRoot = cfg.get<string>('pRtLogRoot', 'D:\\STM32\\tool\\P-RTLog');
     }
 
     return config;

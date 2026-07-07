@@ -111,6 +111,25 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private async readMemory(address: number, size: number) {
+    const session = vscode.debug.activeDebugSession;
+    if (session && session.type === 'ozone') {
+      try {
+        const result = await session.customRequest('readMemory', {
+          memoryReference: `0x${(address >>> 0).toString(16).toUpperCase()}`,
+          count: size,
+        });
+        if (result && result.data) {
+          const bytes = Buffer.from(result.data, 'base64');
+          const data = Array.from(bytes);
+          const ascii = data.map((b: number) => (b >= 0x20 && b <= 0x7E) ? String.fromCharCode(b) : '.').join('');
+          this.view?.webview.postMessage({
+            command: 'memoryData',
+            block: { address, data, ascii, unreadableBytes: result.unreadableBytes ?? 0 },
+          });
+          return;
+        }
+      } catch { }
+    }
     const result = await this.backend.execute({ cmd: 'readMemory', address, size });
     if (result.ok) {
       this.view?.webview.postMessage({ command: 'memoryData', block: result.data });

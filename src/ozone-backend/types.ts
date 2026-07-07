@@ -38,6 +38,7 @@ export interface StackFrame {
 
 export interface WatchValue {
   expression: string;
+  evaluateName?: string;
   value: number;
   display: string;
   hex: string;
@@ -95,6 +96,7 @@ export interface MemoryBlock {
   address: number;
   data: number[];
   ascii: string;
+  unreadableBytes?: number;
 }
 
 export interface DebugContext {

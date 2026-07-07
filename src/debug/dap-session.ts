@@ -1,7 +1,8 @@
 import { EventEmitter } from 'events';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
-import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
+import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
+import { PRtLogDecoder } from './p-rtlog-decoder';
 
 function daLog(_msg: string) {
   // no-op
@@ -36,7 +37,13 @@ export class DapSession extends EventEmitter {
   private rttReadSize = 4096;
   private rttControlBlockAddress: number | undefined;
   private rttStripAnsi = true;
+  private rttLogTarget: 'terminal' | 'debugConsole' | 'both' = 'terminal';
   private rttDecoder = new StringDecoder('utf8');
+  private rttControlCarry = '';
+  private rttLineCarry = '';
+  private pRtLogEnabled = false;
+  private pRtLogRoot = 'D:\\STM32\\tool\\P-RTLog';
+  private pRtLogDecoder = new PRtLogDecoder();
   private watchExpressions: string[] = [];
   private _watchPollCycle = 0;
   private lastHaltReason: 'entry' | 'breakpoint' | 'step' | 'pause' = 'entry';
@@ -61,6 +68,10 @@ export class DapSession extends EventEmitter {
   private dataSamplingNextSendMs = 0;
   private readonly highResEpochMs = Date.now();
   private readonly highResStartNs = process.hrtime.bigint();
+  private variableHandles = new Map<number, WatchValue[]>();
+  private nextVariableHandle = 1000;
+  private runtimeWatchReadInFlight = false;
+  private runtimeWatchCache = new Map<string, WatchValue>();
 
   constructor(backend: OzoneBackend) {
     super();
@@ -96,6 +107,57 @@ export class DapSession extends EventEmitter {
     this.emit('send', { type: 'event', seq: this.seq++, event, body } as DebugProtocolMessage);
   }
 
+  private resetVariableHandles() {
+    this.variableHandles.clear();
+    this.nextVariableHandle = 1000;
+  }
+
+  private allocateVariableHandle(children?: WatchValue[]): number {
+    if (!children || children.length === 0) return 0;
+    const ref = this.nextVariableHandle++;
+    this.variableHandles.set(ref, children);
+    return ref;
+  }
+
+  private formatMemoryReference(address: number): string {
+    return `0x${Math.max(0, address >>> 0).toString(16).toUpperCase()}`;
+  }
+
+  private parseMemoryReference(memoryReference: unknown, offset: unknown = 0): number | null {
+    if (typeof memoryReference !== 'string' && typeof memoryReference !== 'number') return null;
+    const refText = String(memoryReference).trim();
+    const match = refText.match(/0x[0-9a-fA-F]+|\b\d+\b/);
+    if (!match) return null;
+    const base = match[0].toLowerCase().startsWith('0x') ? parseInt(match[0], 16) : parseInt(match[0], 10);
+    if (!Number.isFinite(base)) return null;
+    const off = typeof offset === 'number' && Number.isFinite(offset) ? offset : 0;
+    return (base + off) >>> 0;
+  }
+
+  private memoryReferenceForWatch(value: WatchValue): string | undefined {
+    if (value.typeName?.includes('*') && value.value) {
+      return this.formatMemoryReference(value.value);
+    }
+    if (typeof value.address === 'number') {
+      return this.formatMemoryReference(value.address);
+    }
+    if ((value.expression.startsWith('&') || /^0x[0-9a-fA-F]+$/.test(value.expression)) && Number.isFinite(value.value)) {
+      return this.formatMemoryReference(value.value);
+    }
+    return undefined;
+  }
+
+  private toDapVariable(value: WatchValue) {
+    return {
+      name: value.expression,
+      value: value.error || value.display || value.hex || `${value.value}`,
+      type: value.typeName || undefined,
+      variablesReference: this.allocateVariableHandle(value.children),
+      memoryReference: this.memoryReferenceForWatch(value),
+      evaluateName: value.evaluateName || value.expression,
+    };
+  }
+
   private startPolling() {
     this.stopPolling();
     daLog(`startPolling: started, ${this.watchExpressions.length} watch expressions`);
@@ -108,13 +170,7 @@ export class DapSession extends EventEmitter {
         if (stateResult.ok && stateResult.data === 'halted') {
           daLog('pollLoop: CPU is halted, stopping polling');
           if (this.watchExpressions.length > 0) {
-            const results: any[] = [];
-            for (const expr of this.watchExpressions) {
-              const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
-              daLog(`pollLoop halted read: ${expr} ok=${r.ok} val=${r.ok ? (r.data as any).value : r.error}`);
-              if (r.ok) results.push(r.data);
-              else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
-            }
+            const results = await this.readWatchExpressions(this.watchExpressions, false);
             this.sendWatchUpdate(results);
           }
           this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
@@ -123,18 +179,9 @@ export class DapSession extends EventEmitter {
         }
 
         if (this.watchExpressions.length > 0) {
-          if (this.pollTimer === null) return;
           this._watchPollCycle++;
-          daLog(`pollLoop: reading watches without halt (cycle ${this._watchPollCycle})`);
-          const results: any[] = [];
-          for (const expr of this.watchExpressions) {
-            if (this.pollTimer === null) return;
-            const r = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
-            daLog(`pollLoop read: ${expr} ok=${r.ok} val=${r.ok ? (r.data as any).value : r.error}`);
-            if (r.ok) results.push(r.data);
-            else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
-          }
-          daLog(`pollLoop: sending ${results.length} results`);
+          daLog(`pollLoop: runtime watch read (cycle ${this._watchPollCycle})`);
+          const results = await this.readWatchExpressions(this.watchExpressions, true);
           this.sendWatchUpdate(results);
         } else {
           daLog('pollLoop: no watch expressions, skipping');
@@ -153,6 +200,64 @@ export class DapSession extends EventEmitter {
     this.sendEvent('ozoneWatchData', { results });
   }
 
+  private makeRunningWatchValue(expression: string): WatchValue {
+    return { expression, value: 0, display: '', hex: '', error: 'running' };
+  }
+
+  private makeRunningWatchValues(expressions: string[]): WatchValue[] {
+    return expressions.map(expression => this.makeRunningWatchValue(expression));
+  }
+
+  private async isTargetHalted(): Promise<boolean> {
+    const result = await this.backend.execute({ cmd: 'getTargetState' });
+    return result.ok && result.data === 'halted';
+  }
+
+  private async readWatchExpressions(expressions: string[], forceRuntimeRead: boolean): Promise<WatchValue[]> {
+    if (expressions.length === 0) return [];
+    const halted = await this.isTargetHalted();
+    if (!halted && forceRuntimeRead) {
+      return this.readRuntimeWatchExpressions(expressions);
+    }
+
+    const results: WatchValue[] = [];
+    for (const expr of expressions) {
+      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+      if (result.ok) {
+        const value = result.data as WatchValue;
+        this.runtimeWatchCache.set(expr, value);
+        results.push(value);
+      } else {
+        results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+      }
+    }
+    return results;
+  }
+
+  private async readRuntimeWatchExpressions(expressions: string[]): Promise<WatchValue[]> {
+    if (this.runtimeWatchReadInFlight) {
+      return expressions.map(expr => this.runtimeWatchCache.get(expr) || this.makeRunningWatchValue(expr));
+    }
+
+    this.runtimeWatchReadInFlight = true;
+    try {
+      const results: WatchValue[] = [];
+      for (const expr of expressions) {
+        const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
+        if (result.ok) {
+          const value = result.data as WatchValue;
+          this.runtimeWatchCache.set(expr, value);
+          results.push(value);
+        } else {
+          results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+        }
+      }
+      return results;
+    } finally {
+      this.runtimeWatchReadInFlight = false;
+    }
+  }
+
   private stopPolling() {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
@@ -165,6 +270,10 @@ export class DapSession extends EventEmitter {
     this.stopRttLogPolling();
     this.rttStarted = false;
     this.rttDecoder = new StringDecoder('utf8');
+    this.rttControlCarry = '';
+    this.rttLineCarry = '';
+    this.pRtLogDecoder.resetFrames();
+    this.emitRttTerminalStarted();
 
     const pollLoop = async () => {
       if (this.rttPollTimer === null) return;
@@ -186,11 +295,7 @@ export class DapSession extends EventEmitter {
           if (readResult.ok) {
             const bytes = (readResult.data as any)?.bytes;
             if (Array.isArray(bytes) && bytes.length > 0) {
-              let output = this.rttDecoder.write(Buffer.from(bytes));
-              if (this.rttStripAnsi) output = this.stripAnsi(output);
-              if (output.length > 0) {
-                this.sendEvent('output', { category: 'stdout', output });
-              }
+              this.emitRttBytes(Buffer.from(bytes));
             }
           } else {
             this.rttStarted = false;
@@ -215,16 +320,131 @@ export class DapSession extends EventEmitter {
     }
     const trailing = this.rttDecoder.end();
     if (trailing) {
-      const output = this.rttStripAnsi ? this.stripAnsi(trailing) : trailing;
-      if (output) this.sendEvent('output', { category: 'stdout', output });
+      this.emitRttOutput(trailing);
+    }
+    if (this.pRtLogEnabled) {
+      for (const line of this.pRtLogDecoder.flush()) {
+        this.emitRttOutput(line);
+      }
+    }
+    if (this.rttControlCarry) {
+      this.emitRttText(this.rttControlCarry);
+    }
+    if (this.rttLineCarry) {
+      this.emitRttLine(this.rttLineCarry);
     }
     this.rttDecoder = new StringDecoder('utf8');
+    this.rttControlCarry = '';
+    this.rttLineCarry = '';
     this.rttStarted = false;
     void this.backend.execute({ cmd: 'stopRtt' });
   }
 
   private stripAnsi(text: string): string {
     return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+  }
+
+  private emitRttBytes(bytes: Buffer) {
+    if (this.pRtLogEnabled) {
+      for (const line of this.pRtLogDecoder.feed(bytes)) {
+        this.emitRttOutput(line);
+      }
+      return;
+    }
+
+    this.emitRttOutput(this.rttDecoder.write(bytes));
+  }
+
+  private emitRttOutput(text: string) {
+    text = this.rttControlCarry + text;
+    this.rttControlCarry = this.takeTrailingClearPrefix(text);
+    if (this.rttControlCarry) {
+      text = text.slice(0, -this.rttControlCarry.length);
+    }
+
+    const clearPattern = /\x1B\[2J/g;
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = clearPattern.exec(text)) !== null) {
+      const beforeClear = text.slice(cursor, match.index).replace(/[ \t]+$/g, '');
+      this.emitRttText(beforeClear);
+      this.sendEvent('ozoneClearDebugConsole', {});
+      this.sendRttClearMarker();
+      cursor = match.index + match[0].length;
+    }
+    this.emitRttText(text.slice(cursor));
+  }
+
+  private sendRttClearMarker() {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    this.emitRttTerminalText(`\x1B[2J\x1B[H\x1B[1;36m========== RTT Log_Clear() ${time} ==========\x1B[0m\r\n`);
+    this.emitRttDebugConsoleLine(`\n========== RTT Log_Clear() ${time} ==========\n`, 'stdout');
+  }
+
+  private takeTrailingClearPrefix(text: string): string {
+    const clearSequence = '\x1B[2J';
+    for (let len = clearSequence.length - 1; len > 0; len--) {
+      const suffix = text.slice(-len);
+      if (clearSequence.startsWith(suffix)) return suffix;
+    }
+    return '';
+  }
+
+  private emitRttText(text: string) {
+    if (text.length === 0) return;
+
+    text = this.rttLineCarry + text;
+    this.rttLineCarry = '';
+
+    let cursor = 0;
+    const linePattern = /\r\n|\n|\r/g;
+    let match: RegExpExecArray | null;
+    while ((match = linePattern.exec(text)) !== null) {
+      this.emitRttLine(text.slice(cursor, match.index + match[0].length));
+      cursor = match.index + match[0].length;
+    }
+
+    const rest = text.slice(cursor);
+    if (rest.length > 0) {
+      this.rttLineCarry = rest;
+    }
+  }
+
+  private emitRttLine(text: string) {
+    if (text.length > 0) {
+      this.emitRttTerminalText(text);
+    }
+    const output = this.rttStripAnsi ? this.stripAnsi(text) : text;
+    if (output.length <= 0) return;
+    const category = this.isWarningOrErrorRttLine(text) ? 'stderr' : 'stdout';
+    this.emitRttDebugConsoleLine(output, category);
+  }
+
+  private isWarningOrErrorRttLine(text: string): boolean {
+    if (/\x1B\[1;3[13]m\s*[WE]:/.test(text)) return true;
+    return /^\s*[WE]:/.test(this.stripAnsi(text));
+  }
+
+  private emitRttTerminalText(text: string) {
+    if (this.rttLogTarget === 'terminal' || this.rttLogTarget === 'both') {
+      this.sendEvent('ozoneRttOutput', { text });
+    }
+  }
+
+  private emitRttTerminalStarted() {
+    if (this.rttLogTarget === 'terminal' || this.rttLogTarget === 'both') {
+      this.sendEvent('ozoneRttStarted', {});
+    }
+  }
+
+  private emitRttDebugConsoleLine(output: string, category: 'stdout' | 'stderr') {
+    if (this.rttLogTarget === 'debugConsole' || this.rttLogTarget === 'both') {
+      this.sendEvent('output', { category, output });
+    }
+  }
+
+  private parseRttLogTarget(value: unknown): 'terminal' | 'debugConsole' | 'both' {
+    return value === 'debugConsole' || value === 'both' ? value : 'terminal';
   }
 
   private async handleRequest(msg: DebugProtocolMessage) {
@@ -247,7 +467,8 @@ export class DapSession extends EventEmitter {
             supportTerminateDebuggee: false,
             supportsLogPoints: false,
             supportsDataBreakpoints: false,
-            supportsReadMemoryRequest: false,
+            supportsReadMemoryRequest: true,
+            supportsWriteMemoryRequest: true,
             supportsDisassembleRequest: false,
             supportsCancelRequest: false,
             supportsBreakpointLocationsRequest: false,
@@ -277,6 +498,10 @@ export class DapSession extends EventEmitter {
           });
         case 'variables':
           return this.handleVariables(msg);
+        case 'readMemory':
+          return this.handleReadMemory(msg);
+        case 'writeMemory':
+          return this.handleWriteMemory(msg);
         case 'continue':
           return this.handleContinue(msg);
         case 'next':
@@ -318,7 +543,7 @@ export class DapSession extends EventEmitter {
   private async handleLaunch(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
-      const device = args.device || 'STM32F407VG';
+      const device = args.device || args.deviceName || 'STM32F407VG';
       const interface_ = args.interface || 'SWD';
       const speedKHz = args.speedKHz || 4000;
       const elfPath = args.program || args.elfPath || '';
@@ -329,11 +554,24 @@ export class DapSession extends EventEmitter {
       this.rttReadSize = Math.floor(this.clampNumber(args.rttReadSize, 4096, 64, 65536));
       this.rttControlBlockAddress = this.parseOptionalAddress(args.rttControlBlockAddress);
       this.rttStripAnsi = args.rttStripAnsi !== false;
+      this.rttLogTarget = this.parseRttLogTarget(args.rttLogTarget);
+      this.pRtLogEnabled = args.pRtLogEnabled === true;
+      this.pRtLogRoot = typeof args.pRtLogRoot === 'string' && args.pRtLogRoot.trim()
+        ? args.pRtLogRoot.trim()
+        : 'D:\\STM32\\tool\\P-RTLog';
       this._elfPath = elfPath;
       this._device = device;
       this._interface = interface_;
       this._speedKHz = speedKHz;
       this._flashEnabled = flashEnabled;
+      this.resetVariableHandles();
+      if (this.pRtLogEnabled) {
+        const tokenLoad = this.pRtLogDecoder.loadTokenDatabase(elfPath);
+        const output = tokenLoad.ok
+          ? `P-RTLog enabled (${tokenLoad.count} token strings loaded from ${elfPath}).\n`
+          : `P-RTLog enabled, but token database was not loaded: ${tokenLoad.error}. Root: ${this.pRtLogRoot}\n`;
+        this.sendEvent('output', { category: tokenLoad.ok ? 'console' : 'stderr', output });
+      }
 
       if (elfPath && this._flashEnabled) {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
@@ -369,6 +607,9 @@ export class DapSession extends EventEmitter {
         await new Promise<void>(r => setTimeout(r, 200));
       }
       await this.backend.execute({ cmd: 'halt' });
+      // Wait for CPU to actually halt before sending stopped event
+      await new Promise<void>(r => setTimeout(r, 200));
+      this.lastHaltReason = 'entry';
       if (this.rttLogEnabled) {
         this.startRttLogPolling();
       } else {
@@ -431,6 +672,8 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleConfigurationDone(msg: DebugProtocolMessage) {
+    // Wait for CPU to be halted before sending stopped event
+    await new Promise<void>(r => setTimeout(r, 100));
     this.lastHaltReason = 'entry';
     this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
     this.sendResponse(msg);
@@ -476,18 +719,74 @@ export class DapSession extends EventEmitter {
         const regResult = await this.backend.execute({ cmd: 'getRegisters' });
         if (regResult.ok) {
           const regs = (regResult.data as any[]).map((r: any) => ({
-            name: r.name, value: r.hex, type: 'uint32', variablesReference: 0,
+            name: r.name,
+            value: r.hex,
+            type: 'uint32',
+            variablesReference: 0,
+            memoryReference: this.formatMemoryReference(r.value),
           }));
           this.sendResponse(msg, { variables: regs });
         } else {
           this.sendResponse(msg, { variables: [] });
         }
+      } else if (this.variableHandles.has(ref)) {
+        const children = this.variableHandles.get(ref) || [];
+        this.sendResponse(msg, { variables: children.map(value => this.toDapVariable(value)) });
       } else {
         this.sendResponse(msg, { variables: [] });
       }
     } catch (err: any) {
       this.sendResponse(msg, { variables: [] });
     }
+  }
+
+  private async handleReadMemory(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    const address = this.parseMemoryReference(args.memoryReference, args.offset);
+    const count = Math.max(0, Math.min(Number(args.count) || 0, 1024 * 1024));
+    if (address === null || count <= 0) {
+      this.sendResponse(msg, undefined, false, 'Invalid memoryReference or count');
+      return;
+    }
+
+    const result = await this.backend.execute({ cmd: 'readMemory', address, size: count });
+    if (!result.ok) {
+      this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, result.error);
+      return;
+    }
+
+    const block = result.data as MemoryBlock;
+    const bytes = Uint8Array.from(block.data);
+    this.sendResponse(msg, {
+      address: this.formatMemoryReference(address),
+      data: Buffer.from(bytes).toString('base64'),
+      unreadableBytes: block.unreadableBytes ?? Math.max(0, count - bytes.length),
+    });
+  }
+
+  private async handleWriteMemory(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    const address = this.parseMemoryReference(args.memoryReference, args.offset);
+    if (address === null || typeof args.data !== 'string') {
+      this.sendResponse(msg, undefined, false, 'Invalid memoryReference or data');
+      return;
+    }
+
+    let data: number[];
+    try {
+      data = Array.from(Buffer.from(args.data, 'base64'));
+    } catch {
+      this.sendResponse(msg, undefined, false, 'Invalid base64 memory payload');
+      return;
+    }
+
+    const result = await this.backend.execute({ cmd: 'writeMemory', address, data });
+    if (!result.ok) {
+      this.sendResponse(msg, { offset: 0, bytesWritten: 0 }, false, result.error);
+      return;
+    }
+
+    this.sendResponse(msg, { offset: 0, bytesWritten: data.length });
   }
 
   private async handleContinue(msg: DebugProtocolMessage) {
@@ -515,6 +814,7 @@ export class DapSession extends EventEmitter {
       const runResult = await this.backend.execute({ cmd: 'run' });
       daLog(`handleContinue: run result ok=${runResult.ok}`);
       this.sendResponse(msg, { allThreadsContinued: true });
+      this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
       this.lastHaltReason = 'breakpoint';
       if (!runResult.ok) {
         daLog('handleContinue: run failed, sending stopped');
@@ -658,6 +958,7 @@ export class DapSession extends EventEmitter {
       }
       await this.backend.execute({ cmd: 'reset' });
       await this.backend.execute({ cmd: 'halt' });
+      await new Promise<void>(r => setTimeout(r, 200));
       await this.backend.execute({ cmd: 'clearAllBreakpoints' });
       this.breakpoints.clear();
 
@@ -682,11 +983,14 @@ export class DapSession extends EventEmitter {
     const args = msg.arguments || {};
     const expr = args.expression;
     const context = args.context;
-    daLog(`handleEvaluate: expr="${expr}" context=${context}`);
+    const frameId = args.frameId;
+    daLog(`handleEvaluate: expr="${expr}" context=${context} frameId=${frameId}`);
     if (!expr) {
       this.sendResponse(msg, { result: '', variablesReference: 0 });
       return;
     }
+
+    const isNewRuntimeWatch = context === 'watch' && !this.watchExpressions.includes(expr) && !(await this.isTargetHalted());
 
     if (context === 'watch' && !this.watchExpressions.includes(expr)) {
       this.watchExpressions.push(expr);
@@ -694,11 +998,30 @@ export class DapSession extends EventEmitter {
       const session = this.listeners('send').length > 0 ? this : null;
     }
 
-    const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+    if (isNewRuntimeWatch) {
+      daLog(`handleEvaluate: target running, deferring first watch read for "${expr}"`);
+      const wv = this.runtimeWatchCache.get(expr) || this.makeRunningWatchValue(expr);
+      this.sendResponse(msg, {
+        result: wv.display || wv.hex || wv.error || `${wv.value}`,
+        type: wv.typeName || undefined,
+        variablesReference: 0,
+        memoryReference: this.memoryReferenceForWatch(wv),
+      });
+      return;
+    }
+
+    // Existing watch entries and RTOS hover reads are allowed to sample while the CPU is running.
+    const force = context === 'watch' || context === 'hover';
+    const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force });
     if (result.ok) {
       const wv = result.data as WatchValue;
       daLog(`handleEvaluate: result="${wv.display}"`);
-      this.sendResponse(msg, { result: wv.display, variablesReference: 0 });
+      this.sendResponse(msg, {
+        result: wv.display || wv.hex || `${wv.value}`,
+        type: wv.typeName || undefined,
+        variablesReference: this.allocateVariableHandle(wv.children),
+        memoryReference: this.memoryReferenceForWatch(wv),
+      });
     } else {
       daLog(`handleEvaluate: error="${result.error}"`);
       this.sendResponse(msg, { result: result.error, variablesReference: 0 });
@@ -709,24 +1032,11 @@ export class DapSession extends EventEmitter {
     const args = msg.arguments || {};
     const expressions: string[] = args.expressions || [];
     daLog(`handleWatchEvaluate: ${expressions.length} expressions`);
-    const wasHalted = await this.backend.execute({ cmd: 'getTargetState' });
-    const needResume = wasHalted.ok && wasHalted.data !== 'halted';
-    if (needResume) {
-      await this.backend.execute({ cmd: 'halt' });
-      await new Promise<void>(r => setTimeout(r, 100));
+    if (!(await this.isTargetHalted())) {
+      this.sendResponse(msg, { results: await this.readRuntimeWatchExpressions(expressions) });
+      return;
     }
-    const results: any[] = [];
-    for (const expr of expressions) {
-      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
-      if (result.ok) {
-        results.push(result.data);
-      } else {
-        results.push({ expression: expr, value: 0, display: '', hex: '', error: result.error });
-      }
-    }
-    if (needResume) {
-      await this.backend.execute({ cmd: 'run' });
-    }
+    const results = await this.readWatchExpressions(expressions, false);
     this.sendResponse(msg, { results });
   }
 
@@ -734,15 +1044,7 @@ export class DapSession extends EventEmitter {
     const args = msg.arguments || {};
     const expressions: string[] = args.expressions || [];
     daLog(`handleDataSample: ${expressions.length} expressions`);
-    const results: any[] = [];
-    for (const expr of expressions) {
-      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
-      if (result.ok) {
-        results.push(result.data);
-      } else {
-        results.push({ expression: expr, value: 0, display: '', hex: '', error: result.error });
-      }
-    }
+    const results = await this.readWatchExpressions(expressions, true);
     this.sendResponse(msg, { results });
   }
 

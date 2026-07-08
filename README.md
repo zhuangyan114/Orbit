@@ -82,7 +82,7 @@ P-RTLog 项目地址：[https://github.com/moment-NEW/P-RTLog](https://github.co
 - SEGGER RTT 文本日志读取。
 - P-RTLog tokenized RTT 日志解码。
 - MemoryView / Peripheral Viewer 可通过标准 DAP memory request 读取目标内存。(暂时无法使用)
-~~ - RTOS Views 可通过标准 DAP evaluate/variables request 展开 RTOS 对象。 ~~
+- RTOS Views 可通过标准 DAP evaluate/variables request 展开 RTOS 对象。
 - 符号与 DWARF 解析使用 `arm-none-eabi-nm` 和 `arm-none-eabi-objdump`。
 - 本地插件 API 通过 `127.0.0.1` HTTP RPC 暴露目标状态、表达式读写、波形记录和实验流程。
 - MCP server 可让 Codex、Claude Desktop 等 MCP 客户端读取和控制当前 Ozone 调试会话。

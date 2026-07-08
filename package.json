@@ -289,6 +289,11 @@
           "default": "",
           "description": "Default RTOS name for RTOS Views, for example FreeRTOS"
         },
+        "ozone.rtosViewsAutoRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically focus and refresh MCU Debug RTOS Views after the first stack trace. Disabled by default because it adds debug-session overhead."
+        },
         "ozone.rttLogEnabled": {
           "type": "boolean",
           "default": true,
@@ -344,6 +349,13 @@
           "type": "string",
           "default": "D:\\STM32\\tool\\P-RTLog",
           "description": "Path to the P-RTLog toolkit root"
+        },
+        "ozone.watchPollIntervalMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "Watch polling interval in milliseconds when target is halted. When running, polling is automatically slowed. Default 500ms."
         },
         "ozone.timelineSampleIntervalMs": {
           "type": "number",

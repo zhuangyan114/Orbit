@@ -1,0 +1,8 @@
+{
+    "memory-view.trackDebuggers": [
+        "ozone"
+    ],
+    "mcu-debug.rtos-views.trackDebuggers": [
+        "ozone"
+    ]
+}

@@ -2,9 +2,21 @@
 
 Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展。扩展通过 SEGGER J-Link DLL 直接访问目标板，提供 Debug Adapter Protocol 调试、Watch 变量、实时 Timeline 采样、SEGGER RTT 日志、P-RTLog tokenized RTT 日志解码、本地插件 API 和 MCP 工具集成。
 
-当前版本：`0.4.5`
+当前版本：`0.4.6`
 
 ## 版本更新日志
+
+### 0.4.6
+
+- 适配 mcu-debug.rtos-views v0.0.16 FreeRTOS 任务检测。
+- 修复 RTOS Views 检测 FreeRTOS 时的堆栈溢出问题：限制指针深度遍历（`MAX_POINTER_DEPTH = 5`），防止循环链表（如 `pxReadyTasksLists`）无限递归。
+- 修复 RTOS Views 任务名乱码问题：`resolveAddressExpression` 优先返回字符数组的 `address` 而非 `value`，确保 `pcTaskName` 正确寻址。
+- 新增 Ozone Tracker 检测到 First Stack Trace 后自动延迟刷新 RTOS Views，确保 FreeRTOS 检测窗口不丢失。
+- 固件侧需在 `FreeRTOSConfig.h` 中启用以下宏以显示完整信息：
+  - `configUSE_TRACE_FACILITY` → 显示 Thread ID（uxTCBNumber）
+  - `configRECORD_STACK_HIGH_ADDRESS` → 显示 Stack End / Size / Used
+  - `configGENERATE_RUN_TIME_STATS` → 显示 Runtime（%）
+- 打包产物更新为 `ozone-for-vscode-0.4.6.vsix`。
 
 ### 0.4.5
 
@@ -20,7 +32,7 @@ Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展�
   - launch 配置中的 `pRtLogRoot`
 - 保留普通 SEGGER RTT 文本日志路径，默认不启用 P-RTLog 解码，避免影响现有项目。
 - 改进 RTT 输出目标控制，支持 `terminal`、`debugConsole`、`both`。
-- 打包产物更新为 `ozone-for-vscode-0.4.5.vsix`。
+- 打包产物更新为 `ozone-for-vscode-0.4.6.vsix`。
 
 P-RTLog 项目地址：[https://github.com/moment-NEW/P-RTLog](https://github.com/moment-NEW/P-RTLog)
 
@@ -80,7 +92,7 @@ P-RTLog 项目地址：[https://github.com/moment-NEW/P-RTLog](https://github.co
 生成的扩展包为：
 
 ```powershell
-ozone-for-vscode-0.4.5.vsix
+ozone-for-vscode-0.4.6.vsix
 ```
 
 在 VS Code 中安装：
@@ -88,12 +100,12 @@ ozone-for-vscode-0.4.5.vsix
 1. 打开扩展面板。
 2. 点击右上角 `...`。
 3. 选择 `Install from VSIX...`。
-4. 选择 `ozone-for-vscode-0.4.5.vsix`。
+4. 选择 `ozone-for-vscode-0.4.6.vsix`。
 
 也可以使用命令行安装：
 
 ```powershell
-code --install-extension .\ozone-for-vscode-0.4.5.vsix
+code --install-extension .\ozone-for-vscode-0.4.6.vsix
 ```
 
 ## 快速开始
@@ -215,21 +227,64 @@ RTOS Views 需要配置 RTOS 类型：
 }
 ```
 
-也可以直接写在 `launch.json` 中：
+### FreeRTOS 适配说明
+
+本扩展已适配 mcu-debug.rtos-views v0.0.16 的 FreeRTOS 检测协议。RTOS Views 自动读取以下 FreeRTOS 内核变量：
+
+- `uxCurrentNumberOfTasks` — 任务总数
+- `pxReadyTasksLists` / `xDelayedTaskList1` / `xDelayedTaskList2` / `xSuspendedTaskList` — 各状态任务链表
+- 每个 `TCB_t` 中的 `pcTaskName`、`uxTCBNumber`（需启用 `configUSE_TRACE_FACILITY`）、`pxEndOfStack`（需启用 `configRECORD_STACK_HIGH_ADDRESS`）、`ulRunTimeCounter`（需启用 `configGENERATE_RUN_TIME_STATS`）
+
+#### 固件配置要求
+
+在工程的 `FreeRTOSConfig.h` 中 **USER CODE BEGIN Defines** 区域添加以下宏：
+
+```c
+/* RTOS Views: 显示 Thread ID（uxTCBNumber） */
+#define configUSE_TRACE_FACILITY              1
+
+/* RTOS Views: 显示 Stack End / Size / Used */
+#define configRECORD_STACK_HIGH_ADDRESS       1
+
+/* RTOS Views: 显示 Runtime（%），使用 Cortex-M DWT 周期计数器 */
+#define configGENERATE_RUN_TIME_STATS         1
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()  (CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk, DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk)
+#define portGET_RUN_TIME_COUNTER_VALUE()           (DWT->CYCCNT)
+```
+
+> **注意：** 修改后需要重新编译固件并烧录，RTOS Views 才能读取到完整的任务信息。
+
+#### VS Code 配置
+
+1. 确保在 `.vscode/settings.json` 中有以下配置：
+
+```json
+{
+  "ozone.defaultRtos": "FreeRTOS"
+}
+```
+
+2. 或者在 `launch.json` 中为每个调试配置指定：
 
 ```json
 {
   "type": "ozone",
   "request": "launch",
   "name": "Ozone Debug",
-  "program": "${workspaceFolder}/build/Debug/frame.elf",
-  "device": "STM32F407VG",
-  "deviceName": "STM32F407VG",
-  "svdFile": "${workspaceFolder}/STM32F407.svd",
-  "svdPath": "${workspaceFolder}/STM32F407.svd",
   "rtos": "FreeRTOS"
 }
 ```
+
+3. 在命令面板执行 `Ozone: Enable MCU Debug Views Integration`，确保 RTOS Views 跟踪 `ozone` 类型的调试会话。
+
+#### 启动调试
+
+F5 启动调试后，等待程序运行到创建 FreeRTOS 任务之后（通常在 `vTaskStartScheduler()` 之后），然后：
+
+1. 打开 RTOS Views 面板（在 VS Code 活动栏的 MCU 图标下）。
+2. 如果面板显示 "FreeRTOS detected with N threads"，说明检测成功。
+3. 展开单个任务可查看：Task Name、State、Priority、Stack（Size / Used）、Thread ID、Runtime。
+4. 如果显示 "No RTOS detected"，可以手动执行命令 `mcu-debug.rtos-views.refresh` 刷新。
 
 ## 配置项
 
@@ -318,7 +373,7 @@ npm run typecheck
 打包 VSIX：
 
 ```powershell
-npx @vscode/vsce package --out ozone-for-vscode-0.4.5.vsix
+npx @vscode/vsce package --out ozone-for-vscode-0.4.6.vsix
 ```
 
 运行 MCP server：

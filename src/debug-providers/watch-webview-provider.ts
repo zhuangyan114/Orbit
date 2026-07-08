@@ -8,6 +8,10 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   private _onExpressionsChanged: ((exprs: string[]) => void) | null = null;
   onSendToTimeline: ((exprs: string[]) => void) | null = null;
 
+  get isVisible(): boolean {
+    return this.view?.visible ?? false;
+  }
+
   constructor(
     private context: vscode.ExtensionContext,
     private backend: OzoneBackend,

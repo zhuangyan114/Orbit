@@ -4,9 +4,13 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 
-function daLog(_msg: string) {
-  // no-op
+let daLog_Enabled = false;
+function daLog(msg: string) {
+  if (daLog_Enabled) {
+    process.stderr.write('[DapSession] ' + msg + '\n');
+  }
 }
+function enableDaLog() { daLog_Enabled = true; }
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -37,6 +41,7 @@ export class DapSession extends EventEmitter {
   private rttReadSize = 4096;
   private rttControlBlockAddress: number | undefined;
   private rttStripAnsi = true;
+  private _rtos = '';
   private rttLogTarget: 'terminal' | 'debugConsole' | 'both' = 'terminal';
   private rttDecoder = new StringDecoder('utf8');
   private rttControlCarry = '';
@@ -47,6 +52,11 @@ export class DapSession extends EventEmitter {
   private watchExpressions: string[] = [];
   private _watchPollCycle = 0;
   private lastHaltReason: 'entry' | 'breakpoint' | 'step' | 'pause' = 'entry';
+  private targetRunning = false;
+  private controlInProgress = false;
+  private readCancelEpoch = 0;
+  private targetReadInProgress = false;
+  private lowPriorityReadBlockedUntil = 0;
 
   private breakpoints = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
@@ -72,6 +82,8 @@ export class DapSession extends EventEmitter {
   private nextVariableHandle = 1000;
   private runtimeWatchReadInFlight = false;
   private runtimeWatchCache = new Map<string, WatchValue>();
+  private runtimeWatchCacheTime = new Map<string, number>();
+  private readonly runtimeEvaluateCacheMs = 250;
 
   constructor(backend: OzoneBackend) {
     super();
@@ -88,6 +100,84 @@ export class DapSession extends EventEmitter {
     } finally {
       resolve!();
     }
+  }
+
+  private beginControl() {
+    this.controlInProgress = true;
+    this.readCancelEpoch++;
+  }
+
+  private endControl() {
+    this.controlInProgress = false;
+  }
+
+  private shouldDeferTargetRead(): boolean {
+    return this.controlInProgress;
+  }
+
+  private beginTargetRead(priority: 'high' | 'low' = 'low'): boolean {
+    if (this.shouldDeferTargetRead() || this.targetReadInProgress) return false;
+    if (priority === 'low' && Date.now() < this.lowPriorityReadBlockedUntil) return false;
+    this.targetReadInProgress = true;
+    return true;
+  }
+
+  private async beginTargetReadWhenAvailable(priority: 'high' | 'low' = 'low', timeoutMs = 0): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.beginTargetRead(priority)) {
+      if (this.controlInProgress || Date.now() >= deadline) return false;
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+    }
+    return true;
+  }
+
+  private endTargetRead() {
+    this.targetReadInProgress = false;
+  }
+
+  private cachedOrRunningWatchValue(expression: string): WatchValue {
+    return this.runtimeWatchCache.get(expression) || this.makeRunningWatchValue(expression);
+  }
+
+  private sendEvaluateValue(msg: DebugProtocolMessage, value: WatchValue, allowChildren: boolean) {
+    this.sendResponse(msg, {
+      result: value.display || value.hex || value.error || `${value.value}`,
+      type: value.typeName || undefined,
+      variablesReference: allowChildren ? this.allocateVariableHandle(value.children) : 0,
+      memoryReference: this.memoryReferenceForWatch(value),
+    });
+  }
+
+  private markStoppedForUi() {
+    this.targetRunning = false;
+    this.readCancelEpoch++;
+    this.lowPriorityReadBlockedUntil = Date.now() + 150;
+  }
+
+  private isRtosEvaluateExpression(expression: string): boolean {
+    return expression === 'uxCurrentNumberOfTasks'
+      || expression === 'pxCurrentTCB'
+      || expression === 'pxCurrentTCBs'
+      || expression === 'pxReadyTasksLists'
+      || expression === 'ulTotalRunTime'
+      || expression === 'uxTopReadyPriority'
+      || expression.includes('xDelayed')
+      || expression.includes('xPending')
+      || expression.includes('xSuspended')
+      || expression.includes('xTasksWaitingTermination')
+      || expression.includes('xQueueRegistry')
+      || expression.includes('xTimerQueue')
+      || expression.includes('pxCurrentTCBs')
+      || expression.includes('ulTotalRunTime')
+      || expression.includes('TCB_t')
+      || expression.includes('tskTaskControlBlock')
+      || expression.includes('Queue_t')
+      || expression.includes('List_t')
+      || expression.includes('ListItem_t')
+      || expression.includes('ulRunTimeCounter')
+      || expression.includes('pcTaskName')
+      || expression.includes('pxTopOfStack')
+      || expression.includes('pxStack');
   }
 
   handleMessage(message: DebugProtocolMessage): void {
@@ -169,23 +259,20 @@ export class DapSession extends EventEmitter {
         daLog(`pollLoop: state=${stateResult.ok ? stateResult.data : 'error'}`);
         if (stateResult.ok && stateResult.data === 'halted') {
           daLog('pollLoop: CPU is halted, stopping polling');
-          if (this.watchExpressions.length > 0) {
-            const results = await this.readWatchExpressions(this.watchExpressions, false);
-            this.sendWatchUpdate(results);
-          }
+          this.markStoppedForUi();
           this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
           this.stopPolling();
+          if (this.watchExpressions.length > 0) {
+            setTimeout(() => {
+              void this.readWatchExpressions(this.watchExpressions, false)
+                .then(results => this.sendWatchUpdate(results))
+                .catch(err => daLog(`pollLoop: deferred watch read error ${err}`));
+            }, 150);
+          }
           return;
         }
 
-        if (this.watchExpressions.length > 0) {
-          this._watchPollCycle++;
-          daLog(`pollLoop: runtime watch read (cycle ${this._watchPollCycle})`);
-          const results = await this.readWatchExpressions(this.watchExpressions, true);
-          this.sendWatchUpdate(results);
-        } else {
-          daLog('pollLoop: no watch expressions, skipping');
-        }
+        daLog('pollLoop: target running');
       } catch (err) {
         daLog(`startPolling: error ${err}`);
       }
@@ -208,6 +295,18 @@ export class DapSession extends EventEmitter {
     return expressions.map(expression => this.makeRunningWatchValue(expression));
   }
 
+  private cacheRuntimeWatchValue(expression: string, value: WatchValue) {
+    this.runtimeWatchCache.set(expression, value);
+    this.runtimeWatchCacheTime.set(expression, Date.now());
+  }
+
+  private getFreshRuntimeWatchValue(expression: string, maxAgeMs = this.runtimeEvaluateCacheMs): WatchValue | undefined {
+    const cached = this.runtimeWatchCache.get(expression);
+    const timestamp = this.runtimeWatchCacheTime.get(expression);
+    if (!cached || timestamp === undefined || Date.now() - timestamp > maxAgeMs) return undefined;
+    return cached;
+  }
+
   private async isTargetHalted(): Promise<boolean> {
     const result = await this.backend.execute({ cmd: 'getTargetState' });
     return result.ok && result.data === 'halted';
@@ -215,38 +314,64 @@ export class DapSession extends EventEmitter {
 
   private async readWatchExpressions(expressions: string[], forceRuntimeRead: boolean): Promise<WatchValue[]> {
     if (expressions.length === 0) return [];
-    const halted = await this.isTargetHalted();
-    if (!halted && forceRuntimeRead) {
-      return this.readRuntimeWatchExpressions(expressions);
+    const epoch = this.readCancelEpoch;
+    if (!this.beginTargetRead()) {
+      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
     }
-
-    const results: WatchValue[] = [];
-    for (const expr of expressions) {
-      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
-      if (result.ok) {
-        const value = result.data as WatchValue;
-        this.runtimeWatchCache.set(expr, value);
-        results.push(value);
-      } else {
-        results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+    try {
+      const halted = await this.isTargetHalted();
+      if (!halted && forceRuntimeRead) {
+        return await this.readRuntimeWatchExpressions(expressions);
       }
+      if (!halted) {
+        return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
+      }
+      if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+        return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
+      }
+
+      const results: WatchValue[] = [];
+      for (const expr of expressions) {
+        if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+          results.push(this.cachedOrRunningWatchValue(expr));
+          continue;
+        }
+        const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
+        if (result.ok) {
+          const value = result.data as WatchValue;
+          this.cacheRuntimeWatchValue(expr, value);
+          results.push(value);
+        } else {
+          results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+        }
+      }
+      return results;
+    } finally {
+      this.endTargetRead();
     }
-    return results;
   }
 
   private async readRuntimeWatchExpressions(expressions: string[]): Promise<WatchValue[]> {
+    if (this.controlInProgress) {
+      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
+    }
     if (this.runtimeWatchReadInFlight) {
-      return expressions.map(expr => this.runtimeWatchCache.get(expr) || this.makeRunningWatchValue(expr));
+      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
     }
 
     this.runtimeWatchReadInFlight = true;
     try {
       const results: WatchValue[] = [];
+      const epoch = this.readCancelEpoch;
       for (const expr of expressions) {
+        if (epoch !== this.readCancelEpoch || this.controlInProgress) {
+          results.push(this.cachedOrRunningWatchValue(expr));
+          continue;
+        }
         const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
         if (result.ok) {
           const value = result.data as WatchValue;
-          this.runtimeWatchCache.set(expr, value);
+          this.cacheRuntimeWatchValue(expr, value);
           results.push(value);
         } else {
           results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
@@ -474,6 +599,8 @@ export class DapSession extends EventEmitter {
             supportsBreakpointLocationsRequest: false,
             supportsSteppingGranularity: false,
             supportsInstructionBreakpoints: false,
+            supportsRTOS: true,
+            rtosName: this._rtos || '',
           });
         case 'launch':
           return this.handleLaunch(msg);
@@ -486,7 +613,12 @@ export class DapSession extends EventEmitter {
         case 'configurationDone':
           return this.handleConfigurationDone(msg);
         case 'threads':
-          return this.sendResponse(msg, { threads: [{ id: 1, name: 'Cortex-M4' }] });
+          return this.sendResponse(msg, {
+            threads: [{
+              id: 1,
+              name: this._rtos ? `${this._device} (${this._rtos})` : this._device || 'Cortex-M4',
+            }]
+          });
         case 'stackTrace':
           return this.handleStackTrace(msg);
         case 'scopes':
@@ -532,6 +664,12 @@ export class DapSession extends EventEmitter {
           return this.handleSetWatchValue(msg);
         case 'getTargetState':
           return this.handleGetTargetState(msg);
+        case 'rtosInfo':
+          return this.sendResponse(msg, {
+            rtos: this._rtos,
+            device: this._device,
+            detected: false,
+          });
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
       }
@@ -546,6 +684,7 @@ export class DapSession extends EventEmitter {
       const device = args.device || args.deviceName || 'STM32F407VG';
       const interface_ = args.interface || 'SWD';
       const speedKHz = args.speedKHz || 4000;
+      this._rtos = args.rtos || args.defaultRtos || '';
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = args.flashBeforeDebug !== false;
       this.rttLogEnabled = args.rttLogEnabled !== false;
@@ -564,6 +703,7 @@ export class DapSession extends EventEmitter {
       this._interface = interface_;
       this._speedKHz = speedKHz;
       this._flashEnabled = flashEnabled;
+      console.log(`[Ozone] Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
       this.resetVariableHandles();
       if (this.pRtLogEnabled) {
         const tokenLoad = this.pRtLogDecoder.loadTokenDatabase(elfPath);
@@ -598,7 +738,12 @@ export class DapSession extends EventEmitter {
       }
 
       if (elfPath) {
-        await this.backend.execute({ cmd: 'loadSymbols', elfPath });
+        const loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
+        if (loadResult.ok) {
+          daLog(`Symbol loading: ${JSON.stringify(loadResult.data)}`);
+        } else {
+          daLog(`Symbol loading failed: ${loadResult.error}`);
+        }
       }
 
       if (elfPath && this._flashEnabled) {
@@ -609,6 +754,7 @@ export class DapSession extends EventEmitter {
       await this.backend.execute({ cmd: 'halt' });
       // Wait for CPU to actually halt before sending stopped event
       await new Promise<void>(r => setTimeout(r, 200));
+      this.markStoppedForUi();
       this.lastHaltReason = 'entry';
       if (this.rttLogEnabled) {
         this.startRttLogPolling();
@@ -624,17 +770,24 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleDisconnect(msg: DebugProtocolMessage) {
+    this.beginControl();
     this.stopRttLogPolling();
     this.stopPolling();
-    for (const [key, bpIndex] of this.breakpoints) {
-      await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
+    try {
+      this.targetRunning = false;
+      for (const [key, bpIndex] of this.breakpoints) {
+        await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
+      }
+      this.breakpoints.clear();
+      await this.backend.execute({ cmd: 'disconnect' });
+      this.sendResponse(msg);
+    } finally {
+      this.endControl();
     }
-    this.breakpoints.clear();
-    await this.backend.execute({ cmd: 'disconnect' });
-    this.sendResponse(msg);
   }
 
   private async handleSetBreakpoints(msg: DebugProtocolMessage) {
+    this.beginControl();
     try {
       const args = msg.arguments || {};
       const source = args.source || {};
@@ -668,6 +821,8 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, { breakpoints: results });
     } catch (err: any) {
       this.sendResponse(msg, { breakpoints: [] });
+    } finally {
+      this.endControl();
     }
   }
 
@@ -675,27 +830,40 @@ export class DapSession extends EventEmitter {
     // Wait for CPU to be halted before sending stopped event
     await new Promise<void>(r => setTimeout(r, 100));
     this.lastHaltReason = 'entry';
+    this.markStoppedForUi();
     this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
     this.sendResponse(msg);
   }
 
   private async handleStackTrace(msg: DebugProtocolMessage) {
     try {
-      const result = await this.backend.execute({ cmd: 'getCallStack' });
-      if (!result.ok) {
+      if (!(await this.beginTargetReadWhenAvailable('high', 700))) {
         this.sendResponse(msg, { stackFrames: [] });
         return;
       }
-      const frames = result.data as StackFrame[];
-      const stackFrames = frames.map((f) => ({
-        id: f.id,
-        name: f.function,
-        source: f.file ? { path: f.file } : undefined,
-        line: f.line > 0 ? f.line : 0,
-        column: 0,
-      }));
-      this.sendResponse(msg, { stackFrames });
+      try {
+        daLog('handleStackTrace called');
+        const result = await this.backend.execute({ cmd: 'getCallStack' });
+        if (!result.ok) {
+          daLog(`handleStackTrace failed: ${result.error}`);
+          this.sendResponse(msg, { stackFrames: [] });
+          return;
+        }
+        const frames = result.data as StackFrame[];
+        daLog(`handleStackTrace: ${frames.length} frames`);
+        const stackFrames = frames.map((f) => ({
+          id: f.id,
+          name: f.function,
+          source: f.file ? { path: f.file } : undefined,
+          line: f.line > 0 ? f.line : 0,
+          column: 0,
+        }));
+        this.sendResponse(msg, { stackFrames });
+      } finally {
+        this.endTargetRead();
+      }
     } catch (err: any) {
+      daLog(`handleStackTrace error: ${err.message}`);
       this.sendResponse(msg, { stackFrames: [] });
     }
   }
@@ -704,30 +872,50 @@ export class DapSession extends EventEmitter {
     try {
       const args = msg.arguments || {};
       const ref = args.variablesReference;
+      if (this.shouldDeferTargetRead()) {
+        this.sendResponse(msg, { variables: [] });
+        return;
+      }
 
       if (ref === 1) {
-        const result = await this.backend.execute({ cmd: 'getLocals' });
-        if (result.ok) {
-          const vars = (result.data as Variable[]).map((v) => ({
-            name: v.name, value: v.value, type: v.type, variablesReference: 0,
-          }));
-          this.sendResponse(msg, { variables: vars });
-        } else {
+        if (!this.beginTargetRead('high')) {
           this.sendResponse(msg, { variables: [] });
+          return;
+        }
+        try {
+          const result = await this.backend.execute({ cmd: 'getLocals' });
+          if (result.ok) {
+            const vars = (result.data as Variable[]).map((v) => ({
+              name: v.name, value: v.value, type: v.type, variablesReference: 0,
+            }));
+            this.sendResponse(msg, { variables: vars });
+          } else {
+            this.sendResponse(msg, { variables: [] });
+          }
+        } finally {
+          this.endTargetRead();
         }
       } else if (ref === 2) {
-        const regResult = await this.backend.execute({ cmd: 'getRegisters' });
-        if (regResult.ok) {
-          const regs = (regResult.data as any[]).map((r: any) => ({
-            name: r.name,
-            value: r.hex,
-            type: 'uint32',
-            variablesReference: 0,
-            memoryReference: this.formatMemoryReference(r.value),
-          }));
-          this.sendResponse(msg, { variables: regs });
-        } else {
+        if (!this.beginTargetRead('high')) {
           this.sendResponse(msg, { variables: [] });
+          return;
+        }
+        try {
+          const regResult = await this.backend.execute({ cmd: 'getRegisters' });
+          if (regResult.ok) {
+            const regs = (regResult.data as any[]).map((r: any) => ({
+              name: r.name,
+              value: r.hex,
+              type: 'uint32',
+              variablesReference: 0,
+              memoryReference: this.formatMemoryReference(r.value),
+            }));
+            this.sendResponse(msg, { variables: regs });
+          } else {
+            this.sendResponse(msg, { variables: [] });
+          }
+        } finally {
+          this.endTargetRead();
         }
       } else if (this.variableHandles.has(ref)) {
         const children = this.variableHandles.get(ref) || [];
@@ -749,19 +937,28 @@ export class DapSession extends EventEmitter {
       return;
     }
 
-    const result = await this.backend.execute({ cmd: 'readMemory', address, size: count });
-    if (!result.ok) {
-      this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, result.error);
+    if (!(await this.beginTargetReadWhenAvailable('low', 700))) {
+      this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, 'Target is running');
       return;
     }
 
-    const block = result.data as MemoryBlock;
-    const bytes = Uint8Array.from(block.data);
-    this.sendResponse(msg, {
-      address: this.formatMemoryReference(address),
-      data: Buffer.from(bytes).toString('base64'),
-      unreadableBytes: block.unreadableBytes ?? Math.max(0, count - bytes.length),
-    });
+    try {
+      const result = await this.backend.execute({ cmd: 'readMemory', address, size: count });
+      if (!result.ok) {
+        this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, result.error);
+        return;
+      }
+
+      const block = result.data as MemoryBlock;
+      const bytes = Uint8Array.from(block.data);
+      this.sendResponse(msg, {
+        address: this.formatMemoryReference(address),
+        data: Buffer.from(bytes).toString('base64'),
+        unreadableBytes: block.unreadableBytes ?? Math.max(0, count - bytes.length),
+      });
+    } finally {
+      this.endTargetRead();
+    }
   }
 
   private async handleWriteMemory(msg: DebugProtocolMessage) {
@@ -791,191 +988,223 @@ export class DapSession extends EventEmitter {
 
   private async handleContinue(msg: DebugProtocolMessage) {
     await this.withStepLock(async () => {
+      this.beginControl();
       this.stopPolling();
-      daLog('handleContinue: reading PC');
-      const pcResult = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-      let bpAddr: number | null = null;
-      if (pcResult.ok) {
-        const pcData = pcResult.data as any;
-        bpAddr = pcData.value as number;
-        daLog(`handleContinue: pc=0x${bpAddr.toString(16)}`);
-      }
-
-      if (bpAddr !== null) {
-        const clearResult = await this.backend.execute({ cmd: 'clearBreakpointAtAddr', addr: bpAddr });
-        daLog(`handleContinue: clear bp result ok=${clearResult.ok}`);
-        await this.backend.execute({ cmd: 'stepInto' });
-        if (clearResult.ok) {
-          await this.backend.execute({ cmd: 'setBreakpointAtAddr', addr: bpAddr });
-          daLog('handleContinue: re-set bp after step');
+      try {
+        daLog('handleContinue: reading PC');
+        const pcResult = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+        let bpAddr: number | null = null;
+        if (pcResult.ok) {
+          const pcData = pcResult.data as any;
+          bpAddr = pcData.value as number;
+          daLog(`handleContinue: pc=0x${bpAddr.toString(16)}`);
         }
-      }
 
-      const runResult = await this.backend.execute({ cmd: 'run' });
-      daLog(`handleContinue: run result ok=${runResult.ok}`);
-      this.sendResponse(msg, { allThreadsContinued: true });
-      this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
-      this.lastHaltReason = 'breakpoint';
-      if (!runResult.ok) {
-        daLog('handleContinue: run failed, sending stopped');
-        this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
-        return;
+        if (bpAddr !== null) {
+          const clearResult = await this.backend.execute({ cmd: 'clearBreakpointAtAddr', addr: bpAddr });
+          daLog(`handleContinue: clear bp result ok=${clearResult.ok}`);
+          if (clearResult.ok) {
+            await this.backend.execute({ cmd: 'stepInto' });
+            await this.backend.execute({ cmd: 'setBreakpointAtAddr', addr: bpAddr });
+            daLog('handleContinue: re-set bp after step');
+          }
+        }
+
+        const runResult = await this.backend.execute({ cmd: 'run' });
+        daLog(`handleContinue: run result ok=${runResult.ok}`);
+        this.targetRunning = runResult.ok;
+        if (runResult.ok) {
+          this.readCancelEpoch++;
+        }
+        this.sendResponse(msg, { allThreadsContinued: true });
+        this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+        this.lastHaltReason = 'breakpoint';
+        if (!runResult.ok) {
+          daLog('handleContinue: run failed, sending stopped');
+          this.markStoppedForUi();
+          this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
+          return;
+        }
+        this.startPolling();
+      } finally {
+        this.endControl();
       }
-      await new Promise<void>(r => setTimeout(r, 300));
-      this.startPolling();
     });
   }
 
   private async handleStep(msg: DebugProtocolMessage, cmd: 'stepOver' | 'stepInto' | 'stepOut') {
     await this.withStepLock(async () => {
+      this.beginControl();
       this.stopPolling();
-      const pcBefore = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-      const pcBeforeVal = pcBefore.ok ? (pcBefore.data as any).value as number : null;
-      daLog(`handleStep: ${cmd} pcBefore=0x${pcBeforeVal !== null ? pcBeforeVal.toString(16) : 'null'}`);
+      this.targetRunning = false;
+      try {
+        const pcBefore = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+        const pcBeforeVal = pcBefore.ok ? (pcBefore.data as any).value as number : null;
+        daLog(`handleStep: ${cmd} pcBefore=0x${pcBeforeVal !== null ? pcBeforeVal.toString(16) : 'null'}`);
 
-      let responseSent = false;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        daLog(`handleStep: ${cmd} attempt ${attempt + 1}/3 start`);
-        const result = await this.backend.execute({ cmd });
-        daLog(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
-        if (!result.ok) {
-          if (attempt < 2) {
+        let responseSent = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          daLog(`handleStep: ${cmd} attempt ${attempt + 1}/3 start`);
+          const result = await this.backend.execute({ cmd });
+          daLog(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
+          if (!result.ok) {
+            if (attempt < 2) {
+              await new Promise<void>(r => setTimeout(r, 50));
+              continue;
+            }
+            if (!responseSent) {
+              this.sendResponse(msg, undefined, false, result.error);
+              responseSent = true;
+            }
+            return;
+          }
+
+          if (!responseSent) {
+            this.sendResponse(msg);
+            responseSent = true;
+            daLog(`handleStep: ${cmd} response sent, starting poll`);
+          }
+          this.lastHaltReason = 'step';
+
+          await new Promise<void>(r => setTimeout(r, 100));
+
+          let pcStuck = false;
+          for (let i = 0; i < 200; i++) {
+            await new Promise<void>(r => setTimeout(r, 10));
+            const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
+            if (i === 0 || (i + 1) % 20 === 0 || i === 199) {
+              daLog(`handleStep: poll ${i + 1}/200 state=${stateResult.ok ? JSON.stringify((stateResult as any).data) : 'err'} ok=${stateResult.ok}`);
+            }
+            if (stateResult.ok && stateResult.data === 'halted') {
+              if (pcBeforeVal !== null) {
+                const pcAfter = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+                const pcAfterVal = pcAfter.ok ? (pcAfter.data as any).value as number : null;
+                daLog(`handleStep: halted after ${(i + 1) * 10}ms, pcBefore=0x${pcBeforeVal.toString(16)} pcAfter=0x${pcAfterVal !== null ? pcAfterVal.toString(16) : 'null'}`);
+                if (pcAfterVal !== null && pcAfterVal === pcBeforeVal) {
+                  daLog(`handleStep: PC same, re-reading to rule out stale DLL state`);
+                  let reReadOk = false;
+                  for (let r = 0; r < 5; r++) {
+                    await new Promise<void>(r2 => setTimeout(r2, 50));
+                    const reRead = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+                    const reReadVal = reRead.ok ? (reRead.data as any).value as number : null;
+                    if (reReadVal !== null && reReadVal !== pcBeforeVal) {
+                      daLog(`handleStep: re-read ${r + 1}/5 PC changed to 0x${reReadVal.toString(16)}, step OK`);
+                      reReadOk = true;
+                      break;
+                    }
+                  }
+                  if (reReadOk) {
+                    daLog(`handleStep: ${cmd} complete after re-read`);
+                    this.markStoppedForUi();
+                    this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+                    return;
+                  }
+                  daLog(`handleStep: PC unchanged after 5 re-reads (250ms), will retry`);
+                  pcStuck = true;
+                  break;
+                }
+              }
+              daLog(`handleStep: ${cmd} complete`);
+              this.markStoppedForUi();
+              this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+              return;
+            }
+            if (i > 50 && (i % 25 === 0)) {
+              const settleResult = await this.backend.execute({ cmd: 'halt' });
+              daLog(`handleStep: soft settle at poll ${i + 1} halt=${settleResult.ok}`);
+            }
+          }
+          if (pcStuck) {
             await new Promise<void>(r => setTimeout(r, 50));
             continue;
           }
-          if (!responseSent) {
-            this.sendResponse(msg, undefined, false, result.error);
-            responseSent = true;
-          }
+          daLog(`handleStep: not halted after 2000ms, starting polling`);
+          this.targetRunning = true;
+          this.readCancelEpoch++;
+          this.startPolling();
           return;
         }
-
+        daLog(`handleStep: ${cmd} failed after 3 attempts`);
         if (!responseSent) {
-          this.sendResponse(msg);
-          responseSent = true;
-          daLog(`handleStep: ${cmd} response sent, starting poll`);
+          this.sendResponse(msg, undefined, false, 'Step failed after 3 attempts');
         }
-        this.lastHaltReason = 'step';
-
-        await new Promise<void>(r => setTimeout(r, 100));
-
-        let pcStuck = false;
-        for (let i = 0; i < 200; i++) {
-          await new Promise<void>(r => setTimeout(r, 10));
-          const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
-          if (i === 0 || (i + 1) % 20 === 0 || i === 199) {
-            daLog(`handleStep: poll ${i + 1}/200 state=${stateResult.ok ? JSON.stringify((stateResult as any).data) : 'err'} ok=${stateResult.ok}`);
-          }
-          if (stateResult.ok && stateResult.data === 'halted') {
-            if (pcBeforeVal !== null) {
-              const pcAfter = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-              const pcAfterVal = pcAfter.ok ? (pcAfter.data as any).value as number : null;
-              daLog(`handleStep: halted after ${(i + 1) * 10}ms, pcBefore=0x${pcBeforeVal.toString(16)} pcAfter=0x${pcAfterVal !== null ? pcAfterVal.toString(16) : 'null'}`);
-              if (pcAfterVal !== null && pcAfterVal === pcBeforeVal) {
-                daLog(`handleStep: PC same, re-reading to rule out stale DLL state`);
-                let reReadOk = false;
-                for (let r = 0; r < 5; r++) {
-                  await new Promise<void>(r2 => setTimeout(r2, 50));
-                  const reRead = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-                  const reReadVal = reRead.ok ? (reRead.data as any).value as number : null;
-                  if (reReadVal !== null && reReadVal !== pcBeforeVal) {
-                    daLog(`handleStep: re-read ${r + 1}/5 PC changed to 0x${reReadVal.toString(16)}, step OK`);
-                    reReadOk = true;
-                    break;
-                  }
-                }
-                if (reReadOk) {
-                  daLog(`handleStep: ${cmd} complete after re-read`);
-                  this.sendEvent('stopped', { reason: 'step', threadId: 1 });
-                  return;
-                }
-                daLog(`handleStep: PC unchanged after 5 re-reads (250ms), will retry`);
-                pcStuck = true;
-                break;
-              }
-            }
-            daLog(`handleStep: ${cmd} complete`);
-            this.sendEvent('stopped', { reason: 'step', threadId: 1 });
-            return;
-          }
-          if (i > 50 && (i % 25 === 0)) {
-            const settleResult = await this.backend.execute({ cmd: 'halt' });
-            daLog(`handleStep: soft settle at poll ${i + 1} halt=${settleResult.ok}`);
-          }
-        }
-        if (pcStuck) {
-          await new Promise<void>(r => setTimeout(r, 50));
-          continue;
-        }
-        daLog(`handleStep: not halted after 2000ms, starting polling`);
-        this.startPolling();
-        return;
-      }
-      daLog(`handleStep: ${cmd} failed after 3 attempts`);
-      if (!responseSent) {
-        this.sendResponse(msg, undefined, false, 'Step failed after 3 attempts');
+      } finally {
+        this.endControl();
       }
     });
   }
 
   private async handlePause(msg: DebugProtocolMessage) {
     await this.withStepLock(async () => {
+      this.beginControl();
       this.stopPolling();
-      await this.backend.execute({ cmd: 'halt' });
-      this.lastHaltReason = 'pause';
-      this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
-      this.sendResponse(msg);
+      try {
+        await this.backend.execute({ cmd: 'halt' });
+        this.markStoppedForUi();
+        this.lastHaltReason = 'pause';
+        this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
+        this.sendResponse(msg);
+      } finally {
+        this.endControl();
+      }
     });
   }
 
   private async handleRestart(msg: DebugProtocolMessage) {
     await this.withStepLock(async () => {
+      this.beginControl();
       this.stopRttLogPolling();
       this.stopPolling();
+      this.targetRunning = false;
 
-      const savedBps: Array<{ file: string; line: number }> = [];
-      for (const [key] of this.breakpoints) {
-        const colonIdx = key.lastIndexOf(':');
-        if (colonIdx > 0) {
-          savedBps.push({ file: key.substring(0, colonIdx), line: parseInt(key.substring(colonIdx + 1)) });
+      try {
+        const savedBps: Array<{ file: string; line: number }> = [];
+        for (const [key] of this.breakpoints) {
+          const colonIdx = key.lastIndexOf(':');
+          if (colonIdx > 0) {
+            savedBps.push({ file: key.substring(0, colonIdx), line: parseInt(key.substring(colonIdx + 1)) });
+          }
         }
-      }
 
-      if (this._elfPath && this._flashEnabled) {
-        this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
-        const flashResult = await this.backend.execute({
-          cmd: 'flash', elfPath: this._elfPath, device: this._device,
-          interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
-        });
-        if (flashResult.ok) {
-          this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
-        } else {
-          this.sendEvent('output', { category: 'stderr', output: `Restart: flash failed: ${flashResult.error}\n` });
-          this.sendResponse(msg, undefined, false, flashResult.error);
-          return;
+        if (this._elfPath && this._flashEnabled) {
+          this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
+          const flashResult = await this.backend.execute({
+            cmd: 'flash', elfPath: this._elfPath, device: this._device,
+            interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
+          });
+          if (flashResult.ok) {
+            this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
+          } else {
+            this.sendEvent('output', { category: 'stderr', output: `Restart: flash failed: ${flashResult.error}\n` });
+            this.sendResponse(msg, undefined, false, flashResult.error);
+            return;
+          }
+          await new Promise<void>(r => setTimeout(r, 500));
         }
-        await new Promise<void>(r => setTimeout(r, 500));
-      }
-      await this.backend.execute({ cmd: 'reset' });
-      await this.backend.execute({ cmd: 'halt' });
-      await new Promise<void>(r => setTimeout(r, 200));
-      await this.backend.execute({ cmd: 'clearAllBreakpoints' });
-      this.breakpoints.clear();
+        await this.backend.execute({ cmd: 'reset' });
+        await this.backend.execute({ cmd: 'halt' });
+        await new Promise<void>(r => setTimeout(r, 200));
+        await this.backend.execute({ cmd: 'clearAllBreakpoints' });
+        this.breakpoints.clear();
 
-      for (const bp of savedBps) {
-        const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
-        if (result.ok) {
-          const data = result.data as any;
-          this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+        for (const bp of savedBps) {
+          const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
+          if (result.ok) {
+            const data = result.data as any;
+            this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+          }
         }
-      }
 
-      this.lastHaltReason = 'entry';
-      if (this.rttLogEnabled) {
-        this.startRttLogPolling();
+        this.markStoppedForUi();
+        this.lastHaltReason = 'entry';
+        if (this.rttLogEnabled) {
+          this.startRttLogPolling();
+        }
+        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+        this.sendResponse(msg);
+      } finally {
+        this.endControl();
       }
-      this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
-      this.sendResponse(msg);
     });
   }
 
@@ -985,46 +1214,62 @@ export class DapSession extends EventEmitter {
     const context = args.context;
     const frameId = args.frameId;
     daLog(`handleEvaluate: expr="${expr}" context=${context} frameId=${frameId}`);
+    const isRTOS = this.isRtosEvaluateExpression(expr);
+    if (isRTOS) daLog(`handleEvaluate RTOS: "${expr}" context=${context}`);
     if (!expr) {
       this.sendResponse(msg, { result: '', variablesReference: 0 });
       return;
     }
 
-    const isNewRuntimeWatch = context === 'watch' && !this.watchExpressions.includes(expr) && !(await this.isTargetHalted());
-
+    const force = context === 'watch' || context === 'hover';
+    const waitForConsistentEvaluate = context === 'hover' || isRTOS;
     if (context === 'watch' && !this.watchExpressions.includes(expr)) {
       this.watchExpressions.push(expr);
       daLog(`handleEvaluate: auto-captured watch expression "${expr}"`);
-      const session = this.listeners('send').length > 0 ? this : null;
     }
 
-    if (isNewRuntimeWatch) {
-      daLog(`handleEvaluate: target running, deferring first watch read for "${expr}"`);
-      const wv = this.runtimeWatchCache.get(expr) || this.makeRunningWatchValue(expr);
-      this.sendResponse(msg, {
-        result: wv.display || wv.hex || wv.error || `${wv.value}`,
-        type: wv.typeName || undefined,
-        variablesReference: 0,
-        memoryReference: this.memoryReferenceForWatch(wv),
-      });
+    if (this.shouldDeferTargetRead()) {
+      daLog(`handleEvaluate: deferring read while target/control busy for "${expr}"`);
+      this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
       return;
     }
 
-    // Existing watch entries and RTOS hover reads are allowed to sample while the CPU is running.
-    const force = context === 'watch' || context === 'hover';
-    const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force });
-    if (result.ok) {
-      const wv = result.data as WatchValue;
-      daLog(`handleEvaluate: result="${wv.display}"`);
-      this.sendResponse(msg, {
-        result: wv.display || wv.hex || `${wv.value}`,
-        type: wv.typeName || undefined,
-        variablesReference: this.allocateVariableHandle(wv.children),
-        memoryReference: this.memoryReferenceForWatch(wv),
-      });
-    } else {
-      daLog(`handleEvaluate: error="${result.error}"`);
-      this.sendResponse(msg, { result: result.error, variablesReference: 0 });
+    // Running-target evaluate requests can arrive in bursts from RTOS Views and hovers.
+    // Reuse very recent values so those bursts do not monopolize J-Link.
+    if (force && this.targetReadInProgress && !waitForConsistentEvaluate) {
+      const wv = this.runtimeWatchReadInFlight
+        ? this.cachedOrRunningWatchValue(expr)
+        : this.getFreshRuntimeWatchValue(expr);
+      if (wv) {
+        this.sendEvaluateValue(msg, wv, false);
+        return;
+      }
+    }
+
+    if (!(await this.beginTargetReadWhenAvailable('low', waitForConsistentEvaluate ? 700 : 0))) {
+      this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
+      return;
+    }
+    try {
+      const targetHalted = force ? await this.isTargetHalted() : true;
+      if (!targetHalted) {
+        this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
+        return;
+      }
+
+      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force });
+      if (result.ok) {
+        const wv = result.data as WatchValue;
+        this.cacheRuntimeWatchValue(expr, wv);
+        if (isRTOS) daLog(`evaluate RTOS success: "${expr}" = ${wv.display}`);
+        daLog(`handleEvaluate: result="${wv.display}"`);
+        this.sendEvaluateValue(msg, wv, true);
+      } else {
+        if (isRTOS) daLog(`evaluate RTOS failed: "${expr}" -> ${result.error}`);
+        this.sendResponse(msg, { result: result.error, variablesReference: 0 }, false, result.error);
+      }
+    } finally {
+      this.endTargetRead();
     }
   }
 
@@ -1032,11 +1277,11 @@ export class DapSession extends EventEmitter {
     const args = msg.arguments || {};
     const expressions: string[] = args.expressions || [];
     daLog(`handleWatchEvaluate: ${expressions.length} expressions`);
-    if (!(await this.isTargetHalted())) {
-      this.sendResponse(msg, { results: await this.readRuntimeWatchExpressions(expressions) });
+    if (this.shouldDeferTargetRead()) {
+      this.sendResponse(msg, { results: expressions.map(expr => this.cachedOrRunningWatchValue(expr)) });
       return;
     }
-    const results = await this.readWatchExpressions(expressions, false);
+    const results = await this.readWatchExpressions(expressions, true);
     this.sendResponse(msg, { results });
   }
 
@@ -1138,16 +1383,21 @@ export class DapSession extends EventEmitter {
   }
 
   private async captureFastDataSample() {
-    const result = await this.backend.execute({ cmd: 'readFastDataSampling', specs: this.dataSamplingSpecs });
-    if (!result.ok) return;
-    const values = result.data as WatchValue[];
-    const timestamp = this.nowMs();
-    for (const value of values) {
-      if (!value || value.error) continue;
-      const pending = this.dataSamplingPending.get(value.expression);
-      if (!pending) continue;
-      pending.push({ timestamp, value: value.value, display: value.display });
-      this.dataSamplingLastDisplay.set(value.expression, value.display);
+    if (!this.beginTargetRead()) return;
+    try {
+      const result = await this.backend.execute({ cmd: 'readFastDataSampling', specs: this.dataSamplingSpecs });
+      if (!result.ok) return;
+      const values = result.data as WatchValue[];
+      const timestamp = this.nowMs();
+      for (const value of values) {
+        if (!value || value.error) continue;
+        const pending = this.dataSamplingPending.get(value.expression);
+        if (!pending) continue;
+        pending.push({ timestamp, value: value.value, display: value.display });
+        this.dataSamplingLastDisplay.set(value.expression, value.display);
+      }
+    } finally {
+      this.endTargetRead();
     }
   }
 

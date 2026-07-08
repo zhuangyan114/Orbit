@@ -228,7 +228,19 @@ export class JLinkDLL {
     try {
       const func = this.lib.func('int JLINK_ReadReg(int)');
       const ret = func(regIndex);
-      return ret >= 0 ? ret >>> 0 : null;
+      // JLINK_ReadReg returns -1 on error. Register values are unsigned 32-bit.
+      // ARM registers (e.g. LR with EXC_RETURN 0xFFFFFFF9) or high-bit-set values
+      // would appear negative as signed int — only treat -1 as failure.
+      if (ret === -1) {
+        // Direct JLINK_ReadReg failed — try DAP-based read as fallback
+        // (DCRSR/DCRDR memory-mapped registers on Cortex-M)
+        if (regIndex >= 0 && regIndex <= 16) {
+          const dapVal = this.readRegisterDAP(regIndex);
+          if (dapVal !== null) return dapVal;
+        }
+        return null;
+      }
+      return ret >>> 0;
     } catch { return null; }
   }
 

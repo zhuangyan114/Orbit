@@ -11,9 +11,13 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
-function daLog(_msg: string) {
-  // no-op
+let daLog_Enabled = false;
+function daLog(msg: string) {
+  if (daLog_Enabled) {
+    process.stderr.write('[OzoneBackend] ' + msg + '\n');
+  }
 }
+function enableDaLog() { daLog_Enabled = true; }
 
 const REG_INDEXES: Record<string, number> = {
   R0: 0, R1: 1, R2: 2, R3: 3, R4: 4, R5: 5, R6: 6, R7: 7,
@@ -33,6 +37,7 @@ export class OzoneBackend {
   private stepOverClearedBps: { index: number; addr: number }[] = [];
   private _lastTempBpAddr = -1;
   private dwarfInfo: DwarfInfo = { varToType: new Map(), typeDefs: new Map() };
+  private runtimeCounterWraps = new Map<string, { lastRaw: number; base: number }>();
 
   get currentState(): TargetState {
     return this.state;
@@ -126,6 +131,7 @@ case 'readVariableRuntime':
     this.elfPath = command.elfPath;
     this.symbols = await readElfSymbols(command.elfPath);
     daLog(`loadSymbols symbols: ${this.symbols.length}`);
+    daLog(`loadSymbols: ${this.symbols.length} symbols, uxCurrentNumberOfTasks=${this.symbols.find(s => s.name === 'uxCurrentNumberOfTasks') ? 'FOUND' : 'NOT FOUND'}`);
     this.lineMapCache = await preloadLineMappings(command.elfPath);
     daLog(`loadSymbols lineMapCache: ${this.lineMapCache.size} files`);
     const funcAddrs = this.symbols
@@ -213,6 +219,7 @@ case 'readVariableRuntime':
     this.lineMapCache.clear();
     this.addressLocCache.clear();
     this.lineEntries = [];
+    this.runtimeCounterWraps.clear();
     return { ok: true, data: null };
   }
 
@@ -339,21 +346,36 @@ case 'readVariableRuntime':
     }
     await new Promise<void>(r => setTimeout(r, 100));
 
-    const pc = this.jlink.readRegister(REG_INDEXES.PC);
-    const lr = this.jlink.readRegister(REG_INDEXES.LR);
+    let pc = this.jlink.readRegister(REG_INDEXES.PC);
+    let lr = this.jlink.readRegister(REG_INDEXES.LR);
+
+    // Retry LR with DAP as readRegister now auto-fallsback to DAP,
+    // but also try once more after a small delay for robustness
+    if (pc !== null && lr === null) {
+      await new Promise<void>(r => setTimeout(r, 50));
+      lr = this.jlink.readRegister(REG_INDEXES.LR);
+    }
+
     daLog(`doGetCallStack pc=${pc !== null ? '0x' + pc.toString(16) : 'null'} lr=${lr !== null ? '0x' + lr.toString(16) : 'null'}`);
 
-    if (pc === null || lr === null) {
-      daLog('doGetCallStack readReg failed');
-      return { ok: false, error: 'Cannot read core registers' };
+    if (pc === null) {
+      process.stderr.write(`[OzoneBackend-DIAG] doGetCallStack: PC read failed (isHalted=${isHalted})\n`);
+      return { ok: false, error: 'Cannot read core registers (PC)' };
+    }
+
+    // If LR still fails, use a fallback value so we can deliver at least one frame
+    if (lr === null) {
+      process.stderr.write(`[OzoneBackend-DIAG] doGetCallStack: LR read failed, using fallback (isHalted=${isHalted} pc=0x${pc.toString(16)})\n`);
+      lr = 0xFFFFFFFF;
     }
 
     const frames: StackFrame[] = [];
+    let frameIdCounter = 1;
 
     const pcLoc = this.resolveAddressLoc(pc);
     daLog(`doGetCallStack pcLoc=${JSON.stringify(pcLoc)}`);
     frames.push({
-      id: 0, level: 0,
+      id: frameIdCounter++, level: 0,
       function: pcLoc?.func || this.resolveSymbolName(pc) || `0x${pc.toString(16)}`,
       file: pcLoc?.file || '',
       line: pcLoc?.line || 0,
@@ -363,7 +385,7 @@ case 'readVariableRuntime':
     if (lr !== 0xFFFFFFFF) {
       const lrLoc = this.resolveAddressLoc(lr);
       frames.push({
-        id: 1, level: 1,
+        id: frameIdCounter++, level: 1,
         function: lrLoc?.func || this.resolveSymbolName(lr) || `0x${lr.toString(16)}`,
         file: lrLoc?.file || '',
         line: lrLoc?.line || 0,
@@ -990,6 +1012,10 @@ case 'readVariableRuntime':
   private async doEvaluateExpression(expression: string, force: boolean = false): Promise<OzoneCommandResult> {
     expression = expression.trim();
     daLog(`doEvaluateExpression: "${expression}" force=${force}`);
+    const isRTOS = expression === 'uxCurrentNumberOfTasks' || expression === 'pxCurrentTCB' || expression === 'pxReadyTasksLists';
+    if (isRTOS) {
+      daLog(`doEvaluateExpression RTOS: "${expression}" force=${force} symbols=${this.symbols.length}`);
+    }
 
     const sizeofValue = this.evaluateSizeofExpression(expression);
     if (sizeofValue !== null) {
@@ -1099,7 +1125,9 @@ case 'readVariableRuntime':
       return { ok: false, error: `Symbol not found: ${expression}` };
     }
 
-    daLog(`doEvaluateExpression: sym=${sym.name} addr=0x${sym.address.toString(16)}`);
+    if (isRTOS || expression.startsWith('ux') || expression.startsWith('px') || expression.startsWith('x')) {
+      daLog(`sym=${sym.name} addr=0x${sym.address.toString(16)} size=${sym.size} type=${sym.type} isHalted=${this.jlink.isHalted()} force=${force}`);
+    }
 
     if (!force && !this.jlink.isHalted()) {
       daLog(`doEvaluateExpression: CPU is running, returning running`);
@@ -1121,7 +1149,7 @@ case 'readVariableRuntime':
         const raw = this.jlink.readMemory(sym.address, readLen);
         if (raw) {
           daLog(`doEvaluateExpression: raw bytes length=${raw.length}`);
-          const children = this.evaluateStructFields(raw, resolvedType.fields, resolvedType.typeDefs || this.dwarfInfo.typeDefs, sym.address, expression);
+          const children = this.evaluateStructFields(raw, resolvedType.fields, resolvedType.typeDefs || this.dwarfInfo.typeDefs, sym.address, expression, 0);
           daLog(`doEvaluateExpression: struct children count=${children.length}`);
           const structTypeName = resolvedType.typeName || resolvedType.name || 'struct';
           const summary = `${structTypeName} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
@@ -1158,7 +1186,7 @@ case 'readVariableRuntime':
             const elemRawOffset = i * elemSize;
             if (elemType?.kind === 'struct' && elemType.fields) {
               const childRaw = raw.slice(elemRawOffset, elemRawOffset + elemSize);
-              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr, `${expression}[${i}]`);
+              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr, `${expression}[${i}]`, 0);
               children.push({
                 expression: `[${i}]`,
                 value: structChildren[0]?.value ?? 0,
@@ -1207,9 +1235,13 @@ case 'readVariableRuntime':
     }
 
     const readSize = this.getScalarReadSize(sym.size, resolvedType);
+    if (isRTOS || expression.startsWith('ux') || expression.startsWith('px') || expression.startsWith('x')) {
+      daLog(`reading mem addr=0x${sym.address.toString(16)} size=${readSize}`);
+    }
     const raw = this.jlink.readMemory(sym.address, readSize);
 
     if (!raw) {
+      if (isRTOS) daLog(`memory read failed for "${expression}" at 0x${sym.address.toString(16)}`);
       return { ok: false, error: `read failed at 0x${sym.address.toString(16)}` };
     }
 
@@ -1226,18 +1258,28 @@ case 'readVariableRuntime':
       value = formatted.value;
       display = formatted.display;
     }
-
     let typeName = '';
     if (varTypeOffset) {
       const tn = this.getDwarfTypeName(varTypeOffset);
       if (tn) typeName = tn;
     }
 
+    if (this.shouldUnwrapRuntimeCounter(expression)) {
+      const counter = this.formatRuntimeCounterValue(expression, value, sym.address, typeName || 'uint32_t');
+      value = counter.value;
+      display = counter.display;
+    }
+    if (isRTOS || expression.startsWith('ux')) {
+      daLog(`read result value=${value} display="${display}"`);
+    }
+
     const pointerChildren = resolvedType?.kind === 'pointer' && resolvedType.typeOffset && value
-      ? this.evaluatePointerChildren(value, resolvedType.typeOffset, expression)
+      ? this.evaluatePointerChildren(value, resolvedType.typeOffset, expression, 1)
       : undefined;
 
-    const hexValue = isFloat
+    const hexValue = this.shouldUnwrapRuntimeCounter(expression)
+      ? `0x${(this.readUnsignedLittleEndian(raw, readSize) >>> 0).toString(16).toUpperCase().padStart(readSize * 2, '0')}`
+      : isFloat
       ? `0x${Array.from(raw.slice(0, readSize)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
       : this.formatScalarValue(raw, readSize, resolvedType).hex;
 
@@ -1263,6 +1305,41 @@ case 'readVariableRuntime':
       display: isAddress ? hex : `${normalized}`,
       hex,
       address: isAddress ? normalized : undefined,
+      typeName,
+    };
+  }
+
+  private shouldUnwrapRuntimeCounter(expression: string): boolean {
+    return expression === 'ulTotalRunTime' || expression.endsWith('.ulRunTimeCounter') || expression.endsWith('->ulRunTimeCounter');
+  }
+
+  private unwrapRuntimeCounter(key: string, rawValue: number): number {
+    const raw = rawValue >>> 0;
+    const previous = this.runtimeCounterWraps.get(key);
+    if (!previous) {
+      this.runtimeCounterWraps.set(key, { lastRaw: raw, base: 0 });
+      return raw;
+    }
+
+    let base = previous.base;
+    if (raw < previous.lastRaw) {
+      base += 0x1_0000_0000;
+    }
+    this.runtimeCounterWraps.set(key, { lastRaw: raw, base });
+    return base + raw;
+  }
+
+  private formatRuntimeCounterValue(expression: string, rawValue: number, address?: number, typeName = 'uint32_t'): WatchValue {
+    const raw = rawValue >>> 0;
+    const value = this.unwrapRuntimeCounter(expression, raw);
+    const hex = `0x${raw.toString(16).toUpperCase().padStart(8, '0')}`;
+    return {
+      expression,
+      evaluateName: expression,
+      value,
+      display: value > raw ? `${value}` : `${hex} (${value})`,
+      hex,
+      address,
       typeName,
     };
   }
@@ -1360,17 +1437,27 @@ case 'readVariableRuntime':
   }
 
   private evaluateFieldAccessExpression(expression: string): WatchValue | null {
-    const match = expression.match(/^(.+?)(?:->|\.)\s*([A-Za-z_]\w*)$/);
+    const match = expression.match(/^(.+?)(->|\.)\s*([A-Za-z_]\w*)$/);
     if (!match) return null;
     const baseExpr = match[1].trim();
-    const fieldName = match[2];
+    const operator = match[2];
+    const fieldName = match[3];
     let base = this.evaluateCastStructExpression(baseExpr);
     if (!base && /^[A-Za-z_]\w*$/.test(baseExpr)) {
       const sym = this.symbols.find(s => s.name === baseExpr) || this.symbols.find(s => s.name.toLowerCase() === baseExpr.toLowerCase());
       if (sym) {
         const offset = this.dwarfInfo.varToType.get(sym.name);
-        const typeName = offset ? this.getDwarfTypeName(offset) : '';
-        base = this.evaluateStructAtAddress(baseExpr, typeName, sym.address);
+        const resolved = offset ? this.resolveDwarfType(offset) : null;
+        if (operator === '->' && resolved?.kind === 'pointer' && resolved.typeOffset) {
+          const raw = this.jlink.readMemory(sym.address, this.getScalarReadSize(sym.size, resolved));
+          const pointeeAddress = raw ? this.readUnsignedLittleEndian(raw, raw.length) >>> 0 : 0;
+          if (pointeeAddress) {
+            base = this.evaluateStructAtTypeOffset(baseExpr, resolved.typeOffset, pointeeAddress);
+          }
+        } else {
+          const typeName = offset ? this.getDwarfTypeName(offset) : '';
+          base = this.evaluateStructAtAddress(baseExpr, typeName, sym.address);
+        }
       }
     }
     const child = base?.children?.find(c => c.expression === fieldName);
@@ -1379,11 +1466,18 @@ case 'readVariableRuntime':
 
   private evaluateStructAtAddress(expression: string, typeName: string, address: number): WatchValue | null {
     const offset = this.findDwarfTypeOffsetByName(typeName) || (typeName === 'TCB_t' ? this.findDwarfTypeOffsetByName('tskTaskControlBlock') : undefined);
+    if (!offset) return null;
+    return this.evaluateStructAtTypeOffset(expression, offset, address);
+  }
+
+  private evaluateStructAtTypeOffset(expression: string, typeOffset: string, address: number): WatchValue | null {
+    const typeName = this.getDwarfTypeName(typeOffset);
+    const offset = typeOffset;
     const resolved = offset ? this.resolveDwarfType(offset) : null;
     if (!resolved || resolved.kind !== 'struct' || !resolved.fields || !resolved.byteSize) return null;
     const raw = this.jlink.readMemory(address, resolved.byteSize);
     if (!raw) return null;
-    const children = this.evaluateStructFields(raw, resolved.fields, resolved.typeDefs || this.dwarfInfo.typeDefs, address, expression);
+    const children = this.evaluateStructFields(raw, resolved.fields, resolved.typeDefs || this.dwarfInfo.typeDefs, address, expression, 0);
     return {
       expression,
       evaluateName: expression,
@@ -1411,7 +1505,15 @@ case 'readVariableRuntime':
       return raw ? this.readUnsignedLittleEndian(raw, raw.length) >>> 0 : sym.address;
     }
     const field = this.evaluateFieldAccessExpression(expr);
-    return field ? field.value >>> 0 : null;
+    // For fields that have an address (arrays, struct members), use that memory
+    // address rather than the scalar value (which for char arrays is the first
+    // character, not the address of the string).
+    if (field) {
+      if (field.address !== undefined) return field.address >>> 0;
+      if (field.children && field.children.length > 0) return field.address ?? (field.value >>> 0);
+      return field.value >>> 0;
+    }
+    return null;
   }
 
   private normalizeTypeName(typeName: string): string {
@@ -1547,19 +1649,23 @@ case 'readVariableRuntime':
     return resolved?.typeName || resolved?.name || '';
   }
 
-  private evaluateStructFields(raw: Uint8Array, fields: DwarfField[], typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number, parentExpr = ''): WatchValue[] {
-    return fields.map(f => this.evaluateSingleField(raw, f, typeDefs, baseAddress, parentExpr));
+  private evaluateStructFields(raw: Uint8Array, fields: DwarfField[], typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number, parentExpr = '', _depth = 0): WatchValue[] {
+    return fields.map(f => this.evaluateSingleField(raw, f, typeDefs, baseAddress, parentExpr, _depth));
   }
 
-  private evaluatePointerChildren(address: number, typeOffset: string, parentExpr = ''): WatchValue[] | undefined {
+  /** Max depth for pointer chasing — prevents stack overflow on circular lists (FreeRTOS pxNext/pxPrevious). */
+  private static readonly MAX_POINTER_DEPTH = 5;
+
+  private evaluatePointerChildren(address: number, typeOffset: string, parentExpr = '', _depth = 1): WatchValue[] | undefined {
+    if (_depth > OzoneBackend.MAX_POINTER_DEPTH) return undefined;
     const pointee = this.resolveDwarfType(typeOffset);
     if (!pointee || pointee.kind !== 'struct' || !pointee.fields || !pointee.byteSize) return undefined;
     const raw = this.jlink.readMemory(address, pointee.byteSize);
     if (!raw) return undefined;
-    return this.evaluateStructFields(raw, pointee.fields, pointee.typeDefs || this.dwarfInfo.typeDefs, address, parentExpr);
+    return this.evaluateStructFields(raw, pointee.fields, pointee.typeDefs || this.dwarfInfo.typeDefs, address, parentExpr, _depth);
   }
 
-  private evaluateSingleField(raw: Uint8Array, field: DwarfField, typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number, parentExpr = ''): WatchValue {
+  private evaluateSingleField(raw: Uint8Array, field: DwarfField, typeDefs: Map<string, DwarfTypeInfo>, baseAddress: number, parentExpr = '', _depth = 0): WatchValue {
     const addr = baseAddress + field.byteOffset;
     const evaluateName = parentExpr ? `${parentExpr}.${field.name}` : field.name;
     const resolved = this.resolveDwarfType(field.typeOffset);
@@ -1572,7 +1678,7 @@ case 'readVariableRuntime':
       const childRaw = resolvedByteSize > 0
         ? raw.slice(field.byteOffset, field.byteOffset + resolvedByteSize)
         : raw;
-      const children = this.evaluateStructFields(childRaw, resolved.fields, typeDefs, addr, evaluateName);
+      const children = this.evaluateStructFields(childRaw, resolved.fields, typeDefs, addr, evaluateName, _depth);
       const summary = `${resolvedTypeName || 'struct'} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`;
       return {
         expression: field.name,
@@ -1604,7 +1710,7 @@ case 'readVariableRuntime':
         const elemRawOffset = i * elemSize;
         if (elemType?.kind === 'struct' && elemType.fields) {
           const childRaw = arrRaw.slice(elemRawOffset, elemRawOffset + elemSize);
-              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr, `${evaluateName}[${i}]`);
+              const structChildren = this.evaluateStructFields(childRaw, elemType.fields, elemType.typeDefs || this.dwarfInfo.typeDefs, elemAddr, `${evaluateName}[${i}]`, _depth);
           children.push({
             expression: `[${i}]`,
             evaluateName: `${evaluateName}[${i}]`,
@@ -1621,22 +1727,23 @@ case 'readVariableRuntime':
           const isFloatArrElem = this.isFloatType(elemType);
           let value: number;
           let display: string;
+          let hex: string;
           if (isFloatArrElem && elemRaw.length >= elemSize) {
             value = this.readBytesAsFloat(elemRaw, elemSize);
             display = elemSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+            hex = `0x${Array.from(elemRaw).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
           } else {
-            value = 0;
-            for (let j = end - 1; j >= elemRawOffset; j--) {
-              value = (value << 8) | arrRaw[j];
-            }
-            display = elemSize <= 2 ? `0x${value.toString(16).toUpperCase()} (${value})` : `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+            const formatted = this.formatScalarValue(elemRaw, elemSize, elemType);
+            value = formatted.value;
+            display = formatted.display;
+            hex = formatted.hex;
           }
           children.push({
             expression: `[${i}]`,
             evaluateName: `${evaluateName}[${i}]`,
             value,
             display,
-            hex: `0x${Array.from(elemRaw).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`,
+            hex,
             address: elemAddr,
             typeName: elemTypeName,
           });
@@ -1665,21 +1772,27 @@ case 'readVariableRuntime':
 
     let value: number;
     let display: string;
+    let hex: string;
     if (isFloat && fieldRaw.length >= fieldSize) {
       value = this.readBytesAsFloat(fieldRaw, fieldSize);
       display = fieldSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+      hex = `0x${Array.from(fieldRaw).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
     } else {
-      value = 0;
-      for (let i = fieldEnd - 1; i >= field.byteOffset; i--) {
-        value = (value << 8) | raw[i];
-      }
-      if (fieldSize <= 1) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-      else if (fieldSize <= 2) display = `0x${value.toString(16).toUpperCase()} (${value})`;
-      else display = `0x${value.toString(16).toUpperCase().padStart(8, '0')} (${value})`;
+      const formatted = this.formatScalarValue(fieldRaw, fieldSize, resolved);
+      value = formatted.value;
+      display = formatted.display;
+      hex = formatted.hex;
+    }
+
+    if (field.name === 'ulRunTimeCounter') {
+      const counter = this.formatRuntimeCounterValue(evaluateName, value, addr, resolvedTypeName || 'uint32_t');
+      value = counter.value;
+      display = counter.display;
+      hex = counter.hex;
     }
 
     const pointerChildren = resolvedKind === 'pointer' && resolved?.typeOffset && value
-      ? this.evaluatePointerChildren(value >>> 0, resolved.typeOffset, evaluateName)
+      ? this.evaluatePointerChildren(value >>> 0, resolved.typeOffset, evaluateName, _depth + 1)
       : undefined;
 
     return {
@@ -1687,7 +1800,7 @@ case 'readVariableRuntime':
       evaluateName,
       value,
       display: resolvedKind === 'pointer' ? this.formatAddress(value) : display,
-      hex: `0x${(value >>> 0).toString(16).toUpperCase().padStart(fieldSize * 2, '0')}`,
+      hex,
       address: addr,
       typeName: resolvedTypeName,
       children: pointerChildren,

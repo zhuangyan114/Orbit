@@ -108,12 +108,16 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(pluginApiServer);
     console.log(`[Ozone] Plugin API listening on ${apiEndpoint.url}`);
 
-    // Silently ensure ozone is tracked by mcu-debug views on activation
-    appendWorkspaceArraySetting('memory-view', 'trackDebuggers', 'ozone').catch(() => {});
-    appendWorkspaceArraySetting('mcu-debug.rtos-views', 'trackDebuggers', 'ozone').catch(() => {});
+    // Ensure ozone is tracked by mcu-debug views on activation
+    for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
+      appendWorkspaceArraySetting(section, 'trackDebuggers', 'ozone').catch((err) => {
+        console.error(`[Ozone] Failed to register with ${section}.trackDebuggers:`, err);
+      });
+    }
 
-    // Ensure debug-tracker-vscode tracks ozone
-    appendWorkspaceArraySetting('mcu-debug.debug-tracker-vscode', 'trackDebuggers', 'ozone').catch(() => {});
+    if (vscode.workspace.getConfiguration('ozone').get<boolean>('rtosViewsAutoRefresh', false)) {
+      setupRtosViewsAutoRefresh(context);
+    }
 
     // 激活时自动检测 .elf/.axf，写入设置
     const ozCfg = vscode.workspace.getConfiguration('ozone');
@@ -261,32 +265,97 @@ async function readWatchValues(exprs: string[]): Promise<any[]> {
 
 function startWatchPolling() {
   stopWatchPolling();
+  const cfg = vscode.workspace.getConfiguration('ozone');
+  const baseInterval = cfg.get<number>('watchPollIntervalMs', 500);
+
   const loop = async () => {
     if (watchPollTimer === null) return;
     try {
       const expressions = watchProvider?.watches.map(w => w.expression) || [];
-      if (expressions.length === 0) { watchPollTimer = setTimeout(loop, 200); return; }
+      if (expressions.length === 0) {
+        watchPollTimer = setTimeout(loop, baseInterval);
+        return;
+      }
+      if (!watchWebviewProvider?.isVisible) {
+        watchPollTimer = setTimeout(loop, baseInterval);
+        return;
+      }
       const results = await readWatchValues(expressions);
       if (results.length > 0) {
         watchProvider?.updateResults(results);
         watchWebviewProvider?.sendWatchResults(results as any);
       }
     } catch {}
-    if (watchPollTimer !== null) watchPollTimer = setTimeout(loop, 200);
+    if (watchPollTimer !== null) watchPollTimer = setTimeout(loop, baseInterval);
   };
-  watchPollTimer = setTimeout(loop, 200);
+  watchPollTimer = setTimeout(loop, baseInterval);
 }
 
 function stopWatchPolling() {
   if (watchPollTimer) { clearTimeout(watchPollTimer); watchPollTimer = null; }
 }
 
+function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
+  const diagChannel = vscode.window.createOutputChannel('Ozone RTOS Views');
+  let refreshScheduled = false;
+
+  vscode.extensions.getExtension("mcu-debug.debug-tracker-vscode")?.activate().then((trackerApi: any) => {
+    if (!trackerApi || typeof trackerApi.subscribe !== 'function') {
+      diagChannel.appendLine('Debug tracker API has no subscribe method');
+      return;
+    }
+    try {
+      const result = trackerApi.subscribe({
+        version: 1,
+        body: {
+          debuggers: ["ozone"],
+          handler: (event: any) => {
+            if (event.event === 'first-stack-trace' && !refreshScheduled) {
+              refreshScheduled = true;
+
+              // Trigger RTOS Views detection: the 'refresh' command calls
+              // RTOSTracker.update() → updateRTOSInfo() → rtosSession.refresh()
+              // → onStopped(lastFrameId) → tryDetect()
+              //
+              // Optional compatibility path only; normal debug flow should not
+              // wait for RTOS Views detection.
+              setTimeout(() => {
+                vscode.commands.executeCommand('rtos-views.rtos.focus').then(() => {
+                  // Wait for resolveWebviewView to render the panel
+                  setTimeout(() => {
+                    vscode.commands.executeCommand('mcu-debug.rtos-views.refresh').then(undefined, (e2: any) => {
+                      diagChannel.appendLine(`RTOS Views refresh failed: ${e2?.message || e2}`);
+                    });
+                  }, 500);
+                }, () => {
+                  diagChannel.appendLine('RTOS Views panel not found (not installed?)');
+                });
+              }, 1000);
+            }
+          },
+          wantCurrentStatus: true,
+          notifyAllEvents: false,
+        }
+      });
+      diagChannel.appendLine(`Subscribed: clientId=${result?.clientId || 'unknown'}`);
+    } catch (e: any) {
+      diagChannel.appendLine(`Subscribe failed: ${e.message}`);
+    }
+  }, (e: any) => {
+    diagChannel.appendLine(`Activation failed: ${e.message}`);
+  });
+}
+
 async function appendWorkspaceArraySetting(section: string, key: string, value: string): Promise<boolean> {
   const cfg = vscode.workspace.getConfiguration(section);
   const current = cfg.get<unknown>(key);
   const list = Array.isArray(current) ? current.filter((item): item is string => typeof item === 'string') : [];
-  if (list.includes(value)) return false;
+  if (list.includes(value)) {
+    console.log(`[Ozone] ${section}.${key} already includes "${value}"`);
+    return false;
+  }
   await cfg.update(key, [...list, value], vscode.ConfigurationTarget.Workspace);
+  console.log(`[Ozone] Added "${value}" to ${section}.${key}`);
   return true;
 }
 

@@ -21,6 +21,13 @@
 - Watch expressions persist in `workspaceState` key `ozoneWatchExpressions`; data-sampling expressions persist in `ozoneDataSamplingExpressions`.
 - Data sampling uses `DataSamplingManager` with 10 ms sample/send intervals and a 50,000 point cap per variable; verify performance-sensitive changes against that cadence.
 
+## MCU Debug Views Compatibility
+- Keep the `ozone` debug adapter compatible with mcu-debug MemoryView, Peripheral Viewer, and RTOS Views through standard DAP requests where possible, not plugin-specific UI coupling.
+- MemoryView and Peripheral Viewer depend on `initialize` advertising `supportsReadMemoryRequest: true` and on `readMemory` returning base64 data from a valid DAP `memoryReference`. If write support changes, keep `writeMemory` byte-oriented; DAP payloads are base64 bytes, not `uint32[]`.
+- Peripheral Viewer expects launch configuration fields such as `deviceName`, `svdFile`, or `svdPath`; preserve the aliases in `package.json` and `src/debug/ozone-debug-config.ts`.
+- RTOS Views relies heavily on `evaluate`, `variables`, and expandable `variablesReference` trees. Preserve struct/array/pointer child expansion and `memoryReference` values in `src/debug/dap-session.ts`.
+- The command `ozone.enableMcuDebugViews` should only append workspace settings for external tracking (`memory-view.trackDebuggers` and `mcu-debug.rtos-views.trackDebuggers`); do not silently mutate global user settings on activation.
+
 ## J-Link/DAP Pitfalls
 - `JLINK_SetBP` is used as `(slotIndex, address)` with six tracked hardware slots; `ExecCommand("SetBP ...")` is intentionally avoided because it can hang.
 - `disconnect()` in `JLinkDLL` must not call `JLINK_Close()`; reconnect relies on the loaded DLL and `_wasOpened` state to avoid close/open crashes.

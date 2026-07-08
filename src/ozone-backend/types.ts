@@ -3,6 +3,7 @@ export interface DebugSessionConfig {
   interface: 'SWD' | 'JTAG';
   speedKHz: number;
   jdebugScript?: string;
+  rtos?: string;
 }
 
 export enum TargetState {

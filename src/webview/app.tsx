@@ -474,15 +474,6 @@ function WatchPanel({ watches, setWatches }: {
     }
   };
 
-  useEffect(() => {
-    if (watches.length === 0 || polling === false) return;
-    const interval = setInterval(() => {
-      const exprs = watchesRef.current.map(w => w.expression);
-      vscode.postMessage({ command: 'evaluateWatches', expressions: exprs });
-    }, 200);
-    return () => clearInterval(interval);
-  }, [polling]);
-
   const startEditing = (key: string, currentValue: string) => {
     setEditingKey(key);
     setEditValue(extractValue(currentValue));

@@ -2,9 +2,17 @@
 
 Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展。扩展通过 SEGGER J-Link DLL 直接访问目标板，提供 Debug Adapter Protocol 调试、Watch 变量、实时 Timeline 采样、SEGGER RTT 日志、P-RTLog tokenized RTT 日志解码、本地插件 API 和 MCP 工具集成。
 
-当前版本：`0.4.6`
+当前版本：`0.4.7`
 
 ## 版本更新日志
+
+### 0.4.7（稳定）
+
+- 优化 RTOS Views 与 Watch / Timeline 并发读取调度，降低调试运行期间的 J-Link 访问压力。
+- 修复 RTOS Views 刷新导致断点、继续运行、光标追踪响应变慢的问题，避免低优先级 RTOS 读取阻塞高优先级调试操作。
+- 修复 FreeRTOS Runtime 统计在 DWT 32 位计数器回绕后出现 `NaN%`、超过 100% 或总和缓慢漂移的问题。
+- 保持 Watch 和 Timeline 运行时实时刷新能力，不影响正常变量监控和波形采样。
+- 打包产物更新为 `ozone-for-vscode-0.4.7.vsix`。
 
 ### 0.4.6
 
@@ -92,7 +100,7 @@ P-RTLog 项目地址：[https://github.com/moment-NEW/P-RTLog](https://github.co
 生成的扩展包为：
 
 ```powershell
-ozone-for-vscode-0.4.6.vsix
+ozone-for-vscode-0.4.7.vsix
 ```
 
 在 VS Code 中安装：
@@ -100,12 +108,12 @@ ozone-for-vscode-0.4.6.vsix
 1. 打开扩展面板。
 2. 点击右上角 `...`。
 3. 选择 `Install from VSIX...`。
-4. 选择 `ozone-for-vscode-0.4.6.vsix`。
+4. 选择 `ozone-for-vscode-0.4.7.vsix`。
 
 也可以使用命令行安装：
 
 ```powershell
-code --install-extension .\ozone-for-vscode-0.4.6.vsix
+code --install-extension .\ozone-for-vscode-0.4.7.vsix
 ```
 
 ## 快速开始
@@ -373,7 +381,7 @@ npm run typecheck
 打包 VSIX：
 
 ```powershell
-npx @vscode/vsce package --out ozone-for-vscode-0.4.6.vsix
+npx @vscode/vsce package --out ozone-for-vscode-0.4.7.vsix
 ```
 
 运行 MCP server：

@@ -38,6 +38,7 @@ export class OzoneBackend {
   private _lastTempBpAddr = -1;
   private dwarfInfo: DwarfInfo = { varToType: new Map(), typeDefs: new Map() };
   private runtimeCounterWraps = new Map<string, { lastRaw: number; base: number }>();
+  private runtimeTaskCounters = new Map<string, number>();
 
   get currentState(): TargetState {
     return this.state;
@@ -220,6 +221,7 @@ case 'readVariableRuntime':
     this.addressLocCache.clear();
     this.lineEntries = [];
     this.runtimeCounterWraps.clear();
+    this.runtimeTaskCounters.clear();
     return { ok: true, data: null };
   }
 
@@ -1331,7 +1333,14 @@ case 'readVariableRuntime':
 
   private formatRuntimeCounterValue(expression: string, rawValue: number, address?: number, typeName = 'uint32_t'): WatchValue {
     const raw = rawValue >>> 0;
-    const value = this.unwrapRuntimeCounter(expression, raw);
+    const key = this.runtimeCounterKey(expression, address);
+    let value = this.unwrapRuntimeCounter(key, raw);
+    if (expression === 'ulTotalRunTime') {
+      const taskTotal = this.latestTaskRuntimeTotal();
+      if (taskTotal > value) value = taskTotal;
+    } else if (this.isTaskRuntimeCounterExpression(expression)) {
+      this.runtimeTaskCounters.set(key, value);
+    }
     const hex = `0x${raw.toString(16).toUpperCase().padStart(8, '0')}`;
     return {
       expression,
@@ -1342,6 +1351,25 @@ case 'readVariableRuntime':
       address,
       typeName,
     };
+  }
+
+  private isTaskRuntimeCounterExpression(expression: string): boolean {
+    return expression.endsWith('.ulRunTimeCounter') || expression.endsWith('->ulRunTimeCounter');
+  }
+
+  private runtimeCounterKey(expression: string, address?: number): string {
+    if (this.isTaskRuntimeCounterExpression(expression) && address !== undefined) {
+      return `tcb-runtime@0x${address.toString(16).toUpperCase()}`;
+    }
+    return expression;
+  }
+
+  private latestTaskRuntimeTotal(): number {
+    let total = 0;
+    for (const value of this.runtimeTaskCounters.values()) {
+      if (Number.isFinite(value) && value > 0) total += value;
+    }
+    return total;
   }
 
   private formatAddress(value: number): string {

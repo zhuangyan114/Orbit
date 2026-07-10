@@ -2,9 +2,18 @@
 
 Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展。扩展通过 SEGGER J-Link DLL 直接访问目标板，提供 Debug Adapter Protocol 调试、Watch 变量、实时 Timeline 采样、SEGGER RTT 日志、P-RTLog tokenized RTT 日志解码、本地插件 API 和 MCP 工具集成。
 
-当前版本：`0.4.7`
+当前版本：`0.4.9`
 
 ## 版本更新日志
+
+### 0.4.9（断点与逐过程修复）
+
+- 修复循环中“逐过程”卡死、超时后停在随机位置的问题；当下一源行地址落在当前 PC 后方或路径不可达时，改用多步进策略，避免临时断点永远不触发。
+- 修复 `switch-case` 的 `break;` 行逐过程异常；识别 Thumb 无条件分支（`B` / `B.W`），避免把临时断点设置到分支不会执行的紧邻地址。
+- 修复断点地址解析错误导致 J-Link 将 BKPT 写入 Cortex-M 系统区的问题；断点设置前会校验合法地址范围，DWARF 行号匹配也优先使用已过滤的有效代码地址。
+- 修复运行中删除未命中断点后 CPU 被 `halt` 遗留的问题；清除断点前保存运行状态，清除完成后自动恢复运行。
+- 改进临时断点槽位复用和 stale breakpoint 判断，减少同行调用、循环尾和用户断点混合场景下的误停与重复点击。
+- 打包产物更新为 `ozone-for-vscode-0.4.9.vsix`，本次构建输出放在 `artifacts/0.4.9/`。
 
 ### 0.4.7（稳定）
 
@@ -100,7 +109,7 @@ P-RTLog 项目地址：[https://github.com/moment-NEW/P-RTLog](https://github.co
 生成的扩展包为：
 
 ```powershell
-ozone-for-vscode-0.4.7.vsix
+ozone-for-vscode-0.4.9.vsix
 ```
 
 在 VS Code 中安装：
@@ -108,12 +117,12 @@ ozone-for-vscode-0.4.7.vsix
 1. 打开扩展面板。
 2. 点击右上角 `...`。
 3. 选择 `Install from VSIX...`。
-4. 选择 `ozone-for-vscode-0.4.7.vsix`。
+4. 选择 `ozone-for-vscode-0.4.9.vsix`。
 
 也可以使用命令行安装：
 
 ```powershell
-code --install-extension .\ozone-for-vscode-0.4.7.vsix
+code --install-extension .\artifacts\0.4.9\ozone-for-vscode-0.4.9.vsix
 ```
 
 ## 快速开始
@@ -381,7 +390,7 @@ npm run typecheck
 打包 VSIX：
 
 ```powershell
-npx @vscode/vsce package --out ozone-for-vscode-0.4.7.vsix
+npx @vscode/vsce package --out artifacts/0.4.9/ozone-for-vscode-0.4.9.vsix
 ```
 
 运行 MCP server：

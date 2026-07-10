@@ -17,6 +17,7 @@ function daLog(msg: string) {
   }
 }
 function enableDaLog() { daLog_Enabled = true; }
+enableDaLog();
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -281,9 +282,7 @@ export class DapSession extends EventEmitter {
       try {
         if (this.pollTimer === null) return;
         const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
-        daLog(`pollLoop: state=${stateResult.ok ? stateResult.data : 'error'}`);
         if (stateResult.ok && stateResult.data === 'halted') {
-          daLog('pollLoop: CPU is halted, stopping polling');
           this.markStoppedForUi();
           this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
           this.stopPolling();
@@ -296,8 +295,6 @@ export class DapSession extends EventEmitter {
           }
           return;
         }
-
-        daLog('pollLoop: target running');
       } catch (err) {
         daLog(`startPolling: error ${err}`);
       }
@@ -412,7 +409,6 @@ export class DapSession extends EventEmitter {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
-      daLog('stopPolling: stopped');
     }
   }
 
@@ -677,7 +673,6 @@ export class DapSession extends EventEmitter {
           return this.handleWatchEvaluate(msg);
         case 'setWatches':
           this.watchExpressions = msg.arguments?.expressions || [];
-          daLog(`setWatches: ${this.watchExpressions.length} expressions: [${this.watchExpressions.join(', ')}]`);
           return this.sendResponse(msg);
         case 'dataSample':
           return this.handleDataSample(msg);
@@ -765,9 +760,7 @@ export class DapSession extends EventEmitter {
       if (elfPath) {
         const loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
         if (loadResult.ok) {
-          daLog(`Symbol loading: ${JSON.stringify(loadResult.data)}`);
         } else {
-          daLog(`Symbol loading failed: ${loadResult.error}`);
         }
       }
 
@@ -864,15 +857,12 @@ export class DapSession extends EventEmitter {
         return;
       }
       try {
-        daLog('handleStackTrace called');
         const result = await this.backend.execute({ cmd: 'getCallStack' });
         if (!result.ok) {
-          daLog(`handleStackTrace failed: ${result.error}`);
           this.sendResponse(msg, { stackFrames: [] });
           return;
         }
         const frames = result.data as StackFrame[];
-        daLog(`handleStackTrace: ${frames.length} frames`);
         const stackFrames = frames.map((f) => ({
           id: f.id,
           name: f.function,
@@ -885,7 +875,6 @@ export class DapSession extends EventEmitter {
         this.endTargetRead();
       }
     } catch (err: any) {
-      daLog(`handleStackTrace error: ${err.message}`);
       this.sendResponse(msg, { stackFrames: [] });
     }
   }
@@ -1090,55 +1079,17 @@ export class DapSession extends EventEmitter {
 
           await new Promise<void>(r => setTimeout(r, 100));
 
-          let pcStuck = false;
           for (let i = 0; i < 200; i++) {
             await new Promise<void>(r => setTimeout(r, 10));
             const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
-            if (i === 0 || (i + 1) % 20 === 0 || i === 199) {
-              daLog(`handleStep: poll ${i + 1}/200 state=${stateResult.ok ? JSON.stringify((stateResult as any).data) : 'err'} ok=${stateResult.ok}`);
-            }
             if (stateResult.ok && stateResult.data === 'halted') {
-              if (pcBeforeVal !== null) {
-                const pcAfter = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-                const pcAfterVal = pcAfter.ok ? (pcAfter.data as any).value as number : null;
-                daLog(`handleStep: halted after ${(i + 1) * 10}ms, pcBefore=0x${pcBeforeVal.toString(16)} pcAfter=0x${pcAfterVal !== null ? pcAfterVal.toString(16) : 'null'}`);
-                if (pcAfterVal !== null && pcAfterVal === pcBeforeVal) {
-                  daLog(`handleStep: PC same, re-reading to rule out stale DLL state`);
-                  let reReadOk = false;
-                  for (let r = 0; r < 5; r++) {
-                    await new Promise<void>(r2 => setTimeout(r2, 50));
-                    const reRead = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-                    const reReadVal = reRead.ok ? (reRead.data as any).value as number : null;
-                    if (reReadVal !== null && reReadVal !== pcBeforeVal) {
-                      daLog(`handleStep: re-read ${r + 1}/5 PC changed to 0x${reReadVal.toString(16)}, step OK`);
-                      reReadOk = true;
-                      break;
-                    }
-                  }
-                  if (reReadOk) {
-                    daLog(`handleStep: ${cmd} complete after re-read`);
-                    this.markStoppedForUi();
-                    this.sendEvent('stopped', { reason: 'step', threadId: 1 });
-                    return;
-                  }
-                  daLog(`handleStep: PC unchanged after 5 re-reads (250ms), will retry`);
-                  pcStuck = true;
-                  break;
-                }
-              }
-              daLog(`handleStep: ${cmd} complete`);
               this.markStoppedForUi();
               this.sendEvent('stopped', { reason: 'step', threadId: 1 });
               return;
             }
             if (i > 50 && (i % 25 === 0)) {
-              const settleResult = await this.backend.execute({ cmd: 'halt' });
-              daLog(`handleStep: soft settle at poll ${i + 1} halt=${settleResult.ok}`);
+              await this.backend.execute({ cmd: 'halt' });
             }
-          }
-          if (pcStuck) {
-            await new Promise<void>(r => setTimeout(r, 50));
-            continue;
           }
           daLog(`handleStep: not halted after 2000ms (soft settle attempts may have halted CPU), starting polling`);
           this.targetRunning = true;
@@ -1235,9 +1186,7 @@ export class DapSession extends EventEmitter {
     const expr = args.expression;
     const context = args.context;
     const frameId = args.frameId;
-    daLog(`handleEvaluate: expr="${expr}" context=${context} frameId=${frameId}`);
     const isRTOS = this.isRtosEvaluateExpression(expr);
-    if (isRTOS) daLog(`handleEvaluate RTOS: "${expr}" context=${context}`);
     if (!expr) {
       this.sendResponse(msg, { result: '', variablesReference: 0 });
       return;
@@ -1247,11 +1196,9 @@ export class DapSession extends EventEmitter {
     const waitForConsistentEvaluate = context === 'hover' || isRTOS;
     if (context === 'watch' && !this.watchExpressions.includes(expr)) {
       this.watchExpressions.push(expr);
-      daLog(`handleEvaluate: auto-captured watch expression "${expr}"`);
     }
 
     if (this.shouldDeferTargetRead()) {
-      daLog(`handleEvaluate: deferring read while target/control busy for "${expr}"`);
       this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
       return;
     }
@@ -1283,11 +1230,8 @@ export class DapSession extends EventEmitter {
       if (result.ok) {
         const wv = result.data as WatchValue;
         this.cacheRuntimeWatchValue(expr, wv);
-        if (isRTOS) daLog(`evaluate RTOS success: "${expr}" = ${wv.display}`);
-        daLog(`handleEvaluate: result="${wv.display}"`);
         this.sendEvaluateValue(msg, wv, true);
       } else {
-        if (isRTOS) daLog(`evaluate RTOS failed: "${expr}" -> ${result.error}`);
         this.sendResponse(msg, { result: result.error, variablesReference: 0 }, false, result.error);
       }
     } finally {
@@ -1298,7 +1242,6 @@ export class DapSession extends EventEmitter {
   private async handleWatchEvaluate(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
     const expressions: string[] = args.expressions || [];
-    daLog(`handleWatchEvaluate: ${expressions.length} expressions`);
     if (this.shouldDeferTargetRead()) {
       this.sendResponse(msg, { results: expressions.map(expr => this.cachedOrRunningWatchValue(expr)) });
       return;
@@ -1310,7 +1253,6 @@ export class DapSession extends EventEmitter {
   private async handleDataSample(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
     const expressions: string[] = args.expressions || [];
-    daLog(`handleDataSample: ${expressions.length} expressions`);
     const results = await this.readWatchExpressions(expressions, true);
     this.sendResponse(msg, { results });
   }
@@ -1479,7 +1421,6 @@ export class DapSession extends EventEmitter {
     const value: number = args.value ?? 0;
     const address = this.parseOptionalAddress(args.address);
     const typeName = typeof args.typeName === 'string' ? args.typeName : undefined;
-    daLog(`handleSetWatchValue: "${expression}" = ${value}`);
     if (!expression || !Number.isFinite(value)) {
       this.sendResponse(msg, { ok: false, error: 'Invalid watch value request' });
       return;

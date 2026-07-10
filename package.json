@@ -2,7 +2,7 @@
   "name": "ozone-for-vscode",
   "displayName": "Ozone for VS Code",
   "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "publisher": "ozone-debug",
   "license": "MIT",
   "repository": {

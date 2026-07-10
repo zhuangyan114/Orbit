@@ -23,6 +23,7 @@ function daLog(msg: string) {
   }
 }
 function enableDaLog() { daLog_Enabled = true; }
+enableDaLog();
 
 const REG_INDEXES: Record<string, number> = {
   R0: 0, R1: 1, R2: 2, R3: 3, R4: 4, R5: 5, R6: 6, R7: 7,
@@ -133,18 +134,13 @@ case 'readVariableRuntime':
     if (this.elfPath === command.elfPath && this.symbols.length > 0) {
       return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };
     }
-    daLog(`loadSymbols start: ${command.elfPath}`);
     this.elfPath = command.elfPath;
     this.symbols = await readElfSymbols(command.elfPath);
-    daLog(`loadSymbols symbols: ${this.symbols.length}`);
-    daLog(`loadSymbols: ${this.symbols.length} symbols, uxCurrentNumberOfTasks=${this.symbols.find(s => s.name === 'uxCurrentNumberOfTasks') ? 'FOUND' : 'NOT FOUND'}`);
     this.lineMapCache = await preloadLineMappings(command.elfPath);
-    daLog(`loadSymbols lineMapCache: ${this.lineMapCache.size} files`);
     const funcAddrs = this.symbols
       .filter(s => s.type === 'T' || s.type === 't')
       .map(s => s.address);
     this.addressLocCache = await preloadAddressMappings(command.elfPath, funcAddrs);
-    daLog(`loadSymbols addressLocCache: ${this.addressLocCache.size}`);
 
     const fnameToAbs = new Map<string, string>();
     for (const loc of this.addressLocCache.values()) {
@@ -155,7 +151,6 @@ case 'readVariableRuntime':
       const base = path.basename(loc.file);
       if (base) fnameToAbs.set(base, loc.file);
     }
-    daLog(`loadSymbols fnameToAbs: ${fnameToAbs.size}, entries: ${JSON.stringify([...fnameToAbs].slice(0, 5))}`);
 
     this.lineEntries = [];
     for (const [fName, entries] of this.lineMapCache) {
@@ -180,9 +175,7 @@ case 'readVariableRuntime':
       }
     }
     this.lineEntries.sort((a, b) => a.address - b.address);
-    daLog(`loadSymbols lineEntries (filtered): ${this.lineEntries.length}`);
     this.dwarfInfo = await parseDwarfTypeInfo(command.elfPath);
-    daLog(`loadSymbols dwarf: ${this.dwarfInfo.varToType.size} vars, ${this.dwarfInfo.typeDefs.size} types`);
     return { ok: true, data: `Loaded ${this.symbols.length} symbols` };
         default:
           return { ok: false, error: `Unsupported command: ${(command as any).cmd}` };
@@ -235,6 +228,7 @@ case 'readVariableRuntime':
     const addr = await this.resolveLineAddress(file, line);
     daLog(`setBreakpoint resolved addr=${addr}`);
     if (addr === null) return { ok: false, error: `Cannot resolve ${file}:${line}` };
+    if (addr < 0x08000000 || addr >= 0x20100000) return { ok: false, error: `Resolved address 0x${addr.toString(16)} for ${file}:${line} is outside valid flash range` };
     console.log(`[Ozone] SetBreakpoint ${file}:${line} → 0x${addr.toString(16).toUpperCase()}`);
     daLog(`setBreakpoint calling jlink.setBreakpoint(${addr.toString(16)})`);
     const bpIndex = this.jlink.setBreakpoint(addr);
@@ -271,7 +265,6 @@ case 'readVariableRuntime':
 
   private async doGetRegisters(): Promise<OzoneCommandResult> {
     const isHalted = this.jlink.isHalted();
-    daLog(`doGetRegisters: isHalted=${isHalted}`);
     if (!isHalted) {
       return { ok: true, data: [] };
     }
@@ -306,7 +299,6 @@ case 'readVariableRuntime':
 
   private async doGetLocals(): Promise<OzoneCommandResult> {
     const isHalted = this.jlink.isHalted();
-    daLog(`doGetLocals: isHalted=${isHalted}`);
     if (!isHalted) {
       return { ok: true, data: [] };
     }
@@ -380,7 +372,6 @@ case 'readVariableRuntime':
     let frameIdCounter = 1;
 
     const pcLoc = this.resolveAddressLoc(pc);
-    daLog(`doGetCallStack pcLoc=${JSON.stringify(pcLoc)}`);
     frames.push({
       id: frameIdCounter++, level: 0,
       function: pcLoc?.func || this.resolveSymbolName(pc) || `0x${pc.toString(16)}`,
@@ -455,17 +446,14 @@ case 'readVariableRuntime':
 
   private async doStepInto(): Promise<OzoneCommandResult> {
     const haltedBefore = await this.ensureHalted();
-    daLog(`doStepInto: ensureHalted=${haltedBefore}`);
     if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step into' };
     await new Promise<void>(r => setTimeout(r, 20));
     this.cleanupStepBreakpoints();
     const pc = this.jlink.readRegister(REG_INDEXES.PC);
-    daLog(`doStepInto: pc=0x${pc !== null ? pc.toString(16) : 'null'}`);
     if (pc === null) return { ok: false, error: 'Cannot read PC' };
 
     let raw = this.jlink.readMemory(pc, 4);
     if (!raw || raw.length < 4) {
-      daLog('doStepInto: readMemory failed, retrying after 10ms');
       await new Promise<void>(r => setTimeout(r, 10));
       raw = this.jlink.readMemory(pc, 4);
     }
@@ -479,7 +467,6 @@ case 'readVariableRuntime':
     const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
     const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0x8000;
     const isBLXReg = (hw1 & 0xFF87) === 0x4780;
-    daLog(`doStepInto: hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg}`);
 
     this.clearCurrentBpAndTrack(pc);
 
@@ -495,25 +482,18 @@ case 'readVariableRuntime':
       if (imm32 & 0x01000000) imm32 |= 0xFE000000;
       let target = ((pc + 4) + imm32) >>> 0;
       if (isBLX) target = (target & ~3) >>> 0;
-      daLog(`doStepInto: BL target=0x${target.toString(16)}`);
       return this.setTempBpAndRun(target);
     }
 
     if (isBLXReg) {
       const rmIndex = (hw1 >> 3) & 0xF;
       const rmVal = this.jlink.readRegister(rmIndex);
-      daLog(`doStepInto: BLX Rm r${rmIndex}=0x${rmVal !== null ? rmVal.toString(16) : 'null'}`);
-      if (rmVal === null) {
-        daLog('doStepInto: BLX Rm read failed, single step');
-        return await this.doSingleStep();
-      }
+      if (rmVal === null) return await this.doSingleStep();
       const target = (rmVal & ~1) >>> 0;
-      daLog(`doStepInto: BLX Rm target=0x${target.toString(16)}`);
       return this.setTempBpAndRun(target);
     }
 
     const startLoc = this.resolveAddressLoc(pc);
-    daLog(`doStepInto: not a call instruction, smart step on line ${startLoc?.line} file=${startLoc?.file}`);
     if (startLoc) {
       for (let i = 0; i < 20; i++) {
         const stepResult = await this.doSingleStep();
@@ -524,7 +504,6 @@ case 'readVariableRuntime':
 
         const newLoc = this.resolveAddressLoc(newPc);
         if (!newLoc || newLoc.file !== startLoc.file || newLoc.line !== startLoc.line) {
-          daLog(`doStepInto: smart step reached diff line at 0x${newPc.toString(16)}`);
           this.restoreClearedBps();
           return { ok: true, data: 'Stepped' };
         }
@@ -538,7 +517,6 @@ case 'readVariableRuntime':
         const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
         const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0x8000;
         const isBLXReg = (hw1 & 0xFF87) === 0x4780;
-        daLog(`doStepInto: smart step ${i + 1} pc=0x${newPc.toString(16)} hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg}`);
 
         if (isBL || isBLX) {
           const S = (hw1 >> 10) & 1;
@@ -552,7 +530,6 @@ case 'readVariableRuntime':
           if (imm32 & 0x01000000) imm32 |= 0xFE000000;
           let target = ((newPc + 4) + imm32) >>> 0;
           if (isBLX) target = (target & ~3) >>> 0;
-          daLog(`doStepInto: smart step found call target=0x${target.toString(16)}`);
           return this.setTempBpAndRun(target);
         }
 
@@ -561,37 +538,30 @@ case 'readVariableRuntime':
           const rmVal = this.jlink.readRegister(rmIndex);
           if (rmVal === null) continue;
           const target = (rmVal & ~1) >>> 0;
-          daLog(`doStepInto: smart step BLX Rm target=0x${target.toString(16)}`);
           return this.setTempBpAndRun(target);
         }
       }
     }
-    daLog('doStepInto: smart step exhausted, single step fallback');
     this.restoreClearedBps();
     return await this.doSingleStep();
   }
 
   private async doStepOut(): Promise<OzoneCommandResult> {
     const haltedBefore = await this.ensureHalted();
-    daLog(`doStepOut: ensureHalted=${haltedBefore}`);
     if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step out' };
     await new Promise<void>(r => setTimeout(r, 20));
     this.cleanupStepBreakpoints();
     const pc = this.jlink.readRegister(REG_INDEXES.PC);
     const lr = this.jlink.readRegister(REG_INDEXES.LR);
-    daLog(`doStepOut: pc=0x${pc !== null ? pc.toString(16) : 'null'} lr=0x${lr !== null ? lr.toString(16) : 'null'}`);
     if (pc === null || lr === null) return { ok: false, error: 'Cannot read PC/LR' };
     if (lr === 0xFFFFFFFF || (lr & 0xF0000000) === 0xF0000000) {
-      daLog('doStepOut: LR is not a valid return address, falling back to single step');
       this.clearCurrentBpAndTrack(pc);
       return await this.doSingleStep();
     }
     const returnAddr = (lr & ~1) >>> 0;
-    daLog(`doStepOut: setting temp bp at return addr 0x${returnAddr.toString(16)}`);
     this.clearCurrentBpAndTrack(pc);
     const result = await this.setTempBpAndRun(returnAddr);
     if (!this.jlink.isHalted()) {
-      daLog('doStepOut: BP did not fire, falling back to single step');
       this.jlink.halt();
       await new Promise<void>(r => setTimeout(r, 100));
       if (this.jlink.isHalted()) {
@@ -604,83 +574,141 @@ case 'readVariableRuntime':
 
   private async doStepOver(): Promise<OzoneCommandResult> {
     const haltedBefore = await this.ensureHalted();
-    daLog(`doStepOver: ensureHalted=${haltedBefore}`);
     if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step over' };
     await new Promise<void>(r => setTimeout(r, 20));
     this.cleanupStepBreakpoints();
     const pc = this.jlink.readRegister(REG_INDEXES.PC);
-    daLog(`doStepOver: pc=0x${pc !== null ? pc.toString(16) : 'null'}`);
     if (pc === null) return { ok: false, error: 'Cannot read PC' };
 
-    let raw = this.jlink.readMemory(pc, 4);
-    if (!raw || raw.length < 4) {
-      daLog('doStepOver: readMemory failed, retrying after 10ms');
+    let raw = this.jlink.readMemory(pc, 6);
+    if (!raw || raw.length < 6) {
       await new Promise<void>(r => setTimeout(r, 10));
-      raw = this.jlink.readMemory(pc, 4);
+      raw = this.jlink.readMemory(pc, 6);
     }
 
-    let hw1 = 0, hw2 = 0;
+    let hw1 = 0, hw2 = 0, hw3 = 0;
     if (raw && raw.length >= 2) {
       hw1 = (raw[1] << 8) | raw[0];
       if (raw.length >= 4) hw2 = (raw[3] << 8) | raw[2];
+      if (raw.length >= 6) hw3 = (raw[5] << 8) | raw[4];
     }
 
     const isBL = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0xD000;
     const isBLX = (hw1 & 0xF800) === 0xF000 && (hw2 & 0xD000) === 0x8000;
     const isBLXReg = (hw1 & 0xFF87) === 0x4780;
     const instrIs32 = (hw1 >> 11) >= 0x1D;
-    daLog(`doStepOver: hw1=0x${hw1.toString(16)} hw2=0x${hw2.toString(16)} isBL=${isBL} isBLX=${isBLX} isBLXReg=${isBLXReg} is32=${instrIs32}`);
+    const isBranch = !instrIs32 && (hw1 & 0xF000) === 0xE000
+      || (hw1 & 0xF800) === 0xF000 && (hw2 & 0xC000) === 0x8000;
 
     this.clearCurrentBpAndTrack(pc);
     const startLoc = this.resolveAddressLoc(pc);
 
     if (isBLXReg) {
       const nextAddr = ((pc + 2) >>> 0);
-      daLog(`doStepOver: BLX Rm at 0x${pc.toString(16)}, setting temp bp at return addr 0x${nextAddr.toString(16)}`);
-      return this.setTempBpAndRun(nextAddr);
-    }
-
-    if (isBL || isBLX) {
+      const stepResult = await this.setTempBpAndRun(nextAddr);
+      const newPc = this.jlink.readRegister(REG_INDEXES.PC);
+      if (newPc !== null && startLoc) {
+        const newLoc = this.resolveAddressLoc(newPc);
+        if (newLoc && newLoc.file === startLoc.file && newLoc.line > startLoc.line) {
+          return stepResult;
+        }
+      }
+    } else if (isBL || isBLX) {
       const nextAddr = ((pc + 4) >>> 0);
-      daLog(`doStepOver: ${isBL ? 'BL' : 'BLX'} at 0x${pc.toString(16)}, setting temp bp at return addr 0x${nextAddr.toString(16)}`);
-      return this.setTempBpAndRun(nextAddr);
+      const stepResult = await this.setTempBpAndRun(nextAddr);
+      const newPc = this.jlink.readRegister(REG_INDEXES.PC);
+      if (newPc !== null && startLoc) {
+        const newLoc = this.resolveAddressLoc(newPc);
+        if (newLoc && newLoc.file === startLoc.file && newLoc.line > startLoc.line) {
+          return stepResult;
+        }
+      }
     }
 
-    daLog(`doStepOver: find next source line line=${startLoc?.line} file=${startLoc?.file}`);
-    const nextAddr = this.findNextSourceLineAddress(pc, startLoc);
-    if (nextAddr !== null && nextAddr > pc) {
-      daLog(`doStepOver: next source line at 0x${nextAddr.toString(16)}`);
-      return this.setTempBpAndRun(nextAddr);
+    if (isBranch) {
+    } else {
+      let nextOffset = instrIs32 ? 4 : 2;
+      if (!instrIs32 && raw && raw.length >= 4) {
+        if ((hw2 & 0xFF00) === 0xDF00 || (hw2 & 0xF000) === 0xE000) {
+          nextOffset = 4;
+        } else if (raw.length >= 6 && (hw2 >> 11) >= 0x1D) {
+          const nextIsCall = (hw2 & 0xF800) === 0xF000 && ((hw3 & 0xD000) === 0xD000 || (hw3 & 0xD000) === 0x8000);
+          const nextIsBranch = (hw2 & 0xF800) === 0xF000 && (hw3 & 0xC000) === 0x8000;
+          if (nextIsCall || nextIsBranch) nextOffset = 6;
+        }
+      }
+      const nextAddr = ((pc + nextOffset) >>> 0);
+      if (nextAddr > pc) {
+        const stepResult = await this.setTempBpAndRun(nextAddr, 500);
+        const newPc = this.jlink.readRegister(REG_INDEXES.PC);
+        if (newPc !== null && startLoc) {
+          const newLoc = this.resolveAddressLoc(newPc);
+          daLog(`nonBranchBp: fired pc=0x${newPc.toString(16)} loc=${newLoc ? `${newLoc.file}:${newLoc.line}` : 'null'} startLoc=${startLoc.file}:${startLoc.line}`);
+          if (newLoc && newLoc.file === startLoc.file && newLoc.line > startLoc.line) {
+            return stepResult;
+          }
+          if (newLoc && newLoc.file === startLoc.file && newLoc.line < startLoc.line) {
+            daLog(`nonBranchBp: loop wrap to line ${newLoc.line}, step done`);
+            return { ok: true, data: 'Stepped' };
+          }
+          if (newLoc && newLoc.file === startLoc.file && newLoc.line === startLoc.line) {
+            daLog(`sameLineStepping: start 0x${newPc.toString(16)} line=${newLoc.line}`);
+            for (let i = 0; i < 10; i++) {
+              const step2Result = await this.doSingleStep();
+              if (!step2Result.ok) { daLog(`sameLineStepping: step fail ${step2Result.error}`); break; }
+              const step2Pc = this.jlink.readRegister(REG_INDEXES.PC);
+              if (step2Pc !== null && startLoc) {
+                const step2Loc = this.resolveAddressLoc(step2Pc);
+                daLog(`sameLineStepping: step${i} pc=0x${step2Pc.toString(16)} loc=${step2Loc ? `${step2Loc.file}:${step2Loc.line}` : 'null'}`);
+                if (step2Loc && step2Loc.file === startLoc.file && step2Loc.line !== startLoc.line) {
+                  daLog(`sameLineStepping: reached line ${step2Loc.line}, done`);
+                  return { ok: true, data: 'Stepped' };
+                }
+              }
+            }
+            daLog(`sameLineStepping: exhausted 10 steps, still on same line`);
+          }
+        }
+      }
     }
-    daLog('doStepOver: stepping to next call or new source line');
     for (let stepCount = 0; stepCount < 20; stepCount++) {
       const stepResult = await this.doSingleStep();
       if (!stepResult.ok) return stepResult;
       const newPc = this.jlink.readRegister(REG_INDEXES.PC);
       if (newPc !== null) {
         const newLoc = this.resolveAddressLoc(newPc);
-        if (newLoc && startLoc && (newLoc.line !== startLoc.line || newLoc.file !== startLoc.file)) {
-          daLog(`doStepOver: reached new source line after ${stepCount + 1} steps`);
+        daLog(`multiStep: step${stepCount} pc=0x${newPc.toString(16)} loc=${newLoc ? `${newLoc.file}:${newLoc.line}` : 'null'}`);
+        if (newLoc && startLoc && newLoc.file === startLoc.file && newLoc.line > startLoc.line) {
           return { ok: true, data: 'Stepped' };
         }
-        const raw = this.jlink.readMemory(newPc, 4);
-        if (raw && raw.length >= 4) {
-          const hw1 = (raw[1] << 8) | raw[0];
-          const hw2 = (raw[3] << 8) | raw[2];
-          if ((hw1 & 0xF800) === 0xF000 && ((hw2 & 0xD000) === 0xD000 || (hw2 & 0xD000) === 0x8000)) {
+        if (newLoc && startLoc && newLoc.file === startLoc.file && newLoc.line < startLoc.line) {
+          const blRaw2 = this.jlink.readMemory(newPc, 4);
+          if (blRaw2 && blRaw2.length >= 4) {
+            const bl2Hw1 = (blRaw2[1] << 8) | blRaw2[0];
+            const bl2Hw2 = (blRaw2[3] << 8) | blRaw2[2];
+            if ((bl2Hw1 & 0xF800) === 0xF000 && ((bl2Hw2 & 0xD000) === 0xD000 || (bl2Hw2 & 0xD000) === 0x8000)) {
+              daLog(`multiStep: backward+BL at 0x${newPc.toString(16)} line=${newLoc.line} hw=0x${bl2Hw1.toString(16)}`);
+              return { ok: true, data: 'Stepped' };
+            }
+          }
+          continue;
+        }
+        const blRaw = this.jlink.readMemory(newPc, 4);
+        if (blRaw && blRaw.length >= 4) {
+          const blHw1 = (blRaw[1] << 8) | blRaw[0];
+          const blHw2 = (blRaw[3] << 8) | blRaw[2];
+          if ((blHw1 & 0xF800) === 0xF000 && ((blHw2 & 0xD000) === 0xD000 || (blHw2 & 0xD000) === 0x8000)) {
             if (newLoc && startLoc && newLoc.line === startLoc.line) {
-              daLog(`doStepOver: reached call on same line ${startLoc.line}, executing via temp bp`);
+              daLog(`multiStep: sameLine+BL at 0x${newPc.toString(16)} line=${newLoc.line} hw=0x${blHw1.toString(16)}`);
               this.clearCurrentBpAndTrack(newPc);
               const blNextAddr = ((newPc + 4) >>> 0);
               return await this.setTempBpAndRun(blNextAddr);
             }
-            daLog(`doStepOver: reached call instruction after ${stepCount + 1} steps`);
             return { ok: true, data: 'Stepped' };
           }
         }
       }
     }
-    daLog('doStepOver: single step fallback after 20 steps');
     return await this.doSingleStep();
   }
 
@@ -691,13 +719,7 @@ case 'readVariableRuntime':
       || (address >= functionRange.start && address < functionRange.end);
 
     for (const entry of this.lineEntries) {
-      if (entry.address > pc && inCurrentFunction(entry.address) && entry.file === startLoc.file && entry.line !== startLoc.line) {
-        return entry.address;
-      }
-    }
-
-    for (const entry of this.lineEntries) {
-      if (inCurrentFunction(entry.address) && entry.file === startLoc.file && entry.line !== startLoc.line) {
+      if (entry.address > pc && inCurrentFunction(entry.address) && entry.file === startLoc.file && entry.line > startLoc.line) {
         return entry.address;
       }
     }
@@ -746,9 +768,9 @@ case 'readVariableRuntime':
     return { ok: false, error: 'Step failed after retries' };
   }
 
-  private async waitForHalt(): Promise<boolean> {
+  private async waitForHalt(maxPolls: number = 500): Promise<boolean> {
     const tStart = Date.now();
-    for (let i = 0; i < 500; i++) {
+    for (let i = 0; i < maxPolls; i++) {
       await new Promise<void>(r => setTimeout(r, 10));
       if (this.jlink.isHalted()) {
         this.state = TargetState.Halted;
@@ -756,7 +778,7 @@ case 'readVariableRuntime':
         return true;
       }
       if (i % 100 === 99) {
-        daLog(`waitForHalt: poll ${i+1}/500 t=${Date.now()-tStart}ms still waiting`);
+        daLog(`waitForHalt: poll ${i+1}/${maxPolls} t=${Date.now()-tStart}ms still waiting`);
       }
     }
     daLog(`waitForHalt: timeout after ${Date.now()-tStart}ms, one final soft settle`);
@@ -769,7 +791,7 @@ case 'readVariableRuntime':
     return false;
   }
 
-  private async setTempBpAndRun(nextAddr: number): Promise<OzoneCommandResult> {
+  private async setTempBpAndRun(nextAddr: number, maxPolls?: number): Promise<OzoneCommandResult> {
     const bpIndex = this.jlink.setBreakpoint(nextAddr);
     daLog(`setTempBpAndRun: addr=0x${nextAddr.toString(16)} bpIndex=${bpIndex}`);
     if (bpIndex === null) {
@@ -832,7 +854,7 @@ case 'readVariableRuntime':
     this.state = TargetState.Running;
 
     const tWait = Date.now();
-    const halted = await this.waitForHalt();
+    const halted = await this.waitForHalt(maxPolls ?? 500);
     daLog(`setTempBpAndRun: waitForHalt=${halted} t=${Date.now()-tWait}ms pc=0x${(this.jlink.readRegister(REG_INDEXES.PC)??0).toString(16)}`);
     if (!halted) {
       this.jlink.halt();
@@ -957,23 +979,12 @@ case 'readVariableRuntime':
       }
       this.lineEntries.sort((a, b) => a.address - b.address);
       this.dwarfInfo = await parseDwarfTypeInfo(elfPath);
-      daLog(`doFlash dwarf: ${this.dwarfInfo.varToType.size} vars, ${this.dwarfInfo.typeDefs.size} types, diag=${this.dwarfInfo._diag || ''}`);
       if (this.dwarfInfo.typeDefs.size === 0) {
         try {
           const out = await new Promise<string>(r => {
             execFile(OBJDUMP_EXE, ['--dwarf=info', elfPath], { maxBuffer: 50 * 1024 * 1024, timeout: 30000, windowsHide: true }, (e, o) => r(o || ''));
           });
-          const tagSet = new Set<string>();
-          const tagRe = /\(DW_TAG_\w+\)/g;
-          let tagM: RegExpExecArray | null;
-          while ((tagM = tagRe.exec(out)) !== null) tagSet.add(tagM[0]);
-          daLog(`doFlash dwarf tags (${tagSet.size} unique, ${(out.match(/\(DW_TAG_\w+\)/g) || []).length} total): ${[...tagSet].join(', ')}`);
-          const lines = out.split('\n').filter(l => l.includes('DW_TAG'));
-          const trimmed = lines.slice(0, 60).join(' ||| ');
-          daLog(`doFlash dwarf lines (${lines.length}): ${trimmed}`);
-        } catch (e: any) {
-          daLog(`doFlash dwarf raw error: ${e.message}`);
-        }
+        } catch (_) {}
       }
       return { ok: true, data: result };
     }
@@ -996,6 +1007,13 @@ case 'readVariableRuntime':
 
   private async resolveLineAddress(file: string, line: number): Promise<number | null> {
     if (!this.elfPath) return null;
+
+    const fileName = file.split(/[/\\]/).pop() || file;
+    for (const entry of this.lineEntries) {
+      if (entry.line === line && (entry.file === file || entry.file.endsWith(fileName) || entry.file === fileName)) {
+        return entry.address;
+      }
+    }
 
     return resolveMappedStatementAddress(this.lineMapCache, file, line);
   }
@@ -1096,11 +1114,7 @@ case 'readVariableRuntime':
 
   private async doEvaluateExpression(expression: string, force: boolean = false): Promise<OzoneCommandResult> {
     expression = expression.trim();
-    daLog(`doEvaluateExpression: "${expression}" force=${force}`);
     const isRTOS = expression === 'uxCurrentNumberOfTasks' || expression === 'pxCurrentTCB' || expression === 'pxReadyTasksLists';
-    if (isRTOS) {
-      daLog(`doEvaluateExpression RTOS: "${expression}" force=${force} symbols=${this.symbols.length}`);
-    }
 
     const sizeofValue = this.evaluateSizeofExpression(expression);
     if (sizeofValue !== null) {

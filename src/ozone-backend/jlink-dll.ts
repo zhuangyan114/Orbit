@@ -300,7 +300,8 @@ export class JLinkDLL {
   clearBreakpoint(index: number): boolean {
     if (!this.lib) return false;
     try {
-      if (!this.isHalted()) {
+      const wasRunning = !this.isHalted();
+      if (wasRunning) {
         this.halt();
       }
       const ret = this.lib.func('int JLINK_ClrBP(uint32_t)')(index);
@@ -308,13 +309,23 @@ export class JLinkDLL {
         if (index >= 0 && index < this.bpSlots.length) {
           this.bpSlots[index] = null;
         }
+        if (wasRunning) {
+          this.run();
+        }
         return true;
+      }
+      if (wasRunning) {
+        this.run();
       }
       return false;
     } catch { return false; }
   }
 
   clearAllBreakpoints(): void {
+    const wasRunning = !this.isHalted();
+    if (wasRunning) {
+      this.halt();
+    }
     for (let i = 0; i < 6; i++) {
       try {
         this.lib?.func('int JLINK_ClrBP(uint32_t)')(i);
@@ -322,6 +333,9 @@ export class JLinkDLL {
       if (i < this.bpSlots.length) {
         this.bpSlots[i] = null;
       }
+    }
+    if (wasRunning) {
+      this.run();
     }
   }
 

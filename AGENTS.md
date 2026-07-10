@@ -28,6 +28,9 @@
 - RTOS Views relies heavily on `evaluate`, `variables`, and expandable `variablesReference` trees. Preserve struct/array/pointer child expansion and `memoryReference` values in `src/debug/dap-session.ts`.
 - The command `ozone.enableMcuDebugViews` should only append workspace settings for external tracking (`memory-view.trackDebuggers` and `mcu-debug.rtos-views.trackDebuggers`); do not silently mutate global user settings on activation.
 
+## Skills
+- `.agent/skills/ozone-debug-fix/SKILL.md` — 步进/断点 bug 诊断与修复流程。当出现逐过程卡死、断点清除后 PC 跳转、switch-case break 步进异常时加载此 skill。
+
 ## J-Link/DAP Pitfalls
 - `JLINK_SetBP` is used as `(slotIndex, address)` with six tracked hardware slots; `ExecCommand("SetBP ...")` is intentionally avoided because it can hang.
 - `disconnect()` in `JLinkDLL` must not call `JLINK_Close()`; reconnect relies on the loaded DLL and `_wasOpened` state to avoid close/open crashes.

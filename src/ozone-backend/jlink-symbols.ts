@@ -361,10 +361,13 @@ export function parseDecodedLineMappings(stdout: string): LineMappingByFile {
 export function resolveMappedStatementAddress(map: LineMappingByFile, file: string, line: number): number | null {
   const fileName = file.split(/[/\\]/).pop() || file;
 
+  const fNameMatch = (fName: string): boolean =>
+    fName === fileName || fName === file || file.endsWith(fName);
+
   for (const [fName, entries] of map) {
-    if (fName !== fileName && !file.includes(fName)) continue;
+    if (!fNameMatch(fName)) continue;
     const match = entries.find(entry => entry.line === line && entry.isStatement);
-    if (match) return match.address;
+    if (match && match.address >= 0x08000000) return match.address;
   }
 
   return null;

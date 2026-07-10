@@ -1,13 +1,19 @@
+import * as fs from 'fs';
 import { EventEmitter } from 'events';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 
+const LOG_PATH = 'C:\\Users\\22690\\Desktop\\AI\\Ozone for VScode\\Log\\ozone-step.log';
+try { fs.mkdirSync('C:\\Users\\22690\\Desktop\\AI\\Ozone for VScode\\Log', { recursive: true }); fs.writeFileSync(LOG_PATH, ''); } catch {}
+
 let daLog_Enabled = false;
 function daLog(msg: string) {
   if (daLog_Enabled) {
-    process.stderr.write('[DapSession] ' + msg + '\n');
+    const line = new Date().toISOString().slice(11,23) + ' [DapSession] ' + msg + '\n';
+    try { fs.appendFileSync(LOG_PATH, line); } catch {}
+    process.stderr.write(line);
   }
 }
 function enableDaLog() { daLog_Enabled = true; }
@@ -133,6 +139,25 @@ export class DapSession extends EventEmitter {
 
   private endTargetRead() {
     this.targetReadInProgress = false;
+  }
+
+  private async beginTargetWrite(timeoutMs = 1200): Promise<boolean> {
+    this.beginControl();
+    const deadline = Date.now() + timeoutMs;
+    while (this.targetReadInProgress) {
+      if (Date.now() >= deadline) {
+        this.endControl();
+        return false;
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+    }
+    this.targetReadInProgress = true;
+    return true;
+  }
+
+  private endTargetWrite() {
+    this.endTargetRead();
+    this.endControl();
   }
 
   private cachedOrRunningWatchValue(expression: string): WatchValue {
@@ -774,12 +799,9 @@ export class DapSession extends EventEmitter {
     this.stopRttLogPolling();
     this.stopPolling();
     try {
-      this.targetRunning = false;
-      for (const [key, bpIndex] of this.breakpoints) {
-        await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
-      }
       this.breakpoints.clear();
       await this.backend.execute({ cmd: 'disconnect' });
+      this.targetRunning = true;
       this.sendResponse(msg);
     } finally {
       this.endControl();
@@ -1118,7 +1140,7 @@ export class DapSession extends EventEmitter {
             await new Promise<void>(r => setTimeout(r, 50));
             continue;
           }
-          daLog(`handleStep: not halted after 2000ms, starting polling`);
+          daLog(`handleStep: not halted after 2000ms (soft settle attempts may have halted CPU), starting polling`);
           this.targetRunning = true;
           this.readCancelEpoch++;
           this.startPolling();
@@ -1455,9 +1477,27 @@ export class DapSession extends EventEmitter {
     const args = msg.arguments || {};
     const expression: string = args.expression || '';
     const value: number = args.value ?? 0;
+    const address = this.parseOptionalAddress(args.address);
+    const typeName = typeof args.typeName === 'string' ? args.typeName : undefined;
     daLog(`handleSetWatchValue: "${expression}" = ${value}`);
-    const result = await this.backend.execute({ cmd: 'setWatchValue', expression, value });
-    this.sendResponse(msg, result);
+    if (!expression || !Number.isFinite(value)) {
+      this.sendResponse(msg, { ok: false, error: 'Invalid watch value request' });
+      return;
+    }
+    if (!(await this.beginTargetWrite())) {
+      this.sendResponse(msg, { ok: false, error: 'Target busy' });
+      return;
+    }
+    try {
+      const result = await this.backend.execute({ cmd: 'setWatchValue', expression, value, address, typeName });
+      if (result.ok) {
+        this.runtimeWatchCache.delete(expression);
+        this.runtimeWatchCacheTime.delete(expression);
+      }
+      this.sendResponse(msg, result);
+    } finally {
+      this.endTargetWrite();
+    }
   }
 
   private async handleGetTargetState(msg: DebugProtocolMessage) {

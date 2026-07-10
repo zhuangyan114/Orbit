@@ -68,6 +68,7 @@ export function WatchApp() {
         case 'init':
           prevValuesRef.current.clear();
           setWatches(msg.watches || []);
+          setExpanded(new Set((msg.expandedExpressions || []).map((e: unknown) => String(e))));
           break;
         case 'watchResults': {
           const incoming: WatchEntry[] = (msg.results || []).map((r: any) => mapResult(r));
@@ -149,23 +150,32 @@ export function WatchApp() {
     if (raw.startsWith('0x') || raw.startsWith('0X')) num = parseInt(raw, 16);
     else num = parseInt(raw, 10);
     if (isNaN(num)) return;
-    vscode.postMessage({ command: 'setWatchValue', expression: entry.expression, value: num });
+    vscode.postMessage({
+      command: 'setWatchValue',
+      expression: entry.expression,
+      value: num,
+      address: entry.address,
+      typeName: entry.typeName,
+    });
   }, []);
 
   const cancelEdit = useCallback(() => setEditingIndex(null), []);
 
-  const toggleExpand = (key: string) => {
+  const toggleExpand = (expression: string) => {
     setExpanded(prev => {
       const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+      if (next.has(expression)) next.delete(expression);
+      else next.add(expression);
+      vscode.postMessage({ command: 'setExpandedExpressions', expressions: [...next] });
       return next;
     });
   };
 
   const renderRow = (w: WatchEntry, key: string, depth: number): React.ReactNode[] => {
-    const isExpanded = expanded.has(key);
+    const expandId = w.expression;
+    const isExpanded = expanded.has(expandId);
     const showToggle = w.hasChildren && w.children && w.children.length > 0;
+    const canEdit = !w.hasChildren && (!w.error || w.error === 'running');
     const indent = depth * 18;
 
     const rows: React.ReactNode[] = [
@@ -183,7 +193,7 @@ export function WatchApp() {
           borderLeft: depth > 0 ? '1px solid var(--vscode-tree-indentGuidesStroke, rgba(128,128,128,0.35))' : 'none',
           cursor: showToggle ? 'pointer' : 'default', userSelect: 'none',
         }}
-          onClick={() => showToggle && toggleExpand(key)}>
+          onClick={() => showToggle && toggleExpand(expandId)}>
           {showToggle ? (
             <div style={{
               width: 0, height: 0,
@@ -207,13 +217,13 @@ export function WatchApp() {
         {/* Value */}
         <div style={{
           padding: '2px 4px', fontFamily: 'monospace', fontSize: depth > 0 ? '11px' : '12px',
-          cursor: w.hasChildren ? 'default' : 'text',
+          cursor: canEdit ? 'text' : 'default',
           color: changedValues.has(w.expression) ? 'var(--vscode-charts-green, #4ec9b0)' :
                  w.value === 'Running...' ? 'var(--vscode-descriptionForeground, #888)' :
                  w.error ? 'var(--vscode-errorForeground, #f48771)' : 'var(--vscode-editor-foreground, #ccc)',
         }}
           onClick={() => {
-            if (!w.hasChildren && w.value && w.value !== 'Running...' && !w.error) startEditing(key, w.value);
+            if (canEdit) startEditing(key, w.value === 'Running...' ? '' : (w.value || ''));
           }}>
           {editingIndex === key ? (
             <input value={editValue}
@@ -228,7 +238,7 @@ export function WatchApp() {
               style={{ width: '100%', boxSizing: 'border-box', padding: '1px 4px', fontSize: '12px', ...inputStyle }} />
           ) : (
             <span style={{
-              borderBottom: !w.hasChildren && w.value && w.value !== '...' && w.value !== 'Running...'
+              borderBottom: canEdit && w.value && w.value !== '...'
                 ? '1px dashed var(--vscode-input-placeholderForeground, #666)' : 'none',
             }}>
               {w.value || '...'}

@@ -6,6 +6,9 @@
 mcp/node_modules/**
 AGENTS.md
 *.log
+Log/**
+*.cpuprofile
+docs/ozone-for-vscode-config-skill/**
 *.vsix
 check-config.js
 verify-config.js

@@ -274,9 +274,16 @@ export class JLinkDLL {
     catch { return false; }
   }
 
-  setBreakpoint(address: number): number | null {
+  setBreakpoint(address: number, preferredSlot?: number): number | null {
     if (!this.lib) return null;
     try {
+      if (preferredSlot !== undefined && preferredSlot >= 0 && preferredSlot < this.bpSlots.length && this.bpSlots[preferredSlot] === null) {
+        const ret = this.lib.func('int JLINK_SetBP(uint32_t, uint32_t)')(preferredSlot, address >>> 0);
+        if (ret >= 0) {
+          this.bpSlots[preferredSlot] = address;
+          return preferredSlot;
+        }
+      }
       for (let i = 0; i < this.bpSlots.length; i++) {
         if (this.bpSlots[i] === null) {
           const ret = this.lib.func('int JLINK_SetBP(uint32_t, uint32_t)')(i, address >>> 0);

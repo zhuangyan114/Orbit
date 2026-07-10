@@ -2,6 +2,9 @@ node_modules/
 dist/
 .vscode-test/
 *.vsix
+Log/
+*.cpuprofile
+docs/ozone-for-vscode-config-skill/
 .DS_Store
 Thumbs.db
 *.log

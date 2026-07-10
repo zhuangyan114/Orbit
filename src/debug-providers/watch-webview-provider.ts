@@ -2,9 +2,12 @@ import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { WatchValue } from '../ozone-backend/types';
 
+const WATCH_EXPANDED_STATE_KEY = 'ozoneWatchExpandedExpressions';
+
 export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
   private _expressions: string[] = [];
+  private _expandedExpressions = new Set<string>();
   private _onExpressionsChanged: ((exprs: string[]) => void) | null = null;
   onSendToTimeline: ((exprs: string[]) => void) | null = null;
 
@@ -15,7 +18,9 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   constructor(
     private context: vscode.ExtensionContext,
     private backend: OzoneBackend,
-  ) {}
+  ) {
+    this._expandedExpressions = new Set(this.context.workspaceState.get<string[]>(WATCH_EXPANDED_STATE_KEY, []));
+  }
 
   get expressionList(): string[] {
     return this._expressions;
@@ -36,7 +41,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage(msg => {
       switch (msg.command) {
         case 'init':
-          this.postMessage({ command: 'init', watches: this._expressions.map(e => ({ expression: e })) });
+          this.postInit();
           if (this._expressions.length > 0) {
             this.evaluateWatches(this._expressions);
           }
@@ -51,7 +56,10 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
           this.evaluateWatches(msg.expressions);
           break;
         case 'setWatchValue':
-          this.setWatchValue(msg.expression, msg.value);
+          this.setWatchValue(msg.expression, msg.value, msg.address, msg.typeName);
+          break;
+        case 'setExpandedExpressions':
+          this.setExpandedExpressions(msg.expressions);
           break;
         case 'sendToTimeline':
           if (this.onSendToTimeline && msg.expressions?.length > 0) {
@@ -68,7 +76,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
 
   setExpressions(expressions: string[]) {
     this._expressions = [...expressions];
-    this.postMessage({ command: 'init', watches: this._expressions.map(e => ({ expression: e })) });
+    this.postInit();
     if (this._onExpressionsChanged) {
       this._onExpressionsChanged(this._expressions);
     }
@@ -80,7 +88,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   addExpression(expr: string) {
     if (!expr || this._expressions.includes(expr)) return;
     this._expressions = [...this._expressions, expr];
-    this.postMessage({ command: 'init', watches: this._expressions.map(e => ({ expression: e })) });
+    this.postInit();
     if (this._onExpressionsChanged) {
       this._onExpressionsChanged(this._expressions);
     }
@@ -88,7 +96,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
 
   removeExpression(expr: string) {
     this._expressions = this._expressions.filter(e => e !== expr);
-    this.postMessage({ command: 'init', watches: this._expressions.map(e => ({ expression: e })) });
+    this.postInit();
     if (this._onExpressionsChanged) {
       this._onExpressionsChanged(this._expressions);
     }
@@ -124,19 +132,27 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ command: 'watchResults', results });
   }
 
-  private async setWatchValue(expression: string, value: number) {
+  private setExpandedExpressions(expressions: unknown) {
+    const next = Array.isArray(expressions)
+      ? expressions.map(e => String(e)).filter(Boolean)
+      : [];
+    this._expandedExpressions = new Set(next);
+    this.context.workspaceState.update(WATCH_EXPANDED_STATE_KEY, next);
+  }
+
+  private async setWatchValue(expression: string, value: number, address?: number, typeName?: string) {
     let result: any;
     // Route through active DAP session when debugging, same as readWatchValues
     const session = vscode.debug.activeDebugSession;
     if (session && session.type === 'ozone') {
       try {
-        const r: any = await session.customRequest('setWatchValue', { expression, value });
+        const r: any = await session.customRequest('setWatchValue', { expression, value, address, typeName });
         result = r && r.ok !== undefined ? r : { ok: true, data: r };
       } catch (e: any) {
         result = { ok: false, error: e.message || 'DAP setWatchValue failed' };
       }
     } else {
-      result = await this.backend.execute({ cmd: 'setWatchValue', expression, value });
+      result = await this.backend.execute({ cmd: 'setWatchValue', expression, value, address, typeName });
     }
     this.postMessage({
       command: 'watchValueSet',
@@ -150,6 +166,14 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     try {
       this.view?.webview.postMessage(msg);
     } catch { }
+  }
+
+  private postInit() {
+    this.postMessage({
+      command: 'init',
+      watches: this._expressions.map(e => ({ expression: e })),
+      expandedExpressions: [...this._expandedExpressions],
+    });
   }
 
   private getHtml(webview: vscode.Webview): string {

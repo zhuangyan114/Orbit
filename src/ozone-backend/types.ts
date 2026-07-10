@@ -144,7 +144,7 @@ export type OzoneCommand =
   | { cmd: 'evaluateExpression'; expression: string; force?: boolean }
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[] }
-  | { cmd: 'setWatchValue'; expression: string; value: number }
+  | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
   | { cmd: 'startRtt'; controlBlockAddress?: number }
   | { cmd: 'stopRtt' }
   | { cmd: 'readRtt'; bufferIndex: number; size: number };

@@ -322,10 +322,56 @@ export interface LineMapping {
   file: string;
   line: number;
   address: number;
+  isStatement: boolean;
 }
 
-export async function preloadLineMappings(elfPath: string): Promise<Map<string, Array<{ line: number; address: number }>>> {
-  const map = new Map<string, Array<{ line: number; address: number }>>();
+export type LineMappingByFile = Map<string, Array<{ line: number; address: number; isStatement: boolean }>>;
+
+export function parseDecodedLineMappings(stdout: string): LineMappingByFile {
+  const map: LineMappingByFile = new Map();
+  const hasStmtColumn = stdout.split('\n').some(line => /\bFile name\b/.test(line) && /\bStmt\b/.test(line));
+
+  for (const lineStr of stdout.split('\n')) {
+    const match = lineStr.match(/^\s*(\S+)\s+(\d+)\s+(0x[0-9a-fA-F]+|\d+)/);
+    if (!match) continue;
+    const fName = match[1];
+    const lNum = parseInt(match[2], 10);
+    if (isNaN(lNum)) continue;
+    const addrStr = match[3];
+    const addr = addrStr.startsWith('0x') || addrStr.startsWith('0X')
+      ? parseInt(addrStr, 16)
+      : parseInt(addrStr, 10);
+    if (isNaN(addr)) continue;
+
+    let entries = map.get(fName);
+    if (!entries) {
+      entries = [];
+      map.set(fName, entries);
+    }
+    entries.push({ line: lNum, address: addr, isStatement: hasStmtColumn ? lineStr.trim().endsWith(' x') : true });
+  }
+
+  for (const entries of map.values()) {
+    entries.sort((a, b) => a.line - b.line);
+  }
+
+  return map;
+}
+
+export function resolveMappedStatementAddress(map: LineMappingByFile, file: string, line: number): number | null {
+  const fileName = file.split(/[/\\]/).pop() || file;
+
+  for (const [fName, entries] of map) {
+    if (fName !== fileName && !file.includes(fName)) continue;
+    const match = entries.find(entry => entry.line === line && entry.isStatement);
+    if (match) return match.address;
+  }
+
+  return null;
+}
+
+export async function preloadLineMappings(elfPath: string): Promise<LineMappingByFile> {
+  const map: LineMappingByFile = new Map();
 
   return new Promise((resolve) => {
     execFile(OBJDUMP_EXE, [
@@ -341,31 +387,7 @@ export async function preloadLineMappings(elfPath: string): Promise<Map<string, 
         return;
       }
 
-      for (const lineStr of stdout.split('\n')) {
-        const match = lineStr.match(/^\s*(\S+)\s+(\d+)\s+(0x[0-9a-fA-F]+|\d+)/);
-        if (!match) continue;
-        const fName = match[1];
-        const lNum = parseInt(match[2], 10);
-        if (isNaN(lNum)) continue;
-        const addrStr = match[3];
-        const addr = addrStr.startsWith('0x') || addrStr.startsWith('0X')
-          ? parseInt(addrStr, 16)
-          : parseInt(addrStr, 10);
-        if (isNaN(addr)) continue;
-
-        let entries = map.get(fName);
-        if (!entries) {
-          entries = [];
-          map.set(fName, entries);
-        }
-        entries.push({ line: lNum, address: addr });
-      }
-
-      for (const entries of map.values()) {
-        entries.sort((a, b) => a.line - b.line);
-      }
-
-      resolve(map);
+      resolve(parseDecodedLineMappings(stdout));
     });
   });
 }
@@ -421,29 +443,8 @@ export async function resolveLineToAddress(elfPath: string, file: string, line: 
         return;
       }
 
-      const fileName = file.split(/[/\\]/).pop() || file;
-      let bestAddress: number | null = null;
-      let bestLine = 0;
-
-      for (const lineStr of stdout.split('\n')) {
-        const match = lineStr.match(/^\s*(\S+)\s+(\d+)\s+(0x[0-9a-fA-F]+|\d+)/);
-        if (!match) continue;
-        const fName = match[1];
-        const lNum = parseInt(match[2], 10);
-        if (isNaN(lNum)) continue;
-        const addrStr = match[3];
-        const addr = addrStr.startsWith('0x') || addrStr.startsWith('0X')
-          ? parseInt(addrStr, 16)
-          : parseInt(addrStr, 10);
-        if (isNaN(addr)) continue;
-
-        if ((fName === fileName || file.includes(fName)) && lNum <= line && lNum > bestLine) {
-          bestAddress = addr;
-          bestLine = lNum;
-        }
-      }
-
-      resolve(bestAddress);
+      const map = parseDecodedLineMappings(stdout);
+      resolve(resolveMappedStatementAddress(map, file, line));
     });
   });
 }

@@ -1,9 +1,8 @@
 node_modules/
 dist/
 .vscode-test/
-artifacts/
+outputs/
 *.vsix
-Log/
 *.cpuprofile
 docs/ozone-for-vscode-config-skill/
 .DS_Store

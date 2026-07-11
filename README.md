@@ -13,7 +13,7 @@ Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展�
 - 修复断点地址解析错误导致 J-Link 将 BKPT 写入 Cortex-M 系统区的问题；断点设置前会校验合法地址范围，DWARF 行号匹配也优先使用已过滤的有效代码地址。
 - 修复运行中删除未命中断点后 CPU 被 `halt` 遗留的问题；清除断点前保存运行状态，清除完成后自动恢复运行。
 - 改进临时断点槽位复用和 stale breakpoint 判断，减少同行调用、循环尾和用户断点混合场景下的误停与重复点击。
-- 打包产物更新为 `ozone-for-vscode-0.4.9.vsix`，本次构建输出放在 `artifacts/0.4.9/`。
+- 打包产物更新为 `ozone-for-vscode-0.4.9.vsix`，本次构建输出放在 `outputs/artifacts/0.4.9/`。
 
 ### 0.4.7（稳定）
 
@@ -390,7 +390,7 @@ npm run typecheck
 打包 VSIX：
 
 ```powershell
-npx @vscode/vsce package --out artifacts/0.4.9/ozone-for-vscode-0.4.9.vsix
+npx @vscode/vsce package --out outputs/artifacts/0.4.9/ozone-for-vscode-0.4.9.vsix
 ```
 
 运行 MCP server：

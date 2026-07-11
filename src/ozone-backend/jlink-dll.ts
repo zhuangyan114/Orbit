@@ -1,6 +1,7 @@
 import * as koffi from 'koffi';
 import * as path from 'path';
 import * as fs from 'fs';
+import { log } from '../utils/logger';
 
 const REG_INDEXES: Record<string, number> = {
   R0: 0, R1: 1, R2: 2, R3: 3, R4: 4, R5: 5, R6: 6, R7: 7,
@@ -47,13 +48,13 @@ export class JLinkDLL {
     if (this.lib) return true;
     try {
       const dllPath = this.getDllPath();
-      console.log('[JLinkDLL] Loading:', dllPath);
+      log.dll('Loading: ' + dllPath);
       this.lib = koffi.load(dllPath);
       const ver = this.lib.func('int JLINK_GetDLLVersion(void)')();
-      console.log(`[JLinkDLL] v${(ver >>> 8) & 0xFF}.${ver & 0xFF}`);
+      log.dll(`v${(ver >>> 8) & 0xFF}.${ver & 0xFF}`);
       return true;
     } catch (err) {
-      console.error('[JLinkDLL] Open failed:', err);
+      log.dll('Open failed: ' + err);
       return false;
     }
   }
@@ -72,48 +73,48 @@ export class JLinkDLL {
     if (!this.lib) return false;
     try {
       if (!this._wasOpened) {
-        console.log('[JLinkDLL] JLINK_Open...');
+        log.dll('JLINK_Open...');
         if (this.lib.func('int JLINK_Open(void)')() < 0) {
-          console.log('[JLinkDLL] JLINK_Open FAILED');
+          log.dll('JLINK_Open FAILED');
           this.lib = null;
           return false;
         }
         this._wasOpened = true;
-        console.log('[JLinkDLL] JLINK_Open OK');
+        log.dll('JLINK_Open OK');
       }
-      console.log('[JLinkDLL] device', device);
+      log.dll('device ' + device);
       if (this.lib.func('int JLINK_ExecCommand(const char*)')(`device ${device}`) < 0) {
-        console.log('[JLinkDLL] device FAILED');
+        log.dll('device FAILED');
         this.close();
         return false;
       }
-      console.log('[JLinkDLL] device OK');
-      console.log('[JLinkDLL] SetSpeed', speedKHz);
+      log.dll('device OK');
+      log.dll('SetSpeed ' + speedKHz);
       if (this.lib.func('int JLINK_SetSpeed(int)')(speedKHz) < 0) {
-        console.log('[JLinkDLL] SetSpeed FAILED');
+        log.dll('SetSpeed FAILED');
         this.close();
         return false;
       }
-      console.log('[JLinkDLL] SetSpeed OK');
-      console.log('[JLinkDLL] TIF_Select SWD');
+      log.dll('SetSpeed OK');
+      log.dll('TIF_Select SWD');
       if (this.lib.func('int JLINK_TIF_Select(int)')(1) < 0) {
-        console.log('[JLinkDLL] TIF_Select FAILED');
+        log.dll('TIF_Select FAILED');
         this.close();
         return false;
       }
-      console.log('[JLinkDLL] TIF_Select OK');
-      console.log('[JLinkDLL] JLINK_Connect...');
+      log.dll('TIF_Select OK');
+      log.dll('JLINK_Connect...');
       if (this.lib.func('int JLINK_Connect(const char*)')('') < 0) {
-        console.log('[JLinkDLL] JLINK_Connect FAILED');
+        log.dll('JLINK_Connect FAILED');
         this.close();
         return false;
       }
-      console.log('[JLinkDLL] JLINK_Connect OK');
+      log.dll('JLINK_Connect OK');
       this._state = 'connected';
       this._device = device;
       return true;
     } catch (err) {
-      console.error('[JLinkDLL] Connect error:', err);
+      log.dll('Connect error: ' + err);
       this.close();
       return false;
     }

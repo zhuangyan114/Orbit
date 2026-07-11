@@ -1,23 +1,9 @@
-import * as fs from 'fs';
 import { EventEmitter } from 'events';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
 import { PRtLogDecoder } from './p-rtlog-decoder';
-
-const LOG_PATH = 'C:\\Users\\22690\\Desktop\\AI\\Ozone for VScode\\Log\\ozone-step.log';
-try { fs.mkdirSync('C:\\Users\\22690\\Desktop\\AI\\Ozone for VScode\\Log', { recursive: true }); fs.writeFileSync(LOG_PATH, ''); } catch {}
-
-let daLog_Enabled = false;
-function daLog(msg: string) {
-  if (daLog_Enabled) {
-    const line = new Date().toISOString().slice(11,23) + ' [DapSession] ' + msg + '\n';
-    try { fs.appendFileSync(LOG_PATH, line); } catch {}
-    process.stderr.write(line);
-  }
-}
-function enableDaLog() { daLog_Enabled = true; }
-enableDaLog();
+import { log } from '../utils/logger';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -276,7 +262,7 @@ export class DapSession extends EventEmitter {
 
   private startPolling() {
     this.stopPolling();
-    daLog(`startPolling: started, ${this.watchExpressions.length} watch expressions`);
+    log.dap(`startPolling: started, ${this.watchExpressions.length} watch expressions`);
     const pollLoop = async () => {
       if (this.pollTimer === null) return;
       try {
@@ -290,13 +276,13 @@ export class DapSession extends EventEmitter {
             setTimeout(() => {
               void this.readWatchExpressions(this.watchExpressions, false)
                 .then(results => this.sendWatchUpdate(results))
-                .catch(err => daLog(`pollLoop: deferred watch read error ${err}`));
+                .catch(err => log.dap(`pollLoop: deferred watch read error ${err}`));
             }, 150);
           }
           return;
         }
       } catch (err) {
-        daLog(`startPolling: error ${err}`);
+        log.dap(`startPolling: error ${err}`);
       }
       if (this.pollTimer !== null) {
         this.pollTimer = setTimeout(pollLoop, 200);
@@ -723,7 +709,7 @@ export class DapSession extends EventEmitter {
       this._interface = interface_;
       this._speedKHz = speedKHz;
       this._flashEnabled = flashEnabled;
-      console.log(`[Ozone] Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
+      log.dap(`Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
       this.resetVariableHandles();
       if (this.pRtLogEnabled) {
         const tokenLoad = this.pRtLogDecoder.loadTokenDatabase(elfPath);
@@ -811,7 +797,7 @@ export class DapSession extends EventEmitter {
 
       for (const [key, bpIndex] of this.breakpoints) {
         if (key.startsWith(filePath + ':')) {
-          daLog(`handleSetBreakpoints: clearing old bp ${key} index=${bpIndex}`);
+          log.dap(`handleSetBreakpoints: clearing old bp ${key} index=${bpIndex}`);
           await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
           this.breakpoints.delete(key);
         }
@@ -1002,27 +988,27 @@ export class DapSession extends EventEmitter {
       this.beginControl();
       this.stopPolling();
       try {
-        daLog('handleContinue: reading PC');
+        log.dap('handleContinue: reading PC');
         const pcResult = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
         let bpAddr: number | null = null;
         if (pcResult.ok) {
           const pcData = pcResult.data as any;
           bpAddr = pcData.value as number;
-          daLog(`handleContinue: pc=0x${bpAddr.toString(16)}`);
+          log.dap(`handleContinue: pc=0x${bpAddr.toString(16)}`);
         }
 
         if (bpAddr !== null) {
           const clearResult = await this.backend.execute({ cmd: 'clearBreakpointAtAddr', addr: bpAddr });
-          daLog(`handleContinue: clear bp result ok=${clearResult.ok}`);
+          log.dap(`handleContinue: clear bp result ok=${clearResult.ok}`);
           if (clearResult.ok) {
             await this.backend.execute({ cmd: 'stepInto' });
             await this.backend.execute({ cmd: 'setBreakpointAtAddr', addr: bpAddr });
-            daLog('handleContinue: re-set bp after step');
+            log.dap('handleContinue: re-set bp after step');
           }
         }
 
         const runResult = await this.backend.execute({ cmd: 'run' });
-        daLog(`handleContinue: run result ok=${runResult.ok}`);
+        log.dap(`handleContinue: run result ok=${runResult.ok}`);
         this.targetRunning = runResult.ok;
         if (runResult.ok) {
           this.readCancelEpoch++;
@@ -1031,7 +1017,7 @@ export class DapSession extends EventEmitter {
         this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
         this.lastHaltReason = 'breakpoint';
         if (!runResult.ok) {
-          daLog('handleContinue: run failed, sending stopped');
+          log.dap('handleContinue: run failed, sending stopped');
           this.markStoppedForUi();
           this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
           return;
@@ -1051,13 +1037,13 @@ export class DapSession extends EventEmitter {
       try {
         const pcBefore = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
         const pcBeforeVal = pcBefore.ok ? (pcBefore.data as any).value as number : null;
-        daLog(`handleStep: ${cmd} pcBefore=0x${pcBeforeVal !== null ? pcBeforeVal.toString(16) : 'null'}`);
+        log.dap(`handleStep: ${cmd} pcBefore=0x${pcBeforeVal !== null ? pcBeforeVal.toString(16) : 'null'}`);
 
         let responseSent = false;
         for (let attempt = 0; attempt < 3; attempt++) {
-          daLog(`handleStep: ${cmd} attempt ${attempt + 1}/3 start`);
+          log.dap(`handleStep: ${cmd} attempt ${attempt + 1}/3 start`);
           const result = await this.backend.execute({ cmd });
-          daLog(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
+          log.dap(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
           if (!result.ok) {
             if (attempt < 2) {
               await new Promise<void>(r => setTimeout(r, 50));
@@ -1073,7 +1059,7 @@ export class DapSession extends EventEmitter {
           if (!responseSent) {
             this.sendResponse(msg);
             responseSent = true;
-            daLog(`handleStep: ${cmd} response sent, starting poll`);
+            log.dap(`handleStep: ${cmd} response sent, starting poll`);
           }
           this.lastHaltReason = 'step';
 
@@ -1091,13 +1077,13 @@ export class DapSession extends EventEmitter {
               await this.backend.execute({ cmd: 'halt' });
             }
           }
-          daLog(`handleStep: not halted after 2000ms (soft settle attempts may have halted CPU), starting polling`);
+          log.dap(`handleStep: not halted after 2000ms (soft settle attempts may have halted CPU), starting polling`);
           this.targetRunning = true;
           this.readCancelEpoch++;
           this.startPolling();
           return;
         }
-        daLog(`handleStep: ${cmd} failed after 3 attempts`);
+        log.dap(`handleStep: ${cmd} failed after 3 attempts`);
         if (!responseSent) {
           this.sendResponse(msg, undefined, false, 'Step failed after 3 attempts');
         }

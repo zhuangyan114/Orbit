@@ -1,19 +1,39 @@
 # Ozone for VS Code — Agent Guide
 
 ## Verify Commands
-- Install with `npm install`; `package-lock.json` is committed.
-- `npm run build` bundles all runtime entrypoints with esbuild: `dist/extension.js`, `dist/debugadapter.js`, `dist/webview.js`, `dist/timeline.js`, `dist/watch.js`.
-- Run `npm run typecheck` separately; build does not run `tsc --noEmit`.
-- `npm run watch` starts esbuild watch for all five bundles; `npm run dev` does a one-shot build then launches VS Code with `--extensionDevelopmentPath=.`.
-- VS Code F5 configs are in `.vscode/launch.json`: `Run Extension` runs preLaunchTask `npm: build`; `Extension + Watch` runs background task `npm: watch`.
-- `npm test` is `vitest run`, but there are currently no tests. `npm run lint` exists, but no ESLint config is present in the repo.
+- `npm install`; `package-lock.json` is committed.
+- `npm run build` bundles all 5 entrypoints via esbuild: `dist/{extension,debugadapter,webview,timeline,watch}.js`.
+- `npm run typecheck` = `tsc --noEmit` (separate from build).
+- `npm run watch` starts esbuild watch for all 5 bundles.
+- `npm run dev` builds + launches VS Code at `.`.
+- `npm run mcp` starts the MCP server from `mcp/ozone-mcp-server.js`.
+- `npm test` = `vitest run` (no tests currently). `npm run lint` has no ESLint config — does nothing.
+- F5 configs in `.vscode/launch.json`: `Run Extension` (preTask `npm: build`), `Extension + Watch` (background `npm: watch`).
 
 ## Architecture Boundaries
 - This is a Windows-only VS Code extension: `JLink_x64.dll` is loaded via `koffi`; do not introduce an Ozone GUI or JLink.exe child-process control path for normal debug commands.
 - Host entrypoint is `src/extension.ts`; DAP entrypoint is `src/debugadapter.ts`; browser bundles are `src/webview/main.tsx`, `src/webview/timeline/main.tsx`, and `src/webview/watch/main.tsx`.
-- VS Code launches the debug adapter as a separate Node process from `package.json` debugger `program: "./dist/debugadapter.js"`; keep child_process-heavy work out of inline debug adapters.
+- VS Code launches the debug adapter as a separate Node process from `package.json` debugger `program: "./dist/debugadapter.js"`; DAP adapter reads/writes stdio JSON with `Content-Length:` headers (no HTTP).
 - `src/debug/dap-session.ts` is framework-agnostic DAP logic and should not import `vscode`.
+- `esbuild.config.js` externals: `koffi` (native FFI, loaded at runtime) and `vscode` (provided by VS Code runtime). Sourcemaps for DAP/timeline/watch bundles are intentionally disabled.
 - `OzoneBackend` owns command dispatch through the `OzoneCommand` union in `src/ozone-backend/types.ts`; every `OzoneCommandResult` consumer must check `.ok` before reading `.data`.
+- Activation events: `onStartupFinished`, `onView:ozoneWatch`, `onView:ozoneTimeline`, `onDebugResolve:ozone`.
+- Plugin API: local HTTP server at `127.0.0.1:{randomPort}`, Bearer token auth, writes endpoint to `globalStorage/plugin-api-endpoint.json`. MCP server (`npm run mcp`) calls it via RPC.
+
+## Logging System
+- Shared logger at `src/utils/logger.ts`; writes to `outputs/Log/` (auto-created, gitignored).
+- Four categories, each writes to a separate file:
+
+| Import | File | Content |
+|---|---|---|
+| `log.step(msg)` | `outputs/Log/step.log` | 步进、逐过程、temp BP、断点设置/清除、continue |
+| `log.eval(msg)` | `outputs/Log/eval.log` | evaluate expression、内存读写、DWARF 解析错误 |
+| `log.dll(msg)` | `outputs/Log/dll.log` | J-Link DLL open/close/connect/device/speed |
+| `log.dap(msg)` | `outputs/Log/dap.log` | 启动、polling、Watch、step 命令、会话事件 |
+
+- All categories enabled by default; each line is `HH:MM:SS.mmm [Tag] message`.
+- Replace old `console.log('[JLinkDLL] ...')` and duplicate `daLog()` in `commander.ts`/`dap-session.ts` with appropriate category.
+- Bug fix log is separate: `docs/bug-fix-log.md`, appended by agent per SKILL.md workflow.
 
 ## Runtime Routing
 - The extension host and DAP adapter are different processes with different `OzoneBackend` instances; when an active `ozone` debug session exists, watch/data-sampling requests must route through `session.customRequest(...)` instead of directly using the extension-host backend.
@@ -29,7 +49,7 @@
 - The command `ozone.enableMcuDebugViews` should only append workspace settings for external tracking (`memory-view.trackDebuggers` and `mcu-debug.rtos-views.trackDebuggers`); do not silently mutate global user settings on activation.
 
 ## Skills
-- `.agent/skills/ozone-debug-fix/SKILL.md` — 步进/断点 bug 诊断与修复流程。当出现逐过程卡死、断点清除后 PC 跳转、switch-case break 步进异常时加载此 skill。
+- 修 bug 前先加载 `.agent/skills/ozone-debug-fix/SKILL.md`。
 
 ## J-Link/DAP Pitfalls
 - `JLINK_SetBP` is used as `(slotIndex, address)` with six tracked hardware slots; `ExecCommand("SetBP ...")` is intentionally avoided because it can hang.

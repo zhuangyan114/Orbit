@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { log } from '../utils/logger';
 
 function findArmTool(toolName: string): string {
   const pathDirs = (process.env.Path || process.env.PATH || '').split(';');
@@ -52,7 +53,7 @@ export function readElfSymbols(elfPath: string): Promise<SymbolInfo[]> {
       windowsHide: true,
     }, (error, stdout) => {
       if (error) {
-        console.error('[JLinkSymbols] readElfSymbols error:', error);
+        log.eval('readElfSymbols error: ' + error);
         resolve([]);
         return;
       }
@@ -184,7 +185,7 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
         timeout: 30000,
         windowsHide: true,
       }, (error, stdout) => {
-        if (error) { console.error('[Dwarf] readDwarfTypes error:', error); resolve(''); }
+        if (error) { log.eval('readDwarfTypes error: ' + error); resolve(''); }
         else { resolve(stdout); }
       });
     });
@@ -385,7 +386,7 @@ export async function preloadLineMappings(elfPath: string): Promise<LineMappingB
       windowsHide: true,
     }, (error, stdout) => {
       if (error) {
-        console.error('[JLinkSymbols] preloadLineMappings error:', error);
+        log.eval('preloadLineMappings error: ' + error);
         resolve(map);
         return;
       }
@@ -411,7 +412,7 @@ export async function preloadAddressMappings(elfPath: string, addresses: number[
       windowsHide: true,
     }, (error, stdout) => {
       if (error) {
-        console.error('[JLinkSymbols] preloadAddressMappings error:', error);
+        log.eval('preloadAddressMappings error: ' + error);
         resolve(map);
         return;
       }
@@ -441,7 +442,7 @@ export async function resolveLineToAddress(elfPath: string, file: string, line: 
       windowsHide: true,
     }, (error, stdout) => {
       if (error) {
-        console.error('[JLinkSymbols] resolveLineToAddress error:', error);
+        log.eval('resolveLineToAddress error: ' + error);
         resolve(null);
         return;
       }
@@ -462,7 +463,7 @@ export async function resolveAddressToLine(elfPath: string, address: number): Pr
       windowsHide: true,
     }, (error, stdout) => {
       if (error) {
-        console.error('[JLinkSymbols] resolveAddressToLine error:', error);
+        log.eval('resolveAddressToLine error: ' + error);
         resolve(null);
         return;
       }

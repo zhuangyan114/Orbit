@@ -236,6 +236,32 @@
                 "type": "string",
                 "description": "Path to the P-RTLog toolkit root",
                 "default": "D:\\STM32\\tool\\P-RTLog"
+              },
+              "nativeDebugEngineEnabled": {
+                "type": "boolean",
+                "description": "Enable the experimental Native Debug Engine session path",
+                "default": false
+              },
+              "nativeDebugEngineMode": {
+                "type": "string",
+                "enum": ["legacy", "native", "auto"],
+                "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback",
+                "default": "auto"
+              },
+              "nativeDebugEngineStepInto": {
+                "type": "boolean",
+                "description": "Use Native stepIntoInstruction when an exclusive native executor is connected",
+                "default": false
+              },
+              "nativeDebugEngineStepOver": {
+                "type": "boolean",
+                "description": "Use Native stepOverSourceLine when an exclusive native executor is connected",
+                "default": false
+              },
+              "nativeDebugEngineStepOut": {
+                "type": "boolean",
+                "description": "Use Native stepOut when an exclusive native executor is connected",
+                "default": false
               }
             }
           }
@@ -350,6 +376,32 @@
           "default": "D:\\STM32\\tool\\P-RTLog",
           "description": "Path to the P-RTLog toolkit root"
         },
+        "ozone.nativeDebugEngine.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the experimental Native Debug Engine. Keep disabled until the session owns a single native J-Link channel."
+        },
+        "ozone.nativeDebugEngine.mode": {
+          "type": "string",
+          "enum": ["legacy", "native", "auto"],
+          "default": "auto",
+          "description": "Target owner selection: legacy uses koffi only; native fails without fallback; auto may fall back only before Native connects."
+        },
+        "ozone.nativeDebugEngine.stepOver": {
+          "type": "boolean",
+          "default": false,
+          "description": "Route step over to Native stepOverSourceLine when the Native Debug Engine is enabled and connected."
+        },
+        "ozone.nativeDebugEngine.stepInto": {
+          "type": "boolean",
+          "default": false,
+          "description": "Route step into to Native stepIntoInstruction when the Native Debug Engine is enabled and connected."
+        },
+        "ozone.nativeDebugEngine.stepOut": {
+          "type": "boolean",
+          "default": false,
+          "description": "Route step out to Native stepOut when the Native Debug Engine is enabled and connected."
+        },
         "ozone.watchPollIntervalMs": {
           "type": "number",
           "default": 500,
@@ -377,6 +429,9 @@
   "scripts": {
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.config.js",
+    "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
+    "test:cpp-channel": "node scripts/cpp-channel-smoke.js",
+    "test:cpp-channel:mock": "node scripts/cpp-channel-smoke.js --mock",
     "watch": "node esbuild.config.js --watch",
     "mcp": "node mcp/ozone-mcp-server.js",
     "lint": "eslint src --ext ts,tsx",

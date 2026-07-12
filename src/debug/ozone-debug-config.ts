@@ -75,6 +75,21 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (config.pRtLogRoot === undefined) {
       config.pRtLogRoot = cfg.get<string>('pRtLogRoot', 'D:\\STM32\\tool\\P-RTLog');
     }
+    if (config.nativeDebugEngineEnabled === undefined) {
+      config.nativeDebugEngineEnabled = cfg.get<boolean>('nativeDebugEngine.enabled', false);
+    }
+    if (config.nativeDebugEngineMode === undefined) {
+      config.nativeDebugEngineMode = cfg.get<'legacy' | 'native' | 'auto'>('nativeDebugEngine.mode', 'auto');
+    }
+    if (config.nativeDebugEngineStepOver === undefined) {
+      config.nativeDebugEngineStepOver = cfg.get<boolean>('nativeDebugEngine.stepOver', false);
+    }
+    if (config.nativeDebugEngineStepInto === undefined) {
+      config.nativeDebugEngineStepInto = cfg.get<boolean>('nativeDebugEngine.stepInto', false);
+    }
+    if (config.nativeDebugEngineStepOut === undefined) {
+      config.nativeDebugEngineStepOut = cfg.get<boolean>('nativeDebugEngine.stepOut', false);
+    }
 
     return config;
   }

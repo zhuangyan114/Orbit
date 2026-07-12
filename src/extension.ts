@@ -68,7 +68,7 @@ function writeRttLogTerminal(text: string) {
 
 export async function activate(context: vscode.ExtensionContext) {
   try {
-    const b = new OzoneBackend();
+    const b = new OzoneBackend(undefined, undefined, () => vscode.debug.activeDebugSession?.type === 'ozone');
     backend = b;
 
     const wp = new WatchProvider();
@@ -217,21 +217,17 @@ export async function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        await vscode.window.withProgress({
-          location: vscode.ProgressLocation.Notification,
-          title: `Ozone: Connecting to ${device}...`,
-          cancellable: false,
-        }, async () => {
-          const connectResult = await backend.execute({ cmd: 'connect', config: { device, interface: interface_, speedKHz } });
-          if (!connectResult.ok) {
-            vscode.window.showErrorMessage(`Ozone: ${connectResult.error}`);
-            return;
-          }
-          const loadResult = await backend.execute({ cmd: 'loadSymbols', elfPath });
-          if (loadResult.ok) {
-            vscode.window.showInformationMessage(`Ozone: Connected to ${device}, loaded ${(loadResult.data as string)}`);
-          }
-          startWatchPolling();
+        // Release any pre-existing extension-host legacy session before the DAP
+        // process selects its sole session owner.
+        await backend.execute({ cmd: 'disconnect' });
+        await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
+          type: 'ozone',
+          request: 'launch',
+          name: 'Ozone Debug',
+          program: elfPath,
+          device,
+          interface: interface_,
+          speedKHz,
         });
       }),
     );
@@ -250,7 +246,11 @@ async function readWatchValues(exprs: string[]): Promise<any[]> {
     try {
       const r: any = await session.customRequest('dataSample', { expressions: exprs });
       if (r && r.results) return r.results;
-    } catch {}
+      return exprs.map(expression => ({ expression, value: 0, display: '', hex: '', error: 'DAP dataSample returned no results' }));
+    } catch (err: any) {
+      const error = err?.message || 'DAP dataSample failed';
+      return exprs.map(expression => ({ expression, value: 0, display: '', hex: '', error }));
+    }
   }
   const results: any[] = [];
   for (const expr of exprs) {

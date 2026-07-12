@@ -1,5 +1,7 @@
 node_modules/
 dist/
+out/
+native/jlink-helper/build/
 .vscode-test/
 outputs/
 *.vsix

@@ -163,7 +163,8 @@ export class DataSamplingManager {
     } catch {
       this.remoteSession = null;
       this.remoteSampling = false;
-      if (!this.timer) this.startSampling();
+      const activeSession = vscode.debug.activeDebugSession;
+      if ((!activeSession || activeSession.type !== 'ozone') && !this.timer) this.startSampling();
     }
   }
 
@@ -221,6 +222,7 @@ export class DataSamplingManager {
         if (r && r.state === 'halted') return true;
         if (r && r.state === 'running') return false;
       } catch {}
+      return false;
     }
     const r = await this.backend.execute({ cmd: 'getTargetState' });
     return r.ok && r.data === 'halted';
@@ -254,6 +256,7 @@ export class DataSamplingManager {
         const r: any = await session.customRequest('dataSample', { expressions: exprs });
         if (r && r.results) return r.results;
       } catch {}
+      return exprs.map(() => null);
     }
     const results: (WatchValue | null)[] = [];
     for (const expr of exprs) {

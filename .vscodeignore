@@ -5,6 +5,9 @@
 .vscode/**
 .vscode-test/**
 outputs/**
+out/native/jlink-helper-build/**
+out/native/win32-x64/test/**
+native/jlink-helper/**
 mcp/node_modules/**
 AGENTS.md
 *.log

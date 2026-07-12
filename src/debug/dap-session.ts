@@ -33,6 +33,7 @@ export class DapSession extends EventEmitter {
   private rttPollIntervalMs = 50;
   private rttReadSize = 4096;
   private rttControlBlockAddress: number | undefined;
+  private dapStepProfileSeq = 0;
   private rttStripAnsi = true;
   private _rtos = '';
   private rttLogTarget: 'terminal' | 'debugConsole' | 'both' = 'terminal';
@@ -124,11 +125,20 @@ export class DapSession extends EventEmitter {
     return true;
   }
 
+  private async beginWatchTargetRead(timeoutMs = 250): Promise<boolean> {
+    if (this.beginTargetRead('high')) return true;
+    if (this.controlInProgress) return false;
+    // Let the current Timeline read drain, then keep the low-priority loop
+    // from reacquiring the DAP gate before this Watch request can run.
+    this.lowPriorityReadBlockedUntil = Math.max(this.lowPriorityReadBlockedUntil, Date.now() + timeoutMs);
+    return this.beginTargetReadWhenAvailable('high', timeoutMs);
+  }
+
   private endTargetRead() {
     this.targetReadInProgress = false;
   }
 
-  private async beginTargetWrite(timeoutMs = 1200): Promise<boolean> {
+  private async beginTargetControl(timeoutMs = 1200): Promise<boolean> {
     this.beginControl();
     const deadline = Date.now() + timeoutMs;
     while (this.targetReadInProgress) {
@@ -138,6 +148,11 @@ export class DapSession extends EventEmitter {
       }
       await new Promise<void>(resolve => setTimeout(resolve, 20));
     }
+    return true;
+  }
+
+  private async beginTargetWrite(timeoutMs = 1200): Promise<boolean> {
+    if (!(await this.beginTargetControl(timeoutMs))) return false;
     this.targetReadInProgress = true;
     return true;
   }
@@ -323,7 +338,7 @@ export class DapSession extends EventEmitter {
   private async readWatchExpressions(expressions: string[], forceRuntimeRead: boolean): Promise<WatchValue[]> {
     if (expressions.length === 0) return [];
     const epoch = this.readCancelEpoch;
-    if (!this.beginTargetRead()) {
+    if (!(await this.beginWatchTargetRead())) {
       return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
     }
     try {
@@ -735,7 +750,18 @@ export class DapSession extends EventEmitter {
       }
 
       const connectResult = await this.backend.execute({
-        cmd: 'connect', config: { device, interface: interface_, speedKHz },
+        cmd: 'connect', config: {
+          device,
+          interface: interface_,
+          speedKHz,
+          nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
+            ? args.nativeDebugEngineMode
+            : undefined,
+          nativeDebugEngineEnabled: args.nativeDebugEngineEnabled === true,
+          nativeDebugEngineStepInto: args.nativeDebugEngineStepInto === true,
+          nativeDebugEngineStepOver: args.nativeDebugEngineStepOver === true,
+          nativeDebugEngineStepOut: args.nativeDebugEngineStepOut === true,
+        },
       });
       if (!connectResult.ok) {
         this.sendEvent('output', { category: 'stderr', output: `Connect failed: ${connectResult.error}\n` });
@@ -769,6 +795,7 @@ export class DapSession extends EventEmitter {
       this.sendEvent('initialized', {});
       this.sendResponse(msg);
     } catch (err: any) {
+      this.backend.configureNativeSteps({});
       this.sendResponse(msg, undefined, false, err.message);
     }
   }
@@ -780,6 +807,7 @@ export class DapSession extends EventEmitter {
     try {
       this.breakpoints.clear();
       await this.backend.execute({ cmd: 'disconnect' });
+      this.backend.configureNativeSteps({});
       this.targetRunning = true;
       this.sendResponse(msg);
     } finally {
@@ -855,6 +883,7 @@ export class DapSession extends EventEmitter {
           source: f.file ? { path: f.file } : undefined,
           line: f.line > 0 ? f.line : 0,
           column: 0,
+          instructionPointerReference: this.formatMemoryReference(f.address),
         }));
         this.sendResponse(msg, { stackFrames });
       } finally {
@@ -1001,7 +1030,7 @@ export class DapSession extends EventEmitter {
           const clearResult = await this.backend.execute({ cmd: 'clearBreakpointAtAddr', addr: bpAddr });
           log.dap(`handleContinue: clear bp result ok=${clearResult.ok}`);
           if (clearResult.ok) {
-            await this.backend.execute({ cmd: 'stepInto' });
+            await this.backend.execute({ cmd: 'stepIntoInstruction' });
             await this.backend.execute({ cmd: 'setBreakpointAtAddr', addr: bpAddr });
             log.dap('handleContinue: re-set bp after step');
           }
@@ -1030,20 +1059,35 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleStep(msg: DebugProtocolMessage, cmd: 'stepOver' | 'stepInto' | 'stepOut') {
+    const requestReceivedAt = Date.now();
     await this.withStepLock(async () => {
-      this.beginControl();
+      const profileId = ++this.dapStepProfileSeq;
+      const lockWaitMs = Date.now() - requestReceivedAt;
+      const profileStart = Date.now();
+      if (!(await this.beginTargetControl())) {
+        log.dap(
+          `[stepProfile#${profileId}] ${cmd} phase=targetControl lockWait=${lockWaitMs}ms`
+          + ` controlDrain=${Date.now() - profileStart}ms outcome=busy`,
+        );
+        this.sendResponse(msg, undefined, false, 'Target busy');
+        return;
+      }
+      const controlDrainMs = Date.now() - profileStart;
+      const pollingStopStarted = Date.now();
       this.stopPolling();
+      const pollingStopMs = Date.now() - pollingStopStarted;
       this.targetRunning = false;
       try {
-        const pcBefore = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-        const pcBeforeVal = pcBefore.ok ? (pcBefore.data as any).value as number : null;
-        log.dap(`handleStep: ${cmd} pcBefore=0x${pcBeforeVal !== null ? pcBeforeVal.toString(16) : 'null'}`);
-
         let responseSent = false;
+        let responseSentAt = 0;
+        let responseSendMs = 0;
         for (let attempt = 0; attempt < 3; attempt++) {
           log.dap(`handleStep: ${cmd} attempt ${attempt + 1}/3 start`);
+          const tBackendStep = Date.now();
           const result = await this.backend.execute({ cmd });
+          const backendMs = Date.now() - tBackendStep;
           log.dap(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
+          log.dap(`[stepProfile#${profileId}] ${cmd} backend=${backendMs}ms attempt=${attempt + 1} ok=${result.ok}`);
           if (!result.ok) {
             if (attempt < 2) {
               await new Promise<void>(r => setTimeout(r, 50));
@@ -1057,20 +1101,62 @@ export class DapSession extends EventEmitter {
           }
 
           if (!responseSent) {
+            const tResponse = Date.now();
             this.sendResponse(msg);
             responseSent = true;
+            responseSentAt = Date.now();
+            responseSendMs = responseSentAt - tResponse;
             log.dap(`handleStep: ${cmd} response sent, starting poll`);
+            log.dap(`[stepProfile#${profileId}] ${cmd} DAP response=${responseSendMs}ms sinceStart=${Date.now() - profileStart}ms`);
           }
           this.lastHaltReason = 'step';
 
-          await new Promise<void>(r => setTimeout(r, 100));
+          const stepData = result.data as {
+            mode?: string;
+            pcBefore?: number;
+            pcAfter?: number;
+            classification?: string;
+            helperElapsedMs?: number;
+            timings?: { totalMs?: number };
+          } | undefined;
+          if (stepData?.mode === 'native') {
+            const helperElapsedMs = stepData.helperElapsedMs;
+            const nativeStateMachineMs = stepData.timings?.totalMs;
+            const transportAndBackendMs = helperElapsedMs === undefined
+              ? undefined
+              : Math.max(0, backendMs - helperElapsedMs);
+            const budgetMs = cmd === 'stepOut'
+              ? 100
+              : stepData.classification === 'singleStep' || stepData.classification === 'branchSingleStep'
+                ? 50
+                : undefined;
+            this.markStoppedForUi();
+            this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+            const responseToStoppedMs = Date.now() - responseSentAt;
+            const totalMs = Date.now() - profileStart;
+            const budgetStatus = budgetMs === undefined ? 'unclassified' : totalMs <= budgetMs ? 'within' : 'exceeded';
+            log.dap(
+              `[stepProfile#${profileId}] ${cmd} native`
+              + ` lockWait=${lockWaitMs}ms controlDrain=${controlDrainMs}ms pollingStop=${pollingStopMs}ms`
+              + ` backend=${Date.now() - tBackendStep}ms helper=${helperElapsedMs ?? 'unknown'}ms`
+              + ` nativeStateMachine=${nativeStateMachineMs ?? 'unknown'}ms`
+              + ` transportAndBackend=${transportAndBackendMs ?? 'unknown'}ms`
+              + ` response=${responseSendMs}ms responseToStopped=${responseToStoppedMs}ms total=${totalMs}ms`
+              + ` budget=${budgetMs ?? 'none'}ms budgetStatus=${budgetStatus}`
+              + ` classification=${stepData.classification ?? 'unknown'}`
+              + ` pc=0x${stepData.pcBefore?.toString(16) ?? 'unknown'}->0x${stepData.pcAfter?.toString(16) ?? 'unknown'}`,
+            );
+            return;
+          }
 
           for (let i = 0; i < 200; i++) {
-            await new Promise<void>(r => setTimeout(r, 10));
+            if (i > 0) await new Promise<void>(r => setTimeout(r, 10));
             const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
             if (stateResult.ok && stateResult.data === 'halted') {
               this.markStoppedForUi();
+              const tStoppedEvent = Date.now();
               this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+              log.dap(`[stepProfile#${profileId}] ${cmd} DAP stopped event=${Date.now() - tStoppedEvent}ms poll=${i + 1} sinceStart=${Date.now() - profileStart}ms`);
               return;
             }
             if (i > 50 && (i % 25 === 0)) {
@@ -1201,7 +1287,10 @@ export class DapSession extends EventEmitter {
       }
     }
 
-    if (!(await this.beginTargetReadWhenAvailable('low', waitForConsistentEvaluate ? 700 : 0))) {
+    const acquiredRead = force
+      ? await this.beginWatchTargetRead(waitForConsistentEvaluate ? 700 : 250)
+      : await this.beginTargetReadWhenAvailable('low', 0);
+    if (!acquiredRead) {
       this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
       return;
     }
@@ -1311,6 +1400,17 @@ export class DapSession extends EventEmitter {
 
   private async dataSamplingLoop() {
     if (!this.dataSamplingActive) return;
+    if (this.shouldDeferTargetRead()) {
+      const now = this.nowMs();
+      if (now >= this.dataSamplingNextSendMs) {
+        this.flushDataSampling();
+        this.dataSamplingNextSendMs = now + this.dataSamplingSendIntervalMs;
+      }
+      this.dataSamplingNextSampleMs = now + this.dataSamplingIntervalMs;
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
+      this.scheduleDataSamplingLoop();
+      return;
+    }
     const budgetEndMs = this.nowMs() + 4;
     let samplesThisTurn = 0;
 
@@ -1411,20 +1511,24 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, { ok: false, error: 'Invalid watch value request' });
       return;
     }
-    if (!(await this.beginTargetWrite())) {
-      this.sendResponse(msg, { ok: false, error: 'Target busy' });
-      return;
-    }
-    try {
-      const result = await this.backend.execute({ cmd: 'setWatchValue', expression, value, address, typeName });
-      if (result.ok) {
-        this.runtimeWatchCache.delete(expression);
-        this.runtimeWatchCacheTime.delete(expression);
+    await this.withStepLock(async () => {
+      if (!(await this.beginTargetWrite())) {
+        this.sendResponse(msg, { ok: false, error: 'Target busy' });
+        return;
       }
-      this.sendResponse(msg, result);
-    } finally {
-      this.endTargetWrite();
-    }
+      try {
+        // Preserve timestamp order: publish samples captured before the write before acknowledging it.
+        this.flushDataSampling();
+        const result = await this.backend.execute({ cmd: 'setWatchValue', expression, value, address, typeName });
+        if (result.ok) {
+          this.runtimeWatchCache.delete(expression);
+          this.runtimeWatchCacheTime.delete(expression);
+        }
+        this.sendResponse(msg, result);
+      } finally {
+        this.endTargetWrite();
+      }
+    });
   }
 
   private async handleGetTargetState(msg: DebugProtocolMessage) {

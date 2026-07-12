@@ -18,7 +18,10 @@ export class RuntimeRouter {
       try {
         const response: any = await session.customRequest('getTargetState', {});
         if (typeof response?.state === 'string') return response.state;
-      } catch {}
+        return 'error';
+      } catch {
+        return 'error';
+      }
     }
 
     const result = await this.backend.execute({ cmd: 'getTargetState' });
@@ -41,7 +44,23 @@ export class RuntimeRouter {
             return normalizeWatchValue(signal.alias, signal.expression, value);
           });
         }
-      } catch {}
+        return normalized.map(signal => ({
+          alias: signal.alias,
+          expression: signal.expression,
+          value: 0,
+          display: '',
+          error: 'DAP dataSample returned no results',
+        }));
+      } catch (err: any) {
+        const error = err?.message || 'DAP dataSample failed';
+        return normalized.map(signal => ({
+          alias: signal.alias,
+          expression: signal.expression,
+          value: 0,
+          display: '',
+          error,
+        }));
+      }
     }
 
     const values: RuntimeReadValue[] = [];

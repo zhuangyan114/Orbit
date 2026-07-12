@@ -4,6 +4,11 @@ export interface DebugSessionConfig {
   speedKHz: number;
   jdebugScript?: string;
   rtos?: string;
+  nativeDebugEngineMode?: 'legacy' | 'native' | 'auto';
+  nativeDebugEngineEnabled?: boolean;
+  nativeDebugEngineStepInto?: boolean;
+  nativeDebugEngineStepOver?: boolean;
+  nativeDebugEngineStepOut?: boolean;
 }
 
 export enum TargetState {
@@ -122,6 +127,7 @@ export type OzoneCommand =
   | { cmd: 'halt' }
   | { cmd: 'run' }
   | { cmd: 'stepInto' }
+  | { cmd: 'stepIntoInstruction' }
   | { cmd: 'stepOver' }
   | { cmd: 'stepOut' }
   | { cmd: 'reset' }

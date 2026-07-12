@@ -1,68 +1,62 @@
-# Ozone for VS Code — Agent Guide
+# Ozone for VS Code - Agent Guide
 
-## Verify Commands
-- `npm install`; `package-lock.json` is committed.
-- `npm run build` bundles all 5 entrypoints via esbuild: `dist/{extension,debugadapter,webview,timeline,watch}.js`.
-- `npm run typecheck` = `tsc --noEmit` (separate from build).
-- `npm run watch` starts esbuild watch for all 5 bundles.
-- `npm run dev` builds + launches VS Code at `.`.
-- `npm run mcp` starts the MCP server from `mcp/ozone-mcp-server.js`.
-- `npm test` = `vitest run` (no tests currently). `npm run lint` has no ESLint config — does nothing.
-- F5 configs in `.vscode/launch.json`: `Run Extension` (preTask `npm: build`), `Extension + Watch` (background `npm: watch`).
+## Scope and Working Tree
 
-## Architecture Boundaries
-- This is a Windows-only VS Code extension: `JLink_x64.dll` is loaded via `koffi`; do not introduce an Ozone GUI or JLink.exe child-process control path for normal debug commands.
-- Host entrypoint is `src/extension.ts`; DAP entrypoint is `src/debugadapter.ts`; browser bundles are `src/webview/main.tsx`, `src/webview/timeline/main.tsx`, and `src/webview/watch/main.tsx`.
-- VS Code launches the debug adapter as a separate Node process from `package.json` debugger `program: "./dist/debugadapter.js"`; DAP adapter reads/writes stdio JSON with `Content-Length:` headers (no HTTP).
-- `src/debug/dap-session.ts` is framework-agnostic DAP logic and should not import `vscode`.
-- `esbuild.config.js` externals: `koffi` (native FFI, loaded at runtime) and `vscode` (provided by VS Code runtime). Sourcemaps for DAP/timeline/watch bundles are intentionally disabled.
-- `OzoneBackend` owns command dispatch through the `OzoneCommand` union in `src/ozone-backend/types.ts`; every `OzoneCommandResult` consumer must check `.ok` before reading `.data`.
-- Activation events: `onStartupFinished`, `onView:ozoneWatch`, `onView:ozoneTimeline`, `onDebugResolve:ozone`.
-- Plugin API: local HTTP server at `127.0.0.1:{randomPort}`, Bearer token auth, writes endpoint to `globalStorage/plugin-api-endpoint.json`. MCP server (`npm run mcp`) calls it via RPC.
+- This is a Windows VS Code extension. The target access stack is J-Link DLL plus either the native C++ helper or the in-process `koffi` legacy channel. Do not add OpenOCD, a GDB server, Ozone GUI automation, or `JLink.exe` as a normal debug-control path.
+- The worktree may already contain user changes. Preserve them. Do not revert, overwrite, stage, or otherwise change unrelated files.
+- Source is under `src/` and `native/`; do not manually edit generated `dist/` bundles.
+- Before changing a debugging bug, load `.agent/skills/ozone-debug-fix/SKILL.md`.
 
-## Logging System
-- Shared logger at `src/utils/logger.ts`; writes to `outputs/Log/` (auto-created, gitignored).
-- Four categories, each writes to a separate file:
+## Build and Test
 
-| Import | File | Content |
-|---|---|---|
-| `log.step(msg)` | `outputs/Log/step.log` | 步进、逐过程、temp BP、断点设置/清除、continue |
-| `log.eval(msg)` | `outputs/Log/eval.log` | evaluate expression、内存读写、DWARF 解析错误 |
-| `log.dll(msg)` | `outputs/Log/dll.log` | J-Link DLL open/close/connect/device/speed |
-| `log.dap(msg)` | `outputs/Log/dap.log` | 启动、polling、Watch、step 命令、会话事件 |
+- `npm install` installs the locked dependencies (`package-lock.json` is committed).
+- `npm run build` bundles `dist/{extension,debugadapter,webview,timeline,watch}.js`.
+- `npm run typecheck` runs `tsc --noEmit`; `npm test` runs Vitest.
+- `npm run build:native` builds `out/native/win32-x64/ozone-jlink-helper.exe`.
+- `npm run test:cpp-channel:mock` exercises the helper channel against the mock DLL. It is not hardware validation.
+- `npm run watch`, `npm run dev`, and `npm run mcp` respectively watch bundles, launch Extension Development Host, and start the local MCP client.
+- Do not run target-mutating hardware commands without explicit user authorization.
 
-- All categories enabled by default; each line is `HH:MM:SS.mmm [Tag] message`.
-- Replace old `console.log('[JLinkDLL] ...')` and duplicate `daLog()` in `commander.ts`/`dap-session.ts` with appropriate category.
-- Bug fix log is separate: `docs/bug-fix-log.md`, appended by agent per SKILL.md workflow.
+## Process and Native Boundary
 
-## Runtime Routing
-- The extension host and DAP adapter are different processes with different `OzoneBackend` instances; when an active `ozone` debug session exists, watch/data-sampling requests must route through `session.customRequest(...)` instead of directly using the extension-host backend.
-- Watch UI is a webview view registered as `ozoneWatch`; Timeline is a webview view registered as `ozoneTimeline`, both under panel containers in `package.json`.
-- Watch expressions persist in `workspaceState` key `ozoneWatchExpressions`; data-sampling expressions persist in `ozoneDataSamplingExpressions`.
-- Data sampling uses `DataSamplingManager` with 10 ms sample/send intervals and a 50,000 point cap per variable; verify performance-sensitive changes against that cadence.
+- Extension host (`src/extension.ts`) and DAP adapter (`src/debugadapter.ts`) are separate processes with separate backends. The DAP entrypoint communicates over stdio using DAP `Content-Length` frames; it must remain free of `vscode` imports in `src/debug/dap-session.ts`.
+- `native/jlink-helper/src/main.cpp` is a Windows child process with the J-Link DLL loaded inside it. `ExperimentalCppJLinkChannel` owns its JSON-lines protocol, lifecycle, and process exit. Keep protocol version/capability changes synchronized with `src/ozone-backend/cpp-jlink-channel.ts`.
+- The legacy channel loads `JLink_x64.dll` through `koffi`. Preserve the existing J-Link safety rules: six slot-indexed hardware breakpoints, no `ExecCommand("SetBP ...")`, no new `readMemoryU32` register/stack/local flows, and existing synchronization after run/step.
+- Do not use `JLINK_Close()`/open as an owner switch. In particular, `JLinkDLL.disconnect()` must not close the DLL just to reconnect.
 
-## MCU Debug Views Compatibility
-- Keep the `ozone` debug adapter compatible with mcu-debug MemoryView, Peripheral Viewer, and RTOS Views through standard DAP requests where possible, not plugin-specific UI coupling.
-- MemoryView and Peripheral Viewer depend on `initialize` advertising `supportsReadMemoryRequest: true` and on `readMemory` returning base64 data from a valid DAP `memoryReference`. If write support changes, keep `writeMemory` byte-oriented; DAP payloads are base64 bytes, not `uint32[]`.
-- Peripheral Viewer expects launch configuration fields such as `deviceName`, `svdFile`, or `svdPath`; preserve the aliases in `package.json` and `src/debug/ozone-debug-config.ts`.
-- RTOS Views relies heavily on `evaluate`, `variables`, and expandable `variablesReference` trees. Preserve struct/array/pointer child expansion and `memoryReference` values in `src/debug/dap-session.ts`.
-- The command `ozone.enableMcuDebugViews` should only append workspace settings for external tracking (`memory-view.trackDebuggers` and `mcu-debug.rtos-views.trackDebuggers`); do not silently mutate global user settings on activation.
+## One Target Owner per Debug Session
 
-## Skills
-- 修 bug 前先加载 `.agent/skills/ozone-debug-fix/SKILL.md`。
+- `SessionTargetSelector` is the sole physical target-owner selector. A session has exactly one owner: `native` helper or `legacy` koffi, never both.
+- When the native path is preferred, create and connect the helper first. Construct the legacy owner only after a failed native owner has fully disposed and its process has exited.
+- Legacy fallback is allowed only when native startup fails or the current native owner reports `NativeOwnerLost`. The selector disposes the failed native process, reconnects legacy with the saved config, clears/restores tracked breakpoint slots, then publishes the new owner. Any failed fallback leaves no owner.
+- Native source-level step APIs are unavailable on the legacy owner. Do not silently emulate them through a second DLL owner.
 
-## J-Link/DAP Pitfalls
-- `JLINK_SetBP` is used as `(slotIndex, address)` with six tracked hardware slots; `ExecCommand("SetBP ...")` is intentionally avoided because it can hang.
-- `disconnect()` in `JLinkDLL` must not call `JLINK_Close()`; reconnect relies on the loaded DLL and `_wasOpened` state to avoid close/open crashes.
-- Clearing breakpoints may halt the CPU; setting breakpoints intentionally does not halt first.
-- After `JLINK_Step()` or `JLINK_Go()`, force DLL synchronization with the existing halt/delay patterns before reading registers or memory.
-- Avoid adding new `readMemoryU32`-based register/stack/local-variable flows; this repo treats it as DLL-state-corrupting on affected J-Link versions.
-- `handleContinue` works around breakpoints at the current PC by clearing the current BP, stepping once, restoring it, then running.
+## Command, DAP, and Runtime Routing
 
-## Symbols And Debug Data
-- ELF symbol and DWARF parsing lives in `src/ozone-backend/jlink-symbols.ts` and depends on `arm-none-eabi-nm` plus `arm-none-eabi-objdump` being on `PATH`.
-- Launch/debug config type is `ozone`; default device/interface/speed/program settings are contributed under `ozone.*` in `package.json`.
+- `OzoneBackend` dispatches the `OzoneCommand` union. Every `OzoneCommandResult` consumer must test `.ok` before reading `.data` or using success-only fields.
+- DAP owns target access while an `ozone` debug session is active. `SessionManager` must not connect its extension-host backend in that state.
+- `RuntimeRouter` must send target state, reads, and writes to the active `ozone` session through `session.customRequest(...)`: `getTargetState`, `dataSample`, and `setWatchValue`. If that request is malformed or fails, return an error for that operation. Never fall back to the extension-host backend while the active DAP session exists.
+- Watch and Timeline webviews persist expressions in `ozoneWatchExpressions` and `ozoneDataSamplingExpressions`. Their reads, writes, and sampling must observe the DAP owner rather than a duplicate backend.
+- RTT start/stop/read must use the selected owner and preserve the configured buffer, polling, target, and ANSI behavior.
 
-## Style Notes
-- Keep generated `dist/` outputs out of manual edits; source lives under `src/` and esbuild regenerates bundles.
-- Preserve VS Code theme variables in webview CSS; avoid hardcoded editor colors.
+## Concurrency and Realtime Data
+
+- `NativeScheduler` serializes native-owner access. Its dequeue order is `control > watch > timeline`; queued watch/timeline reads may be coalesced or cancelled, but control work is never bypassed.
+- Steps, continue/halt/reset, breakpoint changes, and variable writes are control work. They must exclude or pause concurrent Watch and Timeline native reads for their complete critical section, then allow sampling to resume.
+- Do not fix a step issue by disabling, bypassing, or corrupting Watch, Timeline, `evaluate`, `variables`, or variable writes. Treat sampling cadence and point retention as performance-sensitive behavior.
+
+## DAP Compatibility Invariants
+
+- Preserve standard DAP `evaluate`, `variables`, expandable `variablesReference` trees, struct/array/pointer children, and `memoryReference` values for RTOS Views.
+- Keep `initialize.supportsReadMemoryRequest`, base64 byte-oriented `readMemory`/`writeMemory`, and valid DAP `memoryReference` behavior for MemoryView and Peripheral Viewer. Preserve `deviceName`, `svdFile`, and `svdPath` launch aliases.
+- A native source-level `stepInto` must scan/enter calls within the current source-line bounds, rather than regressing to repeated instruction-only UI clicks.
+- A native `stepOut` source hint may improve displayed location but must not replace the trusted native PC. The first subsequent source-level step must advance visibly beyond that hint, not consume a visual empty step.
+- Preserve user breakpoint ownership and temporary-breakpoint cleanup/restoration across step, step-out, continue-at-current-PC, timeout, and error paths. Trusted native stop PC/state must not be overwritten by stale legacy state.
+
+## Logging, Symbols, and Configuration
+
+- Use `src/utils/logger.ts`: `log.step` for stepping/breakpoints, `log.eval` for expressions/memory/DWARF, `log.dll` for DLL/connectivity, and `log.dap` for DAP/session/Watch traffic. Logs are `outputs/Log/{step,eval,dll,dap}.log`.
+- Do not replace the shared categories with ad hoc `console.log` or duplicate logger helpers. Read only the log category relevant to the reported problem.
+- ELF/DWARF work belongs in `src/ozone-backend/jlink-symbols.ts`; it requires `arm-none-eabi-nm` and `arm-none-eabi-objdump` on `PATH`.
+- The plugin API is loopback HTTP with bearer authentication and publishes `plugin-api-endpoint.json` in extension global storage. The MCP server is a client of that API.
+- `docs/bug-fix-log.md` is user history: write a new entry only after the user explicitly confirms the fix, inserting it as the first entry under `## 修改记录`.

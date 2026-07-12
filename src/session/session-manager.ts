@@ -18,6 +18,10 @@ export class SessionManager {
   }
 
   async start(config?: DebugSessionConfig): Promise<void> {
+    if (vscode.debug.activeDebugSession?.type === 'ozone') {
+      vscode.window.showErrorMessage('Ozone: target access is owned by the active debug session');
+      return;
+    }
     if (this.current) {
       await this.stop();
     }

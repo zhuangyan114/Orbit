@@ -1,0 +1,20 @@
+LIBRARY JLink_x64
+EXPORTS
+  JLINK_GetDLLVersion
+  JLINK_Open
+  JLINK_ExecCommand
+  JLINK_SetSpeed
+  JLINK_TIF_Select
+  JLINK_Connect
+  JLINK_Halt
+  JLINK_Go
+  JLINK_Step
+  JLINK_Reset
+  JLINK_IsHalted
+  JLINK_ReadReg
+  JLINK_ReadMem
+  JLINK_WriteMem
+  JLINK_SetBP
+  JLINK_ClrBP
+  JLINK_RTTERMINAL_Control
+  JLINK_RTTERMINAL_Read

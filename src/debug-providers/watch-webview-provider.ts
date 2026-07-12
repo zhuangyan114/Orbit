@@ -114,8 +114,13 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
         const r: any = await session.customRequest('dataSample', { expressions });
         if (r && r.results) {
           results = r.results as WatchValue[];
+        } else {
+          results = expressions.map(expression => ({ expression, value: 0, display: '', hex: '', error: 'DAP dataSample returned no results' }));
         }
-      } catch {}
+      } catch (err: any) {
+        const error = err?.message || 'DAP dataSample failed';
+        results = expressions.map(expression => ({ expression, value: 0, display: '', hex: '', error }));
+      }
     }
 
     if (!results) {

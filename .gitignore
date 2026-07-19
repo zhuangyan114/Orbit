@@ -6,6 +6,7 @@ tmp/
 native/jlink-helper/build/
 .vscode-test/
 outputs/
+artifacts/
 *.vsix
 *.cpuprofile
 .DS_Store

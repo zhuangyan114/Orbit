@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orbit Workspace Config"
+  short_description: "Configure Orbit STM32 workspaces."
+  default_prompt: "Use $Orbit-Config-skill to configure or audit this STM32 workspace for Orbit debugging, Native/Legacy J-Link ownership, RTOS Views, RTT, and MCP."

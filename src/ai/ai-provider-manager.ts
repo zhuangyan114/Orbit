@@ -3,6 +3,7 @@ import { AIProvider, AIProviderConfig, AIProviderType, ChatMessage } from './typ
 import { OllamaProvider } from './providers/ollama-provider';
 import { OpenAICompatibleProvider } from './providers/openai-compatible-provider';
 import { DebugContext, AIResult } from '../ozone-backend/types';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 
 export class AIProviderManager {
   private provider: AIProvider | null = null;
@@ -10,14 +11,14 @@ export class AIProviderManager {
   constructor(private context: vscode.ExtensionContext) {
     this.initProvider();
     vscode.workspace.onDidChangeConfiguration(e => {
-      if (e.affectsConfiguration('ozone.ai')) {
+      if (e.affectsConfiguration('orbit.ai') || e.affectsConfiguration('ozone.ai')) {
         this.initProvider();
       }
     });
   }
 
   private initProvider() {
-    const cfg = vscode.workspace.getConfiguration('ozone.ai');
+    const cfg = getOrbitConfiguration('ai');
     if (!cfg.get<boolean>('enabled', true)) {
       this.provider = null;
       return;
@@ -38,7 +39,7 @@ export class AIProviderManager {
 
   async analyze(context: DebugContext, prompt: string): Promise<AIResult> {
     if (!this.provider) {
-      return { text: 'AI is disabled. Enable via settings (ozone.ai.enabled).' };
+      return { text: 'AI is disabled.' };
     }
     return this.provider.analyze(context, prompt);
   }

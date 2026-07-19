@@ -29,7 +29,7 @@ scripts/
 src/ozone-backend/
   cpp-jlink-channel.ts
 out/native/win32-x64/
-  ozone-jlink-helper.exe       # 本地构建产物，gitignored
+  orbit-jlink-helper.exe       # 本地构建产物，gitignored
   test/JLink_x64.dll           # 测试专用 mock DLL，gitignored
 ```
 
@@ -46,7 +46,7 @@ npm run build:native
 脚本优先使用 Visual Studio C++；没有 MSVC workload 时可回退到 MinGW-w64。两种路径都构建 C++17 helper，并静态链接对应的 C/C++ runtime，然后复制到：
 
 ```text
-out/native/win32-x64/ozone-jlink-helper.exe
+out/native/win32-x64/orbit-jlink-helper.exe
 ```
 
 `npm run build` 仍只构建原有五个 TypeScript/browser entrypoint，不隐式要求 C++ 工具链。这样没有安装 MSVC 的扩展开发者仍可使用原有调试路径。

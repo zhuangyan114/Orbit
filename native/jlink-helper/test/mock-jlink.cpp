@@ -3,6 +3,16 @@
 #include <unordered_map>
 
 namespace {
+struct JLinkHwStatus {
+  std::uint16_t vTarget;
+  std::uint8_t tck;
+  std::uint8_t tdi;
+  std::uint8_t tdo;
+  std::uint8_t tms;
+  std::uint8_t tres;
+  std::uint8_t trst;
+};
+
 bool opened = false;
 bool connected = false;
 bool halted = true;
@@ -10,7 +20,10 @@ std::uint32_t pc = 0x08000100u;
 std::array<std::uint32_t, 6> breakpoints{};
 std::unordered_map<std::uint32_t, std::uint8_t> memory;
 bool rttStarted = false;
+bool haltStateError = false;
+bool targetLinkError = false;
 std::uint32_t loopIterations = 0;
+std::uint32_t hitBreakpoint = 0;
 }
 
 extern "C" {
@@ -50,6 +63,7 @@ int __cdecl JLINK_Go() {
     }
     if (nextBreakpoint != 0) {
       pc = nextBreakpoint;
+      hitBreakpoint = pc;
       halted = true;
       return 0;
     }
@@ -57,6 +71,7 @@ int __cdecl JLINK_Go() {
   for (const std::uint32_t breakpoint : breakpoints) {
     if (breakpoint != 0) {
       pc = breakpoint;
+      hitBreakpoint = pc;
       halted = true;
       return 0;
     }
@@ -67,6 +82,12 @@ int __cdecl JLINK_Go() {
 
 int __cdecl JLINK_Step() {
   if (!connected) return -1;
+  if (hitBreakpoint == pc) {
+    for (const std::uint32_t breakpoint : breakpoints) {
+      if (breakpoint == pc) return 0;
+    }
+  }
+  hitBreakpoint = 0;
   if (pc >= 0x08000400u && pc < 0x08000418u) {
     if (pc == 0x08000416u) {
       ++loopIterations;
@@ -85,11 +106,26 @@ int __cdecl JLINK_Reset() {
   if (!connected) return -1;
   pc = 0x08000100u;
   loopIterations = 0;
+  hitBreakpoint = 0;
   halted = true;
   return 0;
 }
 
-int __cdecl JLINK_IsHalted() { return connected && halted ? 1 : 0; }
+int __cdecl JLINK_IsHalted() {
+  if (haltStateError) return -1;
+  return connected && halted ? 1 : 0;
+}
+int __cdecl JLINK_IsConnected() { return connected ? 1 : 0; }
+int __cdecl JLINK_CORESIGHT_ReadAPDPReg(std::uint8_t, std::uint8_t, std::uint32_t* data) {
+  if (!connected || targetLinkError || !data) return -1;
+  *data = 0x2BA01477u;
+  return 0;
+}
+int __cdecl JLINK_GetHWStatus(JLinkHwStatus* status) {
+  if (!opened || !status) return 1;
+  *status = JLinkHwStatus{3300, 0, 0, 0, 0, 0, 0};
+  return 0;
+}
 
 int __cdecl JLINK_ReadReg(int index) {
   if (!connected || index < 0) return -1;
@@ -134,6 +170,8 @@ int __cdecl JLINK_ReadMem(std::uint32_t address, std::uint32_t size, void* desti
 int __cdecl JLINK_WriteMem(std::uint32_t address, std::uint32_t size, const void* source) {
   if (!connected || !source) return -1;
   const auto* bytes = static_cast<const std::uint8_t*>(source);
+  if (address == 0xFFFF0000u && size > 0) haltStateError = bytes[0] != 0;
+  if (address == 0xFFFF0004u && size > 0) targetLinkError = bytes[0] != 0;
   for (std::uint32_t i = 0; i < size; ++i) memory[address + i] = bytes[i];
   return static_cast<int>(size);
 }
@@ -146,6 +184,7 @@ int __cdecl JLINK_SetBP(std::uint32_t slot, std::uint32_t address) {
 
 int __cdecl JLINK_ClrBP(std::uint32_t slot) {
   if (!connected || slot >= breakpoints.size()) return -1;
+  if (breakpoints[slot] == hitBreakpoint) hitBreakpoint = 0;
   breakpoints[slot] = 0;
   return 0;
 }

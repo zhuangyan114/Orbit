@@ -136,9 +136,9 @@ Native 正常路径必须满足下表。超过门槛的样本需要保留完整�
 |---|---|
 | 日期、工作树版本 | 2026-07-12；`7e705cf`；工作树已脏，本轮未修改功能代码、配置、测试、`dist/` 或 `docs/bug-fix-log.md` |
 | Native helper | 已由 `npm run build:native` 重建；Mock 握手报告 helper `0.2.0`，这不是硬件 owner 证据 |
-| 自动验证 | `npm run build:native`、`npm run test:cpp-channel:mock`、`npm run typecheck`、`npm run build`、`npm test` 均通过；Vitest 为 9 个文件、38 项 |
+| 自动验证 | `npm run build:native`、`npm run test:cpp-channel:mock`、`npm run typecheck`、`npm run build`、`npm test` 均通过；本次收尾 Vitest 为 9 个文件、43 项 |
 | 差异检查 | `git diff --check` 通过；仅报告已有文件的 CRLF/LF 转换警告 |
-| 活动 DAP/MCP | plugin API endpoint 文件存在，但 `ozone.status` 的 loopback RPC 连接失败；未发现运行中的 `ozone-jlink-helper` 进程 |
+| 活动 DAP/MCP | plugin API endpoint 文件存在，但 `ozone.status` 的 loopback RPC 连接失败；未发现运行中的 `orbit-jlink-helper` 进程 |
 | 真实硬件环境 | 未提供活动 ozone DAP session，因此 MCU、ELF、优化级别、J-Link DLL、接口、速度、launch 开关、session/mode、owner 数、helper PID、`JLINK_Open/JLINK_Connect` 次数均未采集 |
 | 本轮日志时间范围 | 无本轮真实硬件日志范围。现有 `dll.log`、`dap.log`、`eval.log`、`step.log` 分别最后写于 19:51:28、19:57:47、19:52:21、19:52:20，早于本轮基线，未被引用为本轮结果 |
 
@@ -195,4 +195,4 @@ Native 正常路径必须满足下表。超过门槛的样本需要保留完整�
 - `xDelayedTaskList1`、`xDelayedTaskList2`、`xPendingReadyList`、`xSuspendedTaskList`、`xTasksWaitingTermination` 等 `xLIST` struct 的内存读取与子字段展开；
 - `huart1` 16 字段 struct，以及 `count`、`cnt`、`ulTotalRunTime` 的 evaluate。
 
-日志未出现 `NativeOwnerLost` 或 `Target busy`。本次自动回归在修复后重新通过：`npm run build:native`、`npm run test:cpp-channel:mock`、`npm run typecheck`、`npm run build`、`npm test`；Vitest 为 9 个文件、40 项。VM-17 更新为**部分通过**：Native 的 RTOS/变量树及用户确认的 Viewer 行为已验证，但 legacy owner 下的同一组 MemoryView、Peripheral Viewer、RTOS Views 尚未在本轮留存可复查硬件日志。
+日志未出现 `NativeOwnerLost` 或 `Target busy`。本次收尾自动回归重新通过：`npm run build:native`、`npm run test:cpp-channel:mock`、`npm run typecheck`、`npm run build`、`npm test`；Vitest 为 9 个文件、43 项。VM-17 为**部分通过**：Native 的 RTOS/变量树及用户确认的 Viewer 行为已验证，但 legacy owner 下的同一组 MemoryView、Peripheral Viewer、RTOS Views 尚未在本轮留存可复查硬件日志。

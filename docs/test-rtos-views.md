@@ -2,7 +2,7 @@
 
 ## 已完成的修复
 
-1. **更新了 Ozone 扩展的 `src/extension.ts` 文件**
+1. **更新了 Orbit 扩展的 `src/extension.ts` 文件**
    - 在 `activate` 函数中添加了 `mcu-debug.debug-tracker-vscode.trackDebuggers` 设置
    - 在 `enableMcuDebugViewsIntegration` 函数中添加了 `mcu-debug.debug-tracker-vscode.trackDebuggers` 设置
 
@@ -11,12 +11,12 @@
 
 ## 验证步骤
 
-### 步骤 1：重新安装 Ozone 扩展
+### 步骤 1：重新安装 Orbit 扩展
 
 ```bash
-cd "C:\Users\22690\Desktop\AI\Ozone for VScode"
+cd "C:\Users\22690\Desktop\AI\Orbit"
 npm run build
-code --install-extension ozone-for-vscode-0.4.1.vsix
+code --install-extension artifacts/1.0.0/Orbit-1.0.0.vsix
 ```
 
 ### 步骤 2：重新加载 VS Code 窗口
@@ -41,7 +41,7 @@ code --install-extension ozone-for-vscode-0.4.1.vsix
 ### 步骤 4：启动调试会话
 
 1. 打开测试工程 `D:\STM32\RoboMaster\26Lao_ShaoBin\Down-cmake`
-2. 按 `F5` 启动 Ozone 调试会话
+2. 按 `F5` 启动 Orbit 调试会话
 3. 等待调试会话启动并停止在断点处
 
 ### 步骤 5：检查 RTOS Views
@@ -88,10 +88,10 @@ RTOS Views 应该能够检测到 FreeRTOS 并显示任务列表。
 
 ## 联系支持
 
-如果问题仍然存在，请联系 Ozone 扩展支持团队，并提供以下信息：
+如果问题仍然存在，请联系 Orbit 扩展支持团队，并提供以下信息：
 
 1. VS Code 版本
-2. Ozone 扩展版本
+2. Orbit 扩展版本
 3. RTOS Views 插件版本
 4. debug-tracker-vscode 扩展版本
 5. 测试工程的配置文件（launch.json 和 settings.json）

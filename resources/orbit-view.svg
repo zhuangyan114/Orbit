@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" aria-labelledby="title desc">
+  <title id="title">Orbit view</title>
+  <desc id="desc">A theme-adaptive circular orbit around a microchip.</desc>
+
+  <circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.6"/>
+
+  <g stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="8" y="8" width="8" height="8" rx="2" fill="currentColor" stroke="none"/>
+    <rect x="10.4" y="10.4" width="3.2" height="3.2" rx="0.8" fill="none"/>
+    <path d="M10 6.8V8M12 6.8V8M14 6.8V8M10 16V17.2M12 16V17.2M14 16V17.2M6.8 10H8M6.8 12H8M6.8 14H8M16 10H17.2M16 12H17.2M16 14H17.2"/>
+  </g>
+
+  <circle cx="17.66" cy="6.34" r="1.05" fill="currentColor"/>
+  <circle cx="6.34" cy="17.66" r="1.05" fill="currentColor"/>
+</svg>

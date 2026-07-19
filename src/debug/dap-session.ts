@@ -1,9 +1,12 @@
 import { EventEmitter } from 'events';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
-import { DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock, Variable, StackFrame, WatchValue } from '../ozone-backend/types';
+import {
+  DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock,
+  OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
+} from '../ozone-backend/types';
 import { PRtLogDecoder } from './p-rtlog-decoder';
-import { log } from '../utils/logger';
+import { configureLogger, log } from '../utils/logger';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -26,6 +29,7 @@ export class DapSession extends EventEmitter {
   private backend: OzoneBackend;
   private seq = 1;
   private pollTimer: NodeJS.Timeout | null = null;
+  private connectionMonitorTimer: NodeJS.Timeout | null = null;
   private rttPollTimer: NodeJS.Timeout | null = null;
   private rttLogEnabled = true;
   private rttStarted = false;
@@ -41,16 +45,19 @@ export class DapSession extends EventEmitter {
   private rttControlCarry = '';
   private rttLineCarry = '';
   private pRtLogEnabled = false;
-  private pRtLogRoot = 'D:\\STM32\\tool\\P-RTLog';
+  private pRtLogRoot = '';
   private pRtLogDecoder = new PRtLogDecoder();
   private watchExpressions: string[] = [];
   private _watchPollCycle = 0;
   private lastHaltReason: 'entry' | 'breakpoint' | 'step' | 'pause' = 'entry';
   private targetRunning = false;
+  private timelineClockPausedAtMs: number | null = null;
+  private timelineClockPausedTotalMs = 0;
   private controlInProgress = false;
   private readCancelEpoch = 0;
   private targetReadInProgress = false;
   private lowPriorityReadBlockedUntil = 0;
+  private pendingWatchTargetReads = 0;
 
   private breakpoints = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
@@ -62,14 +69,15 @@ export class DapSession extends EventEmitter {
   private _flashEnabled = true;
   private dataSamplingActive = false;
   private dataSamplingTimer: NodeJS.Immediate | null = null;
+  private dataSamplingSendTimer: NodeJS.Timeout | null = null;
   private dataSamplingEntries: DapSamplingEntry[] = [];
   private dataSamplingSpecs: FastDataSampleSpec[] = [];
   private dataSamplingPending = new Map<string, DataPoint[]>();
   private dataSamplingLastDisplay = new Map<string, string>();
+  private dataSamplingSeenExpressions = new Set<string>();
   private dataSamplingIntervalMs = 0.2;
   private dataSamplingSendIntervalMs = 16;
   private dataSamplingNextSampleMs = 0;
-  private dataSamplingNextSendMs = 0;
   private readonly highResEpochMs = Date.now();
   private readonly highResStartNs = process.hrtime.bigint();
   private variableHandles = new Map<number, WatchValue[]>();
@@ -78,10 +86,106 @@ export class DapSession extends EventEmitter {
   private runtimeWatchCache = new Map<string, WatchValue>();
   private runtimeWatchCacheTime = new Map<string, number>();
   private readonly runtimeEvaluateCacheMs = 250;
+  private readonly watchReadChunkSize = 2;
+  private readonly watchReadBudgetMs = 8;
+  private phase: 'idle' | 'flashing' | 'connecting' | 'connected' | 'terminating' | 'terminated' = 'idle';
+  private targetConnectionEstablished = false;
+  private connectionFailureCount = 0;
+  private terminationPromise: Promise<void> | null = null;
+  private disposePromise: Promise<void> | null = null;
+  private flashAbortController: AbortController | null = null;
 
   constructor(backend: OzoneBackend) {
     super();
     this.backend = backend;
+    this.timelineClockPausedAtMs = this.nowMs();
+  }
+
+  private startConnectionMonitor() {
+    this.stopConnectionMonitor();
+    const monitor = async () => {
+      if (this.connectionMonitorTimer === null) return;
+      if (this.targetConnectionEstablished && !this.targetRunning && !this.controlInProgress) {
+        await this.queryTargetState('health-monitor');
+      }
+      if (this.connectionMonitorTimer !== null) {
+        this.connectionMonitorTimer = setTimeout(monitor, 500);
+      }
+    };
+    this.connectionMonitorTimer = setTimeout(monitor, 500);
+  }
+
+  private isSessionTerminating(): boolean {
+    return this.phase === 'terminating' || this.phase === 'terminated';
+  }
+
+  private stopConnectionMonitor() {
+    if (this.connectionMonitorTimer) clearTimeout(this.connectionMonitorTimer);
+    this.connectionMonitorTimer = null;
+  }
+
+  private async queryTargetState(context: string): Promise<OzoneCommandResult> {
+    const result = await this.backend.execute({ cmd: 'getTargetState' });
+    if (!this.targetConnectionEstablished || this.phase === 'terminating' || this.phase === 'terminated') {
+      return result;
+    }
+
+    const hardDisconnect = result.ok
+      ? result.data === TargetState.Disconnected
+      : result.errorCode === 'NativeOwnerLost'
+        || result.errorCode === 'TargetOwnerUnavailable'
+        || result.errorCode === 'TargetDisconnected';
+    const softDisconnect = result.ok
+      ? result.data === TargetState.Error
+      : result.errorCode === 'JLinkCallFailed'
+        || result.errorCode === 'TargetStateReadFailed';
+
+    if (hardDisconnect) {
+      log.dap(`connection-monitor state=disconnected context=${context} code=${result.ok ? 'TargetDisconnected' : result.errorCode}`);
+      void this.terminateForConnectionLoss(result.ok ? 'TargetDisconnected' : result.errorCode || 'TargetDisconnected');
+    } else if (softDisconnect) {
+      this.connectionFailureCount++;
+      log.dap(`connection-monitor state=error context=${context} consecutiveFailures=${this.connectionFailureCount}`);
+      if (this.connectionFailureCount >= 3) {
+        void this.terminateForConnectionLoss(result.ok ? 'TargetStateError' : result.errorCode || 'TargetStateReadFailed');
+      }
+    } else {
+      this.connectionFailureCount = 0;
+    }
+    return result;
+  }
+
+  private terminateForConnectionLoss(reason: string): Promise<void> {
+    if (this.terminationPromise) return this.terminationPromise;
+    this.terminationPromise = (async () => {
+      const started = Date.now();
+      this.phase = 'terminating';
+      this.targetConnectionEstablished = false;
+      this.connectionFailureCount = 0;
+      this.controlInProgress = true;
+      this.readCancelEpoch++;
+      this.stopDataSampling();
+      this.stopRttLogPolling();
+      this.stopPolling();
+      this.stopConnectionMonitor();
+      this.flashAbortController?.abort('target connection lost');
+      (this.backend as any).cancelFlash?.('target connection lost');
+      log.dap(`session-terminate reason=${reason} phase=connected`);
+      this.sendEvent('output', {
+        category: 'stderr',
+        output: `Target connection lost (${reason}). Ending debug session and cleaning up J-Link processes.\n`,
+      });
+      try {
+        await this.backend.dispose(false);
+      } catch (error) {
+        log.dap(`session-cleanup error=${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.phase = 'terminated';
+      this.sendEvent('terminated', { reason });
+      log.dap(`session-cleanup completed reason=${reason} elapsedMs=${Date.now() - started}`);
+      this.emit('shutdownRequested');
+    })();
+    return this.terminationPromise;
   }
 
   private async withStepLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -111,7 +215,7 @@ export class DapSession extends EventEmitter {
 
   private beginTargetRead(priority: 'high' | 'low' = 'low'): boolean {
     if (this.shouldDeferTargetRead() || this.targetReadInProgress) return false;
-    if (priority === 'low' && Date.now() < this.lowPriorityReadBlockedUntil) return false;
+    if (priority === 'low' && (Date.now() < this.lowPriorityReadBlockedUntil || this.pendingWatchTargetReads > 0)) return false;
     this.targetReadInProgress = true;
     return true;
   }
@@ -128,10 +232,14 @@ export class DapSession extends EventEmitter {
   private async beginWatchTargetRead(timeoutMs = 250): Promise<boolean> {
     if (this.beginTargetRead('high')) return true;
     if (this.controlInProgress) return false;
-    // Let the current Timeline read drain, then keep the low-priority loop
-    // from reacquiring the DAP gate before this Watch request can run.
-    this.lowPriorityReadBlockedUntil = Math.max(this.lowPriorityReadBlockedUntil, Date.now() + timeoutMs);
-    return this.beginTargetReadWhenAvailable('high', timeoutMs);
+    // Keep Timeline behind a Watch request only while that Watch is actually
+    // queued. The timeout is a wait bound, not a post-read blackout period.
+    this.pendingWatchTargetReads++;
+    try {
+      return await this.beginTargetReadWhenAvailable('high', timeoutMs);
+    } finally {
+      this.pendingWatchTargetReads--;
+    }
   }
 
   private endTargetRead() {
@@ -176,9 +284,27 @@ export class DapSession extends EventEmitter {
   }
 
   private markStoppedForUi() {
-    this.targetRunning = false;
+    this.setTargetRunning(false);
     this.readCancelEpoch++;
     this.lowPriorityReadBlockedUntil = Date.now() + 150;
+  }
+
+  private setTargetRunning(running: boolean) {
+    const now = this.nowMs();
+    if (running && this.timelineClockPausedAtMs !== null) {
+      this.timelineClockPausedTotalMs += Math.max(0, now - this.timelineClockPausedAtMs);
+      this.timelineClockPausedAtMs = null;
+    } else if (!running && this.timelineClockPausedAtMs === null) {
+      this.timelineClockPausedAtMs = now;
+    }
+    this.targetRunning = running;
+  }
+
+  private timelineNowMs(now = this.nowMs()): number {
+    const activePauseMs = this.timelineClockPausedAtMs === null
+      ? 0
+      : Math.max(0, now - this.timelineClockPausedAtMs);
+    return now - this.timelineClockPausedTotalMs - activePauseMs;
   }
 
   private isRtosEvaluateExpression(expression: string): boolean {
@@ -282,7 +408,7 @@ export class DapSession extends EventEmitter {
       if (this.pollTimer === null) return;
       try {
         if (this.pollTimer === null) return;
-        const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
+        const stateResult = await this.queryTargetState('run-poll');
         if (stateResult.ok && stateResult.data === 'halted') {
           this.markStoppedForUi();
           this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
@@ -331,78 +457,87 @@ export class DapSession extends EventEmitter {
   }
 
   private async isTargetHalted(): Promise<boolean> {
-    const result = await this.backend.execute({ cmd: 'getTargetState' });
+    const result = await this.queryTargetState('halt-check');
     return result.ok && result.data === 'halted';
   }
 
-  private async readWatchExpressions(expressions: string[], forceRuntimeRead: boolean): Promise<WatchValue[]> {
+  private async readWatchExpressions(
+    expressions: string[],
+    forceRuntimeRead: boolean,
+    expandedExpressions?: string[],
+  ): Promise<WatchValue[]> {
     if (expressions.length === 0) return [];
+    if (forceRuntimeRead && this.runtimeWatchReadInFlight) {
+      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
+    }
+
     const epoch = this.readCancelEpoch;
-    if (!(await this.beginWatchTargetRead())) {
-      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
-    }
-    try {
-      const halted = await this.isTargetHalted();
-      if (!halted && forceRuntimeRead) {
-        return await this.readRuntimeWatchExpressions(expressions);
-      }
-      if (!halted) {
-        return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
-      }
-      if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
-        return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
-      }
+    const results: WatchValue[] = [];
+    const batchStarted = Date.now();
+    let halted: boolean | undefined;
+    let index = 0;
+    if (forceRuntimeRead) this.runtimeWatchReadInFlight = true;
 
-      const results: WatchValue[] = [];
-      for (const expr of expressions) {
+    try {
+      while (index < expressions.length) {
         if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
-          results.push(this.cachedOrRunningWatchValue(expr));
-          continue;
+          while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
+          break;
         }
-        const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr });
-        if (result.ok) {
-          const value = result.data as WatchValue;
-          this.cacheRuntimeWatchValue(expr, value);
-          results.push(value);
-        } else {
-          results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+        if (!(await this.beginWatchTargetRead())) {
+          while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
+          break;
         }
+
+        const chunkStarted = Date.now();
+        let chunkCount = 0;
+        try {
+          if (halted === undefined) halted = await this.isTargetHalted();
+          if (!halted && !forceRuntimeRead) {
+            while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
+            break;
+          }
+
+          while (index < expressions.length) {
+            const expr = expressions[index++];
+            if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+              results.push(this.cachedOrRunningWatchValue(expr));
+            } else {
+              const result = await this.backend.execute({
+                cmd: 'evaluateExpression',
+                expression: expr,
+                force: forceRuntimeRead,
+                expandedExpressions,
+              });
+              if (result.ok) {
+                const value = result.data as WatchValue;
+                this.cacheRuntimeWatchValue(expr, value);
+                results.push(value);
+              } else {
+                results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+              }
+            }
+            chunkCount++;
+            if (chunkCount >= this.watchReadChunkSize || Date.now() - chunkStarted >= this.watchReadBudgetMs) break;
+          }
+        } finally {
+          this.endTargetRead();
+        }
+
+        if (index < expressions.length) {
+          // Keep each Watch slice finite. Releasing the DAP barrier and yielding
+          // here lets the already-scheduled Timeline loop claim one low-priority read.
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+      }
+
+      const elapsed = Date.now() - batchStarted;
+      if (elapsed >= 16) {
+        log.dap(`[watch] batch expressions=${expressions.length} expanded=${expandedExpressions?.length || 0} elapsedMs=${elapsed}`);
       }
       return results;
     } finally {
-      this.endTargetRead();
-    }
-  }
-
-  private async readRuntimeWatchExpressions(expressions: string[]): Promise<WatchValue[]> {
-    if (this.controlInProgress) {
-      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
-    }
-    if (this.runtimeWatchReadInFlight) {
-      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
-    }
-
-    this.runtimeWatchReadInFlight = true;
-    try {
-      const results: WatchValue[] = [];
-      const epoch = this.readCancelEpoch;
-      for (const expr of expressions) {
-        if (epoch !== this.readCancelEpoch || this.controlInProgress) {
-          results.push(this.cachedOrRunningWatchValue(expr));
-          continue;
-        }
-        const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
-        if (result.ok) {
-          const value = result.data as WatchValue;
-          this.cacheRuntimeWatchValue(expr, value);
-          results.push(value);
-        } else {
-          results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
-        }
-      }
-      return results;
-    } finally {
-      this.runtimeWatchReadInFlight = false;
+      if (forceRuntimeRead) this.runtimeWatchReadInFlight = false;
     }
   }
 
@@ -596,6 +731,10 @@ export class DapSession extends EventEmitter {
 
   private async handleRequest(msg: DebugProtocolMessage) {
     try {
+      if ((this.phase === 'terminating' || this.phase === 'terminated') && msg.command !== 'disconnect') {
+        this.sendResponse(msg, undefined, false, 'Debug session is terminating');
+        return;
+      }
       switch (msg.command) {
         case 'initialize':
           return this.sendResponse(msg, {
@@ -702,6 +841,10 @@ export class DapSession extends EventEmitter {
   private async handleLaunch(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
+      configureLogger({
+        enabled: args.loggingEnabled !== false,
+        clearOnStart: args.clearLogsOnStart !== false,
+      });
       const device = args.device || args.deviceName || 'STM32F407VG';
       const interface_ = args.interface || 'SWD';
       const speedKHz = args.speedKHz || 4000;
@@ -718,12 +861,13 @@ export class DapSession extends EventEmitter {
       this.pRtLogEnabled = args.pRtLogEnabled === true;
       this.pRtLogRoot = typeof args.pRtLogRoot === 'string' && args.pRtLogRoot.trim()
         ? args.pRtLogRoot.trim()
-        : 'D:\\STM32\\tool\\P-RTLog';
+        : '';
       this._elfPath = elfPath;
       this._device = device;
       this._interface = interface_;
       this._speedKHz = speedKHz;
       this._flashEnabled = flashEnabled;
+      this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connecting';
       log.dap(`Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
       this.resetVariableHandles();
       if (this.pRtLogEnabled) {
@@ -736,12 +880,18 @@ export class DapSession extends EventEmitter {
 
       if (elfPath && this._flashEnabled) {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
+        const flashAbortController = new AbortController();
+        this.flashAbortController = flashAbortController;
         const flashResult = await this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
+          signal: flashAbortController.signal,
         });
+        if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
+        if (this.isSessionTerminating()) return;
         if (flashResult.ok) {
           this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any).message}\n` });
         } else {
+          this.phase = 'idle';
           this.sendEvent('output', { category: 'stderr', output: `Flash failed: ${flashResult.error}\n` });
           this.sendResponse(msg, undefined, false, flashResult.error);
           return;
@@ -749,6 +899,7 @@ export class DapSession extends EventEmitter {
         await new Promise<void>(r => setTimeout(r, 500));
       }
 
+      this.phase = 'connecting';
       const connectResult = await this.backend.execute({
         cmd: 'connect', config: {
           device,
@@ -756,18 +907,20 @@ export class DapSession extends EventEmitter {
           speedKHz,
           nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
             ? args.nativeDebugEngineMode
-            : undefined,
-          nativeDebugEngineEnabled: args.nativeDebugEngineEnabled === true,
-          nativeDebugEngineStepInto: args.nativeDebugEngineStepInto === true,
-          nativeDebugEngineStepOver: args.nativeDebugEngineStepOver === true,
-          nativeDebugEngineStepOut: args.nativeDebugEngineStepOut === true,
+            : 'auto',
+          nativeDebugEngineEnabled: args.nativeDebugEngineEnabled !== false,
         },
       });
       if (!connectResult.ok) {
+        this.phase = 'idle';
         this.sendEvent('output', { category: 'stderr', output: `Connect failed: ${connectResult.error}\n` });
         this.sendResponse(msg, undefined, false, connectResult.error);
         return;
       }
+      this.targetConnectionEstablished = true;
+      this.connectionFailureCount = 0;
+      this.phase = 'connected';
+      this.startConnectionMonitor();
 
       if (elfPath) {
         const loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
@@ -795,21 +948,40 @@ export class DapSession extends EventEmitter {
       this.sendEvent('initialized', {});
       this.sendResponse(msg);
     } catch (err: any) {
-      this.backend.configureNativeSteps({});
-      this.sendResponse(msg, undefined, false, err.message);
+      this.backend.configureNativeSteps(false);
+      this.flashAbortController = null;
+      if (this.phase !== 'terminating' && this.phase !== 'terminated') {
+        this.phase = 'idle';
+        this.sendResponse(msg, undefined, false, err.message);
+      }
     }
   }
 
   private async handleDisconnect(msg: DebugProtocolMessage) {
+    if (this.phase === 'terminated') {
+      this.sendResponse(msg);
+      return;
+    }
+    this.phase = 'terminating';
+    this.targetConnectionEstablished = false;
     this.beginControl();
     this.stopRttLogPolling();
     this.stopPolling();
+    this.stopConnectionMonitor();
+    this.stopDataSampling();
+    this.flashAbortController?.abort('DAP disconnect requested');
+    (this.backend as any).cancelFlash?.('DAP disconnect requested');
     try {
       this.breakpoints.clear();
       await this.backend.execute({ cmd: 'disconnect' });
-      this.backend.configureNativeSteps({});
-      this.targetRunning = true;
+      await this.backend.dispose(true);
+      this.backend.configureNativeSteps(false);
+      this.setTargetRunning(true);
       this.sendResponse(msg);
+      this.sendEvent('terminated', {});
+      this.phase = 'terminated';
+      this.disposePromise = Promise.resolve();
+      this.emit('shutdownRequested');
     } finally {
       this.endControl();
     }
@@ -1038,7 +1210,7 @@ export class DapSession extends EventEmitter {
 
         const runResult = await this.backend.execute({ cmd: 'run' });
         log.dap(`handleContinue: run result ok=${runResult.ok}`);
-        this.targetRunning = runResult.ok;
+        this.setTargetRunning(runResult.ok);
         if (runResult.ok) {
           this.readCancelEpoch++;
         }
@@ -1076,7 +1248,7 @@ export class DapSession extends EventEmitter {
       const pollingStopStarted = Date.now();
       this.stopPolling();
       const pollingStopMs = Date.now() - pollingStopStarted;
-      this.targetRunning = false;
+      this.setTargetRunning(false);
       try {
         let responseSent = false;
         let responseSentAt = 0;
@@ -1151,7 +1323,7 @@ export class DapSession extends EventEmitter {
 
           for (let i = 0; i < 200; i++) {
             if (i > 0) await new Promise<void>(r => setTimeout(r, 10));
-            const stateResult = await this.backend.execute({ cmd: 'getTargetState' });
+            const stateResult = await this.queryTargetState('step-settle');
             if (stateResult.ok && stateResult.data === 'halted') {
               this.markStoppedForUi();
               const tStoppedEvent = Date.now();
@@ -1164,7 +1336,7 @@ export class DapSession extends EventEmitter {
             }
           }
           log.dap(`handleStep: not halted after 2000ms (soft settle attempts may have halted CPU), starting polling`);
-          this.targetRunning = true;
+          this.setTargetRunning(true);
           this.readCancelEpoch++;
           this.startPolling();
           return;
@@ -1200,7 +1372,7 @@ export class DapSession extends EventEmitter {
       this.beginControl();
       this.stopRttLogPolling();
       this.stopPolling();
-      this.targetRunning = false;
+      this.setTargetRunning(false);
 
       try {
         const savedBps: Array<{ file: string; line: number }> = [];
@@ -1321,14 +1493,14 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, { results: expressions.map(expr => this.cachedOrRunningWatchValue(expr)) });
       return;
     }
-    const results = await this.readWatchExpressions(expressions, true);
+    const results = await this.readWatchExpressions(expressions, true, args.expandedExpressions);
     this.sendResponse(msg, { results });
   }
 
   private async handleDataSample(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
     const expressions: string[] = args.expressions || [];
-    const results = await this.readWatchExpressions(expressions, true);
+    const results = await this.readWatchExpressions(expressions, true, args.expandedExpressions);
     this.sendResponse(msg, { results });
   }
 
@@ -1374,8 +1546,13 @@ export class DapSession extends EventEmitter {
     this.dataSamplingSendIntervalMs = this.clampNumber(args.sendIntervalMs, 16, 1, 10000);
     const now = this.nowMs();
     this.dataSamplingNextSampleMs = now;
-    this.dataSamplingNextSendMs = now + this.dataSamplingSendIntervalMs;
     this.dataSamplingActive = true;
+    const rejected = plan.filter(item => !item.spec).map(item => item.expression);
+    log.dap(
+      `[timeline] start fast=${this.dataSamplingEntries.map(entry => entry.expression).join(',')}`
+      + ` rejected=${rejected.join(',') || 'none'} sampleMs=${this.dataSamplingIntervalMs} sendMs=${this.dataSamplingSendIntervalMs}`,
+    );
+    this.startDataSamplingFlushTimer();
     this.scheduleDataSamplingLoop();
     this.sendResponse(msg, {
       ok: true,
@@ -1400,12 +1577,10 @@ export class DapSession extends EventEmitter {
 
   private async dataSamplingLoop() {
     if (!this.dataSamplingActive) return;
-    if (this.shouldDeferTargetRead()) {
+    if (this.shouldDeferTargetRead() || !this.targetRunning) {
       const now = this.nowMs();
-      if (now >= this.dataSamplingNextSendMs) {
-        this.flushDataSampling();
-        this.dataSamplingNextSendMs = now + this.dataSamplingSendIntervalMs;
-      }
+      // Do not accumulate elapsed sampling slots while the target is stopped.
+      // Continuing starts from the next live target read instead of backfilling time.
       this.dataSamplingNextSampleMs = now + this.dataSamplingIntervalMs;
       await new Promise<void>(resolve => setTimeout(resolve, 10));
       this.scheduleDataSamplingLoop();
@@ -1415,7 +1590,14 @@ export class DapSession extends EventEmitter {
     let samplesThisTurn = 0;
 
     while (this.dataSamplingActive && this.nowMs() >= this.dataSamplingNextSampleMs && this.nowMs() < budgetEndMs && samplesThisTurn < 512) {
-      await this.captureFastDataSample();
+      const captured = await this.captureFastDataSample();
+      if (!captured) {
+        // Watch/control owns the in-flight target read. Do not burn the whole
+        // sampling budget spinning on a rejected low-priority read.
+        this.dataSamplingNextSampleMs = this.nowMs() + this.dataSamplingIntervalMs;
+        await new Promise<void>(resolve => setTimeout(resolve, 1));
+        break;
+      }
       this.dataSamplingNextSampleMs += this.dataSamplingIntervalMs;
       const now = this.nowMs();
       if (this.dataSamplingNextSampleMs < now - this.dataSamplingIntervalMs * 256) {
@@ -1424,28 +1606,42 @@ export class DapSession extends EventEmitter {
       samplesThisTurn++;
     }
 
-    if (this.dataSamplingActive && this.nowMs() >= this.dataSamplingNextSendMs) {
-      this.flushDataSampling();
-      this.dataSamplingNextSendMs = this.nowMs() + this.dataSamplingSendIntervalMs;
-    }
-
     this.scheduleDataSamplingLoop();
   }
 
-  private async captureFastDataSample() {
-    if (!this.beginTargetRead()) return;
+  private startDataSamplingFlushTimer() {
+    if (this.dataSamplingSendTimer) clearInterval(this.dataSamplingSendTimer);
+    this.dataSamplingSendTimer = setInterval(() => {
+      if (!this.dataSamplingActive) return;
+      this.flushDataSampling();
+    }, this.dataSamplingSendIntervalMs);
+  }
+
+  private async captureFastDataSample(): Promise<boolean> {
+    if (!this.targetRunning) return false;
+    if (!this.beginTargetRead()) return false;
     try {
       const result = await this.backend.execute({ cmd: 'readFastDataSampling', specs: this.dataSamplingSpecs });
-      if (!result.ok) return;
+      // A stopped event can win the race while the batch was in flight. Those
+      // bytes are not a post-stop Timeline sample and must not advance the plot.
+      if (!this.targetRunning || !result.ok) return true;
       const values = result.data as WatchValue[];
-      const timestamp = this.nowMs();
+      const timestamp = this.timelineNowMs();
       for (const value of values) {
         if (!value || value.error) continue;
         const pending = this.dataSamplingPending.get(value.expression);
         if (!pending) continue;
-        pending.push({ timestamp, value: value.value, display: value.display });
+        const startsNewSegment = !this.dataSamplingSeenExpressions.has(value.expression);
+        pending.push({
+          timestamp,
+          value: value.value,
+          display: value.display,
+          ...(startsNewSegment ? { startsNewSegment: true } : {}),
+        });
+        this.dataSamplingSeenExpressions.add(value.expression);
         this.dataSamplingLastDisplay.set(value.expression, value.display);
       }
+      return true;
     } finally {
       this.endTargetRead();
     }
@@ -1476,6 +1672,10 @@ export class DapSession extends EventEmitter {
     if (this.dataSamplingTimer) {
       clearImmediate(this.dataSamplingTimer);
       this.dataSamplingTimer = null;
+    }
+    if (this.dataSamplingSendTimer) {
+      clearInterval(this.dataSamplingSendTimer);
+      this.dataSamplingSendTimer = null;
     }
     this.flushDataSampling();
     this.dataSamplingEntries = [];
@@ -1532,14 +1732,28 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleGetTargetState(msg: DebugProtocolMessage) {
-    const r = await this.backend.execute({ cmd: 'getTargetState' });
-    this.sendResponse(msg, r.ok ? { state: r.data } : { state: 'error' });
+    const r = await this.queryTargetState('custom-request');
+    this.sendResponse(msg, r.ok ? { state: r.data } : { state: 'error', error: r.error, errorCode: r.errorCode });
   }
 
-  dispose() {
-    this.stopDataSampling();
-    this.stopRttLogPolling();
-    this.stopPolling();
-    this.backend.dispose();
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    if (this.terminationPromise) {
+      this.disposePromise = this.terminationPromise;
+      return this.disposePromise;
+    }
+    this.disposePromise = (async () => {
+      this.phase = 'terminating';
+      this.targetConnectionEstablished = false;
+      this.stopDataSampling();
+      this.stopRttLogPolling();
+      this.stopPolling();
+      this.stopConnectionMonitor();
+      this.flashAbortController?.abort('DAP session disposed');
+      (this.backend as any).cancelFlash?.('DAP session disposed');
+      await this.backend.dispose(false);
+      this.phase = 'terminated';
+    })();
+    return this.disposePromise;
   }
 }

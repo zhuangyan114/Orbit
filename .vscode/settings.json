@@ -4,5 +4,6 @@
     ],
     "mcu-debug.rtos-views.trackDebuggers": [
         "ozone"
-    ]
+    ],
+    "cmake.sourceDirectory": "${workspaceFolder}/native/jlink-helper"
 }

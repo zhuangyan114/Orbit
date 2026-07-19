@@ -62,7 +62,7 @@ RTOS View 修复后，插件出现整体卡顿，典型表现包括：
 
 现象：
 
-- `ozone.timelineSampleIntervalMs` 默认值是 `0.2` ms，目标采样率约 5 kHz。
+ - `orbit.timelineSampleIntervalMs` 默认值是 `0.2` ms，目标采样率约 5 kHz。
 - DAP 侧 `dataSamplingLoop()` 每次事件循环最多使用约 4ms，并且单轮最多采样 512 次。
 - Timeline 一旦启用表达式采样，就可能持续占用后端读内存能力。
 
@@ -254,13 +254,13 @@ RTOS View 修复后，插件出现整体卡顿，典型表现包括：
 
 影响：
 
-- 即使用户本次没有使用 Ozone，也会在 VS Code 启动后加载插件逻辑。
+- 即使用户本次没有使用 Orbit，也会在 VS Code 启动后加载插件逻辑。
 - 插件启动时还可能做配置更新和 ELF 自动检测。
 
 建议方案：
 
 - 移除或减少 `onStartupFinished`。
-- 改成按需激活：打开 Ozone view、执行 Ozone 命令、启动 ozone debug session 时激活。
+- 改成按需激活：打开 Orbit view、执行 Orbit 命令、启动 ozone debug session 时激活。
 - Plugin API server 可以延迟到首次需要 API 或调试会话开始时启动。
 - MCU debug views tracking 配置不应每次启动都检查/写入，可改成显式命令或首次启用后记录状态。
 

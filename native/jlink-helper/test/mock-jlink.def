@@ -11,6 +11,9 @@ EXPORTS
   JLINK_Step
   JLINK_Reset
   JLINK_IsHalted
+  JLINK_IsConnected
+  JLINK_GetHWStatus
+  JLINK_CORESIGHT_ReadAPDPReg
   JLINK_ReadReg
   JLINK_ReadMem
   JLINK_WriteMem

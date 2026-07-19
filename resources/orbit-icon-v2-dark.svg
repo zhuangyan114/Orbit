@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Orbit Dark</title>
+  <desc id="desc">A white microchip inside a circular cyan and violet orbit with two colored nodes on a deep navy background.</desc>
+
+  <defs>
+    <linearGradient id="orbitGradient" x1="64" y1="256" x2="448" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#18D0F2"/>
+      <stop offset="0.52" stop-color="#3B8EF4"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="96" fill="#071A38"/>
+
+  <circle cx="256" cy="256" r="190" fill="none" stroke="url(#orbitGradient)" stroke-width="18"/>
+
+  <g fill="#B8C9E6">
+    <rect x="230" y="146" width="16" height="34" rx="8"/>
+    <rect x="248" y="146" width="16" height="34" rx="8"/>
+    <rect x="266" y="146" width="16" height="34" rx="8"/>
+    <rect x="230" y="332" width="16" height="34" rx="8"/>
+    <rect x="248" y="332" width="16" height="34" rx="8"/>
+    <rect x="266" y="332" width="16" height="34" rx="8"/>
+    <rect x="146" y="230" width="34" height="16" rx="8"/>
+    <rect x="146" y="248" width="34" height="16" rx="8"/>
+    <rect x="146" y="266" width="34" height="16" rx="8"/>
+    <rect x="332" y="230" width="34" height="16" rx="8"/>
+    <rect x="332" y="248" width="34" height="16" rx="8"/>
+    <rect x="332" y="266" width="34" height="16" rx="8"/>
+    <rect x="190" y="190" width="132" height="132" rx="28"/>
+  </g>
+
+  <rect x="226" y="226" width="60" height="60" rx="15" fill="#071A38"/>
+
+  <g>
+    <circle cx="390.3" cy="121.7" r="21" fill="#071A38"/>
+    <circle cx="390.3" cy="121.7" r="17" fill="#8B5CF6"/>
+    <circle cx="121.7" cy="390.3" r="21" fill="#071A38"/>
+    <circle cx="121.7" cy="390.3" r="17" fill="#18D0F2"/>
+  </g>
+</svg>

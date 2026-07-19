@@ -122,9 +122,6 @@ export interface NativeStepExecutor {
   stepOut(request: NativeStepOutRequest): Promise<CppJLinkResult<NativeStepOutDiagnostics>>;
 }
 
-/** @deprecated Use NativeStepExecutor. */
-export type NativeStepOverExecutor = NativeStepExecutor;
-
 export interface SessionNativeExecutor extends NativeStepExecutor {
   connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp' | 'koffi'; dllPath?: string }>>;
   dispose(graceful?: boolean): Promise<void>;
@@ -533,11 +530,14 @@ function readSchedule(options: CppJLinkReadOptions): Partial<NativeScheduleOptio
 }
 
 function findDefaultHelperPath(): string {
-  const relative = path.join('out', 'native', 'win32-x64', 'ozone-jlink-helper.exe');
-  const candidates = [
+  const relatives = [
+    path.join('out', 'native', 'win32-x64', 'orbit-jlink-helper.exe'),
+    path.join('out', 'native', 'win32-x64', 'ozone-jlink-helper.exe'),
+  ];
+  const candidates = relatives.flatMap(relative => [
     path.resolve(__dirname, '..', relative),
     path.resolve(__dirname, '..', '..', relative),
-  ];
+  ]);
   return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
 }
 

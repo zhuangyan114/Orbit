@@ -1,13 +1,13 @@
 ---
 name: ozone-mcp-control
-description: Use Ozone MCP to inspect and control an STM32/J-Link target through the Ozone for VS Code plugin. Use when an agent needs to read target expressions, write selected numeric values, record synchronized waveform data, run generic experiments, or standardize tuning workflows such as PID, cascaded PID, motor, chassis, gimbal, or other embedded control loops.
+description: Use Orbit MCP to inspect and control an STM32/J-Link target through the Orbit for VS Code plugin. Use when an agent needs to read target expressions, write selected numeric values, record synchronized waveform data, run generic experiments, or standardize tuning workflows such as PID, cascaded PID, motor, chassis, gimbal, or other embedded control loops.
 ---
 
-# Ozone MCP Control
+# Orbit MCP Control
 
 ## Purpose
 
-Use the Ozone MCP server as a generic target experiment interface. Do not assume PID-specific fields. Treat PID tuning as one use of the generic read/write/wait/record experiment model.
+Use the Orbit MCP server as a generic target experiment interface. Do not assume PID-specific fields. Treat PID tuning as one use of the generic read/write/wait/record experiment model.
 
 The VS Code extension owns target access. The MCP server is a thin adapter over the plugin API.
 
@@ -18,13 +18,13 @@ Use this MCP server command when an agent needs to connect:
 ```json
 {
   "mcpServers": {
-    "ozone": {
+    "orbit": {
       "command": "node",
       "args": [
-        "C:\\Users\\22690\\Desktop\\Ozone for VScode\\mcp\\ozone-mcp-server.js"
+        "C:\\Users\\22690\\Desktop\\AI\\Orbit\\Releases\\mcp\\orbit-mcp-server.js"
       ],
       "env": {
-        "OZONE_PLUGIN_API_ENDPOINT_FILE": "C:\\Users\\22690\\AppData\\Roaming\\Code\\User\\globalStorage\\ozone-debug.ozone-for-vscode\\plugin-api-endpoint.json"
+        "ORBIT_PLUGIN_API_ENDPOINT_FILE": "C:\\Users\\22690\\AppData\\Roaming\\Code\\User\\globalStorage\\orbit-debug.orbit-for-vscode\\plugin-api-endpoint.json"
       }
     }
   }
@@ -33,7 +33,7 @@ Use this MCP server command when an agent needs to connect:
 
 Prerequisites:
 
-- VS Code Ozone extension is running.
+- VS Code Orbit extension is running.
 - The target debug session is active when target reads/writes are needed.
 - The endpoint file exists and contains the plugin API URL/token.
 - MCP and VS Code run on the same machine because the plugin API listens on `127.0.0.1`.
@@ -170,5 +170,5 @@ If a tool reports an expression error:
 
 If `ozone_status` does not return `running` or `halted`:
 
-- Ask the user to start or reconnect the Ozone debug session.
+- Ask the user to start or reconnect the Orbit debug session.
 - Do not attempt writes.

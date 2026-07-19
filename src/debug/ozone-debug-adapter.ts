@@ -19,6 +19,6 @@ export class OzoneDebugAdapter implements vscode.DebugAdapter {
   }
 
   dispose() {
-    this.session.dispose();
+    void this.session.dispose();
   }
 }

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { DebugSessionConfig, TargetState } from '../ozone-backend/types';
 import { SessionInfo, RecentSession } from './types';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 
 export class SessionManager {
   private current: SessionInfo | null = null;
@@ -19,7 +20,7 @@ export class SessionManager {
 
   async start(config?: DebugSessionConfig): Promise<void> {
     if (vscode.debug.activeDebugSession?.type === 'ozone') {
-      vscode.window.showErrorMessage('Ozone: target access is owned by the active debug session');
+      vscode.window.showErrorMessage('Orbit: target access is owned by the active debug session');
       return;
     }
     if (this.current) {
@@ -31,7 +32,7 @@ export class SessionManager {
 
     const result = await this.backend.execute({ cmd: 'connect', config: resolvedConfig });
     if (!result.ok) {
-      vscode.window.showErrorMessage(`Ozone: ${result.error}`);
+      vscode.window.showErrorMessage(`Orbit: ${result.error}`);
       return;
     }
 
@@ -45,7 +46,7 @@ export class SessionManager {
 
     this.addRecent(resolvedConfig);
     this.updateStatusBar();
-    vscode.window.showInformationMessage(`Ozone: Connected to ${resolvedConfig.device}`);
+    vscode.window.showInformationMessage(`Orbit: Connected to ${resolvedConfig.device}`);
   }
 
   async stop(): Promise<void> {
@@ -53,7 +54,7 @@ export class SessionManager {
     await this.backend.execute({ cmd: 'disconnect' });
     this.current = null;
     this.updateStatusBar();
-    vscode.window.showInformationMessage('Ozone: Session ended');
+    vscode.window.showInformationMessage('Orbit: Session ended');
   }
 
   async restart(): Promise<void> {
@@ -89,7 +90,7 @@ export class SessionManager {
     }
 
     const pick = await vscode.window.showQuickPick(items, {
-      placeHolder: 'Ozone Debug Sessions',
+      placeHolder: 'Orbit Debug Sessions',
     });
 
     if (!pick) return;
@@ -97,7 +98,7 @@ export class SessionManager {
   }
 
   private async promptConfig(): Promise<DebugSessionConfig | undefined> {
-    const config = vscode.workspace.getConfiguration('ozone');
+    const config = getOrbitConfiguration();
     const device = await vscode.window.showInputBox({
       prompt: 'Target device (e.g., STM32F407VG)',
       value: config.get<string>('defaultDevice', 'STM32F407VG'),
@@ -113,11 +114,11 @@ export class SessionManager {
 
   private updateStatusBar() {
     if (this.current) {
-      this.statusBar.text = `$(debug-alt) Ozone: ${this.current.label}`;
+      this.statusBar.text = `$(debug-alt) Orbit: ${this.current.label}`;
       this.statusBar.tooltip = `State: ${this.current.state}\nClick to manage session`;
       this.statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
     } else {
-      this.statusBar.text = '$(plug) Ozone: Disconnected';
+      this.statusBar.text = '$(plug) Orbit: Disconnected';
       this.statusBar.tooltip = 'Click to start a debug session';
       this.statusBar.backgroundColor = undefined;
     }
@@ -128,7 +129,7 @@ export class SessionManager {
     this.recent = this.recent.filter(r => r.label !== label);
     this.recent.unshift({ config, label, lastUsed: Date.now() });
 
-    const maxRecent = vscode.workspace.getConfiguration('ozone').get<number>('recentSessions', 10);
+    const maxRecent = getOrbitConfiguration().get<number>('recentSessions', 10);
     if (this.recent.length > maxRecent) {
       this.recent = this.recent.slice(0, maxRecent);
     }
@@ -137,7 +138,7 @@ export class SessionManager {
 
   private loadRecent() {
     try {
-      const raw = vscode.workspace.getConfiguration('ozone').get<string>('_recentSessions');
+      const raw = getOrbitConfiguration().get<string>('_recentSessions');
       if (raw) {
         this.recent = JSON.parse(raw);
       }
@@ -145,7 +146,7 @@ export class SessionManager {
   }
 
   private saveRecent() {
-    vscode.workspace.getConfiguration('ozone').update('_recentSessions',
+    getOrbitConfiguration().update('_recentSessions',
       JSON.stringify(this.recent), vscode.ConfigurationTarget.Global);
   }
 

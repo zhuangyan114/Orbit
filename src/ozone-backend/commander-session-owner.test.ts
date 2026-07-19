@@ -53,6 +53,10 @@ describe('OzoneBackend extension-host ownership guard', () => {
 
     const result = await backend.execute({ cmd: 'getTargetState' });
 
-    expect(result).toEqual({ ok: false, error: 'NativeOwnerLost: helper exited' });
+    expect(result).toEqual({
+      ok: false,
+      error: 'NativeOwnerLost: helper exited',
+      errorCode: 'NativeOwnerLost',
+    });
   });
 });

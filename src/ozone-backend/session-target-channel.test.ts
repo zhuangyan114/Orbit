@@ -40,7 +40,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       device: 'STM32F407VG',
       interface: 'SWD',
       speedKHz: 4000,
-    }, true);
+    });
 
     expect(result.ok).toBe(true);
     expect(selector.ownerKind).toBe('native');

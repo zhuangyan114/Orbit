@@ -3,11 +3,12 @@ import * as path from 'path';
 
 const LOG_DIR = path.resolve(__dirname, '..', 'outputs', 'Log');
 
-try {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
-} catch {}
-
 type LogCategory = 'step' | 'eval' | 'dll' | 'dap';
+
+export interface LoggerOptions {
+  enabled?: boolean;
+  clearOnStart?: boolean;
+}
 
 const logFiles: Record<LogCategory, string> = {
   step: path.join(LOG_DIR, 'step.log'),
@@ -16,19 +17,37 @@ const logFiles: Record<LogCategory, string> = {
   dap: path.join(LOG_DIR, 'dap.log'),
 };
 
-for (const f of Object.values(logFiles)) {
-  try { fs.writeFileSync(f, ''); } catch {}
+let loggingEnabled = true;
+let clearOnStart = true;
+let configured = false;
+
+function ensureLogDirectory() {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  } catch {}
 }
 
-const enabled: Record<LogCategory, boolean> = {
-  step: true,
-  eval: true,
-  dll: true,
-  dap: true,
-};
+function clearLogFiles() {
+  for (const f of Object.values(logFiles)) {
+    try { fs.writeFileSync(f, ''); } catch {}
+  }
+}
+
+export function configureLogger(options: LoggerOptions = {}) {
+  if (options.enabled !== undefined) loggingEnabled = options.enabled;
+  if (options.clearOnStart !== undefined) clearOnStart = options.clearOnStart;
+
+  if (!configured) {
+    ensureLogDirectory();
+    if (clearOnStart) clearLogFiles();
+    configured = true;
+  }
+}
 
 function write(cat: LogCategory, tag: string, msg: string) {
-  if (!enabled[cat]) return;
+  if (!configured) configureLogger();
+  if (!loggingEnabled) return;
+  ensureLogDirectory();
   const line = new Date().toISOString().slice(11, 23) + ' [' + tag + '] ' + msg + '\n';
   try { fs.appendFileSync(logFiles[cat], line); } catch {}
   process.stderr.write(line);

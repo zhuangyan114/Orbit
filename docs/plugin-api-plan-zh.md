@@ -1,4 +1,4 @@
-# Ozone 插件 API 计划
+# Orbit 插件 API 计划
 
 ## 目标
 

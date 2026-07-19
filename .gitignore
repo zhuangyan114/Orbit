@@ -1,12 +1,13 @@
 node_modules/
 dist/
 out/
+build/
+tmp/
 native/jlink-helper/build/
 .vscode-test/
 outputs/
 *.vsix
 *.cpuprofile
-docs/ozone-for-vscode-config-skill/
 .DS_Store
 Thumbs.db
 *.log

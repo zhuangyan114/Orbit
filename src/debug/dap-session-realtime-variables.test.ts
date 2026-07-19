@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DapSession, DebugProtocolMessage } from './dap-session';
 
 function deferred<T>() {
@@ -12,7 +12,194 @@ function request(seq: number, command: string, args: Record<string, unknown> = {
 }
 
 describe('DapSession realtime variable arbitration', () => {
-  it('lets a Watch read run after an in-flight Timeline sample instead of returning a stale placeholder', async () => {
+  it('splits Watch batches and lets Timeline read between slices', async () => {
+    const order: string[] = [];
+    const forwardedExpanded: string[][] = [];
+    let session: DapSession;
+    let timelineRead: Promise<boolean> | undefined;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
+        if (command.cmd === 'evaluateExpression') {
+          order.push(`watch:${command.expression}`);
+          forwardedExpanded.push(command.expandedExpressions);
+          if (command.expression === 'b') {
+            setImmediate(() => {
+              timelineRead = (session as any).captureFastDataSample();
+            });
+          }
+          return { ok: true, data: { expression: command.expression, value: 1, display: '1', hex: '0x1' } };
+        }
+        if (command.cmd === 'readFastDataSampling') {
+          order.push('timeline');
+          return { ok: true, data: [] };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}`);
+      },
+      dispose() {},
+    };
+    session = new DapSession(backend as any);
+    const sent: DebugProtocolMessage[] = [];
+    session.on('send', message => sent.push(message));
+    (session as any).setTargetRunning(true);
+    (session as any).dataSamplingSpecs = [{ expression: 'sample', address: 0x20000000, size: 4, format: 'u32' }];
+
+    await (session as any).handleDataSample(request(1, 'dataSample', {
+      expressions: ['a', 'b', 'c'],
+      expandedExpressions: ['a'],
+    }));
+    if (timelineRead) await timelineRead;
+
+    expect(order).toEqual(['watch:a', 'watch:b', 'timeline', 'watch:c']);
+    expect(forwardedExpanded).toEqual([['a'], ['a'], ['a']]);
+    expect(sent.find(message => message.request_seq === 1)?.body?.results).toHaveLength(3);
+  });
+
+  it('flushes pending Timeline data on the configured send interval without waiting for another target read', async () => {
+    vi.useFakeTimers();
+    try {
+      const backend = { async execute() { throw new Error('No target read is expected'); }, dispose() {} };
+      const session = new DapSession(backend as any);
+      const sent: DebugProtocolMessage[] = [];
+      session.on('send', message => sent.push(message));
+      (session as any).dataSamplingActive = true;
+      (session as any).dataSamplingSendIntervalMs = 16;
+      (session as any).dataSamplingEntries = [{ expression: 'counter', color: '#4EC9B0' }];
+      (session as any).dataSamplingPending.set('counter', [{ timestamp: 1, value: 42, display: '42' }]);
+      (session as any).dataSamplingLastDisplay.set('counter', '42');
+
+      (session as any).startDataSamplingFlushTimer();
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(sent).toEqual([expect.objectContaining({
+        event: 'ozoneDataSamples',
+        body: expect.objectContaining({ snapshots: [expect.objectContaining({ data: [{ timestamp: 1, value: 42, display: '42' }] })] }),
+      })]);
+      (session as any).stopDataSampling();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('yields after one rejected Timeline read while a Watch read owns the target', async () => {
+    const backend = {
+      async execute(command: any) {
+        throw new Error(`Timeline must not execute ${command.cmd} while Watch owns the read`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).dataSamplingActive = true;
+    (session as any).setTargetRunning(true);
+    (session as any).targetReadInProgress = true;
+    (session as any).dataSamplingNextSampleMs = 0;
+    vi.spyOn(session as any, 'nowMs').mockReturnValue(0);
+    const capture = vi.spyOn(session as any, 'captureFastDataSample');
+    vi.spyOn(session as any, 'scheduleDataSamplingLoop').mockImplementation(() => {});
+
+    await (session as any).dataSamplingLoop();
+
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect((session as any).dataSamplingNextSampleMs).toBe(0.2);
+  });
+
+  it('does not access the target or create Timeline points while DAP state is halted', async () => {
+    let reads = 0;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'readFastDataSampling') reads++;
+        throw new Error(`Unexpected command: ${command.cmd}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
+    (session as any).dataSamplingPending.set('counter', []);
+    (session as any).setTargetRunning(false);
+
+    await (session as any).captureFastDataSample();
+
+    expect(reads).toBe(0);
+    expect((session as any).dataSamplingPending.get('counter')).toEqual([]);
+  });
+
+  it('resumes Timeline sampling only after DAP returns to running', async () => {
+    let reads = 0;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd !== 'readFastDataSampling') throw new Error(`Unexpected command: ${command.cmd}`);
+        reads++;
+        return { ok: true, data: [{ expression: 'counter', value: 42, display: '42', hex: '0x2A' }] };
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
+    (session as any).dataSamplingPending.set('counter', []);
+    (session as any).setTargetRunning(false);
+
+    await (session as any).captureFastDataSample();
+    (session as any).setTargetRunning(true);
+    await (session as any).captureFastDataSample();
+
+    expect(reads).toBe(1);
+    expect((session as any).dataSamplingPending.get('counter')).toEqual([
+      expect.objectContaining({ value: 42, display: '42', startsNewSegment: true }),
+    ]);
+  });
+
+  it('marks only the first valid sample for each expression as a new DAP session segment', async () => {
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd !== 'readFastDataSampling') throw new Error(`Unexpected command: ${command.cmd}`);
+        return { ok: true, data: [{ expression: 'counter', value: 42, display: '42', hex: '0x2A' }] };
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
+    (session as any).dataSamplingPending.set('counter', []);
+    (session as any).setTargetRunning(true);
+
+    await (session as any).captureFastDataSample();
+    await (session as any).captureFastDataSample();
+
+    const points = (session as any).dataSamplingPending.get('counter');
+    expect(points).toHaveLength(2);
+    expect(points[0]).toMatchObject({ value: 42, startsNewSegment: true });
+    expect(points[1]).not.toHaveProperty('startsNewSegment');
+  });
+
+  it('does not advance the Timeline sampling clock while the target is halted', async () => {
+    let now = 1000;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd !== 'readFastDataSampling') throw new Error(`Unexpected command: ${command.cmd}`);
+        return { ok: true, data: [{ expression: 'counter', value: 42, display: '42', hex: '0x2A' }] };
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    vi.spyOn(session as any, 'nowMs').mockImplementation(() => now);
+    (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
+    (session as any).dataSamplingPending.set('counter', []);
+    (session as any).setTargetRunning(true);
+
+    await (session as any).captureFastDataSample();
+    now = 1100;
+    (session as any).setTargetRunning(false);
+    now = 5100;
+    (session as any).setTargetRunning(true);
+    now = 5200;
+    await (session as any).captureFastDataSample();
+
+    expect((session as any).dataSamplingPending.get('counter').map((point: any) => point.timestamp)).toEqual([
+      1000,
+      1200,
+    ]);
+  });
+
+  it('lets a Watch read run after an in-flight Timeline sample and resumes Timeline when that read completes', async () => {
     const sampleGate = deferred<void>();
     const sampleStarted = deferred<void>();
     let evaluateCount = 0;
@@ -38,6 +225,7 @@ describe('DapSession realtime variable arbitration', () => {
     const session = new DapSession(backend as any);
     const sent: DebugProtocolMessage[] = [];
     session.on('send', message => sent.push(message));
+    (session as any).setTargetRunning(true);
     (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
 
     const sample = (session as any).captureFastDataSample();
@@ -55,6 +243,8 @@ describe('DapSession realtime variable arbitration', () => {
     expect(sent.find(message => message.request_seq === 10)?.body?.results).toEqual([
       expect.objectContaining({ expression: 'counter', value: 42, display: '42' }),
     ]);
+    expect((session as any).beginTargetRead('low')).toBe(true);
+    (session as any).endTargetRead();
   });
 
   it('gives built-in DAP Watch evaluate the same priority over Timeline sampling', async () => {
@@ -81,6 +271,7 @@ describe('DapSession realtime variable arbitration', () => {
     const session = new DapSession(backend as any);
     const sent: DebugProtocolMessage[] = [];
     session.on('send', message => sent.push(message));
+    (session as any).setTargetRunning(true);
     (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
 
     const sample = (session as any).captureFastDataSample();
@@ -128,6 +319,7 @@ describe('DapSession realtime variable arbitration', () => {
     const session = new DapSession(backend as any);
     const responses: DebugProtocolMessage[] = [];
     session.on('send', message => responses.push(message));
+    (session as any).setTargetRunning(true);
     (session as any).dataSamplingEntries = [{ expression: 'counter', color: '#4EC9B0' }];
     (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
     (session as any).dataSamplingPending.set('counter', [{ timestamp: 1, value: 41, display: '41' }]);
@@ -194,6 +386,7 @@ describe('DapSession realtime variable arbitration', () => {
     const session = new DapSession(backend as any);
     const sent: DebugProtocolMessage[] = [];
     session.on('send', message => sent.push(message));
+    (session as any).setTargetRunning(true);
     (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
 
     const sample = (session as any).captureFastDataSample();

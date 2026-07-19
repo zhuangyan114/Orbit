@@ -9,12 +9,15 @@ const REG_INDEXES: Record<string, number> = {
   SP: 13, LR: 14, PC: 15, xPSR: 16,
 };
 
+const MIN_TARGET_VOLTAGE_MV = 1000;
+
 export class JLinkDLL {
   private lib: koffi.LibraryHandle | null = null;
   private _state: 'disconnected' | 'connected' | 'running' | 'halted' | 'error' = 'disconnected';
   private _device = '';
   private _wasOpened = false;
   private _rttStarted = false;
+  private _targetLinkProbeEnabled = false;
   private bpSlots: (number | null)[] = [null, null, null, null, null, null];
 
   get connected() { return this._state !== 'disconnected'; }
@@ -25,7 +28,7 @@ export class JLinkDLL {
   private getDllPath(): string {
     try {
       const vscode = require('vscode') as typeof import('vscode');
-      const config = vscode.workspace.getConfiguration('ozone');
+      const config = vscode.workspace.getConfiguration('orbit');
       const configured = config.get<string>('jlinkDllPath', '');
       if (configured && fs.existsSync(configured)) return configured;
     } catch { }
@@ -60,12 +63,16 @@ export class JLinkDLL {
   }
 
   close(): void {
-    if (!this.lib) return;
+    if (!this.lib) {
+      this._targetLinkProbeEnabled = false;
+      return;
+    }
     this.stopRtt();
     try { this.lib.func('int JLINK_Close(void)')(); } catch { }
     this.lib = null;
     this._state = 'disconnected';
     this._wasOpened = false;
+    this._targetLinkProbeEnabled = false;
     this.bpSlots = [null, null, null, null, null, null];
   }
 
@@ -112,6 +119,11 @@ export class JLinkDLL {
       log.dll('JLINK_Connect OK');
       this._state = 'connected';
       this._device = device;
+      const targetLinkProbeResult = this.readTargetLinkProbe();
+      this._targetLinkProbeEnabled = targetLinkProbeResult !== null && targetLinkProbeResult >= 0;
+      log.dll(this._targetLinkProbeEnabled
+        ? `SW-DP health probe enabled: result=${targetLinkProbeResult}`
+        : 'SW-DP health probe unavailable; preserving legacy state checks');
       return true;
     } catch (err) {
       log.dll('Connect error: ' + err);
@@ -125,7 +137,51 @@ export class JLinkDLL {
     this.stopRtt();
     try { this.lib.func('int JLINK_Halt(void)')(); } catch { }
     this.clearAllBreakpoints();
+    this._targetLinkProbeEnabled = false;
     this._state = 'disconnected';
+  }
+
+  abandon(): void {
+    this._rttStarted = false;
+    this._targetLinkProbeEnabled = false;
+    this.bpSlots = [null, null, null, null, null, null];
+    this._state = 'disconnected';
+  }
+
+  isTargetConnected(): boolean {
+    if (!this.lib || this._state === 'disconnected') return false;
+    let dllConnected = true;
+    try {
+      dllConnected = this.lib.func('int JLINK_IsConnected(void)')() !== 0;
+    } catch {
+      // Older DLLs may not export this optional health check. Preserve the
+      // selected owner and let command failures provide the fallback signal.
+    }
+    if (!dllConnected) return false;
+
+    // JLINK_IsConnected() reflects the DLL's logical connection and can stay
+    // true after the target cable is removed. VTref is supplied by the target
+    // connector, so checking it detects a removed SWD cable without reading
+    // target memory or changing the CPU run state.
+    try {
+      const status = new Uint8Array(8);
+      let result: number;
+      try {
+        result = this.lib.func('int JLINK_GetHWStatus(uint8*)')(status);
+      } catch {
+        result = this.lib.func('int JLINKARM_GetHWStatus(uint8*)')(status);
+      }
+      if (result === 0) {
+        const targetVoltageMv = status[0] | (status[1] << 8);
+        if (targetVoltageMv < MIN_TARGET_VOLTAGE_MV) {
+          log.dll(`Target VTref lost: ${targetVoltageMv} mV`);
+          return false;
+        }
+      }
+    } catch {
+      // The voltage check is optional for old or nonstandard DLLs.
+    }
+    return true;
   }
 
   halt(): boolean {
@@ -174,9 +230,47 @@ export class JLinkDLL {
   }
 
   isHalted(): boolean {
+    return this.getHaltState() === true;
+  }
+
+  getHaltState(): boolean | null {
     if (!this.lib || this._state === 'disconnected') return false;
-    try { return this.lib.func('int JLINK_IsHalted(void)')() !== 0; }
-    catch { return false; }
+    try {
+      const result = this.lib.func('int JLINK_IsHalted(void)')();
+      if (result < 0) {
+        log.dll(`JLINK_IsHalted communication error: ${result}`);
+        return null;
+      }
+      return result > 0;
+    } catch (error) {
+      log.dll(`JLINK_IsHalted call failed: ${error}`);
+      return null;
+    }
+  }
+
+  probeTargetLink(): boolean | null {
+    if (!this._targetLinkProbeEnabled) return null;
+    const result = this.readTargetLinkProbe();
+    if (result === null) return null;
+    if (result < 0) {
+      log.dll(`SW-DP health probe failed: ${result}`);
+      return false;
+    }
+    return true;
+  }
+
+  private readTargetLinkProbe(): number | null {
+    if (!this.lib || this._state === 'disconnected') return null;
+    const data = new Uint32Array(1);
+    try {
+      try {
+        return this.lib.func('int JLINK_CORESIGHT_ReadAPDPReg(uint8, uint8, uint32*)')(0, 0, data);
+      } catch {
+        return this.lib.func('int JLINKARM_CORESIGHT_ReadAPDPReg(uint8, uint8, uint32*)')(0, 0, data);
+      }
+    } catch {
+      return null;
+    }
   }
 
   probeInterface(): boolean {

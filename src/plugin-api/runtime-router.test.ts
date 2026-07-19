@@ -50,4 +50,24 @@ describe('RuntimeRouter active DAP ownership', () => {
     expect((await router.writeMany([{ expression: 'count', value: 42 }]))[0]).toMatchObject({ ok: true });
     expect(backend.execute).toHaveBeenCalledTimes(3);
   });
+
+  it('forwards a resolved field address and type to the active DAP session', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const customRequest = vi.fn(async () => ({ ok: true }));
+    vscodeState.activeDebugSession = { type: 'ozone', customRequest };
+    const router = new RuntimeRouter(backend);
+
+    await expect(router.writeMany([
+      { expression: 'up_yaw->target_ac_Angle', value: 0.25, address: 0x2000712C, typeName: 'float' },
+    ])).resolves.toEqual([
+      expect.objectContaining({ expression: 'up_yaw->target_ac_Angle', ok: true }),
+    ]);
+    expect(customRequest).toHaveBeenCalledWith('setWatchValue', {
+      expression: 'up_yaw->target_ac_Angle',
+      value: 0.25,
+      address: 0x2000712C,
+      typeName: 'float',
+    });
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
 });

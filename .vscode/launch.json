@@ -34,8 +34,8 @@
     {
       "type": "ozone",
       "request": "launch",
-      "name": "Ozone: Debug STM32",
-      "program": "D:\\STM32\\RoboMaster\\26Lao_ShaoBin\\Down-cmake\\build\\Debug\\frame.elf",
+      "name": "Orbit: Debug STM32",
+      "program": "${workspaceFolder}/build/Debug/frame.elf",
       "device": "STM32F407IG",
       "interface": "SWD",
       "speedKHz": 4000

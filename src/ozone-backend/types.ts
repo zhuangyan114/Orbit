@@ -6,9 +6,6 @@ export interface DebugSessionConfig {
   rtos?: string;
   nativeDebugEngineMode?: 'legacy' | 'native' | 'auto';
   nativeDebugEngineEnabled?: boolean;
-  nativeDebugEngineStepInto?: boolean;
-  nativeDebugEngineStepOver?: boolean;
-  nativeDebugEngineStepOut?: boolean;
 }
 
 export enum TargetState {
@@ -51,6 +48,7 @@ export interface WatchValue {
   address?: number;
   error?: string;
   typeName?: string;
+  hasChildren?: boolean;
   children?: WatchValue[];
 }
 
@@ -58,6 +56,7 @@ export interface DataPoint {
   timestamp: number;
   value: number;
   display: string;
+  startsNewSegment?: boolean;
 }
 
 export interface DataSamplingEntry {
@@ -77,6 +76,8 @@ export interface FastDataSampleSpec {
   expression: string;
   address: number;
   size: number;
+  pointerAddress?: number;
+  pointeeOffset?: number;
   typeName?: string;
   isFloat?: boolean;
   signed?: boolean;
@@ -142,12 +143,12 @@ export type OzoneCommand =
   | { cmd: 'writeMemory'; address: number; data: number[] }
   | { cmd: 'readRegister'; name: string }
   | { cmd: 'getTargetState' }
-  | { cmd: 'flash'; elfPath: string; device: string; interface: 'SWD' | 'JTAG'; speedKHz: number }
+  | { cmd: 'flash'; elfPath: string; device: string; interface: 'SWD' | 'JTAG'; speedKHz: number; signal?: AbortSignal }
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
-  | { cmd: 'evaluateExpression'; expression: string; force?: boolean }
+  | { cmd: 'evaluateExpression'; expression: string; force?: boolean; expandedExpressions?: string[] }
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[] }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
@@ -157,4 +158,4 @@ export type OzoneCommand =
 
 export type OzoneCommandResult =
   | { ok: true; data: unknown }
-  | { ok: false; error: string };
+  | { ok: false; error: string; errorCode?: string };

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { TargetState, RegisterValue, WatchValue } from '../ozone-backend/types';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 
 export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -60,7 +61,7 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand('ozone.openMemoryBrowser');
           break;
         case 'openSettings':
-          vscode.commands.executeCommand('workbench.action.openSettings', '@ext:ozone-debug.ozone-for-vscode');
+          vscode.commands.executeCommand('workbench.action.openSettings', '@ext:orbit-debug.orbit-for-vscode');
           break;
         case 'getConfig':
           this.sendConfig();
@@ -207,7 +208,7 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private sendConfig() {
-    const config = vscode.workspace.getConfiguration('ozone');
+    const config = getOrbitConfiguration();
     const wsFolders = vscode.workspace.workspaceFolders;
     const workspaceRoot = wsFolders?.[0]?.uri.fsPath || '';
     const device = config.get<string>('defaultDevice', 'STM32F407VG');
@@ -224,11 +225,11 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private setDevice(device: string) {
-    vscode.workspace.getConfiguration('ozone').update('defaultDevice', device, vscode.ConfigurationTarget.Global);
+      getOrbitConfiguration().update('defaultDevice', device, vscode.ConfigurationTarget.Global);
   }
 
   private setElfPath(elfPath: string) {
-    vscode.workspace.getConfiguration('ozone').update('defaultProgram', elfPath, vscode.ConfigurationTarget.Workspace);
+      getOrbitConfiguration().update('defaultProgram', elfPath, vscode.ConfigurationTarget.Workspace);
   }
 
   private async browseElf() {
@@ -245,9 +246,9 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   createStatusBar() {
-    this.statusBar.text = '$(chip) Ozone Debug';
+    this.statusBar.text = '$(chip) Orbit Debug';
     this.statusBar.command = 'ozone.startSession';
-    this.statusBar.tooltip = 'Ozone Debug Session Manager';
+    this.statusBar.tooltip = 'Orbit Debug Session Manager';
     this.statusBar.show();
   }
 
@@ -272,10 +273,10 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
     body { margin: 0; padding: 8px; font-family: var(--vscode-font-family); background: var(--bg); color: var(--fg); }
     #root { height: 100%; }
   </style>
-  <title>Ozone Debug</title>
+  <title>Orbit Debug</title>
 </head>
 <body>
-  <div id="root"><div style="padding:12px;font-size:12px;color:var(--vscode-descriptionForeground)">Loading Ozone Debug...</div></div>
+  <div id="root"><div style="padding:12px;font-size:12px;color:var(--vscode-descriptionForeground)">Loading Orbit Debug...</div></div>
   <script src="${scriptUri}"></script>
 </body>
 </html>`;

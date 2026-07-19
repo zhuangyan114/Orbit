@@ -38,6 +38,12 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       switch (msg.command) {
         case 'init': {
           const saved = this.context.workspaceState.get<TimelineState>(STATE_KEY);
+          for (const entry of this.sampleManager.entriesList) {
+            const savedEntry = saved?.entries?.find(candidate => candidate.expression === entry.expression);
+            if (savedEntry?.color && savedEntry.color !== entry.color) {
+              this.sampleManager.setColor(entry.expression, savedEntry.color);
+            }
+          }
           const entries = this.sampleManager.entriesList.map(e => {
             const s = saved?.entries?.find(se => se.expression === e.expression);
             return {
@@ -75,13 +81,13 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         case 'addExpression':
           if (msg.expression) {
             this.sampleManager.addExpression(msg.expression);
-            this.sendEntriesRefresh();
+            this.refreshEntries();
           }
           break;
         case 'removeExpression':
           if (msg.expression) {
             this.sampleManager.removeExpression(msg.expression);
-            this.sendEntriesRefresh();
+            this.refreshEntries();
           }
           break;
         case 'toggleExpression':
@@ -98,8 +104,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
           break;
         case 'setColor':
           if (msg.expression && msg.color) {
-            this.sampleManager.setColor(msg.expression, msg.color);
-            this.sendEntriesRefresh();
+            void this.setEntryColor(msg.expression, msg.color);
           }
           break;
       }
@@ -110,7 +115,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private sendEntriesRefresh() {
+  refreshEntries() {
     const saved = this.context.workspaceState.get<TimelineState>(STATE_KEY);
     const entries = this.sampleManager.entriesList.map(e => {
       const s = saved?.entries?.find(se => se.expression === e.expression);
@@ -126,6 +131,21 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ command: 'entries', entries });
   }
 
+  private async setEntryColor(expression: string, color: string) {
+    this.sampleManager.setColor(expression, color);
+    const saved = this.context.workspaceState.get<TimelineState>(STATE_KEY);
+    const entries = saved?.entries || [];
+    const updatedEntries = entries.some(entry => entry.expression === expression)
+      ? entries.map(entry => entry.expression === expression ? { ...entry, color } : entry)
+      : [...entries, { expression, enabled: true, color, yPerDiv: 1, yAutoScale: true, yCenter: 0 }];
+    await this.context.workspaceState.update(STATE_KEY, {
+      autoFollow: saved?.autoFollow ?? true,
+      timePerDiv: saved?.timePerDiv ?? 100,
+      entries: updatedEntries,
+    });
+    this.refreshEntries();
+  }
+
   private sendSamples(snapshots: DataSampleSnapshot[]) {
     this.postMessage({ command: 'samples', snapshots });
   }
@@ -134,7 +154,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     try {
       this.view?.webview.postMessage(msg);
     } catch (e) {
-      console.error('[Ozone Timeline] postMessage error:', e);
+      console.error('[Orbit Timeline] postMessage error:', e);
     }
   }
 
@@ -165,7 +185,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     body { margin: 0; padding: 0; font-family: var(--vscode-font-family, sans-serif); background: var(--bg); color: var(--fg); font-size: 12px; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
     #root { height: 100%; display: flex; flex-direction: column; }
   </style>
-  <title>Ozone Timeline</title>
+  <title>Orbit Timeline</title>
 </head>
 <body>
   <div id="root">Loading...</div>

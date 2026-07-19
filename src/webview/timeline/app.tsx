@@ -1,26 +1,20 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
+import {
+  appendTimelineSamples,
+  TimelineFrameBatcher,
+  type TimelineDataPoint,
+  type TimelineSampleSnapshot,
+} from './timeline-sample-buffer';
+import { buildTimelineTraceCommands, firstPointAtOrAfter } from './timeline-trace-path';
+import {
+  createTimelineEntry,
+  mergeTimelineEntryRefresh,
+  type TimelineEntryState as Entry,
+  type TimelineEntryUpdate,
+} from './timeline-entry-state';
 
-interface Entry {
-  expression: string;
-  enabled: boolean;
-  color: string;
-  yPerDiv: number;
-  yAutoScale: boolean;
-  yCenter: number;
-}
-
-interface DataPoint {
-  timestamp: number;
-  value: number;
-  display: string;
-}
-
-interface SampleSnapshot {
-  expression: string;
-  color: string;
-  currentValue: string;
-  data: DataPoint[];
-}
+type DataPoint = TimelineDataPoint;
+type SampleSnapshot = TimelineSampleSnapshot;
 
 interface VSCODE_API { postMessage(message: any): void; }
 declare function acquireVsCodeApi(): VSCODE_API;
@@ -31,17 +25,13 @@ catch { vscode = { postMessage: () => {} }; }
 const H_DIV = 8;
 const V_DIV = 6;
 const SUB_DIV = 5;
-const MAX_POINTS_PER_VAR = 50000;
-const TIME_PRESETS = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 30000];
+const TIME_PRESETS = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 30000, 60000, 75000];
 
-function makeEntry(expr: string, color: string): Entry {
-  return { expression: expr, enabled: true, color, yPerDiv: 1, yAutoScale: true, yCenter: 0 };
-}
-
-function autoCalcPerDiv(pts: DataPoint[]): { yPerDiv: number; yCenter: number } {
+function autoCalcPerDiv(pts: DataPoint[], firstTimestamp = Number.NEGATIVE_INFINITY): { yPerDiv: number; yCenter: number } {
   if (pts.length === 0) return { yPerDiv: 1, yCenter: 0 };
   let absMax = 0;
-  for (const p of pts) {
+  for (let index = firstPointAtOrAfter(pts, firstTimestamp); index < pts.length; index++) {
+    const p = pts[index];
     const a = Math.abs(p.value);
     if (a > absMax) absMax = a;
   }
@@ -56,20 +46,63 @@ export function TimelineApp() {
   const [entries, setEntries] = useState<Entry[]>([]);
   const allDataRef = useRef<Map<string, DataPoint[]>>(new Map());
   const [timePerDiv, setTimePerDiv] = useState(100);
+  const timePerDivRef = useRef(timePerDiv);
+  timePerDivRef.current = timePerDiv;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [renderTick, setRenderTick] = useState(0);
   const [newExpr, setNewExpr] = useState('');
   const [autoFollow, setAutoFollow] = useState(true);
   const autoFollowRef = useRef(true);
   const tEndRef = useRef(Date.now());
+  const latestSampleTimestampRef = useRef(0);
   const isDraggingRef = useRef(false);
   const dragStartXRef = useRef(0);
   const dragStartTEndRef = useRef(0);
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
   const [hoverVals, setHoverVals] = useState<{ label: string; value: string; color: string }[] | null>(null);
+  const [hoverTooltipWidth, setHoverTooltipWidth] = useState(0);
   const lastHoverClientX = useRef(0);
   const lastHoverClientY = useRef(0);
+  const hoverTooltipRef = useRef<HTMLDivElement>(null);
   const initedRef = useRef(false);
+  const applySamplesRef = useRef<(snapshots: SampleSnapshot[]) => void>(() => {});
+  const sampleBatcherRef = useRef<TimelineFrameBatcher | null>(null);
+
+  applySamplesRef.current = (snapshots) => {
+    const map = allDataRef.current;
+    const latestTimestamp = appendTimelineSamples(map, snapshots);
+    if (latestTimestamp !== undefined) {
+      latestSampleTimestampRef.current = Math.max(latestSampleTimestampRef.current, latestTimestamp);
+      if (autoFollowRef.current) tEndRef.current = latestSampleTimestampRef.current;
+    }
+    if (autoFollowRef.current) {
+      setEntries(prev => {
+        let changed = false;
+        const next = prev.map(e => {
+          if (!e.yAutoScale) return e;
+          const pts = map.get(e.expression);
+          if (!pts || pts.length < 2) return e;
+          const visibleStart = latestSampleTimestampRef.current - timePerDivRef.current * H_DIV;
+          const { yPerDiv, yCenter } = autoCalcPerDiv(pts, visibleStart);
+          if (e.yPerDiv !== yPerDiv || e.yCenter !== yCenter) changed = true;
+          return { ...e, yPerDiv, yCenter };
+        });
+        return changed ? next : prev;
+      });
+    }
+    setRenderTick(t => t + 1);
+    if (lastHoverClientX.current > 0) {
+      computeHoverRef.current(lastHoverClientX.current, lastHoverClientY.current);
+    }
+  };
+
+  if (!sampleBatcherRef.current) {
+    sampleBatcherRef.current = new TimelineFrameBatcher(
+      callback => requestAnimationFrame(callback),
+      handle => cancelAnimationFrame(handle),
+      snapshots => applySamplesRef.current(snapshots),
+    );
+  }
 
   const saveState = useCallback(() => {
     vscode.postMessage({
@@ -94,16 +127,7 @@ export function TimelineApp() {
       const msg = event.data;
       switch (msg.command) {
         case 'init': {
-          const eList: Entry[] = (msg.entries || []).map((e: any) => {
-            const entry = makeEntry(e.expression, e.color);
-            // Apply saved per-entry state from extension
-            if (e.yPerDiv !== undefined) entry.yPerDiv = e.yPerDiv;
-            if (e.yAutoScale !== undefined) entry.yAutoScale = e.yAutoScale;
-            if (e.enabled !== undefined) entry.enabled = e.enabled;
-            // Force yCenter=0 when auto-scaling (zero always at screen center)
-            entry.yCenter = entry.yAutoScale ? 0 : (e.yCenter ?? 0);
-            return entry;
-          });
+          const eList: Entry[] = (msg.entries || []).map((e: TimelineEntryUpdate) => createTimelineEntry(e));
           setEntries(eList);
           // Apply saved global state
           if (msg.autoFollow !== undefined) {
@@ -121,50 +145,14 @@ export function TimelineApp() {
           break;
         }
         case 'entries': {
-          const eList: Entry[] = (msg.entries || []).map((e: any) => makeEntry(e.expression, e.color));
-          setEntries(prev => {
-            const prevMap = new Map(prev.map(e => [e.expression, e]));
-            return eList.map(e => {
-              const old = prevMap.get(e.expression);
-              if (old) {
-                const yAutoScale = old.yAutoScale;
-                return { ...e, yPerDiv: old.yPerDiv, yAutoScale, yCenter: yAutoScale ? 0 : old.yCenter };
-              }
-              return e;
-            });
-          });
+          const updates: TimelineEntryUpdate[] = msg.entries || [];
+          setEntries(prev => mergeTimelineEntryRefresh(prev, updates));
           setRenderTick(t => t + 1);
           break;
         }
         case 'samples': {
           const snapshots: SampleSnapshot[] = msg.snapshots || [];
-          const map = allDataRef.current;
-          for (const snap of snapshots) {
-            const existing = map.get(snap.expression) || [];
-            if (snap.data.length > 0) {
-              const next = [...existing, ...snap.data];
-              if (next.length > MAX_POINTS_PER_VAR) next.splice(0, next.length - MAX_POINTS_PER_VAR);
-              map.set(snap.expression, next);
-            }
-          }
-          // auto-scale entries that have yAutoScale (only when auto-following)
-          if (autoFollowRef.current) {
-            setEntries(prev => {
-              let changed = false;
-              const next = prev.map(e => {
-                if (!e.yAutoScale) return e;
-                const pts = map.get(e.expression);
-                if (!pts || pts.length < 2) return e;
-                const { yPerDiv, yCenter } = autoCalcPerDiv(pts);
-                if (e.yPerDiv !== yPerDiv || e.yCenter !== yCenter) changed = true;
-                return { ...e, yPerDiv, yCenter };
-              });
-              return changed ? next : prev;
-            });
-          }
-          setRenderTick(t => t + 1);
-          // refresh hover values if mouse is still over the canvas
-          if (lastHoverClientX.current > 0) computeHoverRef.current(lastHoverClientX.current, lastHoverClientY.current);
+          sampleBatcherRef.current?.enqueue(snapshots);
           break;
         }
       }
@@ -173,6 +161,8 @@ export function TimelineApp() {
     vscode.postMessage({ command: 'init' });
     return () => window.removeEventListener('message', handler);
   }, []);
+
+  useEffect(() => () => sampleBatcherRef.current?.dispose(), []);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -185,9 +175,13 @@ export function TimelineApp() {
     const W = rect.width;
     const H = rect.height;
     if (W < 50 || H < 50) return;
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    ctx.scale(dpr, dpr);
+    const pixelWidth = Math.round(W * dpr);
+    const pixelHeight = Math.round(H * dpr);
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const margin = { top: 8, right: 12, bottom: 28, left: 12 };
     const plotW = W - margin.left - margin.right;
@@ -197,8 +191,9 @@ export function TimelineApp() {
     const divW = plotW / H_DIV;
     const divH = plotH / V_DIV;
 
-    const now = Date.now();
-    if (autoFollowRef.current) tEndRef.current = now;
+    if (autoFollowRef.current && latestSampleTimestampRef.current > 0) {
+      tEndRef.current = latestSampleTimestampRef.current;
+    }
     const tEnd = tEndRef.current;
     const tStart = tEnd - timePerDiv * H_DIV;
     const map = allDataRef.current;
@@ -206,14 +201,6 @@ export function TimelineApp() {
     ctx.clearRect(0, 0, W, H);
 
     const active = entries.filter(e => e.enabled);
-    const series: { color: string; pts: DataPoint[]; yPerDiv: number; yCenter: number; label: string }[] = [];
-    for (const entry of active) {
-      const pts = map.get(entry.expression);
-      if (!pts || pts.length === 0) continue;
-      const visible = pts.filter(p => p.timestamp >= tStart);
-      if (visible.length === 0) continue;
-      series.push({ color: entry.color, pts: visible, yPerDiv: entry.yPerDiv, yCenter: entry.yCenter, label: entry.expression });
-    }
 
     // -- grid background --
     ctx.fillStyle = 'rgba(0,0,0,0.15)';
@@ -290,17 +277,27 @@ export function TimelineApp() {
 
     clipRegion(ctx);
 
-    for (const s of series) {
-      ctx.strokeStyle = s.color;
+    for (const entry of active) {
+      const pts = map.get(entry.expression);
+      if (!pts || pts.length === 0) continue;
+      const commands = buildTimelineTraceCommands(pts, {
+        tStart,
+        tEnd,
+        plotLeft: margin.left,
+        plotWidth: plotW,
+        projectY: point => {
+          const yNorm = (point.value - entry.yCenter) / entry.yPerDiv;
+          return margin.top + plotH / 2 - yNorm * divH;
+        },
+      });
+      if (commands.length === 0) continue;
+
+      ctx.strokeStyle = entry.color;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      let first = true;
-      for (const p of s.pts) {
-        const x = margin.left + ((p.timestamp - tStart) / (timePerDiv * H_DIV)) * plotW;
-        const yNorm = (p.value - s.yCenter) / s.yPerDiv;
-        const y = margin.top + plotH / 2 - yNorm * divH;
-        if (first) { ctx.moveTo(x, y); first = false; }
-        else ctx.lineTo(x, y);
+      for (const command of commands) {
+        if (command.command === 'moveTo') ctx.moveTo(command.x, command.y);
+        else ctx.lineTo(command.x, command.y);
       }
       ctx.stroke();
     }
@@ -433,8 +430,7 @@ export function TimelineApp() {
     const relX = clientX - rect.left - margin.left;
     if (relX < 0 || relX > plotW) { setMousePos(null); setHoverVals(null); return; }
 
-    const now = Date.now();
-    const tEnd = autoFollowRef.current ? now : tEndRef.current;
+    const tEnd = tEndRef.current;
     const tStart = tEnd - timePerDiv * H_DIV;
     const cursorTime = tStart + (relX / plotW) * timePerDiv * H_DIV;
 
@@ -515,7 +511,9 @@ export function TimelineApp() {
   const onToggleFollow = (follow: boolean) => {
     setAutoFollow(follow);
     autoFollowRef.current = follow;
-    tEndRef.current = Date.now();
+    if (follow && latestSampleTimestampRef.current > 0) {
+      tEndRef.current = latestSampleTimestampRef.current;
+    }
   };
 
   // wheel + drag via ref (passive:false for preventDefault)
@@ -540,6 +538,15 @@ export function TimelineApp() {
     if (val > 0 && val <= 30000) setTimePerDiv(val);
   };
 
+  useLayoutEffect(() => {
+    const width = hoverTooltipRef.current?.getBoundingClientRect().width ?? 0;
+    setHoverTooltipWidth(previousWidth => previousWidth === width ? previousWidth : width);
+  }, [hoverVals]);
+
+  const canvasWidth = canvasRef.current?.getBoundingClientRect().width ?? 0;
+  const showHoverTooltipOnLeft = mousePos !== null
+    && mousePos.x + 14 + hoverTooltipWidth > canvasWidth;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Toolbar
@@ -561,8 +568,11 @@ export function TimelineApp() {
             onMouseUp={handleMouseUp} onMouseLeave={handleCanvasMouseLeave}
           />
           {mousePos && hoverVals && hoverVals.length > 0 && (
-            <div style={{
-              position: 'absolute', left: mousePos.x + 14, top: mousePos.y - 8,
+            <div ref={hoverTooltipRef} style={{
+              position: 'absolute',
+              left: showHoverTooltipOnLeft ? undefined : mousePos.x + 14,
+              right: showHoverTooltipOnLeft ? canvasWidth - mousePos.x + 14 : undefined,
+              top: mousePos.y - 8,
               background: 'rgba(30,30,30,0.92)', border: '1px solid var(--vscode-sideBar-border, #555)',
               borderRadius: 4, padding: '4px 8px', fontSize: 11,
               pointerEvents: 'none', whiteSpace: 'nowrap', zIndex: 10,

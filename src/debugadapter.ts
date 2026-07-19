@@ -16,11 +16,20 @@ try {
   );
   const backend = new OzoneBackend(target, target);
   const session = new DapSession(backend);
-  let disposed = false;
+  let disposePromise: Promise<void> | null = null;
+  let exitPromise: Promise<void> | null = null;
   const disposeSession = () => {
-    if (disposed) return;
-    disposed = true;
-    session.dispose();
+    if (!disposePromise) disposePromise = session.dispose();
+    return disposePromise;
+  };
+  const exitAfterCleanup = (code: number) => {
+    if (exitPromise) return exitPromise;
+    exitPromise = (async () => {
+      await disposeSession();
+      await new Promise<void>(resolve => process.stdout.write('', () => resolve()));
+      process.exit(code);
+    })();
+    return exitPromise;
   };
 
   let buffer = '';
@@ -45,19 +54,27 @@ try {
       } catch {}
     }
   });
-  process.stdin.on('end', disposeSession);
+  process.stdin.on('end', () => { void exitAfterCleanup(0); });
 
   session.on('send', (message: DebugProtocolMessage) => {
     const body = JSON.stringify(message);
     const header = `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n`;
     process.stdout.write(header + body, 'utf8');
   });
+  session.on('shutdownRequested', () => { void exitAfterCleanup(0); });
 
-  process.on('unhandledRejection', () => process.exit(1));
+  process.on('unhandledRejection', reason => {
+    log.dap(`debugadapter unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`);
+    void exitAfterCleanup(1);
+  });
+  process.on('uncaughtException', error => {
+    log.dap(`debugadapter uncaughtException: ${error.message}`);
+    void exitAfterCleanup(1);
+  });
 
-  process.on('SIGINT', () => { disposeSession(); process.exit(0); });
-  process.on('SIGTERM', () => { disposeSession(); process.exit(0); });
-  process.on('exit', disposeSession);
+  process.on('SIGINT', () => { void exitAfterCleanup(0); });
+  process.on('SIGTERM', () => { void exitAfterCleanup(0); });
+  process.on('exit', () => { void disposeSession(); });
 } catch {
   process.exit(1);
 }

@@ -27,12 +27,9 @@ describe('DapSession native executor lifecycle', () => {
         rttLogEnabled: false,
         nativeDebugEngineMode: 'native',
         nativeDebugEngineEnabled: true,
-        nativeDebugEngineStepInto: true,
-        nativeDebugEngineStepOver: true,
-        nativeDebugEngineStepOut: true,
       },
     });
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(250);
     await launch;
 
     const connectCalls = vi.mocked(backend.execute).mock.calls
@@ -43,14 +40,11 @@ describe('DapSession native executor lifecycle', () => {
       config: {
         nativeDebugEngineMode: 'native',
         nativeDebugEngineEnabled: true,
-        nativeDebugEngineStepInto: true,
-        nativeDebugEngineStepOver: true,
-        nativeDebugEngineStepOut: true,
       },
     });
 
     await (session as any).handleDisconnect({ type: 'request', seq: 2, command: 'disconnect' });
-    expect(backend.configureNativeSteps).toHaveBeenLastCalledWith({});
+    expect(backend.configureNativeSteps).toHaveBeenLastCalledWith(false);
   });
 
   it('sends the step response before the stopped event once native reports halted', async () => {

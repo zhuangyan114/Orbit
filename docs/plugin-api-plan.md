@@ -1,4 +1,4 @@
-# Ozone Plugin API Plan
+# Orbit Plugin API Plan
 
 ## Goal
 

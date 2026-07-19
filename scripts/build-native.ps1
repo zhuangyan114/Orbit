@@ -8,7 +8,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $sourceDir = Join-Path $repoRoot 'native/jlink-helper'
 $buildDir = Join-Path $repoRoot 'out/native/jlink-helper-build'
 $outputDir = Join-Path $repoRoot 'out/native/win32-x64'
-$outputExe = Join-Path $outputDir 'ozone-jlink-helper.exe'
+$outputExe = Join-Path $outputDir 'orbit-jlink-helper.exe'
 $mockOutputDir = Join-Path $outputDir 'test'
 
 $cmakeCommand = Get-Command cmake -ErrorAction SilentlyContinue
@@ -51,7 +51,7 @@ if ($LASTEXITCODE -ne 0) { throw "Native build failed with exit code $LASTEXITCO
 
 New-Item -ItemType Directory -Force $outputDir | Out-Null
 New-Item -ItemType Directory -Force $mockOutputDir | Out-Null
-$builtExe = Join-Path $buildDir 'bin/ozone-jlink-helper.exe'
+$builtExe = Join-Path $buildDir 'bin/orbit-jlink-helper.exe'
 $builtMockDll = Join-Path $buildDir 'bin/mock/JLink_x64.dll'
 if (-not (Test-Path -LiteralPath $builtExe)) {
   throw "Native helper was not produced at $builtExe"

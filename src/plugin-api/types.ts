@@ -32,6 +32,8 @@ export interface WriteSpec {
   alias?: string;
   expression: string;
   value: number;
+  address?: number;
+  typeName?: string;
 }
 
 export interface ReadManyParams {

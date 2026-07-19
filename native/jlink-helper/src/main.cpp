@@ -377,6 +377,16 @@ class JLinkChannel {
     if (result < 0) return error("JLinkConnectFailed", "JLINK_Connect returned " + std::to_string(result), started);
     std::cerr << "[JLinkHelper] JLINK_Connect OK" << std::endl;
 
+    targetLinkProbeEnabled_ = false;
+    if (readApDpRegister_) {
+      std::uint32_t dpId = 0;
+      const int probeResult = readApDpRegister_(0, 0, &dpId);
+      targetLinkProbeEnabled_ = probeResult >= 0;
+      std::cerr << "[JLinkHelper] SW-DP health probe "
+                << (targetLinkProbeEnabled_ ? "enabled" : "unavailable")
+                << " result=" << probeResult << " id=0x" << std::hex << dpId << std::dec << std::endl;
+    }
+
     state_ = "Unknown";
     device_ = device;
     const int version = getDllVersion_();
@@ -397,7 +407,39 @@ class JLinkChannel {
   std::string getState() {
     const auto started = std::chrono::steady_clock::now();
     if (const auto unavailable = requireConnected(started)) return *unavailable;
-    state_ = isHalted_() != 0 ? "Halted" : "Running";
+    if (isConnected_ && isConnected_() == 0) {
+      state_ = "Disconnected";
+      return success("{\"state\":\"Disconnected\"}", "target disconnected", started);
+    }
+    if (getHwStatus_) {
+      JLinkHwStatus status{};
+      if (getHwStatus_(&status) == 0 && status.vTarget < kMinTargetVoltageMv) {
+        state_ = "Disconnected";
+        std::cerr << "[JLinkHelper] Target VTref lost: " << status.vTarget << " mV" << std::endl;
+        return success("{\"state\":\"Disconnected\",\"targetVoltageMv\":" +
+                           std::to_string(status.vTarget) + "}",
+                       "target cable disconnected", started);
+      }
+    }
+    if (targetLinkProbeEnabled_) {
+      std::uint32_t dpId = 0;
+      const int probeResult = readApDpRegister_(0, 0, &dpId);
+      if (probeResult < 0) {
+        state_ = "Error";
+        std::cerr << "[JLinkHelper] SW-DP health probe failed: " << probeResult << std::endl;
+        return error("TargetStateReadFailed", "SW-DP health probe returned " + std::to_string(probeResult), started,
+                     "{\"function\":\"JLINK_CORESIGHT_ReadAPDPReg\",\"returnCode\":" +
+                         std::to_string(probeResult) + "}");
+      }
+    }
+    const int haltState = isHalted_();
+    if (haltState < 0) {
+      state_ = "Error";
+      std::cerr << "[JLinkHelper] JLINK_IsHalted communication error: " << haltState << std::endl;
+      return error("TargetStateReadFailed", "JLINK_IsHalted returned " + std::to_string(haltState), started,
+                   "{\"function\":\"JLINK_IsHalted\",\"returnCode\":" + std::to_string(haltState) + "}");
+    }
+    state_ = haltState > 0 ? "Halted" : "Running";
     return success("{\"state\":\"" + state_ + "\"}", "target state read", started);
   }
 
@@ -924,7 +966,26 @@ class JLinkChannel {
       executeMs += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - executeStarted).count();
       if (goResult < 0) return false;
       state_ = "Running";
-      if (waitUntilHalted(waitTimeoutMs)) return true;
+      if (waitUntilHalted(waitTimeoutMs)) {
+        const int stoppedPcResult = readRegister_(15);
+        if (stoppedPcResult == -1) return false;
+        const std::uint32_t stoppedPc = static_cast<std::uint32_t>(stoppedPcResult);
+        if (stoppedPc != returnAddress) return true;
+        // A return-address breakpoint is hit with the PC still pointing at
+        // that breakpoint. Remove only the temporary slot before the outer
+        // loop issues JLINK_Step; stepping while the breakpoint remains at
+        // the current PC can repeatedly stop at the same address.
+        for (auto temporary = temporaryBreakpointSlots.begin();
+             temporary != temporaryBreakpointSlots.end(); ++temporary) {
+          const int slot = *temporary;
+          if (!breakpoints_[slot] || *breakpoints_[slot] != returnAddress) continue;
+          if (clearBreakpoint_(static_cast<std::uint32_t>(slot)) < 0) return false;
+          breakpoints_[slot].reset();
+          temporaryBreakpointSlots.erase(temporary);
+          break;
+        }
+        return true;
+      }
       const int haltResult = halt_();
       if (haltResult < 0) return false;
       waitUntilHalted(50);
@@ -1193,13 +1254,28 @@ class JLinkChannel {
       breakpoints_[slot].reset();
     }
     state_ = "Disconnected";
-    return success("{}", "disconnected", started);
+    const int runResult = go_();
+    if (runResult < 0) return callError("JLINK_Go", runResult, started);
+    return success("{}", "disconnected and target resumed", started);
   }
 
   const std::string& state() const { return state_; }
 
  private:
+  struct JLinkHwStatus {
+    std::uint16_t vTarget;
+    std::uint8_t tck;
+    std::uint8_t tdi;
+    std::uint8_t tdo;
+    std::uint8_t tms;
+    std::uint8_t tres;
+    std::uint8_t trst;
+  };
+
+  static constexpr std::uint16_t kMinTargetVoltageMv = 1000;
   using NoArgFn = int(__cdecl*)();
+  using ReadApDpRegisterFn = int(__cdecl*)(std::uint8_t, std::uint8_t, std::uint32_t*);
+  using GetHwStatusFn = int(__cdecl*)(JLinkHwStatus*);
   using ExecCommandFn = int(__cdecl*)(const char*, char*, int);
   using IntArgFn = int(__cdecl*)(int);
   using ReadMemoryFn = int(__cdecl*)(std::uint32_t, std::uint32_t, void*);
@@ -1255,6 +1331,10 @@ class JLinkChannel {
     reset_ = resolve<NoArgFn>("JLINK_Reset", "JLINKARM_Reset");
     readRegister_ = resolve<IntArgFn>("JLINK_ReadReg", "JLINKARM_ReadReg");
     isHalted_ = resolve<NoArgFn>("JLINK_IsHalted", "JLINKARM_IsHalted");
+    isConnected_ = resolveOptional<NoArgFn>("JLINK_IsConnected", "JLINKARM_IsConnected");
+    getHwStatus_ = resolveOptional<GetHwStatusFn>("JLINK_GetHWStatus", "JLINKARM_GetHWStatus");
+    readApDpRegister_ = resolveOptional<ReadApDpRegisterFn>(
+        "JLINK_CORESIGHT_ReadAPDPReg", "JLINKARM_CORESIGHT_ReadAPDPReg");
     readMemory_ = resolve<ReadMemoryFn>("JLINK_ReadMem", "JLINKARM_ReadMem");
     writeMemory_ = resolve<WriteMemoryFn>("JLINK_WriteMem", "JLINKARM_WriteMem");
     setBreakpoint_ = resolve<BreakpointFn>("JLINK_SetBP", "JLINKARM_SetBP");
@@ -1305,6 +1385,7 @@ class JLinkChannel {
   bool symbolsReady_ = false;
   bool wasOpened_ = false;
   bool rttStarted_ = false;
+  bool targetLinkProbeEnabled_ = false;
   std::string missingSymbol_;
   std::string loadedPath_;
   std::string device_;
@@ -1323,6 +1404,9 @@ class JLinkChannel {
   NoArgFn reset_ = nullptr;
   IntArgFn readRegister_ = nullptr;
   NoArgFn isHalted_ = nullptr;
+  NoArgFn isConnected_ = nullptr;
+  GetHwStatusFn getHwStatus_ = nullptr;
+  ReadApDpRegisterFn readApDpRegister_ = nullptr;
   ReadMemoryFn readMemory_ = nullptr;
   WriteMemoryFn writeMemory_ = nullptr;
   BreakpointFn setBreakpoint_ = nullptr;
@@ -1386,7 +1470,7 @@ int main() {
           result = "{\"ok\":false,\"message\":\"protocol version mismatch\",\"targetState\":\"Disconnected\",\"elapsedMs\":0,"
                    "\"errorCode\":\"ProtocolVersionMismatch\",\"diagnostics\":{\"helperProtocol\":2}}";
         } else {
-          result = "{\"ok\":true,\"message\":\"ozone-jlink-helper ready\",\"targetState\":\"Disconnected\",\"elapsedMs\":0,"
+          result = "{\"ok\":true,\"message\":\"orbit-jlink-helper ready\",\"targetState\":\"Disconnected\",\"elapsedMs\":0,"
                    "\"data\":{\"protocol\":2,\"helperVersion\":\"0.2.0\",\"platform\":\"win32-x64\"," 
                    "\"capabilities\":[\"basicDebug\",\"readRegister\",\"readMemory\",\"hardwareBreakpoints\"," 
                    "\"writeMemory\",\"readMemoryBatch\",\"reset\",\"rtt\"," 

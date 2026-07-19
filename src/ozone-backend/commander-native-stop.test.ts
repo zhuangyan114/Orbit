@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { OzoneBackend } from './commander';
 import { JLinkDLL } from './jlink-dll';
 import { NativeStepExecutor } from './cpp-jlink-channel';
@@ -55,7 +58,7 @@ describe('OzoneBackend native stop routing', () => {
       { address: pcBefore, file: 'main.c', line: 7 },
       { address: 0x0800010C, file: 'main.c', line: 8 },
     ];
-    backend.configureNativeSteps({ stepInto: true });
+    backend.configureNativeSteps();
 
     const result = await backend.execute({ cmd: 'stepInto' });
     expect(result.ok).toBe(true);
@@ -66,6 +69,71 @@ describe('OzoneBackend native stop routing', () => {
     });
     expect(executor.stepIntoInstruction).not.toHaveBeenCalled();
   });
+
+  it.each(['stepInto', 'stepOver'] as const)(
+    'uses one logical source range for a multiline call during %s',
+    async command => {
+      const pcBefore = 0x08001000;
+      const pcAfter = 0x0800100C;
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ozone-native-step-'));
+      const sourceFile = path.join(tempDir, 'main.c');
+      fs.writeFileSync(sourceFile, [
+        'm = calcSum(count,',
+        '              count++);',
+        'osDelay(1);',
+      ].join('\n'), 'utf8');
+
+      const sourceStep = vi.fn(async () => ({
+        ok: true,
+        message: 'native multiline source step',
+        targetState: 'Halted' as const,
+        elapsedMs: 1,
+        data: {
+          pcBefore,
+          pcAfter,
+          classification: command === 'stepInto' ? 'sourceBoundary' as const : 'singleStep' as const,
+          instructions: 3,
+          cleanupOk: true as const,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        },
+      }));
+      const executor = {
+        usingNative: true,
+        readRegister: vi.fn(async () => ({
+          ok: true,
+          message: 'native register',
+          targetState: 'Halted' as const,
+          elapsedMs: 0,
+          data: { value: pcBefore },
+        })),
+        stepIntoInstruction: vi.fn(),
+        stepIntoSourceLine: command === 'stepInto' ? sourceStep : vi.fn(),
+        stepOverSourceLine: command === 'stepOver' ? sourceStep : vi.fn(),
+        stepOut: vi.fn(),
+      } as unknown as NativeStepExecutor;
+      const backend = new OzoneBackend(executor);
+      (backend as any).jlink = legacyJLink(pcBefore);
+      (backend as any).symbols = [{ name: 'caller', address: pcBefore, size: 0x40, type: 'T' }];
+      (backend as any).lineEntries = [
+        { address: pcBefore, file: sourceFile, line: 1 },
+        { address: pcBefore + 4, file: sourceFile, line: 2 },
+        { address: pcBefore + 8, file: sourceFile, line: 1 },
+        { address: pcAfter, file: sourceFile, line: 3 },
+      ];
+      backend.configureNativeSteps();
+
+      try {
+        const result = await backend.execute({ cmd: command });
+        expect(result.ok).toBe(true);
+        expect(sourceStep).toHaveBeenCalledWith(expect.objectContaining({
+          lineStart: pcBefore,
+          lineEnd: pcAfter,
+        }));
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('continues once through a loop header trampoline mapped to the same source line', async () => {
     const loopHeaderPc = 0x08000100;
@@ -125,7 +193,7 @@ describe('OzoneBackend native stop routing', () => {
       { address: trampolinePc, file: 'main.c', line: 7 },
       { address: loopBodyPc, file: 'main.c', line: 8 },
     ];
-    backend.configureNativeSteps({ stepInto: true });
+    backend.configureNativeSteps();
 
     const result = await backend.execute({ cmd: 'stepInto' });
 
@@ -198,7 +266,7 @@ describe('OzoneBackend native stop routing', () => {
       { address: trampolinePc, file: 'main.c', line: 7 },
       { address: loopBodyPc, file: 'main.c', line: 8 },
     ];
-    backend.configureNativeSteps({ stepOver: true });
+    backend.configureNativeSteps();
 
     const result = await backend.execute({ cmd: 'stepOver' });
 
@@ -217,6 +285,99 @@ describe('OzoneBackend native stop routing', () => {
       maxInstructionSteps: 128,
       breakpoints: {},
     });
+  });
+
+  it('continues stepOver after returning from a function into the caller call statement', async () => {
+    const callerStart = 0x08001100;
+    const callStart = 0x08001104;
+    const callArgument = 0x08001108;
+    const callContinuation = 0x0800110A;
+    const returnAddress = 0x0800110C;
+    const nextStatement = 0x08001110;
+    const calleePc = 0x08002000;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ozone-native-step-return-'));
+    const sourceFile = path.join(tempDir, 'main.c');
+    fs.writeFileSync(sourceFile, [
+      'm = calcSum(count,',
+      '              count++);',
+      'osDelay(1);',
+    ].join('\n'), 'utf8');
+    const sourceStep = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        message: 'returned from callee',
+        targetState: 'Halted' as const,
+        elapsedMs: 1,
+        data: {
+          pcBefore: calleePc,
+          pcAfter: returnAddress,
+          classification: 'singleStep',
+          instructions: 1,
+          cleanupOk: true,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        message: 'completed caller statement',
+        targetState: 'Halted' as const,
+        elapsedMs: 1,
+        data: {
+          pcBefore: returnAddress,
+          pcAfter: nextStatement,
+          classification: 'singleStep',
+          instructions: 1,
+          cleanupOk: true,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        },
+      });
+    const executor = {
+      usingNative: true,
+      readRegister: vi.fn(async () => ({
+        ok: true,
+        message: 'native register',
+        targetState: 'Halted' as const,
+        elapsedMs: 0,
+        data: { value: calleePc },
+      })),
+      stepIntoInstruction: vi.fn(),
+      stepIntoSourceLine: vi.fn(),
+      stepOverSourceLine: sourceStep,
+      stepOut: vi.fn(),
+    } as unknown as NativeStepExecutor;
+    const backend = new OzoneBackend(executor);
+    (backend as any).jlink = legacyJLink(calleePc);
+    (backend as any).symbols = [
+      { name: 'caller', address: callerStart, size: 0x100, type: 'T' },
+      { name: 'calcSum', address: calleePc, size: 0x20, type: 't' },
+    ];
+    (backend as any).lineEntries = [
+      { address: callerStart, file: sourceFile, line: 0 },
+      { address: callStart, file: sourceFile, line: 1 },
+      { address: callArgument, file: sourceFile, line: 2 },
+      { address: callContinuation, file: sourceFile, line: 1 },
+      { address: nextStatement, file: sourceFile, line: 3 },
+      { address: calleePc, file: sourceFile, line: 5 },
+    ];
+      backend.configureNativeSteps();
+
+    try {
+      const result = await backend.execute({ cmd: 'stepOver' });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.error);
+      expect(sourceStep).toHaveBeenCalledTimes(2);
+      expect(sourceStep).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        lineStart: calleePc,
+      }));
+      expect(sourceStep).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        lineStart: callContinuation,
+        lineEnd: nextStatement,
+      }));
+      expect(result.data).toMatchObject({ pcAfter: nextStatement });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('does not continue a call stepOver that stops on the same source line', async () => {
@@ -259,7 +420,7 @@ describe('OzoneBackend native stop routing', () => {
       { address: returnPc, file: 'main.c', line: 7 },
       { address: returnPc + 4, file: 'main.c', line: 8 },
     ];
-    backend.configureNativeSteps({ stepOver: true });
+    backend.configureNativeSteps();
 
     const result = await backend.execute({ cmd: 'stepOver' });
 
@@ -304,7 +465,7 @@ describe('OzoneBackend native stop routing', () => {
       { address: pcBefore, file: 'main.c', line: 7 },
       { address: 0x0800010C, file: 'main.c', line: 8 },
     ];
-    backend.configureNativeSteps({ stepOver: true });
+    backend.configureNativeSteps();
 
     const step = await backend.execute({ cmd: 'stepOver' });
     expect(step.ok).toBe(true);
@@ -392,7 +553,7 @@ describe('OzoneBackend native stop routing', () => {
       { address: 0x08001108, file: 'main.c', line: 8 },
       { address: calleePc, file: 'main.c', line: 20 },
     ];
-    backend.configureNativeSteps({ stepOut: true });
+    backend.configureNativeSteps();
 
     const step = await backend.execute({ cmd: 'stepOut' });
     if (!step.ok) throw new Error(step.error);
@@ -452,7 +613,7 @@ describe('OzoneBackend native stop routing', () => {
       { name: '__aeabi_dmul', address: helperPc, size: helperEnd - helperPc, type: 'W' },
       { name: 'caller', address: returnAddress, size: 0x100, type: 'T' },
     ];
-    backend.configureNativeSteps({ stepOut: true });
+    backend.configureNativeSteps();
 
     const step = await backend.execute({ cmd: 'stepOut' });
     expect(step.ok).toBe(true);
@@ -531,7 +692,7 @@ describe('OzoneBackend native stop routing', () => {
         { address: adjustedEnd, file: 'main.c', line: 185 },
         { address: calleePc, file: 'main.c', line: 220 },
       ];
-      backend.configureNativeSteps({ stepOut: true, [command]: true });
+      backend.configureNativeSteps();
 
       const stepOut = await backend.execute({ cmd: 'stepOut' });
       if (!stepOut.ok) throw new Error(stepOut.error);
@@ -606,7 +767,7 @@ describe('OzoneBackend native stop routing', () => {
         rawLine: 178,
       },
     };
-    backend.configureNativeSteps({ stepInto: true });
+    backend.configureNativeSteps();
 
     const result = await backend.execute({ cmd: 'stepInto' });
     if (!result.ok) throw new Error(result.error);

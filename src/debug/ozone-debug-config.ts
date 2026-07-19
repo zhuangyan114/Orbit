@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 
 export class OzoneDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
   resolveDebugConfiguration(
@@ -8,12 +9,12 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     config: vscode.DebugConfiguration,
     _token?: vscode.CancellationToken
   ): vscode.ProviderResult<vscode.DebugConfiguration> {
-    const cfg = vscode.workspace.getConfiguration('ozone');
+    const cfg = getOrbitConfiguration();
 
     if (!config.request) {
       config.type = 'ozone';
       config.request = 'launch';
-      config.name = 'Ozone Debug';
+      config.name = 'Orbit Debug';
     }
 
     if (!config.device) {
@@ -51,6 +52,12 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (config.rttLogEnabled === undefined) {
       config.rttLogEnabled = cfg.get<boolean>('rttLogEnabled', true);
     }
+    if (config.loggingEnabled === undefined) {
+      config.loggingEnabled = cfg.get<boolean>('logging.enabled', true);
+    }
+    if (config.clearLogsOnStart === undefined) {
+      config.clearLogsOnStart = cfg.get<boolean>('logging.clearOnStart', true);
+    }
     if (config.rttBufferIndex === undefined) {
       config.rttBufferIndex = cfg.get<number>('rttBufferIndex', 0);
     }
@@ -73,22 +80,13 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
       config.pRtLogEnabled = cfg.get<boolean>('pRtLogEnabled', false);
     }
     if (config.pRtLogRoot === undefined) {
-      config.pRtLogRoot = cfg.get<string>('pRtLogRoot', 'D:\\STM32\\tool\\P-RTLog');
+      config.pRtLogRoot = cfg.get<string>('pRtLogRoot', '');
     }
     if (config.nativeDebugEngineEnabled === undefined) {
-      config.nativeDebugEngineEnabled = cfg.get<boolean>('nativeDebugEngine.enabled', false);
+      config.nativeDebugEngineEnabled = cfg.get<boolean>('nativeDebugEngine.enabled', true);
     }
     if (config.nativeDebugEngineMode === undefined) {
       config.nativeDebugEngineMode = cfg.get<'legacy' | 'native' | 'auto'>('nativeDebugEngine.mode', 'auto');
-    }
-    if (config.nativeDebugEngineStepOver === undefined) {
-      config.nativeDebugEngineStepOver = cfg.get<boolean>('nativeDebugEngine.stepOver', false);
-    }
-    if (config.nativeDebugEngineStepInto === undefined) {
-      config.nativeDebugEngineStepInto = cfg.get<boolean>('nativeDebugEngine.stepInto', false);
-    }
-    if (config.nativeDebugEngineStepOut === undefined) {
-      config.nativeDebugEngineStepOut = cfg.get<boolean>('nativeDebugEngine.stepOut', false);
     }
 
     return config;

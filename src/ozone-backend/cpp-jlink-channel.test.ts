@@ -6,7 +6,7 @@ import { NativeSchedulerCancelledError } from './native-scheduler';
 describe('ExperimentalCppJLinkChannel', () => {
   it('never opens a hidden koffi fallback when the helper cannot start', async () => {
     const channel = new ExperimentalCppJLinkChannel({
-      helperPath: path.join(__dirname, 'missing-ozone-jlink-helper.exe'),
+      helperPath: path.join(__dirname, 'missing-orbit-jlink-helper.exe'),
       requestTimeoutMs: 250,
     });
 
@@ -20,7 +20,7 @@ describe('ExperimentalCppJLinkChannel', () => {
 
   it('reports native unavailability without a channel-local fallback option', async () => {
     const channel = new ExperimentalCppJLinkChannel({
-      helperPath: path.join(__dirname, 'missing-ozone-jlink-helper.exe'),
+      helperPath: path.join(__dirname, 'missing-orbit-jlink-helper.exe'),
       requestTimeoutMs: 250,
     });
 

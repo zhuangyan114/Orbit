@@ -2,6 +2,7 @@ import {
   CppJLinkConnectConfig,
   CppJLinkReadOptions,
   CppJLinkResult,
+  CppJLinkTargetState,
   NativeStepExecutor,
   NativeStepIntoDiagnostics,
   NativeStepIntoSourceLineRequest,
@@ -212,7 +213,29 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
   async step() { return this.booleanCall(() => this.jlink.step(), 'step'); }
   async reset() { return this.booleanCall(() => this.jlink.reset(), 'reset'); }
   async getState() {
-    const state = this.jlink.isHalted() ? 'Halted' : this.jlink.state === 'running' ? 'Running' : 'Unknown';
+    const disconnected = !this.jlink.isTargetConnected() || this.jlink.state === 'disconnected';
+    if (disconnected) this.jlink.abandon();
+    const targetLinkAlive = disconnected ? null : this.jlink.probeTargetLink();
+    if (targetLinkAlive === false) {
+      return failure<{ state: CppJLinkTargetState }>(
+        'legacy SW-DP health probe could not reach the target',
+        'TargetStateReadFailed',
+      );
+    }
+    const haltState = disconnected ? false : this.jlink.getHaltState();
+    if (haltState === null) {
+      return failure<{ state: CppJLinkTargetState }>(
+        'legacy JLINK_IsHalted could not read target state',
+        'TargetStateReadFailed',
+      );
+    }
+    const state = disconnected
+      ? 'Disconnected'
+      : haltState
+        ? 'Halted'
+        : this.jlink.state === 'running'
+          ? 'Running'
+          : 'Unknown';
     return this.success({ state }, 'target state read');
   }
   async readRegister(index: number) {
@@ -275,7 +298,10 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
   async stepOut(_request: NativeStepOutRequest): Promise<CppJLinkResult<NativeStepOutDiagnostics>> {
     return this.nativeUnsupported();
   }
-  async dispose() { this.jlink.disconnect(); }
+  async dispose(graceful = true) {
+    if (graceful) this.jlink.disconnect();
+    else this.jlink.abandon();
+  }
 
   private booleanCall(run: () => boolean, operation: string): CppJLinkResult {
     return run() ? this.success({}, `${operation} completed`) : failure(`legacy ${operation} failed`, 'JLinkCallFailed');
@@ -284,7 +310,13 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
     return failure('native step is unavailable on the legacy owner', 'NativeChannelUnavailable');
   }
   private success<T>(data: T, message: string): CppJLinkResult<T> {
-    const targetState = this.jlink.state === 'running' ? 'Running' : this.jlink.isHalted() ? 'Halted' : 'Unknown';
+    const targetState = this.jlink.state === 'disconnected'
+      ? 'Disconnected'
+      : this.jlink.state === 'running'
+        ? 'Running'
+        : this.jlink.isHalted()
+          ? 'Halted'
+          : 'Unknown';
     return { ok: true, data, message, targetState, elapsedMs: 0 };
   }
 }

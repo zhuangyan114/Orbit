@@ -30,7 +30,7 @@
 
 ```json
 {
-    "ozone.defaultProgram": "d:\\STM32\\RoboMaster\\26Lao_ShaoBin\\Down-cmake\\build\\Debug\\frame.elf",
+"orbit.defaultProgram": "d:\\STM32\\RoboMaster\\26Lao_ShaoBin\\Down-cmake\\build\\Debug\\frame.elf",
     "memory-view.trackDebuggers": [
         "ozone"
     ],
@@ -65,7 +65,7 @@
 ### 步骤 4：启动调试会话
 
 1. 打开测试工程 `D:\STM32\RoboMaster\26Lao_ShaoBin\Down-cmake`
-2. 按 `F5` 启动 Ozone 调试会话
+2. 按 `F5` 启动 Orbit 调试会话
 3. 等待调试会话启动并停止在断点处
 
 ### 步骤 5：检查 RTOS Views
@@ -112,10 +112,10 @@ RTOS Views 应该能够检测到 FreeRTOS 并显示任务列表。
 
 ## 联系支持
 
-如果问题仍然存在，请联系 Ozone 扩展支持团队，并提供以下信息：
+如果问题仍然存在，请联系 Orbit 扩展支持团队，并提供以下信息：
 
 1. VS Code 版本
-2. Ozone 扩展版本
+2. Orbit 扩展版本
 3. RTOS Views 插件版本
 4. debug-tracker-vscode 扩展版本
 5. 测试工程的配置文件（launch.json 和 settings.json）

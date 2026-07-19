@@ -107,6 +107,8 @@ export class RuntimeRouter {
           const response: any = await session.customRequest('setWatchValue', {
             expression: write.expression,
             value: write.value,
+            address: write.address,
+            typeName: write.typeName,
           });
           if (response?.ok === true) {
             results.push({ ...write, ok: true });
@@ -125,6 +127,8 @@ export class RuntimeRouter {
           cmd: 'setWatchValue',
           expression: write.expression,
           value: write.value,
+          address: write.address,
+          typeName: write.typeName,
         });
         results.push(result.ok ? { ...write, ok: true } : { ...write, ok: false, error: result.error });
       } catch (err: any) {
@@ -151,6 +155,14 @@ export class RuntimeRouter {
     if (!expression) throw new Error('Write expression is required');
     const value = Number(write.value);
     if (!Number.isFinite(value)) throw new Error(`Write value for ${expression} must be finite`);
-    return { ...write, expression, value };
+    const address = write.address === undefined ? undefined : Number(write.address);
+    if (address !== undefined && (!Number.isInteger(address) || address < 0 || address > 0xFFFFFFFF)) {
+      throw new Error(`Write address for ${expression} must be a 32-bit unsigned integer`);
+    }
+    const typeName = write.typeName === undefined ? undefined : String(write.typeName).trim();
+    if (write.typeName !== undefined && !typeName) {
+      throw new Error(`Write typeName for ${expression} must not be empty`);
+    }
+    return { ...write, expression, value, address, typeName };
   }
 }

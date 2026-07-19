@@ -26,6 +26,10 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     return this._expressions;
   }
 
+  get expandedExpressions(): string[] {
+    return [...this._expandedExpressions];
+  }
+
   set onExpressionsChanged(cb: ((exprs: string[]) => void) | null) {
     this._onExpressionsChanged = cb;
   }
@@ -111,7 +115,10 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     const session = vscode.debug.activeDebugSession;
     if (session && session.type === 'ozone') {
       try {
-        const r: any = await session.customRequest('dataSample', { expressions });
+        const r: any = await session.customRequest('dataSample', {
+          expressions,
+          expandedExpressions: this.expandedExpressions,
+        });
         if (r && r.results) {
           results = r.results as WatchValue[];
         } else {
@@ -126,7 +133,12 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     if (!results) {
       results = [];
       for (const expr of expressions) {
-        const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
+        const result = await this.backend.execute({
+          cmd: 'evaluateExpression',
+          expression: expr,
+          force: true,
+          expandedExpressions: this.expandedExpressions,
+        });
         if (result.ok) {
           results.push(result.data as WatchValue);
         } else {
@@ -143,6 +155,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
       : [];
     this._expandedExpressions = new Set(next);
     this.context.workspaceState.update(WATCH_EXPANDED_STATE_KEY, next);
+    if (this._expressions.length > 0) void this.evaluateWatches(this._expressions);
   }
 
   private async setWatchValue(expression: string, value: number, address?: number, typeName?: string) {
@@ -204,7 +217,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     .watch-row:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.06)); border-left: 2px solid var(--vscode-focusBorder, #007acc); }
     .watch-row { border-left: 2px solid transparent; transition: background 0.1s, border-color 0.1s; }
   </style>
-  <title>Ozone Watch</title>
+  <title>Orbit Watch</title>
 </head>
 <body>
   <div id="root">Loading...</div>

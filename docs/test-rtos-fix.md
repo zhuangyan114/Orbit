@@ -10,15 +10,15 @@ XRTOS 插件无法正常使用，显示 "No RTOS detected" 和 "RTOS detection m
 4. 虽然用户配置了 `mcu-debug.rtos-views.trackDebuggers: ["ozone"]`，但 RTOS Views 插件在激活时读取配置并订阅，此时可能配置还未生效
 
 ## 修复方案
-在 Ozone 扩展的 activate 函数中添加 `mcu-debug.debug-tracker-vscode.trackDebuggers` 设置，确保 debug-tracker-vscode 扩展跟踪 ozone 调试器。
+在 Orbit 扩展的 activate 函数中添加 `mcu-debug.debug-tracker-vscode.trackDebuggers` 设置，确保 debug-tracker-vscode 扩展跟踪 ozone 调试器。
 
 ## 验证步骤
 
-### 1. 重新安装 Ozone 扩展
+### 1. 重新安装 Orbit 扩展
 ```bash
-cd "C:\Users\22690\Desktop\AI\Ozone for VScode"
+cd "C:\Users\22690\Desktop\AI\Orbit"
 npm run build
-code --install-extension ozone-for-vscode-0.4.1.vsix
+code --install-extension artifacts/1.0.0/Orbit-1.0.0.vsix
 ```
 
 ### 2. 重新加载 VS Code 窗口
@@ -38,7 +38,7 @@ code --install-extension ozone-for-vscode-0.4.1.vsix
 ```
 
 ### 5. 启动调试会话
-- 按 `F5` 启动 Ozone 调试会话
+- 按 `F5` 启动 Orbit 调试会话
 - 等待调试会话启动并停止在断点处
 
 ### 6. 检查 RTOS Views

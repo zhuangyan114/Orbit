@@ -34,7 +34,7 @@ Write-Host "`n2. 检查扩展是否安装" -ForegroundColor Yellow
 $extensions = @(
     "mcu-debug.rtos-views",
     "mcu-debug.debug-tracker-vscode",
-    "ozone-debug.ozone-for-vscode"
+    "orbit-debug.orbit-for-vscode"
 )
 
 foreach ($ext in $extensions) {
@@ -54,7 +54,7 @@ Write-Host "   输入 'Reload Window' 并选择 'Developer: Reload Window'" -For
 # 提示用户启动调试会话
 Write-Host "`n4. 启动调试会话" -ForegroundColor Yellow
 Write-Host "   打开测试工程 D:\STM32\RoboMaster\26Lao_ShaoBin\Down-cmake" -ForegroundColor White
-Write-Host "   按 F5 启动 Ozone 调试会话" -ForegroundColor White
+Write-Host "   按 F5 启动 Orbit 调试会话" -ForegroundColor White
 
 # 提示用户检查 RTOS Views
 Write-Host "`n5. 检查 RTOS Views" -ForegroundColor Yellow

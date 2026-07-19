@@ -34,7 +34,7 @@ Native 层承载 J-Link 串行调度、step 状态机、断点槽位管理、寄
 ### TypeScript 保留
 
 - DAP 请求/响应/event：`initialize`、`continue`、`next`、`stepIn`、`stepOut`、`readMemory`、`variables`、`evaluate`、custom request。
-- VS Code 配置读取和开关：例如 `ozone.nativeDebugEngine.enabled`、`stepOver`、`fastSampling`。
+ - VS Code 配置读取和开关：例如 `orbit.nativeDebugEngine.enabled`、`stepOver`、`fastSampling`。
 - Debug session 生命周期、WebView 生命周期、Watch/Timeline 面板消息。
 - active DAP session 路由：Watch/Timeline 在有 `ozone` debug session 时继续使用 `session.customRequest(...)`。
 - DAP 兼容转换：base64 memory payload、`variablesReference`、`memoryReference`、stopped/continued event。
@@ -561,12 +561,9 @@ SampleQueue: readFastSample
 
 ```json
 {
-  "ozone.nativeDebugEngine.enabled": false,
-  "ozone.nativeDebugEngine.stepOver": false,
-  "ozone.nativeDebugEngine.stepInto": false,
-  "ozone.nativeDebugEngine.stepOut": false,
-  "ozone.nativeDebugEngine.fastSampling": false,
-  "ozone.nativeDebugEngine.memory": false
+"orbit.nativeDebugEngine.enabled": false,
+"orbit.nativeDebugEngine.fastSampling": false,
+"orbit.nativeDebugEngine.memory": false
 }
 ```
 

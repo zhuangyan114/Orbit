@@ -1,9 +1,10 @@
 import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '../ozone-backend/types';
+import { trimTimelineHistory } from '../utils/timeline-history';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 
 const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
-const MAX_POINTS_PER_VAR = 50000;
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
 const DEFAULT_SEND_INTERVAL_MS = 16;
 const MIN_INTERVAL_MS = 0.1;
@@ -30,7 +31,8 @@ export class DataSamplingManager {
     this.backend = backend;
     this.refreshIntervals();
     this.disposables.push(vscode.workspace.onDidChangeConfiguration(e => {
-      if (!e.affectsConfiguration('ozone.timelineSampleIntervalMs') && !e.affectsConfiguration('ozone.timelineSendIntervalMs')) return;
+      if (!e.affectsConfiguration('orbit.timelineSampleIntervalMs') && !e.affectsConfiguration('orbit.timelineSendIntervalMs') &&
+          !e.affectsConfiguration('ozone.timelineSampleIntervalMs') && !e.affectsConfiguration('ozone.timelineSendIntervalMs')) return;
       const previousSendInterval = this.sendIntervalMs;
       this.refreshIntervals();
       if (this.sendTimer && previousSendInterval !== this.sendIntervalMs) {
@@ -209,7 +211,7 @@ export class DataSamplingManager {
   }
 
   private getConfiguredInterval(key: string, defaultValue: number): number {
-    const value = vscode.workspace.getConfiguration('ozone').get<number>(key, defaultValue);
+    const value = getOrbitConfiguration().get<number>(key, defaultValue);
     if (!Number.isFinite(value)) return defaultValue;
     return Math.max(MIN_INTERVAL_MS, Math.min(MAX_INTERVAL_MS, value));
   }
@@ -242,7 +244,7 @@ export class DataSamplingManager {
       const pts = this.dataMap.get(entry.expression);
       if (pts) {
         pts.push(pt);
-        if (pts.length > MAX_POINTS_PER_VAR) pts.splice(0, pts.length - MAX_POINTS_PER_VAR);
+        trimTimelineHistory(pts);
       }
       const pending = this.pendingMap.get(entry.expression);
       if (pending) pending.push(pt);
@@ -275,7 +277,7 @@ export class DataSamplingManager {
       if (!entry || !Array.isArray(snapshot.data) || snapshot.data.length === 0) continue;
       const pts = this.dataMap.get(snapshot.expression) || [];
       pts.push(...snapshot.data);
-      if (pts.length > MAX_POINTS_PER_VAR) pts.splice(0, pts.length - MAX_POINTS_PER_VAR);
+      trimTimelineHistory(pts);
       this.dataMap.set(snapshot.expression, pts);
       accepted.push({
         expression: snapshot.expression,

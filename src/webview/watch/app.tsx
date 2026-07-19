@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { extractEditableWatchValue, parseWatchValueInput } from '../watch-value-input';
 
 interface VSCODE_API { postMessage(message: any): void; }
 declare function acquireVsCodeApi(): VSCODE_API;
@@ -17,16 +18,8 @@ interface WatchEntry {
   children?: WatchEntry[];
 }
 
-function extractValue(display: string): string {
-  const m = display.match(/^(0x[0-9A-Fa-f]+)/);
-  if (m) return m[1];
-  const d = display.match(/^\(?(-?\d+)/);
-  if (d) return d[1];
-  return display;
-}
-
 function mapResult(r: any, parentExpr?: string): WatchEntry {
-  const isCompound = !!(r.children && r.children.length > 0);
+  const isCompound = !!r.hasChildren || !!(r.children && r.children.length > 0);
   const label = String(r.expression ?? '');
   const fullExpr = parentExpr
     ? (label.startsWith('[') ? `${parentExpr}${label}` : `${parentExpr}.${label}`)
@@ -41,7 +34,7 @@ function mapResult(r: any, parentExpr?: string): WatchEntry {
     address: r.address,
     error: r.error,
     hasChildren: isCompound,
-    children: isCompound ? r.children.map((c: any) => mapResult(c, fullExpr)) : undefined,
+    children: Array.isArray(r.children) ? r.children.map((c: any) => mapResult(c, fullExpr)) : undefined,
   };
 }
 
@@ -126,9 +119,13 @@ export function WatchApp() {
     }
   };
 
+  const sendToTimeline = (expression: string) => {
+    vscode.postMessage({ command: 'sendToTimeline', expressions: [expression] });
+  };
+
   const startEditing = useCallback((key: string, currentValue: string) => {
     setEditingIndex(key);
-    setEditValue(extractValue(currentValue));
+    setEditValue(extractEditableWatchValue(currentValue));
   }, []);
 
   const commitEdit = useCallback((key: string) => {
@@ -146,14 +143,12 @@ export function WatchApp() {
     if (!entry) return;
     const raw = editValueRef.current.trim();
     if (raw === '') return;
-    let num: number;
-    if (raw.startsWith('0x') || raw.startsWith('0X')) num = parseInt(raw, 16);
-    else num = parseInt(raw, 10);
-    if (isNaN(num)) return;
+    const value = parseWatchValueInput(raw);
+    if (value === null) return;
     vscode.postMessage({
       command: 'setWatchValue',
       expression: entry.expression,
-      value: num,
+      value,
       address: entry.address,
       typeName: entry.typeName,
     });
@@ -174,14 +169,15 @@ export function WatchApp() {
   const renderRow = (w: WatchEntry, key: string, depth: number): React.ReactNode[] => {
     const expandId = w.expression;
     const isExpanded = expanded.has(expandId);
-    const showToggle = w.hasChildren && w.children && w.children.length > 0;
+    const showToggle = !!w.hasChildren;
     const canEdit = !w.hasChildren && (!w.error || w.error === 'running');
+    const canSendToTimeline = !w.hasChildren && !w.error;
     const indent = depth * 18;
 
     const rows: React.ReactNode[] = [
       <div key={key} className="watch-row" title={`${w.expression}${w.typeName ? ' (' + w.typeName + ')' : ''} = ${w.value || '...'}`}
         style={{
-        display: 'grid', gridTemplateColumns: `${indent + 18}px minmax(96px, 1fr) minmax(120px, 1.5fr) minmax(72px, 1fr) ${depth === 0 ? '48px' : '0px'}`,
+        display: 'grid', gridTemplateColumns: `${indent + 18}px minmax(96px, 1fr) minmax(120px, 1.5fr) minmax(72px, 1fr) 48px`,
         borderBottom: '1px solid var(--vscode-sideBar-border, #333)',
         alignItems: 'center',
         background: depth > 0 ? 'rgba(127, 127, 127, 0.035)' : 'transparent',
@@ -255,11 +251,17 @@ export function WatchApp() {
         </div>
 
         {/* Actions */}
-        {depth === 0 && (
-          <div style={{ display: 'flex', gap: 2, justifyContent: 'flex-end', opacity: 0.4, transition: 'opacity 0.15s' }}
+        {(canSendToTimeline || depth === 0) && (
+          <div style={{ display: 'flex', gap: 0, justifyContent: 'flex-end', opacity: 0.4, transition: 'opacity 0.15s' }}
             className="watch-actions">
-            <button onClick={() => removeWatch(parseInt(key, 10))}
-              style={{ ...actionBtnStyle, color: 'var(--vscode-errorForeground, #f48771)' }} title="删除">×</button>
+            {canSendToTimeline && (
+              <button onClick={() => sendToTimeline(w.expression)}
+                style={actionBtnStyle} title="添加到 Timeline">→</button>
+            )}
+            {depth === 0 && (
+              <button onClick={() => removeWatch(parseInt(key, 10))}
+                style={{ ...actionBtnStyle, color: 'var(--vscode-errorForeground, #f48771)' }} title="删除">×</button>
+            )}
           </div>
         )}
       </div>,

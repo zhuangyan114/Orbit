@@ -1,427 +1,155 @@
-# Ozone for VS Code
+<p align="center">
+  <img src="resources/orbit-icon-256.png" width="128" height="128" alt="Orbit icon">
+</p>
 
-Ozone for VS Code 是一个面向 STM32 / ARM Cortex-M 的 VS Code 调试扩展。扩展通过 SEGGER J-Link DLL 直接访问目标板，提供 Debug Adapter Protocol 调试、Watch 变量、实时 Timeline 采样、SEGGER RTT 日志、P-RTLog tokenized RTT 日志解码、本地插件 API 和 MCP 工具集成。
+<h1 align="center">Orbit — The Debugger for What’s Next</h1>
 
-当前版本：`0.4.9`
+<p align="center">
+  面向 STM32 / ARM Cortex-M 的 VS Code 调试前端：直接连接 J-Link，<br>
+  把源码调试、运行时变量、波形、RTT 日志和自动化实验放在同一条目标访问链路上。
+</p>
 
-## 版本更新日志
+<p align="center">
+  <a href="Releases/docs/全套工具链教程.md">全套工具链教程</a> ·
+  <a href="Releases/docs/user-guide.md">用户文档</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/releases">Orbit Releases</a>
+</p>
 
-### 0.4.9（断点与逐过程修复）
+> 本 README 是 Orbit 正式版 1.0.0 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
 
-- 修复循环中“逐过程”卡死、超时后停在随机位置的问题；当下一源行地址落在当前 PC 后方或路径不可达时，改用多步进策略，避免临时断点永远不触发。
-- 修复 `switch-case` 的 `break;` 行逐过程异常；识别 Thumb 无条件分支（`B` / `B.W`），避免把临时断点设置到分支不会执行的紧邻地址。
-- 修复断点地址解析错误导致 J-Link 将 BKPT 写入 Cortex-M 系统区的问题；断点设置前会校验合法地址范围，DWARF 行号匹配也优先使用已过滤的有效代码地址。
-- 修复运行中删除未命中断点后 CPU 被 `halt` 遗留的问题；清除断点前保存运行状态，清除完成后自动恢复运行。
-- 改进临时断点槽位复用和 stale breakpoint 判断，减少同行调用、循环尾和用户断点混合场景下的误停与重复点击。
-- 打包产物更新为 `ozone-for-vscode-0.4.9.vsix`，本次构建输出放在 `outputs/artifacts/0.4.9/`。
+## Orbit 是什么
 
-### 0.4.7（稳定）
+Orbit 是一个运行在 VS Code 中的嵌入式调试前端。它以 Debug Adapter Protocol（DAP）承接 VS Code 的调试请求，通过 J-Link DLL 访问 STM32 / ARM Cortex-M 目标，并在同一目标所有权模型下提供：
 
-- 优化 RTOS Views 与 Watch / Timeline 并发读取调度，降低调试运行期间的 J-Link 访问压力。
-- 修复 RTOS Views 刷新导致断点、继续运行、光标追踪响应变慢的问题，避免低优先级 RTOS 读取阻塞高优先级调试操作。
-- 修复 FreeRTOS Runtime 统计在 DWT 32 位计数器回绕后出现 `NaN%`、超过 100% 或总和缓慢漂移的问题。
-- 保持 Watch 和 Timeline 运行时实时刷新能力，不影响正常变量监控和波形采样。
-- 打包产物更新为 `ozone-for-vscode-0.4.7.vsix`。
+- 源码级启动、暂停、继续、单步、复位和断点；
+- 可展开的 Watch 表达式、运行时数值写入和变化高亮；
+- Timeline 实时采样、缩放、悬停读数和短期历史保留；
+- SEGGER RTT 输出、ANSI 处理和 P-RTLog tokenized 帧解码；
+- 通过标准 DAP memory / variables 能力接入外部 Memory View、Peripheral Viewer 和 RTOS Views；
+- 面向脚本和 AI 工具的本机 Plugin API 与 MCP 适配器。
 
-### 0.4.6
+Orbit 的目标不是复制一个完整 IDE，而是把“程序停在哪里、变量现在是多少、波形怎样变化、日志从哪里来、实验是否可重复”连接到同一套调试会话中。
 
-- 适配 mcu-debug.rtos-views v0.0.16 FreeRTOS 任务检测。
-- 修复 RTOS Views 检测 FreeRTOS 时的堆栈溢出问题：限制指针深度遍历（`MAX_POINTER_DEPTH = 5`），防止循环链表（如 `pxReadyTasksLists`）无限递归。
-- 修复 RTOS Views 任务名乱码问题：`resolveAddressExpression` 优先返回字符数组的 `address` 而非 `value`，确保 `pcTaskName` 正确寻址。
-- 新增 Ozone Tracker 检测到 First Stack Trace 后自动延迟刷新 RTOS Views，确保 FreeRTOS 检测窗口不丢失。
-- 固件侧需在 `FreeRTOSConfig.h` 中启用以下宏以显示完整信息：
-  - `configUSE_TRACE_FACILITY` → 显示 Thread ID（uxTCBNumber）
-  - `configRECORD_STACK_HIGH_ADDRESS` → 显示 Stack End / Size / Used
-  - `configGENERATE_RUN_TIME_STATS` → 显示 Runtime（%）
-- 打包产物更新为 `ozone-for-vscode-0.4.6.vsix`。
+## 能力地图
 
-### 0.4.5
+### 源码调试
 
-- 新增 P-RTLog tokenized RTT 日志解码支持。
-- 支持从 ELF/AXF 的 `.pw_tokenizer.entries` 中加载 token 字符串表。
-- 支持解析 P-RTLog RTT 二进制帧格式：`[2-byte length][token + encoded args]`。
-- 支持还原常见 printf 参数：`%d`、`%u`、`%x`、`%X`、`%c`、`%f`、`%s`、`%p`。
-- RTT Terminal 中按日志级别显示 `I:`、`W:`、`E:` 前缀，并保留 ANSI 颜色输出。
-- 新增配置项：
-  - `ozone.pRtLogEnabled`
-  - `ozone.pRtLogRoot`
-  - launch 配置中的 `pRtLogEnabled`
-  - launch 配置中的 `pRtLogRoot`
-- 保留普通 SEGGER RTT 文本日志路径，默认不启用 P-RTLog 解码，避免影响现有项目。
-- 改进 RTT 输出目标控制，支持 `terminal`、`debugConsole`、`both`。
-- 打包产物更新为 `ozone-for-vscode-0.4.6.vsix`。
+Orbit 暴露 `ozone` DAP 调试器类型，使用 ELF/AXF 载入符号、行号和 DWARF 类型信息。标准 DAP 的 `evaluate`、可展开 `variablesReference`、结构体/数组/指针子节点、`memoryReference`、读写内存和 RTOS capability 会保留给 VS Code 及外部视图使用。
 
-P-RTLog 项目地址：[https://github.com/moment-NEW/P-RTLog](https://github.com/moment-NEW/P-RTLog)
+### 运行时观察
 
-### 0.4.1
+WATCH 和 TIMELINE 是两个 VS Code Webview 视图。Watch 负责表达式列表、子节点展开、数值编辑和发送到 Timeline；Timeline 负责采样通道、曲线、时间窗口、自动跟随、手动缩放及悬停读数。两者的表达式与视图状态保存在 VS Code workspace state 中。
 
-- 增强 Watch 和 Timeline 运行时读取能力。
-- 改进 RTT Terminal 与 Debug Console 的输出分流。
-- 修复运行中 Watch 轮询和缓存更新的稳定性问题。
-- 补充 RTOS Views、MemoryView、Peripheral Viewer 相关 DAP 能力。
+### 日志与实时数据
 
-### 0.4.0
+  RTT 由选定的目标 owner 读取，既可以显示在 `Orbit RTT Log` 终端，也可以显示在 Debug Console。启用 P-RTLog 后，Orbit 从 ELF 的 `.pw_tokenizer.entries` 节加载 token 数据，再把 RTT 二进制帧转换为带级别、模块和位置的文本。
 
-- 适配 mcu-debug 系列外部视图：MemoryView、Peripheral Viewer、RTOS Views。
-- DAP 初始化能力新增 `supportsReadMemoryRequest` 和 `supportsWriteMemoryRequest`。
-- 实现标准 `readMemory` / `writeMemory` 请求。
-- `evaluate` 和 `variables` 支持结构体、数组、指针 child expansion。
-- 返回 `variablesReference` 和 `memoryReference`，便于外部视图递归展开对象。
-- 表达式读取新增地址表达式支持，例如 `0x20000000` 和 `&symbol`。
-- 新增 launch 配置别名：`deviceName`、`svdFile`、`svdPath`、`rtos`。
-- 新增设置项：`ozone.defaultSvdFile` 和 `ozone.defaultRtos`。
-- 新增命令 `Ozone: Enable MCU Debug Views Integration`。
-- 打包产物更新为 `ozone-for-vscode-0.4.0.vsix`。
+### 外部调试视图
 
-### 0.3.0
+Memory View、Peripheral Viewer、RTOS Views 和 debug tracker 不是 Orbit 内置的独立实现。Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以及 `trackDebuggers` 设置为这些外部扩展提供连接面；它们的版本、寄存器树和 RTOS 解析能力由外部扩展决定。
 
-- 新增 SEGGER RTT 日志读取。
-- 调试启动后自动读取 RTT up-buffer 并输出到 VS Code。
-- 新增 RTT 配置项：`rttLogEnabled`、`rttBufferIndex`、`rttPollIntervalMs`、`rttReadSize`、`rttControlBlockAddress`、`rttStripAnsi`。
-- 注册 `ozone` debug configuration provider，使 RTT 默认配置可以从 VS Code settings 自动带入调试会话。
-- Timeline 采样优先通过当前 `ozone` debug session 进行高速读取。
-- 打包产物更新为 `ozone-for-vscode-0.3.0.vsix`。
+### 自动化与 AI 接入
 
-## 功能
+Extension Host 激活时启动仅监听 `127.0.0.1` 的 Plugin API，并写出带随机 Bearer Token 的 endpoint 文件。独立的 MCP server 通过 stdio 暴露状态、批量读写、录波和通用实验工具；目标访问仍由 Orbit 的活动调试会话负责。
 
-- J-Link DLL 直连调试：启动、暂停、继续、单步、复位、断点。
-- VS Code Debug Adapter Protocol 集成，可通过 `.vscode/launch.json` 启动 `ozone` 调试会话。
-- Watch 视图支持表达式读取、结构体/数组/指针展开和运行时轮询。
-- Timeline 视图支持变量实时采样和 Canvas 波形显示。
-- SEGGER RTT 文本日志读取。
-- P-RTLog tokenized RTT 日志解码。
-- MemoryView / Peripheral Viewer 可通过标准 DAP memory request 读取目标内存。(暂时无法使用)
-- RTOS Views 可通过标准 DAP evaluate/variables request 展开 RTOS 对象。
-- 符号与 DWARF 解析使用 `arm-none-eabi-nm` 和 `arm-none-eabi-objdump`。
-- 本地插件 API 通过 `127.0.0.1` HTTP RPC 暴露目标状态、表达式读写、波形记录和实验流程。
-- MCP server 可让 Codex、Claude Desktop 等 MCP 客户端读取和控制当前 Ozone 调试会话。
+## 系统架构
 
-## 系统要求
+Orbit 的访问链路可以概括为：
 
-- Windows 10/11。
-- VS Code `1.90.0` 或更高版本。
-- 已安装 SEGGER J-Link，并能找到 `JLink_x64.dll`。
-- `arm-none-eabi-nm` 和 `arm-none-eabi-objdump` 在 `PATH` 中，用于 ELF 符号和 DWARF 信息解析。
-- Node.js 18 或更高版本，仅源码开发和 MCP server 运行需要。
+**VS Code / MCP → Orbit 会话层 → 一个 J-Link owner → J-Link DLL → 目标 MCU**
 
-## 安装 VSIX
+```mermaid
+flowchart TB
+  subgraph Users["使用者与 VS Code 生态"]
+    VSCode["VS Code\n调试器 / Watch / Timeline"]
+    Views["MCU Debug Views\nMemory / Peripheral / RTOS"]
+    MCP["MCP Client\nAI / Script"]
+  end
 
-生成的扩展包为：
+  subgraph Orbit["Orbit 会话层"]
+    UI["Extension Host\nWatch · Timeline · RTT\nPlugin API"]
+    DAP["DAP Adapter\n标准 DAP 会话"]
+    Router["RuntimeRouter\n活动 DAP 会话"]
+    Selector["SessionTargetSelector\n每个会话只选一个 owner"]
+    Native["Native owner\nC++ helper"]
+    Legacy["Legacy owner\nNode + koffi"]
+  end
 
-```powershell
-ozone-for-vscode-0.4.9.vsix
+  subgraph Hardware["J-Link 与目标硬件"]
+    DLL["JLink_x64.dll"]
+    Probe["J-Link Probe"]
+    Target["STM32 / ARM Cortex-M\nFirmware + ELF/DWARF"]
+  end
+
+  VSCode -->|启动 / 控制| DAP
+  VSCode -->|打开视图| UI
+  UI -->|Runtime requests| Router
+  Router -->|customRequest| DAP
+  MCP -->|stdio + 本机 endpoint| UI
+  DAP -->|memory / variables / RTOS capability| Views
+  DAP --> Selector
+  Selector -->|Native 优先| Native
+  Selector -.->|启动失败时允许 fallback| Legacy
+  Selector -->|legacy 模式| Legacy
+  Native --> DLL
+  Legacy --> DLL
+  DLL --> Probe --> Target
+
+  classDef consumer fill:#e8f1ff,stroke:#3973b9,color:#172b4d
+  classDef session fill:#eaf7ef,stroke:#328452,color:#173b27
+  classDef hardware fill:#fff3df,stroke:#c77b1a,color:#4a2b05
+  class VSCode,Views,MCP consumer
+  class UI,DAP,Router,Selector,Native,Legacy session
+  class DLL,Probe,Target hardware
 ```
 
-在 VS Code 中安装：
+数据流和所有权关系：
 
-1. 打开扩展面板。
-2. 点击右上角 `...`。
-3. 选择 `Install from VSIX...`。
-4. 选择 `ozone-for-vscode-0.4.9.vsix`。
+- VS Code 的调试请求进入 DAP Adapter；Watch、Timeline、RTT 和 MCP 的运行时请求最终复用活动的 DAP 会话。
+- `SessionTargetSelector` 在每个会话中只建立一个物理 target owner：Native helper 或 Legacy `koffi` channel。
+- Native helper 与 Legacy channel 都通过 `JLink_x64.dll` 访问 J-Link；DLL 之后才是探针和目标 MCU。
+- Memory View、Peripheral Viewer、RTOS Views 位于 DAP 会话外侧，通过标准 DAP 数据和 launch metadata 接入，不是 Orbit 内置的第二套调试后端。
 
-也可以使用命令行安装：
+关键架构约束：
 
-```powershell
-code --install-extension .\artifacts\0.4.9\ozone-for-vscode-0.4.9.vsix
-```
+- 一个 `ozone` DAP session 只有一个物理 J-Link owner：Native helper 或 Legacy koffi；不会在同一会话中并行持有两个 owner。
+- NativeScheduler 将控制操作置于 Watch、Timeline 读取之前；控制操作完成后再恢复采样。
+- 活动 DAP session 存在时，Watch、Timeline、evaluate、变量写入、Memory View、RTOS/Peripheral Viewer 和 RTT 都沿活动 owner 路由。
+- Native owner 的失败回退只发生在启动阶段；已连接的 Native owner 丢失后会结束当前会话，要求重新启动，不会热切换到第二个 DLL owner。
 
-## 快速开始
+## 产品边界
 
-在目标工程中创建 `.vscode/launch.json`：
+Orbit 的正式能力边界由当前源码和依赖共同决定：
 
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "ozone",
-      "request": "launch",
-      "name": "Ozone Debug",
-      "program": "${workspaceFolder}/build/Debug/frame.elf",
-      "device": "STM32F407VG",
-      "deviceName": "STM32F407VG",
-      "interface": "SWD",
-      "speedKHz": 4000,
-      "svdFile": "${workspaceFolder}/STM32F407.svd",
-      "rtos": "FreeRTOS"
-    }
-  ]
-}
-```
-
-启动调试后，可以在 Watch 面板添加变量，在 Timeline 面板查看变量波形。
-
-## P-RTLog 日志解码
-
-P-RTLog 是一个基于 Pigweed tokenized log 和 SEGGER RTT 的轻量日志库。项目地址：
-
-[https://github.com/moment-NEW/P-RTLog](https://github.com/moment-NEW/P-RTLog)
-
-P-RTLog 固件侧通过 RTT 输出二进制 tokenized 帧。普通 RTT Viewer 或普通文本模式会看到乱码；启用本扩展的 P-RTLog 解码后，扩展会从当前 ELF/AXF 中读取 `.pw_tokenizer.entries`，把 token 和参数还原成可读日志。
-
-### launch.json 示例
-
-```json
-{
-  "type": "ozone",
-  "request": "launch",
-  "name": "Ozone Debug",
-  "program": "${workspaceFolder}/build/Debug/vet6_led.elf",
-  "device": "STM32F407VE",
-  "interface": "SWD",
-  "speedKHz": 4000,
-  "rttLogEnabled": true,
-  "rttBufferIndex": 0,
-  "rttLogTarget": "terminal",
-  "pRtLogEnabled": true,
-  "pRtLogRoot": "D:\\STM32\\tool\\P-RTLog"
-}
-```
-
-### settings.json 示例
-
-```json
-{
-  "ozone.pRtLogEnabled": true,
-  "ozone.pRtLogRoot": "D:\\STM32\\tool\\P-RTLog",
-  "ozone.rttBufferIndex": 0,
-  "ozone.rttLogTarget": "terminal"
-}
-```
-
-### 输出示例
-
-```text
-I: loop cnt=2700 f=-0.558789 data1=141 [default] (D:/STM32/project/vet6_led/Core/Src/main.c)
-W: P-RTLog RTT channel test data1=1 [default] (D:/STM32/project/vet6_led/Core/Src/main.c)
-E: P-RTLog error sample code=-1 [default] (D:/STM32/project/vet6_led/Core/Src/main.c)
-```
-
-### 注意事项
-
-- `pRtLogEnabled` 默认是 `false`，只有 P-RTLog 二进制帧项目才需要启用。
-- 普通 RTT 文本日志不要开启 `pRtLogEnabled`。
-- ELF/AXF 必须保留 `.pw_tokenizer.entries`，否则只能显示 unknown token。
-- RTT Terminal 会保留 ANSI 颜色；Debug Console 是否显示颜色取决于 VS Code 输出面板和 `rttStripAnsi` 设置。
-- 如果固件侧使用不同 RTT channel，请同步设置 `rttBufferIndex`。
-
-## MCU Debug Views 集成
-
-本扩展可以配合 mcu-debug 系列视图使用：
-
-- RTOS Views：查看 FreeRTOS 等 RTOS 的任务、线程、栈和调度状态。
-- MemoryView：按地址查看和编辑目标内存。
-- Peripheral Viewer：通过 CMSIS-SVD 文件查看外设寄存器和 bit 字段。
-
-首次使用时，在命令面板执行：
-
-```text
-Ozone: Enable MCU Debug Views Integration
-```
-
-该命令会在当前 workspace 中追加：
-
-```json
-{
-  "memory-view.trackDebuggers": ["ozone"],
-  "mcu-debug.rtos-views.trackDebuggers": ["ozone"]
-}
-```
-
-Peripheral Viewer 需要配置 SVD 文件：
-
-```json
-{
-  "ozone.defaultSvdFile": "C:\\path\\to\\device.svd"
-}
-```
-
-RTOS Views 需要配置 RTOS 类型：
-
-```json
-{
-  "ozone.defaultRtos": "FreeRTOS"
-}
-```
-
-### FreeRTOS 适配说明
-
-本扩展已适配 mcu-debug.rtos-views v0.0.16 的 FreeRTOS 检测协议。RTOS Views 自动读取以下 FreeRTOS 内核变量：
-
-- `uxCurrentNumberOfTasks` — 任务总数
-- `pxReadyTasksLists` / `xDelayedTaskList1` / `xDelayedTaskList2` / `xSuspendedTaskList` — 各状态任务链表
-- 每个 `TCB_t` 中的 `pcTaskName`、`uxTCBNumber`（需启用 `configUSE_TRACE_FACILITY`）、`pxEndOfStack`（需启用 `configRECORD_STACK_HIGH_ADDRESS`）、`ulRunTimeCounter`（需启用 `configGENERATE_RUN_TIME_STATS`）
-
-#### 固件配置要求
-
-在工程的 `FreeRTOSConfig.h` 中 **USER CODE BEGIN Defines** 区域添加以下宏：
-
-```c
-/* RTOS Views: 显示 Thread ID（uxTCBNumber） */
-#define configUSE_TRACE_FACILITY              1
-
-/* RTOS Views: 显示 Stack End / Size / Used */
-#define configRECORD_STACK_HIGH_ADDRESS       1
-
-/* RTOS Views: 显示 Runtime（%），使用 Cortex-M DWT 周期计数器 */
-#define configGENERATE_RUN_TIME_STATS         1
-#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()  (CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk, DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk)
-#define portGET_RUN_TIME_COUNTER_VALUE()           (DWT->CYCCNT)
-```
-
-> **注意：** 修改后需要重新编译固件并烧录，RTOS Views 才能读取到完整的任务信息。
-
-#### VS Code 配置
-
-1. 确保在 `.vscode/settings.json` 中有以下配置：
-
-```json
-{
-  "ozone.defaultRtos": "FreeRTOS"
-}
-```
-
-2. 或者在 `launch.json` 中为每个调试配置指定：
-
-```json
-{
-  "type": "ozone",
-  "request": "launch",
-  "name": "Ozone Debug",
-  "rtos": "FreeRTOS"
-}
-```
-
-3. 在命令面板执行 `Ozone: Enable MCU Debug Views Integration`，确保 RTOS Views 跟踪 `ozone` 类型的调试会话。
-
-#### 启动调试
-
-F5 启动调试后，等待程序运行到创建 FreeRTOS 任务之后（通常在 `vTaskStartScheduler()` 之后），然后：
-
-1. 打开 RTOS Views 面板（在 VS Code 活动栏的 MCU 图标下）。
-2. 如果面板显示 "FreeRTOS detected with N threads"，说明检测成功。
-3. 展开单个任务可查看：Task Name、State、Priority、Stack（Size / Used）、Thread ID、Runtime。
-4. 如果显示 "No RTOS detected"，可以手动执行命令 `mcu-debug.rtos-views.refresh` 刷新。
-
-## 配置项
-
-| 配置 | 默认值 | 说明 |
+| 范围 | Orbit 负责 | 仍由外部环境负责 |
 | --- | --- | --- |
-| `ozone.jlinkPath` | `C:\Program Files\SEGGER\JLink\JLink.exe` | J-Link Commander 路径，仅作为备用配置。 |
-| `ozone.jlinkDllPath` | 空 | `JLink_x64.dll` 路径，留空时自动检测。 |
-| `ozone.defaultDevice` | `STM32F407VG` | 默认目标芯片型号。 |
-| `ozone.defaultInterface` | `SWD` | 默认调试接口，可选 `SWD` 或 `JTAG`。 |
-| `ozone.defaultSpeed` | `4000` | 默认接口速度，单位 kHz。 |
-| `ozone.defaultProgram` | 空 | 默认 ELF/AXF 路径，留空时自动扫描 `build` 目录。 |
-| `ozone.defaultSvdFile` | 空 | 默认 CMSIS-SVD 文件路径，用于 Peripheral Viewer。 |
-| `ozone.defaultRtos` | 空 | 默认 RTOS 类型，用于 RTOS Views，例如 `FreeRTOS`。 |
-| `ozone.rttLogEnabled` | `true` | 是否读取 SEGGER RTT 输出。 |
-| `ozone.rttBufferIndex` | `0` | SEGGER RTT up-buffer 索引。 |
-| `ozone.rttPollIntervalMs` | `50` | RTT 轮询间隔，单位毫秒。 |
-| `ozone.rttReadSize` | `4096` | 每次 RTT 读取的最大字节数。 |
-| `ozone.rttControlBlockAddress` | 空 | 可选 RTT control block 地址。 |
-| `ozone.rttStripAnsi` | `true` | 是否在 Debug Console 中移除 SEGGER/ANSI 控制序列。 |
-| `ozone.rttLogTarget` | `terminal` | RTT 输出目标：`terminal`、`debugConsole` 或 `both`。 |
-| `ozone.pRtLogEnabled` | `false` | 是否按 P-RTLog tokenized RTT 帧解码。 |
-| `ozone.pRtLogRoot` | `D:\STM32\tool\P-RTLog` | P-RTLog 工具库根目录。 |
-| `ozone.timelineSampleIntervalMs` | `0.2` | Timeline 目标采样间隔，单位毫秒。 |
-| `ozone.timelineSendIntervalMs` | `16` | Timeline UI 更新间隔，单位毫秒。 |
+| 调试访问 | DAP、目标 owner、J-Link DLL 调用、符号/DWARF 解析 | J-Link probe、目标供电、目标设备和固件 |
+| 烧录 | 可选地调用 JLink.exe 的 CommanderScript 烧录流程 | J-Link 软件包和 `JLink.exe` 安装 |
+| RTOS / 外设 | 提供 DAP 数据、RTOS capability、SVD launch metadata 及 debugger tracking 接口 | RTOS Views、debug tracker、Peripheral Viewer、SVD 内容 |
+| MCP | 本机 Plugin API 和 MCP server 适配器 | MCP 宿主、AI 客户端、用户对目标写入的授权 |
+| 发布物 | VSIX 中的扩展构建产物及 Native helper | Releases 页面中的 VSIX、MCP 和 SKILL 资产命名与发布流程 |
 
-## MCP 集成
+## 文档与发布
 
-扩展激活后会启动插件 API，并将连接信息写入 VS Code global storage：
+- [全套工具链教程](Releases/docs/全套工具链教程.md)：面向第一次从 Keil5 等集成 IDE 转到 VS Code 的用户，从零安装和配置 ARM GCC、CMake、CMake Tools、J-Link 与 Orbit，并完成第一次编译和调试。
+- [用户文档](Releases/docs/user-guide.md)：面向已经具备基本 VS Code/嵌入式开发环境的用户，作为 Orbit 的正式参考手册，覆盖安装要求、`launch.json`、Watch、Timeline、RTT、P-RTLog、RTOS Views、Memory View、Peripheral Viewer、Native/Legacy、MCP、FAQ 和已知限制。
 
-```text
-%APPDATA%\Code\User\globalStorage\ozone-debug.ozone-for-vscode\plugin-api-endpoint.json
-```
+两份教程互相补充，并不是重复内容：
 
-MCP server 位于：
+| 文档 | 适用对象 | 主要内容 |
+| --- | --- | --- |
+| [全套工具链教程](Releases/docs/全套工具链教程.md) | 没有完整 VS Code + ARM GCC + CMake 环境，或第一次使用 Orbit 的用户 | 按步骤搭建开发环境，完成工具安装、CMake 配置、编译、J-Link 安装和首次调试 |
+| [用户文档](Releases/docs/user-guide.md) | 已能编译工程，需要深入使用 Orbit 的用户 | 查阅 Orbit 的配置项、调试视图、实时数据、日志、MCP、调试通道、常见问题和能力边界 |
 
-```text
-mcp/ozone-mcp-server.js
-```
+推荐阅读顺序：第一次使用 Orbit 时先看[全套工具链教程](Releases/docs/全套工具链教程.md)，完成环境搭建后再把[用户文档](Releases/docs/user-guide.md)作为功能参考手册。
 
-MCP 客户端配置示例：
+- [Orbit Releases](https://github.com/zhuangyan114/Orbit/releases)：正式版 VSIX 及后续发布资产。
 
-```json
-{
-  "mcpServers": {
-    "ozone": {
-      "command": "node",
-      "args": [
-        "C:\\Users\\22690\\Desktop\\AI\\Ozone for VScode\\mcp\\ozone-mcp-server.js"
-      ],
-      "env": {
-        "OZONE_PLUGIN_API_ENDPOINT_FILE": "C:\\Users\\22690\\AppData\\Roaming\\Code\\User\\globalStorage\\ozone-debug.ozone-for-vscode\\plugin-api-endpoint.json"
-      }
-    }
-  }
-}
-```
+## 1.0.0 更新日志
 
-MCP 工具：
-
-- `ozone_status`：读取插件 API 和目标状态。
-- `ozone_read_many`：读取一个或多个调试表达式。
-- `ozone_write_many`：向一个或多个调试表达式写入数值。
-- `ozone_record`：按固定间隔记录变量波形。
-- `ozone_experiment_run`：执行 read、write、wait、record 组合实验。
-
-## 源码开发
-
-安装依赖：
-
-```powershell
-npm install
-```
-
-构建扩展：
-
-```powershell
-npm run build
-```
-
-类型检查：
-
-```powershell
-npm run typecheck
-```
-
-打包 VSIX：
-
-```powershell
-npx @vscode/vsce package --out outputs/artifacts/0.4.9/ozone-for-vscode-0.4.9.vsix
-```
-
-运行 MCP server：
-
-```powershell
-npm run mcp
-```
-
-## 目录结构
-
-```text
-src/extension.ts                 扩展主入口
-src/debugadapter.ts              Debug Adapter 入口
-src/debug/dap-session.ts         DAP 请求、事件和 RTT/P-RTLog 逻辑
-src/debug/p-rtlog-decoder.ts     P-RTLog tokenized RTT 解码器
-src/ozone-backend/               J-Link DLL、符号和命令分发
-src/debug-providers/             Watch 与数据采样逻辑
-src/webview/                     Watch 和 Timeline 前端
-src/plugin-api/                  本地插件 API
-mcp/ozone-mcp-server.js          MCP server
-dist/                            esbuild 输出
-```
-
-## 注意事项
-
-- 当前扩展主要面向 Windows，因为调试链路依赖 `JLink_x64.dll`。
-- 常规调试命令不启动 Ozone GUI，也不依赖 JLink.exe 子进程。
-- 当已有 `ozone` 调试会话时，Watch 和数据采样请求应通过 debug session 路由。
-- 对目标写值前建议先进行只读检查，并在 MCP 实验里设置安全范围。
-- Peripheral Viewer 的寄存器树质量取决于所配置的 SVD 文件。
-- RTOS Views 的可见信息取决于 ELF/DWARF 符号、RTOS 类型和目标当前运行状态。
+- 以 Orbit 品牌整理正式版产品介绍和系统架构说明。
+- 将完整使用方法从 README 拆分到独立用户文档。
+- 明确 Native / Legacy 单 owner 调试通道、DAP 路由、外部视图边界和 MCP 本机安全边界。
 
 ## 许可证
 

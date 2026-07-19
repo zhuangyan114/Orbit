@@ -7,6 +7,8 @@ import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
+import { configureLogger } from './utils/logger';
+import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import * as fs from 'fs';
 
 let backend: OzoneBackend;
@@ -28,7 +30,7 @@ class RttLogTerminal implements vscode.Pseudoterminal {
 
   open(): void {
     this.closed = false;
-    this.writeEmitter.fire('\x1B[1;36mOzone RTT Log\x1B[0m\r\n');
+    this.writeEmitter.fire('\x1B[1;36mOrbit RTT Log\x1B[0m\r\n');
   }
 
   close(): void {
@@ -50,7 +52,7 @@ function ensureRttLogTerminal(): { terminal: vscode.Terminal; pty: RttLogTermina
       rttLogPty = null;
     });
     rttLogTerminal = vscode.window.createTerminal({
-      name: 'Ozone RTT Log',
+      name: 'Orbit RTT Log',
       pty: rttLogPty,
     });
   }
@@ -68,6 +70,22 @@ function writeRttLogTerminal(text: string) {
 
 export async function activate(context: vscode.ExtensionContext) {
   try {
+    await migrateLegacyOrbitSettings();
+    const logConfig = getOrbitConfiguration();
+    const updateLoggerConfiguration = () => {
+      configureLogger({
+        enabled: logConfig.get<boolean>('logging.enabled', true),
+        clearOnStart: logConfig.get<boolean>('logging.clearOnStart', true),
+      });
+    };
+    updateLoggerConfiguration();
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+      if (event.affectsConfiguration('orbit.logging.enabled') || event.affectsConfiguration('orbit.logging.clearOnStart') ||
+          event.affectsConfiguration('ozone.logging.enabled') || event.affectsConfiguration('ozone.logging.clearOnStart')) {
+        updateLoggerConfiguration();
+      }
+    }));
+
     const b = new OzoneBackend(undefined, undefined, () => vscode.debug.activeDebugSession?.type === 'ozone');
     backend = b;
 
@@ -90,6 +108,7 @@ export async function activate(context: vscode.ExtensionContext) {
     dataSamplingManager = dsm;
     dsm.onExpressionsChanged = (exprs) => {
       context.workspaceState.update('ozoneDataSamplingExpressions', exprs);
+      timelineProvider?.refreshEntries();
     };
     wvp.onSendToTimeline = (exprs) => {
       for (const e of exprs) dsm.addExpression(e);
@@ -106,27 +125,27 @@ export async function activate(context: vscode.ExtensionContext) {
     pluginApiServer = new PluginApiServer(context, backend);
     const apiEndpoint = await pluginApiServer.start();
     context.subscriptions.push(pluginApiServer);
-    console.log(`[Ozone] Plugin API listening on ${apiEndpoint.url}`);
+      console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);
 
     // Ensure ozone is tracked by mcu-debug views on activation
     for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
       appendWorkspaceArraySetting(section, 'trackDebuggers', 'ozone').catch((err) => {
-        console.error(`[Ozone] Failed to register with ${section}.trackDebuggers:`, err);
+        console.error(`[Orbit] Failed to register with ${section}.trackDebuggers:`, err);
       });
     }
 
-    if (vscode.workspace.getConfiguration('ozone').get<boolean>('rtosViewsAutoRefresh', false)) {
+    if (getOrbitConfiguration().get<boolean>('rtosViewsAutoRefresh', false)) {
       setupRtosViewsAutoRefresh(context);
     }
 
     // 激活时自动检测 .elf/.axf，写入设置
-    const ozCfg = vscode.workspace.getConfiguration('ozone');
-    if (!ozCfg.get<string>('defaultProgram') || !fs.existsSync(ozCfg.get<string>('defaultProgram', ''))) {
+    const orbitCfg = getOrbitConfiguration();
+    if (!orbitCfg.get<string>('defaultProgram') || !fs.existsSync(orbitCfg.get<string>('defaultProgram', ''))) {
       const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       if (wsRoot) {
         const candidates = findElfFiles(wsRoot);
         if (candidates.length >= 1) {
-          ozCfg.update('defaultProgram', candidates[0].path, vscode.ConfigurationTarget.Workspace);
+          orbitCfg.update('defaultProgram', candidates[0].path, vscode.ConfigurationTarget.Workspace);
         }
       }
     }
@@ -169,7 +188,7 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
 
       vscode.commands.registerCommand('ozone.openSettings', () => {
-        vscode.commands.executeCommand('workbench.action.openSettings', '@ext:ozone-debug.ozone-for-vscode');
+        vscode.commands.executeCommand('workbench.action.openSettings', '@ext:orbit-debug.orbit-for-vscode');
       }),
 
       vscode.commands.registerCommand('ozone.enableMcuDebugViews', enableMcuDebugViewsIntegration),
@@ -187,7 +206,7 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
 
       vscode.commands.registerCommand('ozone.debug', async () => {
-        const config = vscode.workspace.getConfiguration('ozone');
+        const config = getOrbitConfiguration();
         let elfPath = config.get<string>('defaultProgram', '');
         const device = config.get<string>('defaultDevice', 'STM32F407VG');
         const interface_ = config.get<'SWD' | 'JTAG'>('defaultInterface', 'SWD');
@@ -213,7 +232,7 @@ export async function activate(context: vscode.ExtensionContext) {
           }
         }
         if (!elfPath || !fs.existsSync(elfPath)) {
-          vscode.window.showErrorMessage('Ozone: No ELF file found. Configure it in the settings panel first.');
+          vscode.window.showErrorMessage('Orbit: No ELF file found. Configure it in the settings panel first.');
           return;
         }
 
@@ -223,7 +242,7 @@ export async function activate(context: vscode.ExtensionContext) {
         await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
           type: 'ozone',
           request: 'launch',
-          name: 'Ozone Debug',
+          name: 'Orbit Debug',
           program: elfPath,
           device,
           interface: interface_,
@@ -234,17 +253,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     startWatchPolling();
   } catch (e: any) {
-    console.error('[Ozone] activate FAILED:', e.message);
-    console.error('[Ozone] stack:', e.stack);
-    vscode.window.showErrorMessage(`Ozone activation failed: ${e.message}`);
+    console.error('[Orbit] activate FAILED:', e.message);
+    console.error('[Orbit] stack:', e.stack);
+    vscode.window.showErrorMessage(`Orbit activation failed: ${e.message}`);
   }
 }
 
-async function readWatchValues(exprs: string[]): Promise<any[]> {
+async function readWatchValues(exprs: string[], expandedExpressions: string[] = []): Promise<any[]> {
   const session = vscode.debug.activeDebugSession;
   if (session && session.type === 'ozone') {
     try {
-      const r: any = await session.customRequest('dataSample', { expressions: exprs });
+      const r: any = await session.customRequest('dataSample', { expressions: exprs, expandedExpressions });
       if (r && r.results) return r.results;
       return exprs.map(expression => ({ expression, value: 0, display: '', hex: '', error: 'DAP dataSample returned no results' }));
     } catch (err: any) {
@@ -255,7 +274,7 @@ async function readWatchValues(exprs: string[]): Promise<any[]> {
   const results: any[] = [];
   for (const expr of exprs) {
     try {
-      const r = await backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true });
+      const r = await backend.execute({ cmd: 'evaluateExpression', expression: expr, force: true, expandedExpressions });
       if (r.ok) results.push(r.data);
       else results.push({ expression: expr, value: 0, display: '', hex: '', error: r.error });
     } catch { results.push({ expression: expr, value: 0, display: '', hex: '', error: 'err' }); }
@@ -265,7 +284,7 @@ async function readWatchValues(exprs: string[]): Promise<any[]> {
 
 function startWatchPolling() {
   stopWatchPolling();
-  const cfg = vscode.workspace.getConfiguration('ozone');
+  const cfg = getOrbitConfiguration();
   const baseInterval = cfg.get<number>('watchPollIntervalMs', 500);
 
   const loop = async () => {
@@ -280,7 +299,7 @@ function startWatchPolling() {
         watchPollTimer = setTimeout(loop, baseInterval);
         return;
       }
-      const results = await readWatchValues(expressions);
+      const results = await readWatchValues(expressions, watchWebviewProvider?.expandedExpressions || []);
       if (results.length > 0) {
         watchProvider?.updateResults(results);
         watchWebviewProvider?.sendWatchResults(results as any);
@@ -296,7 +315,7 @@ function stopWatchPolling() {
 }
 
 function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
-  const diagChannel = vscode.window.createOutputChannel('Ozone RTOS Views');
+  const diagChannel = vscode.window.createOutputChannel('Orbit RTOS Views');
   let refreshScheduled = false;
 
   vscode.extensions.getExtension("mcu-debug.debug-tracker-vscode")?.activate().then((trackerApi: any) => {
@@ -351,11 +370,11 @@ async function appendWorkspaceArraySetting(section: string, key: string, value: 
   const current = cfg.get<unknown>(key);
   const list = Array.isArray(current) ? current.filter((item): item is string => typeof item === 'string') : [];
   if (list.includes(value)) {
-    console.log(`[Ozone] ${section}.${key} already includes "${value}"`);
+    console.log(`[Orbit] ${section}.${key} already includes "${value}"`);
     return false;
   }
   await cfg.update(key, [...list, value], vscode.ConfigurationTarget.Workspace);
-  console.log(`[Ozone] Added "${value}" to ${section}.${key}`);
+  console.log(`[Orbit] Added "${value}" to ${section}.${key}`);
   return true;
 }
 
@@ -373,14 +392,14 @@ async function enableMcuDebugViewsIntegration() {
 
   if (changed.length > 0) {
     const choice = await vscode.window.showInformationMessage(
-      `Ozone: MCU Debug Views integration enabled (${changed.join(', ')}). Reload window to activate.`,
+      `Orbit: MCU Debug Views integration enabled (${changed.join(', ')}). Reload window to activate.`,
       'Reload Window',
     );
     if (choice === 'Reload Window') {
       vscode.commands.executeCommand('workbench.action.reloadWindow');
     }
   } else {
-    vscode.window.showInformationMessage('Ozone: MCU Debug Views integration is already enabled for this workspace.');
+    vscode.window.showInformationMessage('Orbit: MCU Debug Views integration is already enabled for this workspace.');
   }
 }
 

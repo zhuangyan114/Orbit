@@ -1,13 +1,13 @@
 {
-  "name": "ozone-for-vscode",
-  "displayName": "Ozone for VS Code",
-  "description": "Modern STM32 debugging frontend powered by SEGGER Ozone with AI integration",
-  "version": "0.4.9",
-  "publisher": "ozone-debug",
+  "name": "orbit-for-vscode",
+  "displayName": "Orbit",
+  "description": "Modern STM32 debugging frontend powered by SEGGER J-Link with AI integration",
+  "version": "1.0.0",
+  "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ozone-debug/ozone-for-vscode"
+    "url": "https://github.com/zhuangyan114/Orbit"
   },
   "engines": {
     "vscode": "^1.90.0"
@@ -22,12 +22,12 @@
     "arm",
     "cortex-m",
     "j-link",
-    "ozone",
+    "orbit",
     "segger",
     "embedded",
     "debug"
   ],
-  "icon": "resources/icon.png",
+  "icon": "resources/orbit-icon-256.png",
   "activationEvents": [
     "onStartupFinished",
     "onView:ozoneTimeline",
@@ -39,35 +39,35 @@
     "commands": [
       {
         "command": "ozone.debug",
-        "title": "Ozone: Connect Target"
+        "title": "Orbit: Connect Target"
       },
       {
         "command": "ozone.addWatch",
-        "title": "Ozone: Add to Watch",
+        "title": "Orbit: Add to Watch",
         "icon": "$(add)"
       },
       {
         "command": "ozone.removeWatch",
-        "title": "Ozone: Remove from Watch",
+        "title": "Orbit: Remove from Watch",
         "icon": "$(trash)"
       },
       {
         "command": "ozone.openTimeline",
-        "title": "Ozone: Open Timeline",
+        "title": "Orbit: Open Timeline",
         "icon": "$(graph)"
       },
       {
         "command": "ozone.addToDataSampling",
-        "title": "Ozone: Add to Data Sampling",
+        "title": "Orbit: Add to Data Sampling",
         "icon": "$(graph)"
       },
       {
         "command": "ozone.openSettings",
-        "title": "Ozone: Settings"
+        "title": "Orbit: Settings"
       },
       {
         "command": "ozone.enableMcuDebugViews",
-        "title": "Ozone: Enable MCU Debug Views Integration"
+        "title": "Orbit: Enable MCU Debug Views Integration"
       }
     ],
     "menus": {
@@ -96,12 +96,12 @@
         {
           "id": "ozone-watch-panel",
           "title": "WATCH",
-          "icon": "resources/icon.svg"
+          "icon": "resources/orbit-view.svg"
         },
         {
           "id": "ozone-timeline-panel",
           "title": "TIMELINE",
-          "icon": "resources/icon.svg"
+          "icon": "resources/orbit-view.svg"
         }
       ]
     },
@@ -130,7 +130,7 @@
     "debuggers": [
       {
         "type": "ozone",
-        "label": "Ozone (J-Link)",
+        "label": "Orbit (J-Link)",
         "runtime": "node",
         "program": "./dist/debugadapter.js",
         "configurationAttributes": {
@@ -185,6 +185,16 @@
                 "description": "Read SEGGER RTT output and show it in the VS Code Debug Console",
                 "default": true
               },
+              "loggingEnabled": {
+                "type": "boolean",
+                "description": "Enable Orbit internal diagnostic logs (step, eval, DLL, and DAP)",
+                "default": true
+              },
+              "clearLogsOnStart": {
+                "type": "boolean",
+                "description": "Clear Orbit internal diagnostic logs when the extension or debug session starts",
+                "default": true
+              },
               "rttBufferIndex": {
                 "type": "number",
                 "description": "SEGGER RTT up-buffer index to read",
@@ -235,33 +245,18 @@
               "pRtLogRoot": {
                 "type": "string",
                 "description": "Path to the P-RTLog toolkit root",
-                "default": "D:\\STM32\\tool\\P-RTLog"
+                "default": ""
               },
               "nativeDebugEngineEnabled": {
                 "type": "boolean",
-                "description": "Enable the experimental Native Debug Engine session path",
-                "default": false
+                "description": "Prefer the Native helper session path and fall back to legacy only when startup fails",
+                "default": true
               },
               "nativeDebugEngineMode": {
                 "type": "string",
                 "enum": ["legacy", "native", "auto"],
-                "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback",
+                "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback; an already connected Native owner never hot-switches",
                 "default": "auto"
-              },
-              "nativeDebugEngineStepInto": {
-                "type": "boolean",
-                "description": "Use Native stepIntoInstruction when an exclusive native executor is connected",
-                "default": false
-              },
-              "nativeDebugEngineStepOver": {
-                "type": "boolean",
-                "description": "Use Native stepOverSourceLine when an exclusive native executor is connected",
-                "default": false
-              },
-              "nativeDebugEngineStepOut": {
-                "type": "boolean",
-                "description": "Use Native stepOut when an exclusive native executor is connected",
-                "default": false
               }
             }
           }
@@ -269,94 +264,104 @@
       }
     ],
     "configuration": {
-      "title": "Ozone Debug",
+      "title": "Orbit Debug",
       "properties": {
-        "ozone.jlinkPath": {
+        "orbit.jlinkPath": {
           "type": "string",
           "default": "C:\\Program Files\\SEGGER\\JLink\\JLink.exe",
-          "description": "Path to J-Link Commander executable (fallback)"
+          "description": "用于固件烧录流程的 J-Link Commander 可执行文件路径"
         },
-        "ozone.jlinkDllPath": {
+        "orbit.jlinkDllPath": {
           "type": "string",
           "default": "",
-          "description": "Path to JLink_x64.dll (auto-detected if empty)"
+          "description": "JLink_x64.dll 的路径（留空则自动检测）"
         },
-        "ozone.defaultDevice": {
+        "orbit.defaultDevice": {
           "type": "string",
           "default": "STM32F407VG",
-          "description": "Default target device name"
+          "description": "默认目标设备名称"
         },
-        "ozone.defaultInterface": {
+        "orbit.defaultInterface": {
           "type": "string",
           "default": "SWD",
           "enum": [
             "SWD",
             "JTAG"
           ],
-          "description": "Default debug interface"
+          "description": "默认调试接口"
         },
-        "ozone.defaultSpeed": {
+        "orbit.defaultSpeed": {
           "type": "number",
           "default": 4000,
-          "description": "Default interface speed (kHz)"
+          "description": "默认接口速度（kHz）"
         },
-        "ozone.defaultProgram": {
+        "orbit.defaultProgram": {
           "type": "string",
           "default": "",
-          "description": "Default ELF/AXF file path (烧录文件, 留空则自动检测 build/ 目录)"
+          "description": "默认 ELF/AXF 文件路径（烧录文件，留空则自动检测 build/ 目录）"
         },
-        "ozone.defaultSvdFile": {
+        "orbit.defaultSvdFile": {
           "type": "string",
           "default": "",
-          "description": "Default CMSIS-SVD file path for Peripheral Viewer"
+          "description": "用于外设查看器的默认 CMSIS-SVD 文件路径"
         },
-        "ozone.defaultRtos": {
+        "orbit.defaultRtos": {
           "type": "string",
           "default": "",
-          "description": "Default RTOS name for RTOS Views, for example FreeRTOS"
+          "description": "RTOS Views 使用的默认 RTOS 名称，例如 FreeRTOS"
         },
-        "ozone.rtosViewsAutoRefresh": {
+        "orbit.rtosViewsAutoRefresh": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically focus and refresh MCU Debug RTOS Views after the first stack trace. Disabled by default because it adds debug-session overhead."
+          "description": "首次获取调用栈后，自动聚焦并刷新 MCU Debug RTOS Views。默认关闭，因为会增加调试会话开销。"
         },
-        "ozone.rttLogEnabled": {
+        "orbit.rttLogEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "Read SEGGER RTT output and show it in the VS Code Debug Console"
+          "description": "读取 SEGGER RTT 输出，并将其显示在 VS Code 调试控制台中"
         },
-        "ozone.rttBufferIndex": {
+        "orbit.logging.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用 Orbit 内部诊断日志（step、eval、DLL 和 DAP）。"
+        },
+        "orbit.logging.clearOnStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "扩展或调试会话启动时清空 Orbit 内部诊断日志。"
+        },
+        "orbit.rttBufferIndex": {
           "type": "number",
           "default": 0,
           "minimum": 0,
           "maximum": 15,
-          "description": "SEGGER RTT up-buffer index to read"
+          "description": "要读取的 SEGGER RTT 上行缓冲区索引"
         },
-        "ozone.rttPollIntervalMs": {
+        "orbit.rttPollIntervalMs": {
           "type": "number",
           "default": 50,
           "minimum": 10,
           "maximum": 5000,
-          "description": "RTT log polling interval in milliseconds"
+          "description": "RTT 日志轮询间隔（毫秒）"
         },
-        "ozone.rttReadSize": {
+        "orbit.rttReadSize": {
           "type": "number",
           "default": 4096,
           "minimum": 64,
           "maximum": 65536,
-          "description": "Maximum bytes to read from RTT on each poll"
+          "description": "每次轮询最多读取的 RTT 字节数"
         },
-        "ozone.rttControlBlockAddress": {
+        "orbit.rttControlBlockAddress": {
           "type": "string",
           "default": "",
-          "description": "Optional SEGGER RTT control block address, for example 0x20000000. Leave empty for J-Link auto-detection."
+          "description": "可选的 SEGGER RTT 控制块地址，例如 0x20000000。留空则由 J-Link 自动检测。"
         },
-        "ozone.rttStripAnsi": {
+        "orbit.rttStripAnsi": {
           "type": "boolean",
           "default": true,
-          "description": "Strip SEGGER/ANSI color control sequences before writing RTT logs to the Debug Console. The RTT terminal always preserves ANSI colors."
+          "description": "写入 RTT 日志到调试控制台前，移除 SEGGER/ANSI 颜色控制序列。RTT 终端始终保留 ANSI 颜色。"
         },
-        "ozone.rttLogTarget": {
+        "orbit.rttLogTarget": {
           "type": "string",
           "default": "terminal",
           "enum": [
@@ -364,64 +369,61 @@
             "debugConsole",
             "both"
           ],
-          "description": "Where RTT logs are shown"
+          "description": "RTT 日志显示位置"
         },
-        "ozone.pRtLogEnabled": {
+        "orbit.pRtLogEnabled": {
           "type": "boolean",
           "default": false,
-          "description": "Decode P-RTLog tokenized RTT frames instead of treating RTT bytes as plain text"
+          "description": "解码 P-RTLog 令牌化 RTT 帧，而不是将 RTT 字节作为纯文本处理"
         },
-        "ozone.pRtLogRoot": {
+        "orbit.pRtLogRoot": {
           "type": "string",
-          "default": "D:\\STM32\\tool\\P-RTLog",
-          "description": "Path to the P-RTLog toolkit root"
+          "default": "",
+          "description": "P-RTLog 工具包根目录路径"
         },
-        "ozone.nativeDebugEngine.enabled": {
+        "orbit.nativeDebugEngine.enabled": {
           "type": "boolean",
-          "default": false,
-          "description": "Enable the experimental Native Debug Engine. Keep disabled until the session owns a single native J-Link channel."
+          "default": true,
+          "description": "优先使用 Native Helper 会话路径，仅在启动失败时回退到 Legacy。"
         },
-        "ozone.nativeDebugEngine.mode": {
+        "orbit.nativeDebugEngine.mode": {
           "type": "string",
           "enum": ["legacy", "native", "auto"],
           "default": "auto",
-          "description": "Target owner selection: legacy uses koffi only; native fails without fallback; auto may fall back only before Native connects."
+          "description": "目标所有者选择：legacy 仅使用 koffi；native 失败时不回退；auto 仅在 Native 连接前启动失败时回退。"
         },
-        "ozone.nativeDebugEngine.stepOver": {
-          "type": "boolean",
-          "default": false,
-          "description": "Route step over to Native stepOverSourceLine when the Native Debug Engine is enabled and connected."
-        },
-        "ozone.nativeDebugEngine.stepInto": {
-          "type": "boolean",
-          "default": false,
-          "description": "Route step into to Native stepIntoInstruction when the Native Debug Engine is enabled and connected."
-        },
-        "ozone.nativeDebugEngine.stepOut": {
-          "type": "boolean",
-          "default": false,
-          "description": "Route step out to Native stepOut when the Native Debug Engine is enabled and connected."
-        },
-        "ozone.watchPollIntervalMs": {
+        "orbit.watchPollIntervalMs": {
           "type": "number",
           "default": 500,
           "minimum": 100,
           "maximum": 10000,
-          "description": "Watch polling interval in milliseconds when target is halted. When running, polling is automatically slowed. Default 500ms."
+          "description": "目标暂停时 Watch 的轮询间隔（毫秒）。目标运行时会自动降低轮询频率。默认 500 毫秒。"
         },
-        "ozone.timelineSampleIntervalMs": {
+        "orbit.timelineSampleIntervalMs": {
           "type": "number",
           "default": 0.2,
           "minimum": 0.1,
           "maximum": 10000,
-          "description": "Target Timeline data sampling interval in milliseconds. 0.2 ms targets 5 kHz; actual rate depends on target read latency and expression count."
+          "description": "Timeline 目标数据采样间隔（毫秒）。0.2 毫秒对应目标 5 kHz；实际速率取决于目标读取延迟和表达式数量。"
         },
-        "ozone.timelineSendIntervalMs": {
+        "orbit.flashBeforeDebug": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动调试前烧录当前 ELF/AXF 文件"
+        },
+        "orbit.recentSessions": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "maximum": 50,
+          "description": "保留的最近调试会话数量"
+        },
+        "orbit.timelineSendIntervalMs": {
           "type": "number",
           "default": 16,
           "minimum": 1,
           "maximum": 10000,
-          "description": "Timeline webview update interval in milliseconds. Sampling can run faster than UI updates."
+          "description": "Timeline Webview 更新间隔（毫秒）。采样可以快于 UI 更新。"
         }
       }
     }
@@ -433,7 +435,7 @@
     "test:cpp-channel": "node scripts/cpp-channel-smoke.js",
     "test:cpp-channel:mock": "node scripts/cpp-channel-smoke.js --mock",
     "watch": "node esbuild.config.js --watch",
-    "mcp": "node mcp/ozone-mcp-server.js",
+    "mcp": "node Releases/mcp/orbit-mcp-server.js",
     "lint": "eslint src --ext ts,tsx",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

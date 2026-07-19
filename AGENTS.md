@@ -1,4 +1,4 @@
-# Ozone for VS Code - Agent Guide
+# Orbit for VS Code - Agent Guide
 
 ## Scope and Working Tree
 
@@ -12,7 +12,7 @@
 - `npm install` installs the locked dependencies (`package-lock.json` is committed).
 - `npm run build` bundles `dist/{extension,debugadapter,webview,timeline,watch}.js`.
 - `npm run typecheck` runs `tsc --noEmit`; `npm test` runs Vitest.
-- `npm run build:native` builds `out/native/win32-x64/ozone-jlink-helper.exe`.
+- `npm run build:native` builds `out/native/win32-x64/orbit-jlink-helper.exe`.
 - `npm run test:cpp-channel:mock` exercises the helper channel against the mock DLL. It is not hardware validation.
 - `npm run watch`, `npm run dev`, and `npm run mcp` respectively watch bundles, launch Extension Development Host, and start the local MCP client.
 - Do not run target-mutating hardware commands without explicit user authorization.

@@ -127,7 +127,7 @@ export class BreakpointManager extends EventEmitter implements vscode.TreeDataPr
   }
 
   private getBreakpointDecoration(): vscode.TextEditorDecorationType {
-    const ext = vscode.extensions.getExtension('ozone-debug.ozone-for-vscode');
+    const ext = vscode.extensions.getExtension('orbit-debug.orbit-for-vscode');
     const gutterIconPath = ext
       ? vscode.Uri.joinPath(ext.extensionUri, 'resources', 'breakpoint.svg')
       : undefined;

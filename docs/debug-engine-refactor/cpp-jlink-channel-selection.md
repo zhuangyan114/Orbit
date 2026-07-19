@@ -92,7 +92,7 @@ native/
   jlink-helper/
     CMakeLists.txt
     src/
-out/native/win32-x64/ozone-jlink-helper.exe
+out/native/win32-x64/orbit-jlink-helper.exe
 ```
 
 构建工具建议：
@@ -100,7 +100,7 @@ out/native/win32-x64/ozone-jlink-helper.exe
 - 使用 CMake + MSVC，目标平台 `win32-x64`。
 - C++ 标准使用 C++20 或 C++17；首版优先 C++17，降低工具链要求。
 - helper 以动态加载方式访问 `JLink_x64.dll`，不要链接 SEGGER import lib，避免用户安装路径和版本差异导致构建产物绑定死。
-- CI 或本地 release 构建生成 `out/native/win32-x64/ozone-jlink-helper.exe`，再由 VS Code extension 打包进 `.vsix`。
+- CI 或本地 release 构建生成 `out/native/win32-x64/orbit-jlink-helper.exe`，再由 VS Code extension 打包进 `.vsix`。
 - `npm run build` 仍只负责 TS/esbuild bundle；新增 `npm run build:native` 和 release 打包脚本时再串联 native 构建。
 
 不建议首版使用 node-gyp 作为主构建，因为 helper 不是 Node addon。若同时保留 N-API 原型，可单独放在 `native/jlink-addon/`，不能阻塞 helper 主线。
@@ -115,15 +115,15 @@ dist/
   debugadapter.js
 native/
   win32-x64/
-    ozone-jlink-helper.exe
+    orbit-jlink-helper.exe
 ```
 
-`package.json` 的 `files` 或 `.vscodeignore` 必须确保包含 `native/win32-x64/ozone-jlink-helper.exe`，同时继续排除中间构建目录和调试符号，除非发布诊断版。
+`package.json` 的 `files` 或 `.vscodeignore` 必须确保包含 `native/win32-x64/orbit-jlink-helper.exe`，同时继续排除中间构建目录和调试符号，除非发布诊断版。
 
 DAP adapter 启动时按以下顺序选择通道：
 
-1. 如果 `ozone.nativeDebugEngine.enabled = true`，优先启动 bundled helper。
-2. 如果用户配置了开发版 helper 路径，例如 `ozone.nativeDebugEngine.helperPath`，仅在开发/诊断模式下使用。
+1. 如果 `orbit.nativeDebugEngine.enabled = true`，优先启动 bundled helper。
+2. 如果用户配置了开发版 helper 路径，例如 `orbit.nativeDebugEngine.helperPath`，仅在开发/诊断模式下使用。
 3. helper 启动失败、版本握手失败或 DLL 加载失败时，返回明确诊断；迁移期可根据配置回退到 `koffi`。
 4. 默认关闭 native 通道，待 step、Watch、Timeline、写变量验收通过后再考虑默认启用。
 
@@ -134,7 +134,7 @@ helper 生命周期归 DAP debug session 管理。每个 active `ozone` debug se
 helper 负责加载 `JLink_x64.dll`，加载路径优先级：
 
 1. launch/config 中显式传入的 `jlinkDllPath`。
-2. 现有 VS Code 设置 `ozone.jlinkDllPath` / `ozone.jlinkPath` 解析出的 DLL 路径。
+2. 现有 VS Code 设置 `orbit.jlinkDllPath` / `orbit.jlinkPath` 解析出的 DLL 路径。
 3. SEGGER 常见安装目录探测。
 4. 系统 `PATH`。
 
@@ -275,7 +275,7 @@ N-API 的主要风险是打包和崩溃隔离：
 
 - native helper 默认关闭。
 - helper 启用后，先迁移 stepOver，再迁移 stepInto/stepOut，最后迁移 fast sampling。
-- 每个能力有独立开关，例如 `ozone.nativeDebugEngine.stepOver`、`ozone.nativeDebugEngine.fastSampling`。
+- 采样等尚未完成迁移的能力可以保留独立灰度开关；Native source-level step 在 Native owner 下统一启用。
 - 发现 helper 版本不匹配、DLL 加载失败或 `EngineStateCorrupted` 时，可按配置回退到 `koffi`，但必须在日志和 UI 中明确说明当前使用的是回退路径。
 
 长期不建议继续把新状态机复杂度加到 `koffi` 路径。`koffi` 的价值是稳定回退和行为对照。
@@ -309,7 +309,7 @@ N-API 的主要风险是打包和崩溃隔离：
 
 - 明确首选方案：独立 C++ helper 进程 + stdio JSON-RPC。
 - 明确备选方案：Node N-API addon 作为性能原型；TCP RPC 作为后续外部复用通道；`koffi` 作为迁移回退。
-- 明确 VS Code extension 打包：随 `.vsix` 打包 `native/win32-x64/ozone-jlink-helper.exe`，由 DAP adapter 管理生命周期。
+- 明确 VS Code extension 打包：随 `.vsix` 打包 `native/win32-x64/orbit-jlink-helper.exe`，由 DAP adapter 管理生命周期。
 - 明确 Windows 构建：CMake + MSVC，动态加载 `JLink_x64.dll`，生成 `win32-x64` helper exe。
 - 明确 DLL 加载、版本检测、错误传播：helper 内集中加载、handshake、capability、结构化 `EngineResult`。
 - 明确不引入 OpenOCD/GDB server 作为实时变量主通道：本方案继续直连 `JLink_x64.dll`，OpenOCD/GDB server 不进入主架构。

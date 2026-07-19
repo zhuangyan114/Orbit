@@ -7,41 +7,44 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
 
-const EXTENSION_ID = 'ozone-debug.ozone-for-vscode';
+const EXTENSION_IDS = [
+  'orbit-debug.orbit-for-vscode',
+];
 const ENDPOINT_FILE = 'plugin-api-endpoint.json';
 
 function defaultEndpointPath() {
-  if (process.env.OZONE_PLUGIN_API_ENDPOINT_FILE) {
-    return process.env.OZONE_PLUGIN_API_ENDPOINT_FILE;
-  }
+  const configured = process.env.ORBIT_PLUGIN_API_ENDPOINT_FILE || process.env.OZONE_PLUGIN_API_ENDPOINT_FILE;
+  if (configured) return configured;
 
+  let storageRoot;
   if (process.platform === 'win32') {
     const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-    return path.join(appData, 'Code', 'User', 'globalStorage', EXTENSION_ID, ENDPOINT_FILE);
+    storageRoot = path.join(appData, 'Code', 'User', 'globalStorage');
+  } else if (process.platform === 'darwin') {
+    storageRoot = path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage');
+  } else {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    storageRoot = path.join(configHome, 'Code', 'User', 'globalStorage');
   }
 
-  if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', EXTENSION_ID, ENDPOINT_FILE);
-  }
-
-  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
-  return path.join(configHome, 'Code', 'User', 'globalStorage', EXTENSION_ID, ENDPOINT_FILE);
+  const candidates = EXTENSION_IDS.map(id => path.join(storageRoot, id, ENDPOINT_FILE));
+  return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
 }
 
 function readEndpoint() {
   const endpointPath = defaultEndpointPath();
   if (!fs.existsSync(endpointPath)) {
-    throw new Error(`Ozone plugin API endpoint file not found: ${endpointPath}`);
+    throw new Error(`Orbit plugin API endpoint file not found: ${endpointPath}`);
   }
 
   const endpoint = JSON.parse(fs.readFileSync(endpointPath, 'utf8'));
   if (!endpoint.url || !endpoint.token) {
-    throw new Error(`Invalid Ozone plugin API endpoint file: ${endpointPath}`);
+    throw new Error(`Invalid Orbit plugin API endpoint file: ${endpointPath}`);
   }
   return endpoint;
 }
 
-async function callOzone(method, params = {}) {
+async function callOrbit(method, params = {}) {
   const endpoint = readEndpoint();
   const response = await fetch(endpoint.url, {
     method: 'POST',
@@ -61,14 +64,14 @@ async function callOzone(method, params = {}) {
   try {
     payload = text ? JSON.parse(text) : {};
   } catch {
-    throw new Error(`Invalid JSON from Ozone plugin API: ${text}`);
+    throw new Error(`Invalid JSON from Orbit plugin API: ${text}`);
   }
 
   if (!response.ok) {
-    throw new Error(payload.error || `Ozone plugin API HTTP ${response.status}`);
+    throw new Error(payload.error || `Orbit plugin API HTTP ${response.status}`);
   }
   if (!payload.ok) {
-    throw new Error(payload.error || `Ozone plugin API call failed: ${method}`);
+    throw new Error(payload.error || `Orbit plugin API call failed: ${method}`);
   }
   return payload.data;
 }
@@ -96,6 +99,8 @@ const WriteSpec = z.object({
   alias: z.string().optional(),
   expression: z.string(),
   value: z.number(),
+  address: z.number().int().min(0).max(0xFFFFFFFF).optional(),
+  typeName: z.string().min(1).optional(),
 });
 
 const SafetyRule = z.object({
@@ -118,31 +123,31 @@ const ExperimentStep = z.discriminatedUnion('type', [
 ]);
 
 const server = new McpServer({
-  name: 'ozone-debug-mcp',
+  name: 'orbit-debug-mcp',
   version: '0.2.0',
 });
 
 server.registerTool(
   'ozone_status',
   {
-    title: 'Get Ozone target status',
-    description: 'Returns the current Ozone plugin API and target state.',
+    title: 'Get Orbit target status',
+    description: 'Returns the current Orbit plugin API and target state.',
     inputSchema: {},
   },
-  async () => toolResult(await callOzone('ozone.status'))
+  async () => toolResult(await callOrbit('ozone.status'))
 );
 
 server.registerTool(
   'ozone_read_many',
   {
     title: 'Read target expressions',
-    description: 'Reads one or more debugger expressions from the active Ozone debug session.',
+    description: 'Reads one or more debugger expressions from the active Orbit debug session.',
     inputSchema: {
       expressions: z.array(z.string()).optional(),
       signals: z.array(SignalSpec).optional(),
     },
   },
-  async args => toolResult(await callOzone('ozone.expr.readMany', args))
+  async args => toolResult(await callOrbit('ozone.expr.readMany', args))
 );
 
 server.registerTool(
@@ -154,7 +159,7 @@ server.registerTool(
       writes: z.array(WriteSpec),
     },
   },
-  async args => toolResult(await callOzone('ozone.expr.writeMany', args))
+  async args => toolResult(await callOrbit('ozone.expr.writeMany', args))
 );
 
 server.registerTool(
@@ -169,10 +174,10 @@ server.registerTool(
     },
   },
   async args => {
-    const started = await callOzone('ozone.record.start', args);
+    const started = await callOrbit('ozone.record.start', args);
     await new Promise(resolve => setTimeout(resolve, Math.max(0, args.durationMs) + 100));
-    const recording = await callOzone('ozone.record.get', { recordingId: started.recordingId });
-    await callOzone('ozone.record.clear', { recordingId: started.recordingId });
+    const recording = await callOrbit('ozone.record.get', { recordingId: started.recordingId });
+    await callOrbit('ozone.record.clear', { recordingId: started.recordingId });
     return toolResult(recording);
   }
 );
@@ -180,7 +185,7 @@ server.registerTool(
 server.registerTool(
   'ozone_experiment_run',
   {
-    title: 'Run a generic Ozone experiment',
+    title: 'Run a generic Orbit experiment',
     description: 'Runs read/write/wait/record steps against the target. The caller decides which expressions to use.',
     inputSchema: {
       name: z.string().optional(),
@@ -189,7 +194,7 @@ server.registerTool(
       safety: z.array(SafetyRule).optional(),
     },
   },
-  async args => toolResult(await callOzone('ozone.experiment.run', args))
+  async args => toolResult(await callOrbit('ozone.experiment.run', args))
 );
 
 async function main() {

@@ -1,0 +1,23 @@
+; =============================================================================
+; P-RTLog scatter file snippet for pw_tokenizer sections (Keil / ARM Compiler 6)
+; =============================================================================
+;
+; These sections stay in the ELF for host-side decoding tools but are NOT
+; loaded into the target's flash/RAM.
+;
+; Usage:
+;   Option A: Copy the load region below into your existing .sct file.
+;   Option B: Add this file to the project:
+;             Options → Linker → Use Scatter File → select this file
+;
+; IMPORTANT: The load region name "PW_TOKENIZER" must not conflict with
+;            any existing load region in your scatter file.
+; =============================================================================
+
+LR_PW_TOKENIZER 0x00000000
+{
+  ER_PW_TOKENIZER 0x00000000
+  {
+    *(.pw_tokenizer.entries)
+  }
+}

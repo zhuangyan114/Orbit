@@ -3,9 +3,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { spawn } from 'child_process';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 
 function getOzonePath(): string {
-  const config = vscode.workspace.getConfiguration('ozone');
+  const config = getOrbitConfiguration();
   const configured = config.get<string>('ozonePath', '');
   if (configured && fs.existsSync(configured)) return configured;
 
@@ -16,7 +17,7 @@ function getOzonePath(): string {
 }
 
 function resolveElfPath(): string | null {
-  const config = vscode.workspace.getConfiguration('ozone');
+  const config = getOrbitConfiguration();
   let elfPath = config.get<string>('defaultProgram', '');
   if (elfPath && fs.existsSync(elfPath)) return elfPath;
 
@@ -49,17 +50,17 @@ function generateJdebugScript(elfPath: string, device: string, interface_: strin
 }
 
 export async function startDebugSession(): Promise<boolean> {
-  const config = vscode.workspace.getConfiguration('ozone');
+  const config = getOrbitConfiguration();
   const wsFolders = vscode.workspace.workspaceFolders;
 
   if (!wsFolders) {
-    vscode.window.showErrorMessage('Ozone: 没有打开的工作区');
+    vscode.window.showErrorMessage('Orbit: 没有打开的工作区');
     return false;
   }
 
   const ozonePath = getOzonePath();
   if (!fs.existsSync(ozonePath)) {
-    vscode.window.showErrorMessage(`Ozone: 未找到 ${ozonePath}`);
+    vscode.window.showErrorMessage(`Orbit: 未找到 ${ozonePath}`);
     return false;
   }
 
@@ -69,16 +70,16 @@ export async function startDebugSession(): Promise<boolean> {
 
   const elfPath = resolveElfPath();
   if (!elfPath) {
-    vscode.window.showErrorMessage('Ozone: 未找到 .elf/.axf 文件，请先在编辑面板中设置');
+    vscode.window.showErrorMessage('Orbit: 未找到 .elf/.axf 文件，请先在编辑面板中设置');
     return false;
   }
 
   const jdebugContent = generateJdebugScript(elfPath, device, interface_, speedKHz);
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ozone-debug-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-debug-'));
   const jdebugPath = path.join(tmpDir, 'debug.jdebug');
   fs.writeFileSync(jdebugPath, jdebugContent, 'utf-8');
 
-  vscode.window.showInformationMessage(`Ozone: 启动调试... ${path.basename(elfPath)}`);
+  vscode.window.showInformationMessage(`Orbit: 启动调试... ${path.basename(elfPath)}`);
 
   try {
     const proc = spawn(`"${ozonePath}"`, ['--jdebug', jdebugPath], {
@@ -87,7 +88,7 @@ export async function startDebugSession(): Promise<boolean> {
     });
 
     proc.on('error', (err) => {
-      vscode.window.showErrorMessage(`Ozone: 启动失败: ${err.message}`);
+      vscode.window.showErrorMessage(`Orbit: 启动失败: ${err.message}`);
       cleanup(tmpDir);
     });
 
@@ -99,7 +100,7 @@ export async function startDebugSession(): Promise<boolean> {
 
     return true;
   } catch (err: any) {
-    vscode.window.showErrorMessage(`Ozone: 启动失败: ${err.message}`);
+    vscode.window.showErrorMessage(`Orbit: 启动失败: ${err.message}`);
     cleanup(tmpDir);
     return false;
   }

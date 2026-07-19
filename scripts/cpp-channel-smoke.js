@@ -9,7 +9,7 @@ function argument(name, fallback = undefined) {
 }
 
 const useMock = process.argv.includes('--mock');
-const helperPath = path.resolve(argument('helper', path.join('out', 'native', 'win32-x64', 'ozone-jlink-helper.exe')));
+const helperPath = path.resolve(argument('helper', path.join('out', 'native', 'win32-x64', 'orbit-jlink-helper.exe')));
 const dllPath = argument('dll', useMock ? path.join('out', 'native', 'win32-x64', 'test', 'JLink_x64.dll') : '');
 const device = argument('device', 'STM32F407VG');
 const speedKHz = Number(argument('speed', '4000'));
@@ -287,10 +287,49 @@ async function main() {
       if (!clear.ok) throw new Error(`clearBreakpoint: ${clear.errorCode}: ${clear.message}`);
       console.log('clearBreakpoint: ok');
     }
+
+    if (useMock) {
+      await request('writeMemory', {
+        address: 0xFFFF0000,
+        bytesBase64: Buffer.from([1]).toString('base64'),
+      });
+      const stateReadError = await request('getState');
+      if (stateReadError.ok || stateReadError.errorCode !== 'TargetStateReadFailed') {
+        throw new Error(`negative JLINK_IsHalted was not propagated: ${JSON.stringify(stateReadError)}`);
+      }
+      console.log('getState: negative JLINK_IsHalted propagated as TargetStateReadFailed');
+      await request('writeMemory', {
+        address: 0xFFFF0000,
+        bytesBase64: Buffer.from([0]).toString('base64'),
+      });
+
+      await request('writeMemory', {
+        address: 0xFFFF0004,
+        bytesBase64: Buffer.from([1]).toString('base64'),
+      });
+      const targetLinkError = await request('getState');
+      if (targetLinkError.ok || targetLinkError.errorCode !== 'TargetStateReadFailed'
+        || targetLinkError.diagnostics?.function !== 'JLINK_CORESIGHT_ReadAPDPReg') {
+        throw new Error(`failed SW-DP health probe was not propagated: ${JSON.stringify(targetLinkError)}`);
+      }
+      console.log('getState: failed SW-DP health probe propagated as TargetStateReadFailed');
+      await request('writeMemory', {
+        address: 0xFFFF0004,
+        bytesBase64: Buffer.from([0]).toString('base64'),
+      });
+    }
   } else {
     const unknown = await request('notARealMethod');
     if (unknown.ok || unknown.errorCode !== 'ProtocolError') throw new Error('protocol error check failed');
     console.log('protocol: malformed method rejected as expected');
+  }
+
+  if (useMock) {
+    const disconnected = await request('disconnect');
+    if (!disconnected.ok || disconnected.message !== 'disconnected and target resumed') {
+      throw new Error(`disconnect did not resume the target: ${JSON.stringify(disconnected)}`);
+    }
+    console.log('disconnect: target resumed after breakpoint cleanup');
   }
 
   await request('shutdown');

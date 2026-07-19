@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { extractEditableWatchValue, parseWatchValueInput } from './watch-value-input';
 
 interface VSCODE_API {
   postMessage(message: any): void;
@@ -9,7 +10,7 @@ let vscode: VSCODE_API;
 try {
   vscode = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : { postMessage: () => {} };
 } catch (err) {
-  console.error('[Ozone] failed to acquire vscode API:', err);
+  console.error('[Orbit] failed to acquire vscode API:', err);
   vscode = { postMessage: () => {} };
 }
 
@@ -52,14 +53,6 @@ interface WatchEntry {
   children?: WatchEntry[];
 }
 
-function extractValue(display: string): string {
-  const m = display.match(/^(0x[0-9A-Fa-f]+)/);
-  if (m) return m[1];
-  const d = display.match(/^\(?(-?\d+)/);
-  if (d) return d[1];
-  return display;
-}
-
 function mapChildren(children: WatchValue[], parentExpr: string): WatchEntry[] {
   return children.map(c => {
     const fullExpr = c.expression.startsWith('[') ? `${parentExpr}${c.expression}` : `${parentExpr}.${c.expression}`;
@@ -87,7 +80,7 @@ interface WatchValue {
 }
 
 export function App() {
-  console.log('[Ozone] App rendering');
+  console.log('[Orbit] App rendering');
   const [state, setState] = useState<DebugState>('disconnected');
   const [activePanel, setActivePanel] = useState<string>('control');
   const [config, setConfig] = useState<FlashConfig>({ device: '', elfPath: '', jlinkPath: '', workspaceRoot: '' });
@@ -476,7 +469,7 @@ function WatchPanel({ watches, setWatches }: {
 
   const startEditing = (key: string, currentValue: string) => {
     setEditingKey(key);
-    setEditValue(extractValue(currentValue));
+    setEditValue(extractEditableWatchValue(currentValue));
   };
 
   const commitEdit = (key: string) => {
@@ -493,11 +486,15 @@ function WatchPanel({ watches, setWatches }: {
     if (!entry) return;
     const raw = editValueRef.current.trim();
     if (raw === '') return;
-    let num: number;
-    if (raw.startsWith('0x') || raw.startsWith('0X')) num = parseInt(raw, 16);
-    else num = parseInt(raw, 10);
-    if (isNaN(num)) return;
-    vscode.postMessage({ command: 'setWatchValue', expression: entry.expression, value: num });
+    const value = parseWatchValueInput(raw);
+    if (value === null) return;
+    vscode.postMessage({
+      command: 'setWatchValue',
+      expression: entry.expression,
+      value,
+      address: entry.address,
+      typeName: entry.typeName,
+    });
   };
 
   const cancelEdit = () => setEditingKey(null);
@@ -693,7 +690,7 @@ function AIPanel() {
 function SettingsPanel({ send }: { send: (cmd: string) => void }) {
   return (
     <div style={{ fontSize: '12px' }}>
-      <p>Configure Ozone paths, AI provider, and debug defaults in VS Code settings.</p>
+      <p>Configure Orbit paths, AI provider, and debug defaults in VS Code settings.</p>
       <button onClick={() => send('openSettings')} style={btnStyle}>
         Open Settings
       </button>

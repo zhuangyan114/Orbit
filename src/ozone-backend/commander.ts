@@ -7,7 +7,17 @@ import {
 import { cancelActiveFlashes, flashElf } from './flasher';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
-import { readElfSymbols, SymbolInfo, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress } from './jlink-symbols';
+import { RttChannelRegistry } from './rtt-channel-registry';
+import { RttControlBlockResolver } from './rtt-control-block-resolver';
+import { RttStreamScheduler } from './rtt-stream-scheduler';
+import { RttTransport } from './rtt-transport';
+import {
+  readElfSymbols, SymbolInfo, preloadLineMappings, preloadAddressMappings,
+  parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, DwarfVariableInfo,
+  DwarfSubprogramInfo, DwarfCallFrameRow, OBJDUMP_EXE, LineMappingByFile,
+  resolveMappedStatementAddress, findDwarfSubprogram, activeDwarfVariables,
+  dwarfLocationExpressionAt, findDwarfCallFrameRow,
+} from './jlink-symbols';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -52,6 +62,20 @@ interface SourceStatementRange {
   endLine: number;
 }
 
+interface DwarfFrameContext {
+  frame: StackFrame;
+  registers: Map<number, number>;
+  pc: number;
+  sp: number;
+  cfa: number;
+}
+
+type EvaluatedDwarfLocation =
+  | { kind: 'memory'; address: number }
+  | { kind: 'register'; register: number; value: number }
+  | { kind: 'value'; value: bigint }
+  | { kind: 'optimizedOut' | 'unavailable' | 'uninitialized' };
+
 export class OzoneBackend {
   private jlink: JLinkDLL = new JLinkDLL();
   private state: TargetState = TargetState.Disconnected;
@@ -64,7 +88,11 @@ export class OzoneBackend {
   private tempBreakpoint: { index: number; addr: number } | null = null;
   private stepOverClearedBps: { index: number; addr: number }[] = [];
   private _lastTempBpAddr = -1;
-  private dwarfInfo: DwarfInfo = { varToType: new Map(), typeDefs: new Map() };
+  private dwarfInfo: DwarfInfo = {
+    varToType: new Map(), typeDefs: new Map(), subprograms: [],
+    locationLists: new Map(), callFrames: [],
+  };
+  private dwarfFrameContexts = new Map<number, DwarfFrameContext>();
   private runtimeCounterWraps = new Map<string, { lastRaw: number; base: number }>();
   private runtimeTaskCounters = new Map<string, number>();
   private stepProfileSeq = 0;
@@ -84,6 +112,46 @@ export class OzoneBackend {
 
   get currentState(): TargetState {
     return this.state;
+  }
+
+  get hasTargetConnection(): boolean {
+    if (this.sessionTarget) {
+      return 'ownerKind' in this.sessionTarget
+        ? this.sessionTarget.ownerKind !== 'none'
+        : true;
+    }
+    return this.jlink.connected
+      && this.state !== TargetState.Disconnected
+      && this.state !== TargetState.Error;
+  }
+
+  getRttTransport(): RttTransport | null {
+    return this.sessionTarget instanceof SessionTargetSelector
+      ? this.sessionTarget.getRttTransport()
+      : null;
+  }
+
+  getRttChannelRegistry(): RttChannelRegistry | null {
+    return this.sessionTarget instanceof SessionTargetSelector
+      ? this.sessionTarget.getRttChannelRegistry()
+      : null;
+  }
+
+  getRttStreamScheduler(): RttStreamScheduler | null {
+    return this.sessionTarget instanceof SessionTargetSelector
+      ? this.sessionTarget.getRttStreamScheduler()
+      : null;
+  }
+
+  /** Returns session-local bounded-queue metrics for RTT stream diagnostics. */
+  getRttStreamMetrics() {
+    return this.getRttStreamScheduler()?.allMetrics() || [];
+  }
+
+  setRttControlBlockResolver(resolver: RttControlBlockResolver | undefined): boolean {
+    return this.sessionTarget instanceof SessionTargetSelector
+      ? this.sessionTarget.setRttControlBlockResolver(resolver)
+      : false;
   }
 
   private async targetHalt(): Promise<boolean> {
@@ -158,12 +226,24 @@ export class OzoneBackend {
   }
 
   private async targetStartRtt(controlBlockAddress?: number): Promise<boolean> {
+    const rttTransport = this.getRttTransport();
+    if (rttTransport) {
+      const result = await rttTransport.start({ controlBlockAddress });
+      if (!result.ok) log.dap(`rtt transport start failed code=${result.error.code} message=${result.error.message}`);
+      return result.ok;
+    }
     if (!this.sessionTarget) return this.jlink.startRtt(controlBlockAddress);
     const result = await this.sessionTarget.startRtt(controlBlockAddress);
     return result.ok;
   }
 
   private async targetStopRtt(): Promise<boolean> {
+    const rttTransport = this.getRttTransport();
+    if (rttTransport) {
+      const result = await rttTransport.stop();
+      if (!result.ok) log.dap(`rtt transport stop failed code=${result.error.code} message=${result.error.message}`);
+      return result.ok;
+    }
     if (!this.sessionTarget) {
       this.jlink.stopRtt();
       return true;
@@ -173,6 +253,41 @@ export class OzoneBackend {
   }
 
   private async targetReadRtt(bufferIndex: number, size: number): Promise<Uint8Array | null> {
+    const streamScheduler = this.getRttStreamScheduler();
+    const channelRegistry = this.getRttChannelRegistry();
+    if (streamScheduler && channelRegistry?.get(bufferIndex)) {
+      const scheduled = await streamScheduler.scheduleRead({ consumer: 'rtt', channelIndex: bufferIndex, size });
+      if (!scheduled.ok) {
+        log.dap(`rtt stream schedule failed channel=${bufferIndex} size=${size} code=${scheduled.error.code} message=${scheduled.error.message}`);
+        // Backpressure is a successful no-data round for the legacy DAP
+        // polling loop. It must not look like a failed RTT owner and cause
+        // repeated startRtt calls. Hard transport/channel failures remain
+        // errors and are surfaced as null below.
+        if (scheduled.error.code === 'QuotaExceeded'
+          || scheduled.error.code === 'QueueFull'
+          || scheduled.error.code === 'Cancelled') {
+          return new Uint8Array();
+        }
+        return null;
+      }
+      const buffered = streamScheduler.readBuffered('rtt', bufferIndex, size);
+      if (!buffered.ok) {
+        log.dap(`rtt stream buffer read failed channel=${bufferIndex} size=${size} code=${buffered.error.code} message=${buffered.error.message}`);
+        if (buffered.error.code === 'QuotaExceeded'
+          || buffered.error.code === 'QueueFull'
+          || buffered.error.code === 'Cancelled') {
+          return new Uint8Array();
+        }
+        return null;
+      }
+      return buffered.data.bytes;
+    }
+    const rttTransport = this.getRttTransport();
+    if (rttTransport) {
+      const result = await rttTransport.read({ channelIndex: bufferIndex, size });
+      if (!result.ok) log.dap(`rtt transport read failed channel=${bufferIndex} size=${size} code=${result.error.code} message=${result.error.message}`);
+      return result.ok ? result.data.bytes : null;
+    }
     if (!this.sessionTarget) return this.jlink.readRtt(bufferIndex, size);
     const result = await this.sessionTarget.readRtt(bufferIndex, size);
     return result.ok && result.data ? result.data.bytes : null;
@@ -202,24 +317,31 @@ export class OzoneBackend {
         case 'disconnect':
           return this.doDisconnect();
         case 'halt':
+          this.dwarfFrameContexts.clear();
           this.clearNativeStopInfo('legacy halt requested');
           return (await this.targetHalt())
             ? (this.state = TargetState.Halted, { ok: true, data: 'Halted' })
             : { ok: false, error: 'Halt failed' };
         case 'run':
+          this.dwarfFrameContexts.clear();
           this.clearNativeStopInfo('legacy run requested');
           return (await this.targetRun())
             ? (this.state = TargetState.Running, { ok: true, data: 'Running' })
             : { ok: false, error: 'Run failed' };
         case 'stepOver':
+          this.dwarfFrameContexts.clear();
           return await this.profileStepCommand('stepOver', () => this.doStepOver());
         case 'stepInto':
+          this.dwarfFrameContexts.clear();
           return await this.profileStepCommand('stepInto', () => this.doStepInto());
         case 'stepIntoInstruction':
+          this.dwarfFrameContexts.clear();
           return await this.doStepIntoInstruction();
         case 'stepOut':
+          this.dwarfFrameContexts.clear();
           return await this.profileStepCommand('stepOut', () => this.doStepOut());
         case 'reset':
+          this.dwarfFrameContexts.clear();
           this.clearNativeStopInfo('reset requested');
           return (await this.targetReset())
             ? { ok: true, data: 'Reset' }
@@ -234,9 +356,9 @@ export class OzoneBackend {
           this.stepOverClearedBps = [];
           return { ok: true, data: 'All breakpoints cleared' };
         case 'getRegisters':
-          return await this.doGetRegisters();
+          return await this.doGetRegisters(command.frame);
         case 'getLocals':
-          return await this.doGetLocals();
+          return await this.doGetLocals(command.frame);
         case 'getCallStack':
           return await this.doGetCallStack();
         case 'readMemory':
@@ -314,7 +436,12 @@ case 'readVariableRuntime':
       return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };
     }
     this.elfPath = command.elfPath;
+    this.dwarfFrameContexts.clear();
     this.symbols = await readElfSymbols(command.elfPath);
+    const rttSymbol = this.symbols.find(symbol => symbol.name === '_SEGGER_RTT' || symbol.name === 'SEGGER_RTT');
+    this.setRttControlBlockResolver(rttSymbol
+      ? new RttControlBlockResolver({ symbols: [rttSymbol] })
+      : undefined);
     this.lineMapCache = await preloadLineMappings(command.elfPath);
     this.sourceStatementRanges.clear();
     const funcAddrs = this.symbols
@@ -497,7 +624,23 @@ case 'readVariableRuntime':
     return { ok: false, error: `Failed to set breakpoint at 0x${addr.toString(16)}` };
   }
 
-  private async doGetRegisters(): Promise<OzoneCommandResult> {
+  private async doGetRegisters(frameId?: number): Promise<OzoneCommandResult> {
+    if (frameId !== undefined) {
+      if (!this.dwarfFrameContexts.has(frameId)) await this.doGetCallStack();
+      const context = this.dwarfFrameContexts.get(frameId);
+      if (!context) return { ok: true, data: [] };
+      const registers: RegisterValue[] = [];
+      for (const [name, index] of Object.entries(REG_INDEXES)) {
+        const value = context.registers.get(index);
+        if (value === undefined) continue;
+        registers.push({
+          name,
+          value,
+          hex: `0x${value.toString(16).toUpperCase().padStart(8, '0')}`,
+        });
+      }
+      return { ok: true, data: registers };
+    }
     const isHalted = this.nativeStepExecutor?.usingNative && this.lastNativeStopInfo
       ? true
       : await this.targetIsHalted();
@@ -545,119 +688,364 @@ case 'readVariableRuntime':
     return { ok: true, data: { name, value: val, hex: `0x${val.toString(16).toUpperCase().padStart(8, '0')}` } };
   }
 
-  private async doGetLocals(): Promise<OzoneCommandResult> {
-    const isHalted = await this.targetIsHalted();
-    if (!isHalted) {
+  private async doGetLocals(frameId = 1): Promise<OzoneCommandResult> {
+    const isHalted = this.nativeStepExecutor?.usingNative && this.lastNativeStopInfo
+      ? true
+      : await this.targetIsHalted();
+    if (!isHalted) return { ok: true, data: [] };
+    if (!this.dwarfFrameContexts.has(frameId)) await this.doGetCallStack();
+    const frame = this.dwarfFrameContexts.get(frameId);
+    if (!frame) return { ok: false, error: `Stack frame ${frameId} is unavailable` };
+
+    const subprogram = findDwarfSubprogram(this.dwarfInfo, frame.pc);
+    if (!subprogram) {
+      log.eval(`locals frame=${frameId} pc=0x${frame.pc.toString(16)} subprogram=unavailable`);
       return { ok: true, data: [] };
     }
+    const definitions = activeDwarfVariables(subprogram, frame.pc);
     const variables: Variable[] = [];
-    const localSymbols = this.symbols.filter(s =>
-      s.type === 'd' || s.type === 'D' || s.type === 'B' || s.type === 'b'
-    );
-
-    for (const sym of localSymbols.slice(0, 50)) {
-      const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
-      const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
-      const readSize = this.getScalarReadSize(sym.size, resolvedType);
-      const raw = await this.targetReadMemory(sym.address, readSize);
-      let value: string;
-      if (raw) {
-        value = this.formatScalarValue(raw, readSize, resolvedType).display;
-      } else {
-        value = `0x${sym.address.toString(16).toUpperCase()}`;
-      }
-      variables.push({
-        name: sym.name,
-        type: sym.type,
-        value,
-        address: sym.address,
-      });
+    for (const definition of definitions) {
+      variables.push(await this.evaluateDwarfLocal(definition, subprogram, frame));
     }
-
+    log.eval(`locals frame=${frameId} pc=0x${frame.pc.toString(16)} function=${subprogram.name} count=${variables.length}`);
     return { ok: true, data: variables };
   }
 
   private async doGetCallStack(): Promise<OzoneCommandResult> {
-    // Wait for CPU to halt if not already halted
     const nativeOwner = this.nativeStepExecutor?.usingNative === true;
     let isHalted = nativeOwner && this.lastNativeStopInfo ? true : await this.targetIsHalted();
-    log.step(`doGetCallStack: isHalted=${isHalted}`);
     if (!isHalted) {
-      for (let i = 0; i < 20; i++) {
-        await new Promise<void>(r => setTimeout(r, 50));
+      for (let attempt = 0; attempt < 20 && !isHalted; attempt++) {
+        await new Promise<void>(resolve => setTimeout(resolve, 50));
         isHalted = nativeOwner && this.lastNativeStopInfo ? true : await this.targetIsHalted();
-        if (isHalted) break;
       }
     }
-    if (!isHalted) {
-      return { ok: true, data: [] };
+    if (!isHalted) return { ok: true, data: [] };
+
+    const registers = new Map<number, number>();
+    for (let index = 0; index <= REG_INDEXES.xPSR; index++) {
+      const value = await this.readRegisterValue(index, index === 13 ? 'SP' : index === 14 ? 'LR' : index === 15 ? 'PC' : `R${index}`);
+      if (value !== null) registers.set(index, value >>> 0);
     }
-    await new Promise<void>(r => setTimeout(r, 100));
-
-    let pc = nativeOwner && this.lastNativeStopInfo
-      ? await this.readRegisterValue(REG_INDEXES.PC, 'PC')
-      : await this.targetReadRegister(REG_INDEXES.PC);
-    let lr = nativeOwner && this.lastNativeStopInfo
-      ? await this.readRegisterValue(REG_INDEXES.LR, 'LR')
-      : await this.targetReadRegister(REG_INDEXES.LR);
-
-    // Retry LR with DAP as readRegister now auto-fallsback to DAP,
-    // but also try once more after a small delay for robustness
-    if (pc !== null && lr === null) {
-      await new Promise<void>(r => setTimeout(r, 50));
-      lr = nativeOwner && this.lastNativeStopInfo
-        ? await this.readRegisterValue(REG_INDEXES.LR, 'LR')
-        : await this.targetReadRegister(REG_INDEXES.LR);
+    const rawPc = registers.get(REG_INDEXES.PC);
+    const sp = registers.get(REG_INDEXES.SP);
+    if (rawPc === undefined || sp === undefined) {
+      this.dwarfFrameContexts.clear();
+      return { ok: false, error: 'Cannot read core registers (PC/SP)' };
     }
 
-    log.dap(`getCallStack PC source=${nativeOwner && this.lastNativeStopInfo ? 'nativeStopInfo/helper' : 'legacyJLinkDLL'} pc=${pc === null ? 'null' : `0x${pc.toString(16)}`}`);
-    log.step(`doGetCallStack pc=${pc !== null ? '0x' + pc.toString(16) : 'null'} lr=${lr !== null ? '0x' + lr.toString(16) : 'null'}`);
-
-    if (pc === null) {
-      process.stderr.write(`[OzoneBackend-DIAG] doGetCallStack: PC read failed (isHalted=${isHalted})\n`);
-      return { ok: false, error: 'Cannot read core registers (PC)' };
-    }
-
-    // If LR still fails, use a fallback value so we can deliver at least one frame
-    if (lr === null) {
-      process.stderr.write(`[OzoneBackend-DIAG] doGetCallStack: LR read failed, using fallback (isHalted=${isHalted} pc=0x${pc.toString(16)})\n`);
-      lr = 0xFFFFFFFF;
-    }
-
+    this.dwarfFrameContexts.clear();
     const frames: StackFrame[] = [];
-    let frameIdCounter = 1;
+    let currentRegisters = registers;
+    let lookupPc = this.normalizeThumbCodeAddress(rawPc, false);
+    for (let level = 0; level < 32; level++) {
+      const context = this.createDwarfFrameContext(level, lookupPc, currentRegisters);
+      if (!context) break;
+      frames.push(context.frame);
+      this.dwarfFrameContexts.set(context.frame.id, context);
+      const caller = await this.unwindDwarfFrame(context);
+      if (!caller) break;
+      lookupPc = caller.pc;
+      currentRegisters = caller.registers;
+    }
+    log.step(`stackTrace frames=${frames.map(frame => `${frame.level}:${frame.function}@0x${frame.address.toString(16)}`).join(' <- ')}`);
+    return { ok: true, data: frames };
+  }
 
-    const sourceHint = nativeOwner && this.lastNativeStopInfo?.pcAfter === pc
-      ? this.lastNativeStopInfo.sourceHint
+  private normalizeThumbCodeAddress(address: number, returnAddress: boolean): number {
+    const canonical = (address & ~1) >>> 0;
+    return returnAddress && canonical > 0 ? (canonical - 1) >>> 0 : canonical;
+  }
+
+  private createDwarfFrameContext(
+    level: number,
+    pc: number,
+    registers: Map<number, number>,
+  ): DwarfFrameContext | null {
+    const resolvedFunctionName = this.resolveSymbolName(pc) || findDwarfSubprogram(this.dwarfInfo, pc)?.name;
+    if (!resolvedFunctionName && level > 0) return null;
+    const functionName = resolvedFunctionName || `0x${pc.toString(16)}`;
+    const row = findDwarfCallFrameRow(this.dwarfInfo.callFrames, pc);
+    const cfaBase = row ? registers.get(row.cfaRegister) : registers.get(REG_INDEXES.SP);
+    if (cfaBase === undefined) return null;
+    const cfa = ((cfaBase + (row?.cfaOffset || 0)) >>> 0);
+    const nativeStopInfo = this.lastNativeStopInfo;
+    const sourceHint = level === 0
+      && nativeStopInfo
+      && nativeStopInfo.pcAfter === registers.get(REG_INDEXES.PC)
+      ? nativeStopInfo.sourceHint
       : undefined;
-    const pcLoc = sourceHint
-      ? { file: sourceHint.file, line: sourceHint.line, func: this.resolveSymbolName(pc) || `0x${pc.toString(16)}` }
+    const location = sourceHint
+      ? { file: sourceHint.file, line: sourceHint.line, func: functionName }
       : this.resolveAddressLoc(pc);
-    log.step(
-      `stackTrace frame0 pc=0x${pc.toString(16)} pcSource=${nativeOwner && this.lastNativeStopInfo ? 'native' : 'legacy'}`
-      + ` sourceSource=${sourceHint ? sourceHint.reason : 'addressMapping'}`
-      + ` source=${pcLoc?.file || 'unknown'}:${pcLoc?.line || 0}`,
-    );
-    frames.push({
-      id: frameIdCounter++, level: 0,
-      function: pcLoc?.func || this.resolveSymbolName(pc) || `0x${pc.toString(16)}`,
-      file: pcLoc?.file || '',
-      line: pcLoc?.line || 0,
+    const frame: StackFrame = {
+      id: level + 1,
+      level,
+      function: functionName,
+      file: location?.file || '',
+      line: location?.line || 0,
       address: pc,
-    });
+    };
+    return { frame, registers, pc, sp: registers.get(REG_INDEXES.SP) || cfa, cfa };
+  }
 
-    if (lr !== 0xFFFFFFFF) {
-      const lrLoc = this.resolveAddressLoc(lr);
-      frames.push({
-        id: frameIdCounter++, level: 1,
-        function: lrLoc?.func || this.resolveSymbolName(lr) || `0x${lr.toString(16)}`,
-        file: lrLoc?.file || '',
-        line: lrLoc?.line || 0,
-        address: lr,
-      });
+  private async unwindDwarfFrame(context: DwarfFrameContext): Promise<{ pc: number; registers: Map<number, number> } | null> {
+    const row = findDwarfCallFrameRow(this.dwarfInfo.callFrames, context.pc);
+    if (!row || context.cfa < context.sp || context.cfa - context.sp > 0x10000) return null;
+    // Only callee-saved registers may be carried across a Cortex-M call without an
+    // explicit CFI rule. Volatile registers belong to the younger frame and must
+    // never be reused to evaluate a caller's locals.
+    const callerRegisters = new Map<number, number>();
+    for (let register = 4; register <= 11; register++) {
+      const value = context.registers.get(register);
+      if (value !== undefined) callerRegisters.set(register, value);
+    }
+    for (const [register, rule] of row.registerRules) {
+      if (rule.kind === 'same') {
+        const value = context.registers.get(register);
+        if (value !== undefined) callerRegisters.set(register, value);
+        continue;
+      }
+      if (rule.kind === 'undefined') {
+        callerRegisters.delete(register);
+        continue;
+      }
+      if (rule.kind === 'register' && rule.value !== undefined) {
+        const value = context.registers.get(rule.value);
+        if (value === undefined) return null;
+        callerRegisters.set(register, value);
+      } else if (rule.kind === 'cfaOffset' && rule.value !== undefined) {
+        const value = await this.readTargetU32((context.cfa + rule.value) >>> 0);
+        if (value === null) return null;
+        callerRegisters.set(register, value);
+      }
+    }
+    const rawReturnAddress = callerRegisters.get(REG_INDEXES.LR)
+      ?? (context.frame.level === 0 ? context.registers.get(REG_INDEXES.LR) : undefined);
+    if (rawReturnAddress === undefined || this.isCortexMExceptionReturn(rawReturnAddress)) return null;
+    const callerPc = this.normalizeThumbCodeAddress(rawReturnAddress, true);
+    if (callerPc === context.pc || (!this.resolveSymbolName(callerPc) && !findDwarfSubprogram(this.dwarfInfo, callerPc))) return null;
+    callerRegisters.set(REG_INDEXES.SP, context.cfa);
+    callerRegisters.set(REG_INDEXES.PC, callerPc);
+    return { pc: callerPc, registers: callerRegisters };
+  }
+
+  private isCortexMExceptionReturn(address: number): boolean {
+    return (address & 0xFFFFFF00) === 0xFFFFFF00;
+  }
+
+  private async readTargetU32(address: number): Promise<number | null> {
+    const raw = await this.targetReadMemory(address, 4);
+    if (!raw || raw.length < 4) return null;
+    return new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint32(0, true);
+  }
+
+  private dwarfFrameBase(subprogram: DwarfSubprogramInfo, frame: DwarfFrameContext): number | undefined {
+    const expression = dwarfLocationExpressionAt(subprogram.frameBase, frame.pc, this.dwarfInfo.locationLists);
+    if (!expression || /DW_OP_call_frame_cfa/.test(expression)) return frame.cfa;
+    const register = expression.match(/DW_OP_reg(\d+)/);
+    if (register) return frame.registers.get(parseInt(register[1], 10));
+    const baseRegister = expression.match(/DW_OP_breg(\d+)[^:]*:\s*(-?\d+)/);
+    if (baseRegister) {
+      const value = frame.registers.get(parseInt(baseRegister[1], 10));
+      return value === undefined ? undefined : (value + parseInt(baseRegister[2], 10)) >>> 0;
+    }
+    return undefined;
+  }
+
+  private evaluateDwarfLocation(
+    definition: DwarfVariableInfo,
+    subprogram: DwarfSubprogramInfo,
+    frame: DwarfFrameContext,
+  ): EvaluatedDwarfLocation {
+    if (!definition.location) return { kind: 'optimizedOut' };
+    const expression = dwarfLocationExpressionAt(definition.location, frame.pc, this.dwarfInfo.locationLists);
+    if (!expression) return { kind: 'optimizedOut' };
+    if (/DW_OP_GNU_uninit/.test(expression)) return { kind: 'uninitialized' };
+    if (/DW_OP_piece|DW_OP_bit_piece|DW_OP_entry_value|DW_OP_implicit_pointer/.test(expression)) return { kind: 'unavailable' };
+    const frameOffset = expression.match(/DW_OP_fbreg:\s*(-?\d+)/);
+    if (frameOffset) {
+      const frameBase = this.dwarfFrameBase(subprogram, frame);
+      return frameBase === undefined
+        ? { kind: 'unavailable' }
+        : { kind: 'memory', address: (frameBase + parseInt(frameOffset[1], 10)) >>> 0 };
+    }
+    const address = expression.match(/DW_OP_addr:\s*(?:0x)?([0-9a-fA-F]+)/);
+    if (address) return { kind: 'memory', address: parseInt(address[1], 16) >>> 0 };
+    const baseRegister = expression.match(/DW_OP_breg(\d+)[^:]*:\s*(-?\d+)/);
+    if (baseRegister) {
+      const registerValue = frame.registers.get(parseInt(baseRegister[1], 10));
+      return registerValue === undefined
+        ? { kind: 'unavailable' }
+        : { kind: 'memory', address: (registerValue + parseInt(baseRegister[2], 10)) >>> 0 };
+    }
+    const register = expression.match(/DW_OP_reg(\d+)/);
+    if (register) {
+      const registerNumber = parseInt(register[1], 10);
+      const value = frame.registers.get(registerNumber);
+      return value === undefined
+        ? { kind: 'unavailable' }
+        : { kind: 'register', register: registerNumber, value };
+    }
+    const constant = expression.match(/DW_OP_consts?:\s*(-?(?:0x[0-9a-fA-F]+|\d+))/);
+    if (constant && /DW_OP_stack_value/.test(expression)) return { kind: 'value', value: BigInt(constant[1]) };
+    if (/DW_OP_call_frame_cfa/.test(expression)) return { kind: 'memory', address: frame.cfa };
+    return { kind: 'unavailable' };
+  }
+
+  private async evaluateDwarfLocal(
+    definition: DwarfVariableInfo,
+    subprogram: DwarfSubprogramInfo,
+    frame: DwarfFrameContext,
+  ): Promise<Variable> {
+    const location = this.evaluateDwarfLocation(definition, subprogram, frame);
+    return this.materializeDwarfVariable(definition.name, definition.typeOffset, location, 0, new Set());
+  }
+
+  private async materializeDwarfVariable(
+    name: string,
+    typeOffset: string,
+    location: EvaluatedDwarfLocation,
+    depth: number,
+    visited: Set<string>,
+  ): Promise<Variable> {
+    const resolved = this.resolveDwarfType(typeOffset);
+    const typeName = this.getDwarfTypeName(typeOffset) || resolved?.typeName || resolved?.name || '<unknown>';
+    if (location.kind === 'optimizedOut') return { name, type: typeName, value: '<optimized out>' };
+    if (location.kind === 'unavailable') return { name, type: typeName, value: '<unavailable>' };
+    if (location.kind === 'uninitialized') return { name, type: typeName, value: '<uninitialized>' };
+    if (!resolved) return { name, type: typeName, value: '<unavailable>' };
+    const address = location.kind === 'memory' ? location.address : undefined;
+    if (depth > 8) return { name, type: typeName, value: '<unavailable>', address };
+
+    if (resolved.kind === 'struct' || resolved.kind === 'union') {
+      if (address === undefined) return { name, type: typeName, value: '<unavailable>' };
+      const visitKey = `${typeOffset}@${address}`;
+      if (visited.has(visitKey)) return { name, type: typeName, value: '<unavailable>', address };
+      const nextVisited = new Set(visited).add(visitKey);
+      const children: Variable[] = [];
+      for (const field of (resolved.fields || []).slice(0, 128)) {
+        children.push(await this.materializeDwarfVariable(
+          field.name,
+          field.typeOffset,
+          { kind: 'memory', address: (address + field.byteOffset) >>> 0 },
+          depth + 1,
+          nextVisited,
+        ));
+      }
+      return {
+        name,
+        type: typeName,
+        value: resolved.kind === 'union' ? 'union {...}' : '{...}',
+        address,
+        children,
+      };
     }
 
-    return { ok: true, data: frames };
+    if (resolved.kind === 'array') {
+      if (address === undefined || !resolved.typeOffset) return { name, type: typeName, value: '<unavailable>', address };
+      const count = Math.max(0, resolved.arrayCount || 0);
+      const elementSize = this.dwarfTypeByteSize(resolved.typeOffset, new Set());
+      if (!elementSize || !count) return { name, type: typeName, value: '<unavailable>', address };
+      const lowerBound = resolved.arrayLowerBound || 0;
+      const expandedCount = Math.min(count, 128);
+      const children: Variable[] = [];
+      for (let index = 0; index < expandedCount; index++) {
+        children.push(await this.materializeDwarfVariable(
+          `[${index + lowerBound}]`,
+          resolved.typeOffset,
+          { kind: 'memory', address: (address + index * elementSize) >>> 0 },
+          depth + 1,
+          visited,
+        ));
+      }
+      if (expandedCount < count) children.push({ name: `[${expandedCount}..${count - 1}]`, type: '', value: '<unavailable>' });
+      return { name, type: typeName, value: `[${count}]`, address, children };
+    }
+
+    const byteSize = Math.max(1, Math.min(resolved.kind === 'pointer' ? 4 : resolved.byteSize || 4, 8));
+    let raw: Uint8Array;
+    if (location.kind === 'memory') {
+      const bytes = await this.targetReadMemory(location.address, byteSize);
+      if (!bytes || bytes.length < byteSize) return { name, type: typeName, value: '<unavailable>', address };
+      raw = bytes;
+    } else {
+      if (location.kind !== 'register' && location.kind !== 'value') {
+        return { name, type: typeName, value: '<unavailable>', address };
+      }
+      const value = location.kind === 'register' ? BigInt(location.value >>> 0) : location.value;
+      raw = new Uint8Array(byteSize);
+      let remaining = BigInt.asUintN(byteSize * 8, value);
+      for (let index = 0; index < byteSize; index++) {
+        raw[index] = Number(remaining & 0xFFn);
+        remaining >>= 8n;
+      }
+    }
+    const value = this.formatDwarfLocalScalar(raw, resolved);
+    if (resolved.kind === 'pointer') {
+      let pointerValue = 0n;
+      for (let index = raw.length - 1; index >= 0; index--) {
+        pointerValue = (pointerValue << 8n) | BigInt(raw[index]);
+      }
+      const pointerAddress = Number(BigInt.asUintN(32, pointerValue));
+      let children: Variable[] | undefined;
+      if (pointerAddress !== 0 && resolved.typeOffset) {
+        const pointeeType = this.resolveDwarfType(resolved.typeOffset);
+        if (pointeeType && (
+          pointeeType.kind === 'struct'
+          || pointeeType.kind === 'union'
+          || pointeeType.kind === 'array'
+        )) {
+          const pointee = await this.materializeDwarfVariable(
+            `*${name}`,
+            resolved.typeOffset,
+            { kind: 'memory', address: pointerAddress },
+            depth + 1,
+            visited,
+          );
+          children = pointee.children?.length ? pointee.children : undefined;
+        }
+      }
+      return {
+        name,
+        type: typeName,
+        value,
+        address: pointerAddress === 0 ? undefined : pointerAddress,
+        children,
+      };
+    }
+    return { name, type: typeName, value, address };
+  }
+
+  private dwarfTypeByteSize(typeOffset: string, visited: Set<string>): number {
+    if (visited.has(typeOffset)) return 0;
+    visited.add(typeOffset);
+    const resolved = this.resolveDwarfType(typeOffset);
+    if (!resolved) return 0;
+    if (resolved.kind === 'array' && resolved.typeOffset) {
+      return (resolved.arrayCount || 0) * this.dwarfTypeByteSize(resolved.typeOffset, visited);
+    }
+    return resolved.kind === 'pointer' ? 4 : resolved.byteSize || 0;
+  }
+
+  private formatDwarfLocalScalar(raw: Uint8Array, type: ReturnType<OzoneBackend['resolveDwarfType']>): string {
+    if (!type || raw.length === 0) return '<unavailable>';
+    if (this.isFloatType(type) && (raw.length === 4 || raw.length === 8)) {
+      const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+      return String(raw.length === 4 ? view.getFloat32(0, true) : view.getFloat64(0, true));
+    }
+    let unsigned = 0n;
+    for (let index = raw.length - 1; index >= 0; index--) unsigned = (unsigned << 8n) | BigInt(raw[index]);
+    if (type.kind === 'pointer') return `0x${unsigned.toString(16).toUpperCase().padStart(8, '0')}`;
+    const encoding = (type.encoding || '').toLowerCase();
+    const signed = encoding.includes('signed') && !encoding.includes('unsigned');
+    const value = signed ? BigInt.asIntN(raw.length * 8, unsigned) : unsigned;
+    if (type.kind === 'enum') {
+      const label = type.enumerators?.get(Number(value));
+      return label ? `${label} (${value})` : String(value);
+    }
+    if (encoding.includes('boolean')) return unsigned === 0n ? 'false' : 'true';
+    return String(value);
   }
 
   private async readRegisterValue(index: number, name: string): Promise<number | null> {
@@ -1923,77 +2311,104 @@ case 'readVariableRuntime':
   private prepareFastDataSampling(expressions: string[]): FastDataSamplePlanItem[] {
     return expressions.map(expression => {
       const spec = this.resolveFastDataSampleSpec(expression);
-      return spec ? { expression, spec } : { expression, error: 'Fast sampling supports scalar globals, scalar array elements, and scalar struct fields only' };
+      return spec ? { expression, spec } : {
+        expression,
+        error: 'Fast sampling supports scalar globals and scalar fields/array elements with inline nested paths only',
+      };
     });
   }
 
   private resolveFastDataSampleSpec(expression: string): FastDataSampleSpec | null {
-    const bracketMatch = expression.match(/^(\w+)\[(\d+)\]$/);
-    if (bracketMatch) {
-      const baseName = bracketMatch[1];
-      const index = parseInt(bracketMatch[2], 10);
+    const pathMatch = expression.match(/^([A-Za-z_]\w*)((?:(?:\.|->)[A-Za-z_]\w*|\[\d+\])+)$/);
+    if (pathMatch) {
+      const [, baseName, suffix] = pathMatch;
       const baseSym = this.findSymbolByName(baseName);
       if (!baseSym) return null;
-      const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
-      const arrayType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
-      if (!arrayType || arrayType.kind !== 'array' || index < 0 || (arrayType.arrayCount !== undefined && index >= arrayType.arrayCount)) return null;
-      const elemType = arrayType.typeOffset ? this.resolveDwarfType(arrayType.typeOffset) : null;
-      if (!this.isFastScalarType(elemType)) return null;
-      const size = this.getScalarReadSize(undefined, elemType);
-      return {
-        expression,
-        address: baseSym.address + index * size,
-        size,
-        typeName: arrayType.typeOffset ? this.getDwarfTypeName(arrayType.typeOffset) : elemType?.typeName || elemType?.name || '',
-        isFloat: this.isFloatType(elemType),
-        signed: this.isSignedIntegerType(elemType),
-      };
-    }
 
-    const fieldMatch = expression.match(/^(\w+)((?:\.|->)[A-Za-z_]\w+)+$/);
-    if (fieldMatch) {
-      const [, baseName] = fieldMatch;
-      const baseSym = this.findSymbolByName(baseName);
-      if (!baseSym) return null;
-      const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
-      const baseType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
-      let currentType = baseType;
+      const segments: Array<
+        | { kind: 'field'; operator: '.' | '->'; name: string }
+        | { kind: 'index'; index: number }
+      > = [];
+      const segmentPattern = /(\.|->)([A-Za-z_]\w*)|\[(\d+)\]/g;
+      let consumed = 0;
+      for (const match of suffix.matchAll(segmentPattern)) {
+        if (match.index !== consumed) return null;
+        consumed += match[0].length;
+        if (match[2]) {
+          segments.push({
+            kind: 'field',
+            operator: match[1] as '.' | '->',
+            name: match[2],
+          });
+        } else {
+          segments.push({ kind: 'index', index: parseInt(match[3], 10) });
+        }
+      }
+      if (consumed !== suffix.length || segments.length === 0) return null;
+
+      const baseTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
+      let currentTypeOffset = baseTypeOffset;
+      let currentType = baseTypeOffset ? this.resolveDwarfType(baseTypeOffset) : null;
       let pointerAddress: number | undefined;
+      const pointerOffsets: number[] = [];
       let fieldOffset = 0;
+      let rootPointerArrowAvailable = false;
       if (currentType?.kind === 'pointer') {
         if (!currentType.typeOffset) return null;
         pointerAddress = baseSym.address;
+        rootPointerArrowAvailable = true;
+        currentTypeOffset = currentType.typeOffset;
         currentType = this.resolveDwarfType(currentType.typeOffset);
       }
 
-      const segments = [...expression.slice(baseName.length).matchAll(/(\.|->)([A-Za-z_]\w*)/g)];
-      for (let index = 0; index < segments.length; index++) {
-        const [, operator, fieldName] = segments[index];
-        if (operator === '->' && pointerAddress === undefined) return null;
-        if (currentType?.kind !== 'struct' || !currentType.fields) return null;
-        const field = currentType.fields.find(candidate => candidate.name === fieldName);
-        if (!field) return null;
-        const fieldType = this.resolveDwarfType(field.typeOffset);
-        fieldOffset += field.byteOffset;
-
-        if (index < segments.length - 1) {
-          if (fieldType?.kind !== 'struct') return null;
-          currentType = fieldType;
+      for (const segment of segments) {
+        if (segment.kind === 'index') {
+          if (currentType?.kind !== 'array' || !currentType.typeOffset) return null;
+          const lowerBound = currentType.arrayLowerBound ?? 0;
+          const count = currentType.arrayCount;
+          if (segment.index < lowerBound || (count !== undefined && segment.index >= lowerBound + count)) return null;
+          const elementSize = this.dwarfTypeByteSize(currentType.typeOffset, new Set());
+          if (elementSize <= 0) return null;
+          fieldOffset += (segment.index - lowerBound) * elementSize;
+          currentTypeOffset = currentType.typeOffset;
+          currentType = this.resolveDwarfType(currentType.typeOffset);
           continue;
         }
 
-        if (!this.isFastScalarType(fieldType)) return null;
-        const size = this.getScalarReadSize(undefined, fieldType);
-        return {
-          expression,
-          address: pointerAddress === undefined ? baseSym.address + fieldOffset : pointerAddress,
-          size,
-          ...(pointerAddress === undefined ? {} : { pointerAddress, pointeeOffset: fieldOffset }),
-          typeName: this.getDwarfTypeName(field.typeOffset) || fieldType?.typeName || fieldType?.name || '',
-          isFloat: this.isFloatType(fieldType),
-          signed: this.isSignedIntegerType(fieldType),
-        };
+        if (segment.operator === '->' && currentType?.kind !== 'pointer' && !rootPointerArrowAvailable) return null;
+        if (currentType?.kind === 'pointer') {
+          if (!currentType.typeOffset) return null;
+          if (pointerAddress === undefined) pointerAddress = baseSym.address + fieldOffset;
+          pointerOffsets.push(fieldOffset);
+          fieldOffset = 0;
+          currentTypeOffset = currentType.typeOffset;
+          currentType = this.resolveDwarfType(currentType.typeOffset);
+        }
+        rootPointerArrowAvailable = false;
+        if ((currentType?.kind !== 'struct' && currentType?.kind !== 'union') || !currentType.fields) return null;
+        const field = currentType.fields.find(candidate => candidate.name === segment.name);
+        if (!field) return null;
+        fieldOffset += field.byteOffset;
+        currentTypeOffset = field.typeOffset;
+        currentType = this.resolveDwarfType(field.typeOffset);
       }
+
+      if (!this.isFastScalarType(currentType)) return null;
+      const size = this.getScalarReadSize(undefined, currentType);
+      if (pointerAddress !== undefined) pointerOffsets.push(fieldOffset);
+      return {
+        expression,
+        address: pointerAddress === undefined ? baseSym.address + fieldOffset : pointerAddress,
+        size,
+        ...(pointerAddress === undefined ? {} : {
+          pointerAddress,
+          ...(pointerOffsets.length === 1 ? { pointeeOffset: pointerOffsets[0] } : {}),
+          pointerOffsets,
+        }),
+        typeName: currentTypeOffset ? this.getDwarfTypeName(currentTypeOffset) : currentType?.typeName || currentType?.name || '',
+        isFloat: this.isFloatType(currentType),
+        signed: this.isSignedIntegerType(currentType),
+      };
     }
 
     const sym = this.findSymbolByName(expression);
@@ -2020,7 +2435,7 @@ case 'readVariableRuntime':
 
   private isFastScalarType(info: { kind?: string; byteSize?: number } | null): boolean {
     if (!info) return true;
-    if (info.kind === 'struct' || info.kind === 'array') return false;
+    if (info.kind === 'struct' || info.kind === 'union' || info.kind === 'array') return false;
     const size = info.byteSize || 4;
     return size > 0 && size <= 8;
   }
@@ -2028,58 +2443,69 @@ case 'readVariableRuntime':
   private async readFastDataSampling(specs: FastDataSampleSpec[]): Promise<WatchValue[]> {
     const rawByIndex: Array<Uint8Array | null> = Array(specs.length).fill(null);
     const resolvedAddresses = specs.map(spec => spec.address);
-    const initialReads = specs.map(spec => ({
-      address: spec.pointerAddress ?? spec.address,
-      size: spec.pointerAddress === undefined ? spec.size : 4,
-    }));
+    const pointerOffsetsByIndex = specs.map(spec => spec.pointerOffsets
+      ?? (spec.pointerAddress === undefined ? [] : [spec.pointeeOffset ?? 0]));
+    const readBatch = async (reads: Array<{ address: number; size: number }>): Promise<Array<Uint8Array | null>> => {
+      const result = Array<Uint8Array | null>(reads.length).fill(null);
+      if (reads.length === 0) return result;
 
-    if (this.sessionTarget && specs.length > 0) {
-      const result = await this.sessionTarget.readMemoryBatch(
-        initialReads,
-        { priority: 'timeline', coalesceKey: 'fast-data-sampling' },
-      );
-      if (result.ok && result.data) {
-        for (let index = 0; index < specs.length; index++) rawByIndex[index] = result.data.reads[index]?.bytes || null;
-      }
-    }
-    for (let index = 0; index < specs.length; index++) {
-      if (rawByIndex[index]) continue;
-      const initial = initialReads[index];
-      rawByIndex[index] = await this.targetReadMemory(initial.address, initial.size, 'timeline');
-    }
-
-    const indirectReads: Array<{ index: number; address: number; size: number }> = [];
-    for (let index = 0; index < specs.length; index++) {
-      const spec = specs[index];
-      if (spec.pointerAddress === undefined) continue;
-      const pointerBytes = rawByIndex[index];
-      const pointer = pointerBytes ? this.readUnsignedLittleEndian(pointerBytes, pointerBytes.length) >>> 0 : 0;
-      if (!pointer || spec.pointeeOffset === undefined) {
-        rawByIndex[index] = null;
-        continue;
-      }
-      const address = (pointer + spec.pointeeOffset) >>> 0;
-      resolvedAddresses[index] = address;
-      rawByIndex[index] = null;
-      indirectReads.push({ index, address, size: spec.size });
-    }
-
-    if (this.sessionTarget && indirectReads.length > 0) {
-      const result = await this.sessionTarget.readMemoryBatch(
-        indirectReads.map(read => ({ address: read.address, size: read.size })),
-        { priority: 'timeline', coalesceKey: 'fast-data-sampling' },
-      );
-      if (result.ok && result.data) {
-        for (let index = 0; index < indirectReads.length; index++) {
-          rawByIndex[indirectReads[index].index] = result.data.reads[index]?.bytes || null;
+      if (this.sessionTarget) {
+        const batch = await this.sessionTarget.readMemoryBatch(
+          reads,
+          { priority: 'timeline', coalesceKey: 'fast-data-sampling' },
+        );
+        if (batch.ok && batch.data) {
+          for (let index = 0; index < reads.length; index++) result[index] = batch.data.reads[index]?.bytes || null;
         }
+      }
+      for (let index = 0; index < reads.length; index++) {
+        if (result[index]) continue;
+        result[index] = await this.targetReadMemory(reads[index].address, reads[index].size, 'timeline');
+      }
+      return result;
+    };
+
+    const initialReads = specs.map((spec, index) => ({
+      address: pointerOffsetsByIndex[index].length > 0 ? (spec.pointerAddress ?? spec.address) : spec.address,
+      size: pointerOffsetsByIndex[index].length > 0 ? 4 : spec.size,
+    }));
+    const initialRaw = await readBatch(initialReads);
+    const pendingPointers: Array<{ index: number; stage: number; bytes: Uint8Array | null }> = [];
+    for (let index = 0; index < specs.length; index++) {
+      if (pointerOffsetsByIndex[index].length === 0) {
+        rawByIndex[index] = initialRaw[index];
       } else {
-        for (const read of indirectReads) rawByIndex[read.index] = null;
+        pendingPointers.push({ index, stage: 0, bytes: initialRaw[index] });
       }
     }
-    for (const read of indirectReads) {
-      if (rawByIndex[read.index]) continue;
-      rawByIndex[read.index] = await this.targetReadMemory(read.address, read.size, 'timeline');
+
+    let pending = pendingPointers;
+    while (pending.length > 0) {
+      const reads: Array<{ address: number; size: number }> = [];
+      const metadata: Array<{ index: number; stage: number; final: boolean }> = [];
+      for (const item of pending) {
+        const offsets = pointerOffsetsByIndex[item.index];
+        const pointer = item.bytes
+          ? this.readUnsignedLittleEndian(item.bytes, item.bytes.length) >>> 0
+          : 0;
+        if (!pointer || item.stage >= offsets.length) {
+          rawByIndex[item.index] = null;
+          continue;
+        }
+        const address = (pointer + offsets[item.stage]) >>> 0;
+        resolvedAddresses[item.index] = address;
+        const final = item.stage + 1 === offsets.length;
+        reads.push({ address, size: final ? specs[item.index].size : 4 });
+        metadata.push({ index: item.index, stage: item.stage + 1, final });
+      }
+      const nextRaw = await readBatch(reads);
+      const nextPending: Array<{ index: number; stage: number; bytes: Uint8Array | null }> = [];
+      for (let index = 0; index < metadata.length; index++) {
+        const item = metadata[index];
+        if (item.final) rawByIndex[item.index] = nextRaw[index];
+        else nextPending.push({ index: item.index, stage: item.stage, bytes: nextRaw[index] });
+      }
+      pending = nextPending;
     }
 
     const results: WatchValue[] = [];
@@ -2251,8 +2677,8 @@ case 'readVariableRuntime':
     const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
     if (varTypeOffset) {
       log.eval(`doEvaluateExpression: resolvedType kind=${resolvedType?.kind} name=${resolvedType?.name} fields=${resolvedType?.fields?.length || 0}`);
-      if (resolvedType && resolvedType.kind === 'struct' && resolvedType.fields && resolvedType.fields.length > 0) {
-        const structTypeName = resolvedType.typeName || resolvedType.name || 'struct';
+      if (resolvedType && (resolvedType.kind === 'struct' || resolvedType.kind === 'union') && resolvedType.fields && resolvedType.fields.length > 0) {
+        const structTypeName = resolvedType.typeName || resolvedType.name || (resolvedType.kind === 'union' ? 'union' : 'struct');
         if (!this.shouldExpandWatchNode(expression, watchContext)) {
           return {
             ok: true,
@@ -2321,7 +2747,7 @@ case 'readVariableRuntime':
           for (let i = 0; i < count; i++) {
             const elemAddr = sym.address + i * elemSize;
             const elemRawOffset = i * elemSize;
-            if (elemType?.kind === 'struct' && elemType.fields) {
+            if ((elemType?.kind === 'struct' || elemType?.kind === 'union') && elemType.fields) {
               const childRaw = raw.slice(elemRawOffset, elemRawOffset + elemSize);
               const elementExpression = `${expression}[${i}]`;
               const structChildren = this.shouldExpandWatchNode(elementExpression, watchContext)
@@ -2420,7 +2846,8 @@ case 'readVariableRuntime':
     const pointerHasChildren = resolvedType?.kind === 'pointer'
       && !!resolvedType.typeOffset
       && this.pointerTargetHasChildren(resolvedType.typeOffset);
-    const pointerChildren = pointerHasChildren && value && this.shouldExpandWatchNode(expression, watchContext)
+    const pointerValueHasChildren = pointerHasChildren && value !== 0;
+    const pointerChildren = pointerValueHasChildren && this.shouldExpandWatchNode(expression, watchContext)
       ? await this.evaluatePointerChildren(value, resolvedType!.typeOffset!, expression, 1, watchContext)
       : undefined;
 
@@ -2437,7 +2864,7 @@ case 'readVariableRuntime':
         hex: hexValue,
         address: sym.address,
         typeName,
-        hasChildren: pointerHasChildren,
+        hasChildren: pointerValueHasChildren,
         children: pointerChildren,
       } as WatchValue,
     };
@@ -2654,7 +3081,7 @@ case 'readVariableRuntime':
     const typeName = this.getDwarfTypeName(typeOffset);
     const offset = typeOffset;
     const resolved = offset ? this.resolveDwarfType(offset) : null;
-    if (!resolved || resolved.kind !== 'struct' || !resolved.fields || !resolved.byteSize) return null;
+    if (!resolved || (resolved.kind !== 'struct' && resolved.kind !== 'union') || !resolved.fields || !resolved.byteSize) return null;
     const raw = await this.targetReadMemory(address, resolved.byteSize);
     if (!raw) return null;
     const children = await this.evaluateStructFields(raw, resolved.fields, resolved.typeDefs || this.dwarfInfo.typeDefs, address, expression, 0);
@@ -2777,7 +3204,7 @@ case 'readVariableRuntime':
     return dv.getFloat32(0, true);
   }
 
-  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number; encoding?: string } | null {
+  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number; arrayLowerBound?: number; encoding?: string; enumerators?: Map<number, string> } | null {
     if (!visited) visited = new Set();
     if (visited.has(offset)) return null;
     visited.add(offset);
@@ -2788,10 +3215,14 @@ case 'readVariableRuntime':
       if (resolved) return { ...resolved, typeName: info.name || resolved.typeName || resolved.name };
       return { kind: info.kind, name: info.name, byteSize: 0, typeName: info.name };
     }
-    if (info.kind === 'struct') {
-      return { kind: 'struct', name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
+    if (info.kind === 'struct' || info.kind === 'union') {
+      return { kind: info.kind, name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
     }
-    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount, encoding: info.encoding };
+    return {
+      kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name,
+      typeOffset: info.typeOffset, arrayCount: info.arrayCount, arrayLowerBound: info.arrayLowerBound,
+      encoding: info.encoding, enumerators: info.enumerators,
+    };
   }
 
   private formatDwarfTypeName(offset?: string, visited: Set<string> = new Set()): string {
@@ -2835,7 +3266,7 @@ case 'readVariableRuntime':
 
   private pointerTargetHasChildren(typeOffset: string): boolean {
     const resolved = this.resolveDwarfType(typeOffset);
-    return resolved?.kind === 'struct' && !!resolved.fields?.length;
+    return (resolved?.kind === 'struct' || resolved?.kind === 'union') && !!resolved.fields?.length;
   }
 
   private async evaluateStructFields(
@@ -2866,7 +3297,7 @@ case 'readVariableRuntime':
   ): Promise<WatchValue[] | undefined> {
     if (_depth > OzoneBackend.MAX_POINTER_DEPTH) return undefined;
     const pointee = this.resolveDwarfType(typeOffset);
-    if (!pointee || pointee.kind !== 'struct' || !pointee.fields || !pointee.byteSize) return undefined;
+    if (!pointee || (pointee.kind !== 'struct' && pointee.kind !== 'union') || !pointee.fields || !pointee.byteSize) return undefined;
     const raw = await this.targetReadMemory(address, pointee.byteSize);
     if (!raw) return undefined;
     return this.evaluateStructFields(raw, pointee.fields, pointee.typeDefs || this.dwarfInfo.typeDefs, address, parentExpr, _depth, watchContext);
@@ -2889,16 +3320,17 @@ case 'readVariableRuntime':
     const resolvedByteSize = resolved?.byteSize || 0;
     const resolvedTypeName = this.getDwarfTypeName(field.typeOffset) || resolvedName;
 
-    if (resolvedKind === 'struct' && resolved?.fields) {
+    if ((resolvedKind === 'struct' || resolvedKind === 'union') && resolved?.fields) {
       const childRaw = resolvedByteSize > 0
         ? raw.slice(field.byteOffset, field.byteOffset + resolvedByteSize)
         : raw;
       const children = this.shouldExpandWatchNode(evaluateName, watchContext)
         ? await this.evaluateStructFields(childRaw, resolved.fields, typeDefs, addr, evaluateName, _depth, watchContext)
         : undefined;
+      const compoundLabel = resolvedKind === 'union' ? 'union' : 'struct';
       const summary = children
-        ? `${resolvedTypeName || 'struct'} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`
-        : (resolvedTypeName || 'struct');
+        ? `${resolvedTypeName || compoundLabel} { ${children.map(c => `${c.expression}=${c.display}`).join(', ')} }`
+        : (resolvedTypeName || compoundLabel);
       return {
         expression: field.name,
         evaluateName,
@@ -2940,7 +3372,7 @@ case 'readVariableRuntime':
       for (let i = 0; i < count; i++) {
         const elemAddr = addr + i * elemSize;
         const elemRawOffset = i * elemSize;
-        if (elemType?.kind === 'struct' && elemType.fields) {
+        if ((elemType?.kind === 'struct' || elemType?.kind === 'union') && elemType.fields) {
           const childRaw = arrRaw.slice(elemRawOffset, elemRawOffset + elemSize);
           const elementExpression = `${evaluateName}[${i}]`;
           const structChildren = this.shouldExpandWatchNode(elementExpression, watchContext)
@@ -2980,7 +3412,8 @@ case 'readVariableRuntime':
           const pointerHasChildren = elemType?.kind === 'pointer'
             && !!elemType.typeOffset
             && this.pointerTargetHasChildren(elemType.typeOffset);
-          const pointerChildren = pointerHasChildren && value && this.shouldExpandWatchNode(elementExpression, watchContext)
+          const pointerValueHasChildren = pointerHasChildren && value !== 0;
+          const pointerChildren = pointerValueHasChildren && this.shouldExpandWatchNode(elementExpression, watchContext)
             ? await this.evaluatePointerChildren(value >>> 0, elemType!.typeOffset!, elementExpression, _depth + 1, watchContext)
             : undefined;
           children.push({
@@ -2991,7 +3424,7 @@ case 'readVariableRuntime':
             hex,
             address: elemAddr,
             typeName: elemTypeName,
-            hasChildren: pointerHasChildren,
+            hasChildren: pointerValueHasChildren,
             children: pointerChildren,
           });
         }
@@ -3042,7 +3475,8 @@ case 'readVariableRuntime':
     const pointerHasChildren = resolvedKind === 'pointer'
       && !!resolved?.typeOffset
       && this.pointerTargetHasChildren(resolved.typeOffset);
-    const pointerChildren = pointerHasChildren && value && this.shouldExpandWatchNode(evaluateName, watchContext)
+    const pointerValueHasChildren = pointerHasChildren && value !== 0;
+    const pointerChildren = pointerValueHasChildren && this.shouldExpandWatchNode(evaluateName, watchContext)
       ? await this.evaluatePointerChildren(value >>> 0, resolved!.typeOffset!, evaluateName, _depth + 1, watchContext)
       : undefined;
 
@@ -3054,7 +3488,7 @@ case 'readVariableRuntime':
       hex,
       address: addr,
       typeName: resolvedTypeName,
-      hasChildren: pointerHasChildren,
+      hasChildren: pointerValueHasChildren,
       children: pointerChildren,
     };
   }

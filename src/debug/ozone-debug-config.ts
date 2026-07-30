@@ -52,6 +52,12 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (config.rttLogEnabled === undefined) {
       config.rttLogEnabled = cfg.get<boolean>('rttLogEnabled', true);
     }
+    if (config.rttTimelineEnabled === undefined) {
+      config.rttTimelineEnabled = cfg.get<boolean>('rttTimelineEnabled', false);
+    }
+    if (config.rttTimelineChannelIndex === undefined) {
+      config.rttTimelineChannelIndex = cfg.get<number>('rttTimelineChannelIndex', 1);
+    }
     if (config.loggingEnabled === undefined) {
       config.loggingEnabled = cfg.get<boolean>('logging.enabled', true);
     }

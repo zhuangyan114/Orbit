@@ -17,6 +17,8 @@ export const ORBIT_SETTING_KEYS = [
   'defaultRtos',
   'rtosViewsAutoRefresh',
   'rttLogEnabled',
+  'rttTimelineEnabled',
+  'rttTimelineChannelIndex',
   'logging.enabled',
   'logging.clearOnStart',
   'rttBufferIndex',
@@ -32,6 +34,7 @@ export const ORBIT_SETTING_KEYS = [
   'watchPollIntervalMs',
   'timelineSampleIntervalMs',
   'timelineSendIntervalMs',
+  'timelineDataSource',
   'flashBeforeDebug',
   'recentSessions',
 ] as const;

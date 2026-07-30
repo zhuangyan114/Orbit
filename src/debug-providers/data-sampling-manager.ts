@@ -3,6 +3,7 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '../ozone-backend/types';
 import { trimTimelineHistory } from '../utils/timeline-history';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import { log } from '../utils/logger';
 
 const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
@@ -21,8 +22,10 @@ export class DataSamplingManager {
   private backend: OzoneBackend;
   private sampleIntervalMs = DEFAULT_SAMPLE_INTERVAL_MS;
   private sendIntervalMs = DEFAULT_SEND_INTERVAL_MS;
+  private dataSource: 'dap' | 'rtt' | 'mixed' = 'dap';
   private remoteSession: vscode.DebugSession | null = null;
   private remoteSampling = false;
+  private lastRemoteSampleLogMs = 0;
   private readonly disposables: vscode.Disposable[] = [];
 
   onExpressionsChanged: ((exprs: { expression: string; color: string }[]) => void) | null = null;
@@ -30,9 +33,16 @@ export class DataSamplingManager {
   constructor(backend: OzoneBackend) {
     this.backend = backend;
     this.refreshIntervals();
+    log.dap(
+      `[timeline] manager-created sampleMs=${this.sampleIntervalMs} sendMs=${this.sendIntervalMs}`
+      + ` activeSession=${vscode.debug.activeDebugSession?.id || 'none'}`,
+    );
     this.disposables.push(vscode.workspace.onDidChangeConfiguration(e => {
       if (!e.affectsConfiguration('orbit.timelineSampleIntervalMs') && !e.affectsConfiguration('orbit.timelineSendIntervalMs') &&
-          !e.affectsConfiguration('ozone.timelineSampleIntervalMs') && !e.affectsConfiguration('ozone.timelineSendIntervalMs')) return;
+          !e.affectsConfiguration('orbit.timelineDataSource')
+          && !e.affectsConfiguration('ozone.timelineSampleIntervalMs')
+          && !e.affectsConfiguration('ozone.timelineSendIntervalMs')
+          && !e.affectsConfiguration('ozone.timelineDataSource')) return;
       const previousSendInterval = this.sendIntervalMs;
       this.refreshIntervals();
       if (this.sendTimer && previousSendInterval !== this.sendIntervalMs) {
@@ -41,7 +51,11 @@ export class DataSamplingManager {
       }
       void this.syncSamplingMode();
     }));
-    this.disposables.push(vscode.debug.onDidChangeActiveDebugSession(() => void this.syncSamplingMode()));
+    this.disposables.push(vscode.debug.onDidChangeActiveDebugSession(() => {
+      const session = vscode.debug.activeDebugSession;
+      log.dap(`[timeline] active-session-changed session=${session?.id || 'none'} type=${session?.type || 'none'}`);
+      void this.syncSamplingMode();
+    }));
     this.disposables.push(vscode.debug.onDidTerminateDebugSession(session => {
       if (this.remoteSession === session) {
         this.remoteSession = null;
@@ -75,6 +89,7 @@ export class DataSamplingManager {
     this.entries.push({ expression, enabled: true, color });
     this.dataMap.set(expression, []);
     this.pendingMap.set(expression, []);
+    log.dap(`[timeline] expression-added expression=${expression} entries=${this.entries.length}`);
     void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
@@ -83,6 +98,7 @@ export class DataSamplingManager {
     this.entries = this.entries.filter(e => e.expression !== expression);
     this.dataMap.delete(expression);
     this.pendingMap.delete(expression);
+    log.dap(`[timeline] expression-removed expression=${expression} entries=${this.entries.length}`);
     void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
@@ -103,6 +119,10 @@ export class DataSamplingManager {
       this.dataMap.set(expr, []);
       this.pendingMap.set(expr, []);
     }
+    log.dap(
+      `[timeline] expressions-set entries=${this.entries.map(entry => entry.expression).join(',') || 'none'}`
+      + ` activeSession=${vscode.debug.activeDebugSession?.id || 'none'}`,
+    );
     void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
@@ -136,12 +156,26 @@ export class DataSamplingManager {
 
   private async syncSamplingMode() {
     if (this.entries.length === 0) {
+      log.dap('[timeline] sync route=none reason=no-expressions');
       await this.stopRemoteSampling();
       this.stopLocalSampling();
       return;
     }
 
     const session = vscode.debug.activeDebugSession;
+    log.dap(
+      `[timeline] sync entries=${this.entries.map(entry => entry.expression).join(',')}`
+      + ` activeSession=${session?.id || 'none'} type=${session?.type || 'none'}`
+      + ` backendConnected=${this.backend.hasTargetConnection}`,
+    );
+    const hasRttExpressions = this.entries.some(entry => /^rttb\.payload\[/.test(entry.expression));
+    if ((this.dataSource === 'rtt' || (this.dataSource === 'mixed' && hasRttExpressions))
+      && (!session || session.type !== 'ozone')) {
+      log.dap(`[timeline] sync route=none reason=${this.dataSource}-source-requires-active-ozone-session`);
+      await this.stopRemoteSampling();
+      this.stopLocalSampling();
+      return;
+    }
     if (session && session.type === 'ozone') {
       this.stopLocalSampling();
       await this.startRemoteSampling(session);
@@ -149,24 +183,56 @@ export class DataSamplingManager {
     }
 
     await this.stopRemoteSampling();
-    if (!this.timer) this.startSampling();
+    if (!this.backend.hasTargetConnection) {
+      log.dap('[timeline] sync route=none reason=no-backend-target-connection');
+      this.stopLocalSampling();
+      return;
+    }
+    if (!this.timer) {
+      log.dap('[timeline] sync route=extension-host-local');
+      this.startSampling();
+    }
   }
 
   private async startRemoteSampling(session: vscode.DebugSession) {
+    const expressions = this.entries.map(e => e.expression);
+    log.dap(
+      `[timeline] remote-start-request session=${session.id} entries=${expressions.join(',')}`
+      + ` sampleMs=${this.sampleIntervalMs} sendMs=${this.sendIntervalMs}`,
+    );
     try {
       const response: any = await session.customRequest('dataSamplingStart', {
         entries: this.entries.map(e => ({ expression: e.expression, color: e.color })),
         sampleIntervalMs: this.sampleIntervalMs,
         sendIntervalMs: this.sendIntervalMs,
+        source: this.dataSource,
       });
       if (response?.ok === false) throw new Error(response?.message || 'remote sampler rejected expressions');
       this.remoteSession = session;
       this.remoteSampling = true;
-    } catch {
+      log.dap(
+        `[timeline] remote-start-response session=${session.id} ok=true`
+        + ` active=${response?.activeExpressions?.join(',') || 'unknown'}`,
+      );
+    } catch (err: any) {
+      const error = err?.message || String(err);
+      log.dap(
+        `[timeline] remote-start-failed session=${session.id} error=${error}`
+        + ` activeSession=${vscode.debug.activeDebugSession?.id || 'none'}`
+        + ` backendConnected=${this.backend.hasTargetConnection}`,
+      );
       this.remoteSession = null;
       this.remoteSampling = false;
       const activeSession = vscode.debug.activeDebugSession;
-      if ((!activeSession || activeSession.type !== 'ozone') && !this.timer) this.startSampling();
+      if ((!activeSession || activeSession.type !== 'ozone') && this.backend.hasTargetConnection && !this.timer) {
+        log.dap('[timeline] remote-start-fallback route=extension-host-local');
+        this.startSampling();
+      } else if (!this.backend.hasTargetConnection) {
+        log.dap('[timeline] remote-start-ended route=none reason=no-backend-target-connection');
+        this.stopLocalSampling();
+      } else {
+        log.dap('[timeline] remote-start-ended route=none reason=active-dap-request-failed');
+      }
     }
   }
 
@@ -175,7 +241,13 @@ export class DataSamplingManager {
     const session = this.remoteSession;
     this.remoteSampling = false;
     this.remoteSession = null;
-    try { await session.customRequest('dataSamplingStop', {}); } catch {}
+    log.dap(`[timeline] remote-stop-request session=${session.id}`);
+    try {
+      await session.customRequest('dataSamplingStop', {});
+      log.dap(`[timeline] remote-stop-response session=${session.id} ok=true`);
+    } catch (err: any) {
+      log.dap(`[timeline] remote-stop-failed session=${session.id} error=${err?.message || String(err)}`);
+    }
   }
 
   private stopLocalSampling() {
@@ -197,6 +269,10 @@ export class DataSamplingManager {
 
   private async sampleLoop() {
     if (this._stopped) return;
+    if (!this.backend.hasTargetConnection) {
+      this.stopLocalSampling();
+      return;
+    }
     const started = Date.now();
     await this.sample();
     if (this._stopped) return;
@@ -208,6 +284,10 @@ export class DataSamplingManager {
   private refreshIntervals() {
     this.sampleIntervalMs = this.getConfiguredInterval('timelineSampleIntervalMs', DEFAULT_SAMPLE_INTERVAL_MS);
     this.sendIntervalMs = this.getConfiguredInterval('timelineSendIntervalMs', DEFAULT_SEND_INTERVAL_MS);
+    const configured = getOrbitConfiguration().get<string>('timelineDataSource', 'dap');
+    this.dataSource = configured === 'rtt' || configured === 'dap' || configured === 'mixed'
+      ? configured
+      : 'mixed';
   }
 
   private getConfiguredInterval(key: string, defaultValue: number): number {
@@ -231,6 +311,7 @@ export class DataSamplingManager {
   }
 
   private async sample() {
+    if (!this.backend.hasTargetConnection) return;
     if (await this.isHalted()) return;
     if (this.entries.length === 0) return;
     const now = Date.now();
@@ -285,6 +366,14 @@ export class DataSamplingManager {
         currentValue: snapshot.currentValue,
         data: snapshot.data,
       });
+    }
+    if (accepted.length > 0) {
+      const now = Date.now();
+      if (now - this.lastRemoteSampleLogMs >= 1000) {
+        const points = accepted.reduce((total, snapshot) => total + snapshot.data.length, 0);
+        log.dap(`[timeline] remote-event snapshots=${accepted.length} points=${points}`);
+        this.lastRemoteSampleLogMs = now;
+      }
     }
     if (accepted.length > 0 && this.onSamples) this.onSamples(accepted);
   }

@@ -5,6 +5,8 @@ export interface NativeScheduleOptions {
   signal?: AbortSignal;
   coalesceKey?: string;
   label?: string;
+  /** Internal escape hatch for a caller already executing inside this scheduler. */
+  bypassScheduler?: boolean;
 }
 
 export interface NativeSchedulerSnapshot {

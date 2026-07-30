@@ -2,7 +2,7 @@
   "name": "orbit-for-vscode",
   "displayName": "Orbit",
   "description": "Modern STM32 debugging frontend powered by SEGGER J-Link with AI integration",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -185,6 +185,18 @@
                 "description": "Read SEGGER RTT output and show it in the VS Code Debug Console",
                 "default": true
               },
+              "rttTimelineEnabled": {
+                "type": "boolean",
+                "description": "Enable the experimental RTTB Timeline sample consumer",
+                "default": false
+              },
+              "rttTimelineChannelIndex": {
+                "type": "number",
+                "description": "SEGGER RTT up-buffer index carrying RTTB Timeline samples",
+                "default": 1,
+                "minimum": 0,
+                "maximum": 15
+              },
               "loggingEnabled": {
                 "type": "boolean",
                 "description": "Enable Orbit internal diagnostic logs (step, eval, DLL, and DAP)",
@@ -254,7 +266,11 @@
               },
               "nativeDebugEngineMode": {
                 "type": "string",
-                "enum": ["legacy", "native", "auto"],
+                "enum": [
+                  "legacy",
+                  "native",
+                  "auto"
+                ],
                 "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback; an already connected Native owner never hot-switches",
                 "default": "auto"
               }
@@ -319,6 +335,18 @@
           "type": "boolean",
           "default": true,
           "description": "读取 SEGGER RTT 输出，并将其显示在 VS Code 调试控制台中"
+        },
+        "orbit.rttTimelineEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "启用实验性的 RTTB Timeline Sample 消费者；需要 launch 中同时启用 RTT Timeline"
+        },
+        "orbit.rttTimelineChannelIndex": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 15,
+          "description": "RTTB Timeline Sample 使用的 SEGGER RTT 上行缓冲区索引"
         },
         "orbit.logging.enabled": {
           "type": "boolean",
@@ -388,7 +416,11 @@
         },
         "orbit.nativeDebugEngine.mode": {
           "type": "string",
-          "enum": ["legacy", "native", "auto"],
+          "enum": [
+            "legacy",
+            "native",
+            "auto"
+          ],
           "default": "auto",
           "description": "目标所有者选择：legacy 仅使用 koffi；native 失败时不回退；auto 仅在 Native 连接前启动失败时回退。"
         },
@@ -405,6 +437,16 @@
           "minimum": 0.1,
           "maximum": 10000,
           "description": "Timeline 目标数据采样间隔（毫秒）。0.2 毫秒对应目标 5 kHz；实际速率取决于目标读取延迟和表达式数量。"
+        },
+        "orbit.timelineDataSource": {
+          "type": "string",
+          "enum": [
+            "dap",
+            "rtt",
+            "mixed"
+          ],
+          "default": "dap",
+          "description": "Timeline 数据源；rtt 仅消费显式 RTTB 信号表达式 rttb.payload[N]"
         },
         "orbit.flashBeforeDebug": {
           "type": "boolean",

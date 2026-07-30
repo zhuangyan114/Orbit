@@ -80,4 +80,15 @@ describe('DapSession connection-loss cleanup', () => {
     expect(messages.some(message => message.type === 'response' && message.command === 'disconnect')).toBe(true);
     expect(messages.some(message => message.event === 'terminated')).toBe(true);
   });
+
+  it('does not start new Watch target reads after termination begins', async () => {
+    const backend = backendWithState({ ok: true, data: TargetState.Halted });
+    const session = connectedSession(backend);
+    (session as any).phase = 'terminating';
+
+    const results = await (session as any).readWatchExpressions(['count'], true);
+
+    expect(results).toEqual([expect.objectContaining({ expression: 'count', error: 'running' })]);
+    expect(backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({ cmd: 'evaluateExpression' }));
+  });
 });

@@ -42,4 +42,21 @@ describe('CppJLinkHelperClient scheduling', () => {
       signal: controller.signal,
     })).rejects.toBeInstanceOf(NativeSchedulerCancelledError);
   });
+
+  it('can send an RTT request directly when the outer RTT scheduler owns serialization', async () => {
+    const helper = new CppJLinkHelperClient('unused-helper.exe');
+    const sendRequest = vi.spyOn(helper as any, 'sendRequest').mockResolvedValue({
+      ok: true,
+      message: 'RTT read',
+      targetState: 'Halted',
+      elapsedMs: 0,
+      data: { bytesBase64: 'UlRU' },
+    });
+
+    await expect(helper.request('readRtt', { bufferIndex: 1, size: 16 }, {
+      priority: 'timeline',
+      bypassScheduler: true,
+    })).resolves.toMatchObject({ ok: true, data: { bytesBase64: 'UlRU' } });
+    expect(sendRequest).toHaveBeenCalledWith('readRtt', { bufferIndex: 1, size: 16 });
+  });
 });

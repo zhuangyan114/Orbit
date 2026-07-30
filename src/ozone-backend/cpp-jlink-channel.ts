@@ -8,6 +8,8 @@ import {
   NativeSchedulerCancelledError,
   NativeTaskPriority,
 } from './native-scheduler';
+import type { RttReadStatistics } from './rtt-transport';
+import type { RttReadBackendOptions } from './rtt-transport';
 
 export type CppJLinkTargetState = 'Disconnected' | 'Unknown' | 'Halted' | 'Running' | 'Stepping' | 'Error';
 
@@ -195,7 +197,7 @@ export class CppJLinkHelperClient {
       extensionVersion: 'experimental',
       requiredCapabilities: [
         'basicDebug', 'readRegister', 'readMemory', 'writeMemory',
-        'readMemoryBatch', 'hardwareBreakpoints', 'reset',
+        'readMemoryBatch', 'hardwareBreakpoints', 'reset', 'rtt',
         'stepIntoInstruction', 'stepIntoSourceLine', 'stepOverSourceLine', 'stepOut',
       ],
     });
@@ -206,10 +208,14 @@ export class CppJLinkHelperClient {
     params: Record<string, unknown> = {},
     schedule: Partial<NativeScheduleOptions> = {},
   ): Promise<CppJLinkResult<T>> {
+    if (schedule.bypassScheduler) {
+      return this.sendRequest<T>(method, params);
+    }
     const priority = schedule.priority || priorityForMethod(method);
+    const { bypassScheduler: _bypassScheduler, ...schedulerOptions } = schedule;
     return this.scheduler.schedule(
       () => this.sendRequest<T>(method, params),
-      { ...schedule, priority, label: schedule.label || method },
+      { ...schedulerOptions, priority, label: schedule.label || method },
     );
   }
 
@@ -224,6 +230,8 @@ export class CppJLinkHelperClient {
   cancelTimeline(reason = 'Timeline sampling cancelled') { this.scheduler.cancel('timeline', reason); }
 
   getSchedulerSnapshot() { return this.scheduler.snapshot(); }
+
+  getNativeScheduler(): NativeScheduler { return this.scheduler; }
 
   private sendRequest<T>(method: string, params: Record<string, unknown>): Promise<CppJLinkResult<T>> {
     if (!this.child || !this.child.stdin.writable) {
@@ -350,11 +358,15 @@ export class ExperimentalCppJLinkChannel {
   }
 
   get usingNative() { return this.nativeConnected; }
+  getNativeScheduler(): NativeScheduler { return this.helper.getNativeScheduler(); }
 
   async connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp' | 'koffi'; dllPath?: string }>> {
     try {
       const hello = await this.helper.start();
       if (!hello.ok) return this.failNative(`helper handshake failed: ${hello.message}`);
+      if (!hello.data?.capabilities?.includes('rtt')) {
+        return this.failNative('helper does not advertise the required RTT capability');
+      }
       const result = await this.helper.request<{ dllPath: string }>('connect', { ...config });
       if (result.ok) {
         this.nativeConnected = true;
@@ -436,10 +448,25 @@ export class ExperimentalCppJLinkChannel {
   async clearAllBreakpoints(): Promise<CppJLinkResult> { return this.callNative('clearAllBreakpoints', {}); }
   async startRtt(controlBlockAddress?: number): Promise<CppJLinkResult> { return this.callNative('startRtt', { controlBlockAddress }); }
   async stopRtt(): Promise<CppJLinkResult> { return this.callNative('stopRtt', {}); }
-  async readRtt(bufferIndex: number, size: number): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
-    const result = await this.callNative<{ bytesBase64: string }>('readRtt', { bufferIndex, size }, { priority: 'timeline' });
+  async readRtt(bufferIndex: number, size: number, options?: RttReadBackendOptions): Promise<CppJLinkResult<{
+    bytes: Uint8Array;
+    stats?: RttReadStatistics;
+  }>> {
+    const result = await this.callNative<{
+      bytesBase64: string;
+      stats?: RttReadStatistics;
+    }>('readRtt', { bufferIndex, size }, {
+      priority: 'timeline',
+      ...(options?.scheduledByOwnerScheduler ? { bypassScheduler: true } : {}),
+    });
     if (!result.ok || !result.data) return withoutData(result);
-    return { ...result, data: { bytes: Uint8Array.from(Buffer.from(result.data.bytesBase64, 'base64')) } };
+    return {
+      ...result,
+      data: {
+        bytes: Uint8Array.from(Buffer.from(result.data.bytesBase64, 'base64')),
+        ...(result.data.stats ? { stats: result.data.stats } : {}),
+      },
+    };
   }
 
   async disconnect(): Promise<CppJLinkResult> {

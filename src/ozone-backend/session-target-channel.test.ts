@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  LegacyJLinkTargetChannel,
   SessionTargetOwner,
   SessionTargetSelector,
 } from './session-target-channel';
+import { JLinkDLL } from './jlink-dll';
 
 function owner(
   kind: 'native' | 'legacy',
@@ -123,6 +125,40 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(result.ok).toBe(true);
     expect(selector.ownerKind).toBe('legacy');
     expect(createNative).not.toHaveBeenCalled();
+    expect(selector.getRttTransport()?.capabilities.supportsOwnerLoss).toBe(true);
+    expect(selector.getRttTransport()?.capabilities.supportsReadStatistics).toBe(false);
+  });
+
+  it('reports Legacy RTT reads before start with the shared NotStarted error code', async () => {
+    const jlink = {
+      connected: true,
+      state: 'halted',
+      isRttStarted: () => false,
+    } as unknown as JLinkDLL;
+    const channel = new LegacyJLinkTargetChannel(jlink);
+
+    await expect(channel.readRtt(1, 16)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'NotStarted',
+    });
+  });
+
+  it('lets Legacy synchronously report target loss after a failed RTT read', async () => {
+    const jlink = {
+      connected: true,
+      state: 'halted',
+      isRttStarted: () => true,
+      readRtt: vi.fn(() => null),
+      isTargetConnected: vi.fn(() => false),
+      abandon: vi.fn(),
+    } as unknown as JLinkDLL;
+    const channel = new LegacyJLinkTargetChannel(jlink);
+
+    await expect(channel.readRtt(1, 16)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'TargetDisconnected',
+    });
+    expect(jlink.abandon).toHaveBeenCalledOnce();
   });
 
   it('does not construct a legacy owner after a connected native owner is lost', async () => {

@@ -11,6 +11,48 @@
 
 ## 修改记录
 
+### Bug: Watch 输入汉字导致界面卡顿，调试控制请求异常
+
+- **日期**: 2026-07-25
+- **问题描述**: 在 `D:\STM32\project\vet6_led` 调试会话中，向 WATCH 输入汉字后，Watch 会持续异常刷新并出现 `dataSample` 请求错误；此前还会导致暂停、重启和退出调试按钮无响应。经验证，逗号、波浪号、`@`、引号和斜杠等字符不会触发同样的问题。
+- **根因分析**:
+  1. Watch 输入内容会通过 Webview、扩展宿主和 DAP 多条路径进入表达式求值；汉字不属于当前 ELF/DWARF 表达式符号语法，进入原有求值路径后会触发异常的 Watch 请求行为。
+  2. 扩展宿主原先没有在 Ozone DAP 会话终止时停止 Watch 轮询，失效会话仍可能继续发送 `dataSample`，并与暂停、重启、退出共用的 J-Link 访问通道产生竞争。
+- **修改方案**:
+  1. 新增 `stripHanCharacters`，仅过滤 Han 字符区间，保留其他表达式字符。
+  2. 在 Watch 输入框输入、添加表达式、恢复已保存表达式以及 WatchProvider/DAP 边界统一过滤汉字。
+  3. 跟踪 Ozone DAP 会话生命周期；会话切换或终止时停止 Watch 轮询，使旧轮询结果失效。
+  4. DAP 进入控制或终止阶段后不再启动新的 Watch 目标读取。
+- **涉及文件**:
+  - `src/utils/watch-expression-validation.ts:1` - Han 字符过滤
+  - `src/webview/watch/app.tsx:109,283` - 输入框和添加入口过滤
+  - `src/debug-providers/watch-webview-provider.ts:82,93,183` - Watch 表达式及展开状态边界过滤
+  - `src/debug-providers/watch-provider.ts:164` - Tree Watch 表达式边界过滤
+  - `src/extension.ts:73,195,337` - DAP 会话跟踪和 Watch 轮询失效
+  - `src/debug/dap-session.ts:217,241,506` - 控制/终止阶段停止新的 Watch 读取
+- **验证结果**:
+  - **Mock/自动化**: `npm run typecheck`、`npm test`（108 项通过，1 项既有集成测试跳过）、`npm run build` 均通过；过滤和失效会话回归测试通过。
+  - **发布安装**: 已生成并安装 `Orbit-1.0.3.vsix`，VS Code 已确认 `orbit-debug.orbit-for-vscode@1.0.3`。
+  - **真实硬件**: 用户已验证生命周期修复后可以正常退出调试；1.0.3 安装后的汉字过滤仍需在目标板上确认。
+
+### Bug: 逐过程后 Local 和 Registers 间歇性为空
+
+- **日期**: 2026-07-22
+- **问题描述**: 调用堆栈正常，但在函数内连续点击“逐过程”时，Local 和 Registers 会偶发同时变为空白；继续逐过程若干次后又重新出现。
+- **根因分析**:
+  1. Native step 完成并发送 DAP `stopped` 事件时，step 的 control 临界区可能还未完全释放；VS Code 随后会并发请求当前 frame 的 Local 和 Registers。
+  2. 原 `handleVariables` 遇到 `controlInProgress` 或另一个 target read 正在执行时会立即返回空数组。Local、Registers、RTOS Views 和 evaluate 共用串行 target-read 通道，因此请求时序不同会造成变量面板间歇性空白，实际寄存器和 DWARF Local 数据并未丢失。
+- **修改方案**:
+  1. stopped 状态下的 Local 和 Registers 改为高优先级串行读取，允许等待 step control 交接及前一个 target read 完成，等待上限为 1200 ms；后台低优先级读取仍在 control 期间立即让出。
+  2. 移除变量请求入口处统一返回空数组的 control 判断，使已缓存的复合变量 children 不受 target control 影响。
+  3. 增加 scope 读取超时和异常日志，并增加 stopped-event control 交接期间 Local/Registers 并发请求的回归测试。
+- **涉及文件**:
+  - `src/debug/dap-session.ts:226`、`:1115` - 高优先级 target-read 等待及 Local/Registers 串行请求
+  - `src/debug/dap-session-scopes.test.ts:58` - stopped 交接期并发 scope 读取回归
+- **验证结果**:
+  - **Mock/自动化**: DAP scope/实时变量/Native executor 聚焦测试 3 个文件、17 项全部通过；全量 Vitest 21 个文件、103 项全部通过；`npm run typecheck`、`npm run build` 和 `git diff --check` 通过。
+  - **真实硬件**: 用户在当前 STM32 调试会话中连续执行逐过程后确认调用堆栈、Local 和 Registers 均显示正常，未再出现间歇性空白。
+
 ### Bug: 多行函数参数逐步调试边界异常及函数调用逐过程缓慢
 
 - **日期**: 2026-07-18

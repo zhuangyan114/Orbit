@@ -29,6 +29,18 @@ export class RuntimeRouter {
     return String(result.data);
   }
 
+  async getRttStats(): Promise<Record<string, unknown>> {
+    const session = this.activeOzoneSession();
+    if (!session) throw new Error('Active ozone debug session is not available');
+    try {
+      const response = await session.customRequest('getRttStats', {});
+      if (!response || typeof response !== 'object') throw new Error('DAP RTT stats returned no data');
+      return response as Record<string, unknown>;
+    } catch (err: any) {
+      throw new Error(err?.message || 'DAP RTT stats failed');
+    }
+  }
+
   async readSignals(signals: SignalSpec[]): Promise<RuntimeReadValue[]> {
     const normalized = signals.map(signal => this.normalizeSignal(signal));
     if (normalized.length === 0) return [];

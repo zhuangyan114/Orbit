@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { performance } from 'perf_hooks';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
 import {
@@ -7,6 +8,16 @@ import {
 } from '../ozone-backend/types';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
+import { RttSessionLifecycle } from '../ozone-backend/rtt-session-lifecycle';
+import {
+  RttFrameDecodeBatch,
+  RttFrameStreamEndReason,
+} from '../ozone-backend/rtt-frame-decoder';
+import {
+  parseRttTimelineSignal,
+  RttTimelineConsumer,
+  RttTimelineSnapshot,
+} from '../ozone-backend/rtt-timeline-consumer';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -25,6 +36,28 @@ interface DapSamplingEntry {
   color: string;
 }
 
+export interface RttPollStats {
+  bufferIndex: number;
+  readSize: number;
+  pollIntervalMs: number;
+  startedAt: number | null;
+  stoppedAt: number | null;
+  durationMs: number;
+  startAttempts: number;
+  startSuccesses: number;
+  startErrors: number;
+  readCalls: number;
+  receivedBytes: number;
+  receivedBytesPerSecond: number;
+  emptyReads: number;
+  readErrors: number;
+  totalReadDurationMs: number;
+  averageReadDurationMs: number;
+  maxReadDurationMs: number;
+  lastReadBytes: number;
+  lastError: string | null;
+}
+
 export class DapSession extends EventEmitter {
   private backend: OzoneBackend;
   private seq = 1;
@@ -32,10 +65,16 @@ export class DapSession extends EventEmitter {
   private connectionMonitorTimer: NodeJS.Timeout | null = null;
   private rttPollTimer: NodeJS.Timeout | null = null;
   private rttLogEnabled = true;
+  private rttTimelineEnabled = false;
+  private rttTimelineChannelIndex = 1;
   private rttStarted = false;
   private rttBufferIndex = 0;
   private rttPollIntervalMs = 50;
   private rttReadSize = 4096;
+  private rttTargetBufferSize = 4096;
+  private rttHostQueueCapacityBytes = 65536;
+  private rttPollStats: RttPollStats = this.createRttPollStats();
+  private rttLifecycle: RttSessionLifecycle | null = null;
   private rttControlBlockAddress: number | undefined;
   private dapStepProfileSeq = 0;
   private rttStripAnsi = true;
@@ -44,6 +83,13 @@ export class DapSession extends EventEmitter {
   private rttDecoder = new StringDecoder('utf8');
   private rttControlCarry = '';
   private rttLineCarry = '';
+  private rttTimelineConsumer: RttTimelineConsumer | null = null;
+  private rttTimelineStopReason: RttFrameStreamEndReason = 'stream-end';
+  private dataSamplingSource: 'dap' | 'rtt' | 'mixed' = 'dap';
+  // RTTB uses target HAL_GetTick() units while DAP samples use the session
+  // Timeline clock. Mixed mode maps the RTT batch into the DAP clock once so
+  // both traces occupy the same viewport without changing the raw RTTB tick.
+  private rttTimelineLastAlignedTimestamp: number | null = null;
   private pRtLogEnabled = false;
   private pRtLogRoot = '';
   private pRtLogDecoder = new PRtLogDecoder();
@@ -74,6 +120,8 @@ export class DapSession extends EventEmitter {
   private dataSamplingSpecs: FastDataSampleSpec[] = [];
   private dataSamplingPending = new Map<string, DataPoint[]>();
   private dataSamplingLastDisplay = new Map<string, string>();
+  private dataSamplingFlushCount = 0;
+  private dataSamplingLastFlushLogMs = 0;
   private dataSamplingSeenExpressions = new Set<string>();
   private dataSamplingIntervalMs = 0.2;
   private dataSamplingSendIntervalMs = 16;
@@ -81,6 +129,9 @@ export class DapSession extends EventEmitter {
   private readonly highResEpochMs = Date.now();
   private readonly highResStartNs = process.hrtime.bigint();
   private variableHandles = new Map<number, WatchValue[]>();
+  private localVariableHandles = new Map<number, Variable[]>();
+  private scopeHandles = new Map<number, { frameId: number; kind: 'locals' | 'registers' }>();
+  private nextScopeHandle = 10;
   private nextVariableHandle = 1000;
   private runtimeWatchReadInFlight = false;
   private runtimeWatchCache = new Map<string, WatchValue>();
@@ -165,7 +216,7 @@ export class DapSession extends EventEmitter {
       this.controlInProgress = true;
       this.readCancelEpoch++;
       this.stopDataSampling();
-      this.stopRttLogPolling();
+      await this.finishRttLifecycle('terminate');
       this.stopPolling();
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('target connection lost');
@@ -210,7 +261,7 @@ export class DapSession extends EventEmitter {
   }
 
   private shouldDeferTargetRead(): boolean {
-    return this.controlInProgress;
+    return this.controlInProgress || this.isSessionTerminating();
   }
 
   private beginTargetRead(priority: 'high' | 'low' = 'low'): boolean {
@@ -223,7 +274,11 @@ export class DapSession extends EventEmitter {
   private async beginTargetReadWhenAvailable(priority: 'high' | 'low' = 'low', timeoutMs = 0): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (!this.beginTargetRead(priority)) {
-      if (this.controlInProgress || Date.now() >= deadline) return false;
+      // Stopped-state DAP requests (stack/scopes) can arrive immediately after
+      // the stopped event, before the step control section has unwound. Let
+      // high-priority reads wait for that short handoff; background reads still
+      // yield immediately while control owns the target.
+      if (this.isSessionTerminating() || (priority === 'low' && this.controlInProgress) || Date.now() >= deadline) return false;
       await new Promise<void>(resolve => setTimeout(resolve, 20));
     }
     return true;
@@ -231,7 +286,7 @@ export class DapSession extends EventEmitter {
 
   private async beginWatchTargetRead(timeoutMs = 250): Promise<boolean> {
     if (this.beginTargetRead('high')) return true;
-    if (this.controlInProgress) return false;
+    if (this.shouldDeferTargetRead()) return false;
     // Keep Timeline behind a Watch request only while that Watch is actually
     // queued. The timeout is a wait bound, not a post-read blackout period.
     this.pendingWatchTargetReads++;
@@ -285,6 +340,7 @@ export class DapSession extends EventEmitter {
 
   private markStoppedForUi() {
     this.setTargetRunning(false);
+    this.resetVariableHandles();
     this.readCancelEpoch++;
     this.lowPriorityReadBlockedUntil = Date.now() + 150;
   }
@@ -352,6 +408,9 @@ export class DapSession extends EventEmitter {
 
   private resetVariableHandles() {
     this.variableHandles.clear();
+    this.localVariableHandles.clear();
+    this.scopeHandles.clear();
+    this.nextScopeHandle = 10;
     this.nextVariableHandle = 1000;
   }
 
@@ -359,6 +418,19 @@ export class DapSession extends EventEmitter {
     if (!children || children.length === 0) return 0;
     const ref = this.nextVariableHandle++;
     this.variableHandles.set(ref, children);
+    return ref;
+  }
+
+  private allocateLocalVariableHandle(children?: Variable[]): number {
+    if (!children || children.length === 0) return 0;
+    const ref = this.nextVariableHandle++;
+    this.localVariableHandles.set(ref, children);
+    return ref;
+  }
+
+  private allocateScopeHandle(frameId: number, kind: 'locals' | 'registers'): number {
+    const ref = this.nextScopeHandle++;
+    this.scopeHandles.set(ref, { frameId, kind });
     return ref;
   }
 
@@ -398,6 +470,19 @@ export class DapSession extends EventEmitter {
       variablesReference: this.allocateVariableHandle(value.children),
       memoryReference: this.memoryReferenceForWatch(value),
       evaluateName: value.evaluateName || value.expression,
+    };
+  }
+
+  private toDapLocalVariable(variable: Variable) {
+    return {
+      name: variable.name,
+      value: variable.value,
+      type: variable.type || undefined,
+      variablesReference: this.allocateLocalVariableHandle(variable.children),
+      memoryReference: typeof variable.address === 'number'
+        ? this.formatMemoryReference(variable.address)
+        : undefined,
+      evaluateName: variable.name,
     };
   }
 
@@ -467,6 +552,9 @@ export class DapSession extends EventEmitter {
     expandedExpressions?: string[],
   ): Promise<WatchValue[]> {
     if (expressions.length === 0) return [];
+    if (this.isSessionTerminating()) {
+      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
+    }
     if (forceRuntimeRead && this.runtimeWatchReadInFlight) {
       return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
     }
@@ -548,42 +636,143 @@ export class DapSession extends EventEmitter {
     }
   }
 
-  private startRttLogPolling() {
-    this.stopRttLogPolling();
-    this.rttStarted = false;
+  private setupRttLifecycle() {
+    this.rttLifecycle?.dispose();
+    this.rttLifecycle = null;
+    const transport = this.backend.getRttTransport();
+    if (!transport) return;
+    this.rttLifecycle = new RttSessionLifecycle(
+      transport,
+      {
+        start: () => this.startRttLogPolling(true),
+        stop: () => this.stopRttLogPolling(),
+      },
+      this.rttLogEnabled || this.rttTimelineEnabled,
+      { controlBlockAddress: this.rttControlBlockAddress },
+    );
+    this.rttLifecycle.connect();
+  }
+
+  private configureRttChannelRegistry() {
+    const registry = this.backend.getRttChannelRegistry();
+    if (!registry) return;
+    if (this.rttLogEnabled) {
+      const result = registry.register({
+        index: this.rttBufferIndex,
+        name: `rtt-log-${this.rttBufferIndex}`,
+        purpose: 'RTT log stream',
+        consumers: ['rtt'],
+        buffer: {
+          targetSizeBytes: this.rttTargetBufferSize,
+          hostQueueCapacityBytes: this.rttHostQueueCapacityBytes,
+        },
+      });
+      if (!result.ok) {
+        log.dap(`rtt channel registry rejected index=${this.rttBufferIndex} message=${result.message}`);
+      }
+    }
+    if (this.rttTimelineEnabled) {
+      const result = registry.register({
+        index: this.rttTimelineChannelIndex,
+        name: `rtt-timeline-${this.rttTimelineChannelIndex}`,
+        purpose: 'RTTB Timeline sample stream',
+        consumers: ['timeline'],
+        buffer: {
+          targetSizeBytes: this.rttTargetBufferSize,
+          hostQueueCapacityBytes: this.rttHostQueueCapacityBytes,
+        },
+      });
+      if (!result.ok) {
+        log.dap(`rtt timeline channel registry rejected index=${this.rttTimelineChannelIndex} message=${result.message}`);
+        return;
+      }
+      const scheduler = this.backend.getRttStreamScheduler();
+      if (scheduler) {
+        this.rttTimelineConsumer = new RttTimelineConsumer(scheduler, this.rttTimelineChannelIndex);
+      } else {
+        log.dap('rtt timeline unavailable: selected owner does not expose NativeScheduler');
+      }
+    }
+  }
+
+  private async finishRttLifecycle(kind: 'disconnect' | 'terminate') {
+    const lifecycle = this.rttLifecycle;
+    if (!lifecycle) {
+      this.stopRttLogPolling();
+      return;
+    }
+    const result = kind === 'disconnect'
+      ? await lifecycle.disconnect()
+      : await lifecycle.terminate();
+    if (!result.ok) {
+      log.dap(`rtt lifecycle ${kind} failed code=${result.error.code} message=${result.error.message}`);
+    }
+    lifecycle.dispose();
+    this.rttLifecycle = null;
+  }
+
+  private startRttLogPolling(transportAlreadyStarted = false) {
+    this.stopRttLogPolling(!transportAlreadyStarted);
+    this.rttPollStats = this.createRttPollStats();
+    this.rttPollStats.startedAt = Date.now();
+    this.rttStarted = transportAlreadyStarted;
     this.rttDecoder = new StringDecoder('utf8');
     this.rttControlCarry = '';
     this.rttLineCarry = '';
     this.pRtLogDecoder.resetFrames();
-    this.emitRttTerminalStarted();
+    if (this.rttLogEnabled) this.emitRttTerminalStarted();
 
     const pollLoop = async () => {
       if (this.rttPollTimer === null) return;
       try {
         if (!this.rttStarted) {
+          this.rttPollStats.startAttempts += 1;
           const startResult = await this.backend.execute({
             cmd: 'startRtt',
             controlBlockAddress: this.rttControlBlockAddress,
           });
           this.rttStarted = startResult.ok;
+          if (startResult.ok) {
+            this.rttPollStats.startSuccesses += 1;
+          } else {
+            this.rttPollStats.startErrors += 1;
+            this.rttPollStats.lastError = startResult.error || 'RTT start failed';
+          }
         }
 
-        if (this.rttStarted) {
+        if (this.rttStarted && this.rttLogEnabled) {
+          this.rttPollStats.readCalls += 1;
+          const readStartedAt = performance.now();
           const readResult = await this.backend.execute({
             cmd: 'readRtt',
             bufferIndex: this.rttBufferIndex,
             size: this.rttReadSize,
           });
+          const readDurationMs = Math.max(0, performance.now() - readStartedAt);
+          this.rttPollStats.totalReadDurationMs += readDurationMs;
+          this.rttPollStats.maxReadDurationMs = Math.max(this.rttPollStats.maxReadDurationMs, readDurationMs);
           if (readResult.ok) {
             const bytes = (readResult.data as any)?.bytes;
+            this.rttPollStats.lastReadBytes = Array.isArray(bytes) ? bytes.length : 0;
             if (Array.isArray(bytes) && bytes.length > 0) {
+              this.rttPollStats.receivedBytes += bytes.length;
               this.emitRttBytes(Buffer.from(bytes));
+            } else {
+              this.rttPollStats.emptyReads += 1;
             }
           } else {
+            this.rttPollStats.readErrors += 1;
+            this.rttPollStats.lastError = readResult.error || 'RTT read failed';
             this.rttStarted = false;
           }
         }
-      } catch {
+        if (this.rttStarted && this.dataSamplingActive
+          && (this.dataSamplingSource === 'rtt' || this.dataSamplingSource === 'mixed')) {
+          await this.pollRttTimeline();
+        }
+      } catch (err: any) {
+        this.rttPollStats.readErrors += 1;
+        this.rttPollStats.lastError = err?.message || String(err);
         this.rttStarted = false;
       }
 
@@ -595,7 +784,7 @@ export class DapSession extends EventEmitter {
     this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
   }
 
-  private stopRttLogPolling() {
+  private stopRttLogPolling(stopTransport = true) {
     if (this.rttPollTimer) {
       clearTimeout(this.rttPollTimer);
       this.rttPollTimer = null;
@@ -615,11 +804,59 @@ export class DapSession extends EventEmitter {
     if (this.rttLineCarry) {
       this.emitRttLine(this.rttLineCarry);
     }
+    if (this.rttTimelineConsumer) {
+      const ownerLost = this.backend.getRttTransport()?.state === 'owner-lost';
+      const reason = ownerLost && this.rttTimelineStopReason === 'stream-end'
+        ? 'owner-lost'
+        : this.rttTimelineStopReason;
+      const decode = this.rttTimelineConsumer.finish(reason);
+      this.logRttTimelineDecode(decode);
+    }
+    this.rttTimelineStopReason = 'stream-end';
     this.rttDecoder = new StringDecoder('utf8');
     this.rttControlCarry = '';
     this.rttLineCarry = '';
     this.rttStarted = false;
-    void this.backend.execute({ cmd: 'stopRtt' });
+    this.rttPollStats.stoppedAt = Date.now();
+    if (stopTransport) void this.backend.execute({ cmd: 'stopRtt' });
+  }
+
+  private createRttPollStats(): RttPollStats {
+    return {
+      bufferIndex: this.rttBufferIndex,
+      readSize: this.rttReadSize,
+      pollIntervalMs: this.rttPollIntervalMs,
+      startedAt: null,
+      stoppedAt: null,
+      durationMs: 0,
+      startAttempts: 0,
+      startSuccesses: 0,
+      startErrors: 0,
+      readCalls: 0,
+      receivedBytes: 0,
+      receivedBytesPerSecond: 0,
+      emptyReads: 0,
+      readErrors: 0,
+      totalReadDurationMs: 0,
+      averageReadDurationMs: 0,
+      maxReadDurationMs: 0,
+      lastReadBytes: 0,
+      lastError: null,
+    };
+  }
+
+  private getRttPollStats(): RttPollStats {
+    const startedAt = this.rttPollStats.startedAt;
+    const durationMs = startedAt === null
+      ? 0
+      : Math.max(0, (this.rttPollStats.stoppedAt ?? Date.now()) - startedAt);
+    const readCalls = this.rttPollStats.readCalls;
+    return {
+      ...this.rttPollStats,
+      durationMs,
+      receivedBytesPerSecond: durationMs > 0 ? this.rttPollStats.receivedBytes * 1000 / durationMs : 0,
+      averageReadDurationMs: readCalls > 0 ? this.rttPollStats.totalReadDurationMs / readCalls : 0,
+    };
   }
 
   private stripAnsi(text: string): string {
@@ -635,6 +872,97 @@ export class DapSession extends EventEmitter {
     }
 
     this.emitRttOutput(this.rttDecoder.write(bytes));
+  }
+
+  private async pollRttTimeline() {
+    const consumer = this.rttTimelineConsumer;
+    if (!consumer) {
+      log.dap('[timeline] RTT source unavailable: no Native RttStreamScheduler');
+      this.dataSamplingActive = false;
+      return;
+    }
+    const result = await consumer.poll(this.rttReadSize);
+    if (!result.ok) {
+      log.dap(
+        `[timeline] RTT read failed channel=${this.rttTimelineChannelIndex}`
+        + ` code=${result.error.code} message=${result.error.message}`,
+      );
+      if (result.error.code === 'OwnerLost' || result.error.code === 'ChannelGone' || result.error.code === 'NotConnected') {
+        const reason = result.error.code === 'OwnerLost'
+          ? 'owner-lost'
+          : result.error.code === 'ChannelGone' ? 'channel-gone' : 'stream-end';
+        const decode = consumer.finish(reason);
+        this.logRttTimelineDecode(decode);
+        this.dataSamplingActive = false;
+      }
+      return;
+    }
+    this.logRttTimelineDecode(result.data.decode);
+    const snapshots = this.dataSamplingSource === 'mixed'
+      ? this.alignMixedRttSnapshots(result.data.snapshots)
+      : result.data.snapshots;
+    for (const snapshot of snapshots) {
+      const pending = this.dataSamplingPending.get(snapshot.expression);
+      if (!pending) continue;
+      pending.push(...snapshot.data);
+      this.dataSamplingLastDisplay.set(snapshot.expression, snapshot.currentValue);
+    }
+  }
+
+  private alignMixedRttSnapshots(
+    snapshots: readonly RttTimelineSnapshot[],
+  ): readonly RttTimelineSnapshot[] {
+    const firstTimestamp = snapshots.reduce((first, snapshot) => {
+      const point = snapshot.data[0];
+      return point !== undefined ? Math.min(first, point.timestamp) : first;
+    }, Number.POSITIVE_INFINITY);
+    const latestTimestamp = snapshots.reduce((latest, snapshot) => {
+      const last = snapshot.data[snapshot.data.length - 1]?.timestamp;
+      return last !== undefined ? Math.max(latest, last) : latest;
+    }, Number.NEGATIVE_INFINITY);
+    if (!Number.isFinite(firstTimestamp) || !Number.isFinite(latestTimestamp)) return snapshots;
+
+    // RTT reads arrive in bursts. Anchor each burst's newest target tick to
+    // the current DAP clock so a buffered RTT batch does not trail the live
+    // DAP sample indefinitely. Preserve the batch's internal target-time span
+    // and clamp only if the new batch would move backwards.
+    let offset = this.timelineNowMs() - latestTimestamp;
+    if (this.rttTimelineLastAlignedTimestamp !== null) {
+      const alignedFirst = firstTimestamp + offset;
+      if (alignedFirst <= this.rttTimelineLastAlignedTimestamp) {
+        offset += this.rttTimelineLastAlignedTimestamp + 0.001 - alignedFirst;
+      }
+    }
+    const alignedLatestTimestamp = latestTimestamp + offset;
+    if (this.rttTimelineLastAlignedTimestamp === null) {
+      log.dap(
+        `[timeline] mixed RTT timestamp alignment target=${latestTimestamp}`
+        + ` aligned=${alignedLatestTimestamp.toFixed(3)}`
+        + ` offsetMs=${offset.toFixed(3)}`,
+      );
+    }
+    this.rttTimelineLastAlignedTimestamp = alignedLatestTimestamp;
+    return snapshots.map(snapshot => ({
+      ...snapshot,
+      data: snapshot.data.map(point => ({
+        ...point,
+        timestamp: point.timestamp + offset,
+      })),
+    }));
+  }
+
+  private logRttTimelineDecode(decode: RttFrameDecodeBatch) {
+    if (decode.errors.length === 0 && decode.sequenceGaps.length === 0 && decode.frames.length === 0) return;
+    log.dap(
+      `[timeline] RTTB decode frames=${decode.frames.length}`
+      + ` errors=${decode.errors.length} checksumErrors=${decode.errors.filter(error => error.code === 'checksum-mismatch').length}`
+      + ` sequenceGaps=${decode.sequenceGaps.length}`
+      + ` missingFrames=${decode.sequenceGaps.reduce((total, gap) => total + gap.missingFrames, 0)}`
+      + ` buffered=${decode.bufferedBytes} latencyMs=${decode.decodeLatencyMs.toFixed(3)}`,
+    );
+    for (const error of decode.errors.slice(0, 3)) {
+      log.dap(`[timeline] RTTB decode-error code=${error.code} message=${error.message}`);
+    }
   }
 
   private emitRttOutput(text: string) {
@@ -783,12 +1111,7 @@ export class DapSession extends EventEmitter {
         case 'stackTrace':
           return this.handleStackTrace(msg);
         case 'scopes':
-          return this.sendResponse(msg, {
-            scopes: [
-              { name: 'Local', variablesReference: 1, expensive: false },
-              { name: 'Registers', variablesReference: 2, expensive: false },
-            ],
-          });
+          return this.handleScopes(msg);
         case 'variables':
           return this.handleVariables(msg);
         case 'readMemory':
@@ -824,6 +1147,10 @@ export class DapSession extends EventEmitter {
           return this.handleSetWatchValue(msg);
         case 'getTargetState':
           return this.handleGetTargetState(msg);
+        case 'getRttStats':
+          return this.sendResponse(msg, this.getRttPollStats());
+        case 'getRttStreamMetrics':
+          return this.sendResponse(msg, this.backend.getRttStreamMetrics());
         case 'rtosInfo':
           return this.sendResponse(msg, {
             rtos: this._rtos,
@@ -852,9 +1179,18 @@ export class DapSession extends EventEmitter {
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = args.flashBeforeDebug !== false;
       this.rttLogEnabled = args.rttLogEnabled !== false;
+      this.rttTimelineEnabled = args.rttTimelineEnabled === true;
+      this.rttTimelineChannelIndex = Math.floor(this.clampNumber(args.rttTimelineChannelIndex, 1, 0, 15));
       this.rttBufferIndex = Math.floor(this.clampNumber(args.rttBufferIndex, 0, 0, 15));
       this.rttPollIntervalMs = Math.floor(this.clampNumber(args.rttPollIntervalMs, 50, 10, 5000));
       this.rttReadSize = Math.floor(this.clampNumber(args.rttReadSize, 4096, 64, 65536));
+      this.rttTargetBufferSize = Math.floor(this.clampNumber(args.rttTargetBufferSize, 4096, 64, 1024 * 1024));
+      this.rttHostQueueCapacityBytes = Math.floor(this.clampNumber(
+        args.rttHostQueueCapacityBytes,
+        Math.max(this.rttTargetBufferSize * 4, 65536),
+        1024,
+        16 * 1024 * 1024,
+      ));
       this.rttControlBlockAddress = this.parseOptionalAddress(args.rttControlBlockAddress);
       this.rttStripAnsi = args.rttStripAnsi !== false;
       this.rttLogTarget = this.parseRttLogTarget(args.rttLogTarget);
@@ -921,6 +1257,8 @@ export class DapSession extends EventEmitter {
       this.connectionFailureCount = 0;
       this.phase = 'connected';
       this.startConnectionMonitor();
+      this.setupRttLifecycle();
+      this.configureRttChannelRegistry();
 
       if (elfPath) {
         const loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
@@ -939,7 +1277,12 @@ export class DapSession extends EventEmitter {
       await new Promise<void>(r => setTimeout(r, 200));
       this.markStoppedForUi();
       this.lastHaltReason = 'entry';
-      if (this.rttLogEnabled) {
+      if (this.rttLifecycle) {
+        const initialized = await this.rttLifecycle.initialized();
+        if (!initialized.ok) {
+          log.dap(`rtt lifecycle initialized failed code=${initialized.error.code} message=${initialized.error.message}`);
+        }
+      } else if (this.rttLogEnabled) {
         this.startRttLogPolling();
       } else {
         this.stopRttLogPolling();
@@ -965,7 +1308,7 @@ export class DapSession extends EventEmitter {
     this.phase = 'terminating';
     this.targetConnectionEstablished = false;
     this.beginControl();
-    this.stopRttLogPolling();
+    await this.finishRttLifecycle('disconnect');
     this.stopPolling();
     this.stopConnectionMonitor();
     this.stopDataSampling();
@@ -1066,26 +1409,36 @@ export class DapSession extends EventEmitter {
     }
   }
 
+  private handleScopes(msg: DebugProtocolMessage) {
+    const frameId = Number(msg.arguments?.frameId);
+    if (!Number.isInteger(frameId) || frameId <= 0) {
+      this.sendResponse(msg, { scopes: [] });
+      return;
+    }
+    this.sendResponse(msg, {
+      scopes: [
+        { name: 'Local', variablesReference: this.allocateScopeHandle(frameId, 'locals'), expensive: false },
+        { name: 'Registers', variablesReference: this.allocateScopeHandle(frameId, 'registers'), expensive: false },
+      ],
+    });
+  }
+
   private async handleVariables(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
       const ref = args.variablesReference;
-      if (this.shouldDeferTargetRead()) {
-        this.sendResponse(msg, { variables: [] });
-        return;
-      }
 
-      if (ref === 1) {
-        if (!this.beginTargetRead('high')) {
+      const scope = this.scopeHandles.get(ref);
+      if (scope?.kind === 'locals') {
+        if (!(await this.beginTargetReadWhenAvailable('high', 1200))) {
+          log.dap(`variables scope=locals frame=${scope.frameId} target read unavailable`);
           this.sendResponse(msg, { variables: [] });
           return;
         }
         try {
-          const result = await this.backend.execute({ cmd: 'getLocals' });
+          const result = await this.backend.execute({ cmd: 'getLocals', frame: scope.frameId });
           if (result.ok) {
-            const vars = (result.data as Variable[]).map((v) => ({
-              name: v.name, value: v.value, type: v.type, variablesReference: 0,
-            }));
+            const vars = (result.data as Variable[]).map(variable => this.toDapLocalVariable(variable));
             this.sendResponse(msg, { variables: vars });
           } else {
             this.sendResponse(msg, { variables: [] });
@@ -1093,13 +1446,14 @@ export class DapSession extends EventEmitter {
         } finally {
           this.endTargetRead();
         }
-      } else if (ref === 2) {
-        if (!this.beginTargetRead('high')) {
+      } else if (scope?.kind === 'registers') {
+        if (!(await this.beginTargetReadWhenAvailable('high', 1200))) {
+          log.dap(`variables scope=registers frame=${scope.frameId} target read unavailable`);
           this.sendResponse(msg, { variables: [] });
           return;
         }
         try {
-          const regResult = await this.backend.execute({ cmd: 'getRegisters' });
+          const regResult = await this.backend.execute({ cmd: 'getRegisters', frame: scope.frameId });
           if (regResult.ok) {
             const regs = (regResult.data as any[]).map((r: any) => ({
               name: r.name,
@@ -1118,10 +1472,14 @@ export class DapSession extends EventEmitter {
       } else if (this.variableHandles.has(ref)) {
         const children = this.variableHandles.get(ref) || [];
         this.sendResponse(msg, { variables: children.map(value => this.toDapVariable(value)) });
+      } else if (this.localVariableHandles.has(ref)) {
+        const children = this.localVariableHandles.get(ref) || [];
+        this.sendResponse(msg, { variables: children.map(variable => this.toDapLocalVariable(variable)) });
       } else {
         this.sendResponse(msg, { variables: [] });
       }
     } catch (err: any) {
+      log.dap(`variables request failed: ${err?.message || String(err)}`);
       this.sendResponse(msg, { variables: [] });
     }
   }
@@ -1211,6 +1569,7 @@ export class DapSession extends EventEmitter {
         const runResult = await this.backend.execute({ cmd: 'run' });
         log.dap(`handleContinue: run result ok=${runResult.ok}`);
         this.setTargetRunning(runResult.ok);
+        if (runResult.ok) this.rttLifecycle?.run();
         if (runResult.ok) {
           this.readCancelEpoch++;
         }
@@ -1325,6 +1684,7 @@ export class DapSession extends EventEmitter {
             if (i > 0) await new Promise<void>(r => setTimeout(r, 10));
             const stateResult = await this.queryTargetState('step-settle');
             if (stateResult.ok && stateResult.data === 'halted') {
+              this.rttLifecycle?.halt();
               this.markStoppedForUi();
               const tStoppedEvent = Date.now();
               this.sendEvent('stopped', { reason: 'step', threadId: 1 });
@@ -1356,7 +1716,8 @@ export class DapSession extends EventEmitter {
       this.beginControl();
       this.stopPolling();
       try {
-        await this.backend.execute({ cmd: 'halt' });
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (haltResult.ok) this.rttLifecycle?.halt();
         this.markStoppedForUi();
         this.lastHaltReason = 'pause';
         this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
@@ -1370,7 +1731,15 @@ export class DapSession extends EventEmitter {
   private async handleRestart(msg: DebugProtocolMessage) {
     await this.withStepLock(async () => {
       this.beginControl();
-      this.stopRttLogPolling();
+      this.rttTimelineStopReason = 'reset';
+      if (this.rttLifecycle) {
+        const resetStarted = await this.rttLifecycle.resetStarted();
+        if (!resetStarted.ok) {
+          log.dap(`rtt lifecycle reset-start failed code=${resetStarted.error.code} message=${resetStarted.error.message}`);
+        }
+      } else {
+        this.stopRttLogPolling();
+      }
       this.stopPolling();
       this.setTargetRunning(false);
 
@@ -1414,7 +1783,12 @@ export class DapSession extends EventEmitter {
 
         this.markStoppedForUi();
         this.lastHaltReason = 'entry';
-        if (this.rttLogEnabled) {
+        if (this.rttLifecycle) {
+          const resetCompleted = await this.rttLifecycle.resetCompleted();
+          if (!resetCompleted.ok) {
+            log.dap(`rtt lifecycle reset-complete failed code=${resetCompleted.error.code} message=${resetCompleted.error.message}`);
+          }
+        } else if (this.rttLogEnabled) {
           this.startRttLogPolling();
         }
         this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
@@ -1512,9 +1886,28 @@ export class DapSession extends EventEmitter {
         .filter((entry: DapSamplingEntry) => entry.expression)
       : (Array.isArray(args.expressions) ? args.expressions.map((expression: string) => ({ expression, color: '#4EC9B0' })) : []);
 
+    const source = args.source === 'rtt' || args.source === 'dap' || args.source === 'mixed'
+      ? args.source
+      : 'mixed';
+    log.dap(
+      `[timeline] start-request entries=${entries.map(entry => entry.expression).join(',') || 'none'}`
+      + ` running=${this.targetRunning} controlInProgress=${this.controlInProgress}`
+      + ` source=${source}`,
+    );
     this.stopDataSampling();
     if (entries.length === 0) {
+      log.dap('[timeline] start-rejected reason=no-expressions');
       this.sendResponse(msg, { ok: true, planned: [] });
+      return;
+    }
+
+    if (source === 'rtt') {
+      await this.handleRttDataSamplingStart(msg, entries, args);
+      return;
+    }
+
+    if (source === 'mixed') {
+      await this.handleMixedDataSamplingStart(msg, entries, args);
       return;
     }
 
@@ -1523,13 +1916,20 @@ export class DapSession extends EventEmitter {
       expressions: entries.map(entry => entry.expression),
     });
     if (!planResult.ok) {
+      log.dap(`[timeline] plan-failed error=${planResult.error || 'unknown'}`);
       this.sendResponse(msg, undefined, false, planResult.error);
       return;
     }
 
     const plan = planResult.data as FastDataSamplePlanItem[];
     const specs = plan.map(item => item.spec).filter((spec): spec is FastDataSampleSpec => !!spec);
+    const rejected = plan.filter(item => !item.spec).map(item => `${item.expression}:${item.error || 'unsupported'}`);
+    log.dap(
+      `[timeline] plan-result supported=${specs.map(spec => spec.expression).join(',') || 'none'}`
+      + ` rejected=${rejected.join(',') || 'none'}`,
+    );
     if (specs.length === 0) {
+      log.dap('[timeline] start-rejected reason=no-fast-sampling-expressions');
       this.sendResponse(msg, { ok: false, planned: plan }, false, 'No expressions can use fast data sampling');
       return;
     }
@@ -1539,6 +1939,8 @@ export class DapSession extends EventEmitter {
     this.dataSamplingSpecs = specs;
     this.dataSamplingPending.clear();
     this.dataSamplingLastDisplay.clear();
+    this.dataSamplingFlushCount = 0;
+    this.dataSamplingLastFlushLogMs = 0;
     for (const entry of this.dataSamplingEntries) {
       this.dataSamplingPending.set(entry.expression, []);
     }
@@ -1547,7 +1949,6 @@ export class DapSession extends EventEmitter {
     const now = this.nowMs();
     this.dataSamplingNextSampleMs = now;
     this.dataSamplingActive = true;
-    const rejected = plan.filter(item => !item.spec).map(item => item.expression);
     log.dap(
       `[timeline] start fast=${this.dataSamplingEntries.map(entry => entry.expression).join(',')}`
       + ` rejected=${rejected.join(',') || 'none'} sampleMs=${this.dataSamplingIntervalMs} sendMs=${this.dataSamplingSendIntervalMs}`,
@@ -1563,8 +1964,169 @@ export class DapSession extends EventEmitter {
   }
 
   private handleDataSamplingStop(msg: DebugProtocolMessage) {
+    log.dap(`[timeline] stop-request active=${this.dataSamplingActive} entries=${this.dataSamplingEntries.map(entry => entry.expression).join(',') || 'none'}`);
     this.stopDataSampling();
     this.sendResponse(msg, { ok: true });
+  }
+
+  private async handleRttDataSamplingStart(
+    msg: DebugProtocolMessage,
+    entries: DapSamplingEntry[],
+    args: any,
+  ) {
+    if (!this.rttTimelineEnabled) {
+      this.sendResponse(msg, undefined, false, 'RTT Timeline source is disabled in the launch configuration');
+      return;
+    }
+    const consumer = this.rttTimelineConsumer;
+    if (!consumer) {
+      this.sendResponse(msg, undefined, false, 'RTT Timeline source requires the active Native RttStreamScheduler');
+      return;
+    }
+    const signals = entries.map(entry => parseRttTimelineSignal(entry.expression, entry.color));
+    const rejected = entries
+      .filter((_entry, index) => !signals[index])
+      .map(entry => `${entry.expression}:expected rttb.payload[N]`);
+    const acceptedSignals = signals.filter((signal): signal is NonNullable<typeof signal> => !!signal);
+    if (acceptedSignals.length === 0) {
+      this.sendResponse(msg, {
+        ok: false,
+        source: 'rtt',
+        planned: entries.map(entry => ({ expression: entry.expression, error: 'expected rttb.payload[N]' })),
+      }, false, 'No RTTB Timeline signals are supported');
+      return;
+    }
+    const configured = consumer.configure(acceptedSignals);
+    if (!configured.ok) {
+      this.sendResponse(msg, undefined, false, configured.error.message);
+      return;
+    }
+
+    this.dataSamplingSource = 'rtt';
+    this.dataSamplingEntries = entries.filter((_entry, index) => !!signals[index]);
+    this.dataSamplingSpecs = [];
+    this.dataSamplingPending.clear();
+    this.dataSamplingLastDisplay.clear();
+    this.dataSamplingSeenExpressions.clear();
+    this.dataSamplingFlushCount = 0;
+    this.dataSamplingLastFlushLogMs = 0;
+    for (const entry of this.dataSamplingEntries) {
+      this.dataSamplingPending.set(entry.expression, []);
+    }
+    this.dataSamplingSendIntervalMs = this.clampNumber(args.sendIntervalMs, 16, 1, 10000);
+    this.dataSamplingActive = true;
+    this.startDataSamplingFlushTimer();
+    log.dap(
+      `[timeline] RTTB source-start channel=${this.rttTimelineChannelIndex}`
+      + ` signals=${this.dataSamplingEntries.map(entry => entry.expression).join(',')}`
+      + ` rejected=${rejected.join(',') || 'none'} sendMs=${this.dataSamplingSendIntervalMs}`,
+    );
+    this.sendResponse(msg, {
+      ok: true,
+      source: 'rtt',
+      planned: this.dataSamplingEntries.map(entry => ({ expression: entry.expression })),
+      activeExpressions: this.dataSamplingEntries.map(entry => entry.expression),
+    });
+  }
+
+  private async handleMixedDataSamplingStart(
+    msg: DebugProtocolMessage,
+    entries: DapSamplingEntry[],
+    args: any,
+  ) {
+    const rttCandidates = entries.filter(entry => /^rttb\.payload\[/.test(entry.expression));
+    const dapEntries = entries.filter(entry => !/^rttb\.payload\[/.test(entry.expression));
+    const rttSignals = rttCandidates
+      .map(entry => ({ entry, signal: parseRttTimelineSignal(entry.expression, entry.color) }))
+      .filter((item): item is { entry: DapSamplingEntry; signal: NonNullable<ReturnType<typeof parseRttTimelineSignal>> } => !!item.signal);
+    const rejectedRtt = rttCandidates
+      .filter(entry => !rttSignals.some(item => item.entry.expression === entry.expression))
+      .map(entry => ({ expression: entry.expression, error: 'invalid RTTB signal; expected rttb.payload[N]' }));
+
+    let plan: FastDataSamplePlanItem[] = [];
+    let specs: FastDataSampleSpec[] = [];
+    let rejectedDap: Array<{ expression: string; error: string }> = [];
+    if (dapEntries.length > 0) {
+      const planResult = await this.backend.execute({
+        cmd: 'prepareFastDataSampling',
+        expressions: dapEntries.map(entry => entry.expression),
+      });
+      if (!planResult.ok) {
+        rejectedDap = dapEntries.map(entry => ({ expression: entry.expression, error: planResult.error || 'unsupported' }));
+      } else {
+        plan = planResult.data as FastDataSamplePlanItem[];
+        specs = plan.map(item => item.spec).filter((spec): spec is FastDataSampleSpec => !!spec);
+        rejectedDap = plan
+          .filter(item => !item.spec)
+          .map(item => ({ expression: item.expression, error: item.error || 'unsupported' }));
+      }
+    }
+
+    let rttConfigured = false;
+    if (rttSignals.length > 0 && this.rttTimelineEnabled && this.rttTimelineConsumer) {
+      const configured = this.rttTimelineConsumer.configure(rttSignals.map(item => item.signal));
+      if (configured.ok) {
+        rttConfigured = true;
+      } else {
+        rejectedRtt.push(...rttSignals.map(item => ({ expression: item.entry.expression, error: configured.error.message })));
+      }
+    } else if (rttSignals.length > 0) {
+      rejectedRtt.push(...rttSignals.map(item => ({
+        expression: item.entry.expression,
+        error: 'RTT Timeline source is disabled or unavailable in this launch',
+      })));
+    }
+    const activeRttExpressions = rttConfigured
+      ? new Set(rttSignals.map(item => item.entry.expression))
+      : new Set<string>();
+    const activeDapExpressions = new Set(specs.map(spec => spec.expression));
+    const activeExpressions = new Set([...activeRttExpressions, ...activeDapExpressions]);
+    if (activeExpressions.size === 0) {
+      this.sendResponse(msg, {
+        ok: false,
+        source: 'mixed',
+        planned: entries.map(entry => ({
+          expression: entry.expression,
+          error: [...rejectedRtt, ...rejectedDap].find(item => item.expression === entry.expression)?.error || 'unsupported',
+        })),
+      }, false, 'No expressions can use mixed Timeline sampling');
+      return;
+    }
+
+    this.dataSamplingSource = 'mixed';
+    this.rttTimelineLastAlignedTimestamp = null;
+    this.dataSamplingEntries = entries.filter(entry => activeExpressions.has(entry.expression));
+    this.dataSamplingSpecs = specs;
+    this.dataSamplingPending.clear();
+    this.dataSamplingLastDisplay.clear();
+    this.dataSamplingSeenExpressions.clear();
+    this.dataSamplingFlushCount = 0;
+    this.dataSamplingLastFlushLogMs = 0;
+    for (const entry of this.dataSamplingEntries) this.dataSamplingPending.set(entry.expression, []);
+    this.dataSamplingIntervalMs = this.clampNumber(args.sampleIntervalMs, 0.2, 0.1, 10000);
+    this.dataSamplingSendIntervalMs = this.clampNumber(args.sendIntervalMs, 16, 1, 10000);
+    this.dataSamplingNextSampleMs = this.nowMs();
+    this.dataSamplingActive = true;
+    this.startDataSamplingFlushTimer();
+    if (this.dataSamplingSpecs.length > 0) this.scheduleDataSamplingLoop();
+    const rejected = [...rejectedRtt, ...rejectedDap];
+    log.dap(
+      `[timeline] mixed source-start rtt=${[...activeRttExpressions].join(',') || 'none'}`
+      + ` dap=${[...activeDapExpressions].join(',') || 'none'}`
+      + ` rejected=${rejected.map(item => `${item.expression}:${item.error}`).join(',') || 'none'}`,
+    );
+    this.sendResponse(msg, {
+      ok: true,
+      source: 'mixed',
+      planned: entries.map(entry => ({
+        expression: entry.expression,
+        ...(activeExpressions.has(entry.expression)
+          ? {}
+          : { error: rejected.find(item => item.expression === entry.expression)?.error || 'unsupported' }),
+      })),
+      activeExpressions: this.dataSamplingEntries.map(entry => entry.expression),
+      intervalMs: this.dataSamplingIntervalMs,
+    });
   }
 
   private scheduleDataSamplingLoop() {
@@ -1577,6 +2139,7 @@ export class DapSession extends EventEmitter {
 
   private async dataSamplingLoop() {
     if (!this.dataSamplingActive) return;
+    if (this.dataSamplingSource === 'rtt') return;
     if (this.shouldDeferTargetRead() || !this.targetRunning) {
       const now = this.nowMs();
       // Do not accumulate elapsed sampling slots while the target is stopped.
@@ -1660,6 +2223,15 @@ export class DapSession extends EventEmitter {
       });
     }
     if (snapshots.length > 0) {
+      this.dataSamplingFlushCount++;
+      const now = Date.now();
+      if (this.dataSamplingFlushCount === 1 || now - this.dataSamplingLastFlushLogMs >= 1000) {
+        const points = snapshots.reduce((total, snapshot) => total + snapshot.data.length, 0);
+        log.dap(
+          `[timeline] flush count=${this.dataSamplingFlushCount} snapshots=${snapshots.length} points=${points}`,
+        );
+        this.dataSamplingLastFlushLogMs = now;
+      }
       this.sendEvent('ozoneDataSamples', {
         snapshots,
         intervalMs: this.dataSamplingIntervalMs,
@@ -1668,6 +2240,10 @@ export class DapSession extends EventEmitter {
   }
 
   private stopDataSampling() {
+    if (this.dataSamplingSource !== 'dap' && this.rttTimelineConsumer) {
+      const decode = this.rttTimelineConsumer.finish('stream-end');
+      this.logRttTimelineDecode(decode);
+    }
     this.dataSamplingActive = false;
     if (this.dataSamplingTimer) {
       clearImmediate(this.dataSamplingTimer);
@@ -1682,6 +2258,10 @@ export class DapSession extends EventEmitter {
     this.dataSamplingSpecs = [];
     this.dataSamplingPending.clear();
     this.dataSamplingLastDisplay.clear();
+    this.dataSamplingFlushCount = 0;
+    this.dataSamplingLastFlushLogMs = 0;
+    this.dataSamplingSource = 'dap';
+    this.rttTimelineLastAlignedTimestamp = null;
   }
 
   private nowMs(): number {
@@ -1746,7 +2326,7 @@ export class DapSession extends EventEmitter {
       this.phase = 'terminating';
       this.targetConnectionEstablished = false;
       this.stopDataSampling();
-      this.stopRttLogPolling();
+      await this.finishRttLifecycle('terminate');
       this.stopPolling();
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('DAP session disposed');

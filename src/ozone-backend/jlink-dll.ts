@@ -24,6 +24,7 @@ export class JLinkDLL {
   get state() { return this._state; }
   get device() { return this._device; }
   get breakpointSlots(): readonly (number | null)[] { return this.bpSlots; }
+  isRttStarted(): boolean { return this._rttStarted; }
 
   private getDllPath(): string {
     try {

@@ -12,6 +12,12 @@ import {
   NativeStepOverRequest,
 } from './cpp-jlink-channel';
 import { JLinkDLL } from './jlink-dll';
+import { RttChannelRegistry } from './rtt-channel-registry';
+import { RttControlBlockResolver } from './rtt-control-block-resolver';
+import { RttStreamScheduler } from './rtt-stream-scheduler';
+import { RttTransport, RttTransportAdapter } from './rtt-transport';
+import type { RttReadStatistics } from './rtt-transport';
+import { NativeScheduler } from './native-scheduler';
 import { log } from '../utils/logger';
 
 export type SessionTargetOwnerKind = 'none' | 'native' | 'legacy';
@@ -41,7 +47,11 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   clearAllBreakpoints(): Promise<CppJLinkResult>;
   startRtt(controlBlockAddress?: number): Promise<CppJLinkResult>;
   stopRtt(): Promise<CppJLinkResult>;
-  readRtt(bufferIndex: number, size: number): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
+  readRtt(bufferIndex: number, size: number): Promise<CppJLinkResult<{
+    bytes: Uint8Array;
+    stats?: RttReadStatistics;
+  }>>;
+  getNativeScheduler?(): NativeScheduler;
   dispose(graceful?: boolean): Promise<void>;
 }
 
@@ -50,6 +60,9 @@ export type SessionTargetOwnerFactory = () => SessionTargetOwner;
 /** Chooses exactly one physical J-Link owner for a debug session. */
 export class SessionTargetSelector {
   private owner: SessionTargetOwner | null = null;
+  private rttTransport: RttTransportAdapter | null = null;
+  private rttStreamScheduler: RttStreamScheduler | null = null;
+  private readonly rttChannelRegistry = new RttChannelRegistry();
   private readonly breakpointSlots: (number | null)[] = [null, null, null, null, null, null];
   private readonly sessionId = `target-${nextSessionId++}`;
   private selectedMode: SessionTargetMode = 'legacy';
@@ -61,6 +74,14 @@ export class SessionTargetSelector {
 
   get ownerKind(): SessionTargetOwnerKind { return this.owner?.kind || 'none'; }
   get usingNative(): boolean { return this.owner?.usingNative === true; }
+  getRttTransport(): RttTransport | null { return this.rttTransport; }
+  getRttChannelRegistry(): RttChannelRegistry { return this.rttChannelRegistry; }
+  getRttStreamScheduler(): RttStreamScheduler | null { return this.rttStreamScheduler; }
+  setRttControlBlockResolver(resolver: RttControlBlockResolver | undefined): boolean {
+    if (!this.rttTransport) return false;
+    this.rttTransport.setControlBlockResolver(resolver);
+    return true;
+  }
 
   async connect(
     config: CppJLinkConnectConfig,
@@ -81,6 +102,11 @@ export class SessionTargetSelector {
       const nativeResult = await native.connect(config);
       if (nativeResult.ok) {
         this.owner = native;
+        this.rttTransport = new RttTransportAdapter(native);
+        const nativeScheduler = native.getNativeScheduler?.();
+        this.rttStreamScheduler = nativeScheduler
+          ? new RttStreamScheduler(this.rttTransport, this.rttChannelRegistry, nativeScheduler)
+          : null;
         log.dll(`target-owner session=${this.sessionId} selected mode=${mode} owner=native command=connect targetConnected=true`);
         return nativeResult;
       }
@@ -103,6 +129,17 @@ export class SessionTargetSelector {
     const legacyResult = await legacy.connect(config);
     if (legacyResult.ok) {
       this.owner = legacy;
+      this.rttTransport = new RttTransportAdapter(legacy, {
+        supportsStart: true,
+        supportsStop: true,
+        supportsRead: true,
+        supportsControlBlockAddress: true,
+        supportsOwnerLoss: true,
+        supportsReadStatistics: false,
+        maxReadSize: 65536,
+        channelCount: 16,
+      });
+      this.rttStreamScheduler = null;
       log.dll(`target-owner session=${this.sessionId} selected mode=${mode} owner=legacy command=connect targetConnected=true`);
       return legacyResult;
     }
@@ -162,6 +199,10 @@ export class SessionTargetSelector {
   async dispose(graceful = true): Promise<void> {
     const owner = this.owner;
     this.owner = null;
+    this.rttStreamScheduler?.dispose();
+    this.rttStreamScheduler = null;
+    this.rttTransport = null;
+    this.rttChannelRegistry.clear();
     if (owner) await owner.dispose(graceful);
   }
 
@@ -173,6 +214,7 @@ export class SessionTargetSelector {
       // A native owner was already connected. Switching to koffi here would
       // create a new physical owner in the same DAP session, so terminate it.
       this.owner = null;
+      this.rttTransport?.markOwnerLost(result.message, result.diagnostics);
       await owner.dispose(false);
       log.dll(`target-owner session=${this.sessionId} native command failed mode=${this.selectedMode} owner=native command=${command} code=NativeOwnerLost targetConnected=true action=restart-session`);
       return {
@@ -276,6 +318,13 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
     return this.success({}, 'all breakpoints cleared');
   }
   async startRtt(controlBlockAddress?: number) {
+    if (!this.jlink.connected || this.jlink.state === 'disconnected') {
+      return failure('legacy RTT owner is disconnected', 'TargetDisconnected');
+    }
+    if (!this.jlink.isTargetConnected()) {
+      this.jlink.abandon();
+      return failure('legacy RTT target is no longer connected', 'TargetDisconnected');
+    }
     return this.booleanCall(() => this.jlink.startRtt(controlBlockAddress), 'start RTT');
   }
   async stopRtt() {
@@ -283,10 +332,22 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
     return this.success({}, 'RTT stopped');
   }
   async readRtt(bufferIndex: number, size: number) {
+    if (!Number.isInteger(bufferIndex) || bufferIndex < 0 || !Number.isInteger(size) || size <= 0) {
+      return failure<{ bytes: Uint8Array }>('legacy RTT read arguments are invalid', 'ProtocolError');
+    }
+    if (!this.jlink.connected || this.jlink.state === 'disconnected') {
+      return failure<{ bytes: Uint8Array }>('legacy RTT owner is disconnected', 'TargetDisconnected');
+    }
+    if (!this.jlink.isRttStarted()) {
+      return failure<{ bytes: Uint8Array }>('RTT must be started before read', 'NotStarted');
+    }
     const bytes = this.jlink.readRtt(bufferIndex, size);
-    return bytes
-      ? this.success({ bytes }, 'RTT read')
-      : failure<{ bytes: Uint8Array }>('legacy RTT read failed', 'JLinkCallFailed');
+    if (bytes) return this.success({ bytes }, 'RTT read');
+    if (!this.jlink.isTargetConnected()) {
+      this.jlink.abandon();
+      return failure<{ bytes: Uint8Array }>('legacy RTT target was lost during read', 'TargetDisconnected');
+    }
+    return failure<{ bytes: Uint8Array }>('legacy RTT read failed', 'JLinkCallFailed');
   }
   async stepIntoInstruction(): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> { return this.nativeUnsupported(); }
   async stepIntoSourceLine(_request: NativeStepIntoSourceLineRequest): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {

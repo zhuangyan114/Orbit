@@ -17,6 +17,8 @@ let watchWebviewProvider: WatchWebviewProvider;
 let dataSamplingManager: DataSamplingManager;
 let timelineProvider: TimelineWebviewProvider;
 let watchPollTimer: NodeJS.Timeout | null = null;
+let watchPollGeneration = 0;
+let activeWatchSession: vscode.DebugSession | null = null;
 let pluginApiServer: PluginApiServer;
 let rttLogTerminal: vscode.Terminal | null = null;
 let rttLogPty: RttLogTerminal | null = null;
@@ -68,6 +70,24 @@ function writeRttLogTerminal(text: string) {
   ensureRttLogTerminal().pty.write(text);
 }
 
+function isUsableWatchSession(session: vscode.DebugSession | undefined): session is vscode.DebugSession {
+  return !!session && session.type === 'ozone' && activeWatchSession === session;
+}
+
+function setActiveWatchSession(session: vscode.DebugSession | undefined) {
+  const next = session?.type === 'ozone' ? session : null;
+  if (activeWatchSession === next) return;
+  activeWatchSession = next;
+  if (next) startWatchPolling();
+  else stopWatchPolling();
+}
+
+function terminateWatchSession(session: vscode.DebugSession) {
+  if (activeWatchSession !== session) return;
+  activeWatchSession = null;
+  stopWatchPolling();
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   try {
     await migrateLegacyOrbitSettings();
@@ -88,11 +108,14 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const b = new OzoneBackend(undefined, undefined, () => vscode.debug.activeDebugSession?.type === 'ozone');
     backend = b;
+    activeWatchSession = vscode.debug.activeDebugSession?.type === 'ozone'
+      ? vscode.debug.activeDebugSession
+      : null;
 
     const wp = new WatchProvider();
     watchProvider = wp;
 
-    const wvp = new WatchWebviewProvider(context, backend);
+    const wvp = new WatchWebviewProvider(context, backend, isUsableWatchSession);
     watchWebviewProvider = wvp;
     wvp.onExpressionsChanged = (exprs) => {
       wp.setExpressions(exprs);
@@ -162,6 +185,15 @@ export async function activate(context: vscode.ExtensionContext) {
         } else if (event.session.type === 'ozone' && event.event === 'ozoneRttOutput') {
           writeRttLogTerminal(String(event.body?.text || ''));
         }
+      }),
+      vscode.debug.onDidStartDebugSession((session) => {
+        if (session.type === 'ozone') setActiveWatchSession(session);
+      }),
+      vscode.debug.onDidChangeActiveDebugSession((session) => {
+        setActiveWatchSession(session);
+      }),
+      vscode.debug.onDidTerminateDebugSession((session) => {
+        terminateWatchSession(session);
       }),
 
       vscode.commands.registerCommand('ozone.addWatch', async () => {
@@ -251,7 +283,7 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
     );
 
-    startWatchPolling();
+    if (activeWatchSession) startWatchPolling();
   } catch (e: any) {
     console.error('[Orbit] activate FAILED:', e.message);
     console.error('[Orbit] stack:', e.stack);
@@ -262,6 +294,15 @@ export async function activate(context: vscode.ExtensionContext) {
 async function readWatchValues(exprs: string[], expandedExpressions: string[] = []): Promise<any[]> {
   const session = vscode.debug.activeDebugSession;
   if (session && session.type === 'ozone') {
+    if (!isUsableWatchSession(session)) {
+      return exprs.map(expression => ({
+        expression,
+        value: 0,
+        display: '',
+        hex: '',
+        error: 'Debug session is not available',
+      }));
+    }
     try {
       const r: any = await session.customRequest('dataSample', { expressions: exprs, expandedExpressions });
       if (r && r.results) return r.results;
@@ -270,6 +311,15 @@ async function readWatchValues(exprs: string[], expandedExpressions: string[] = 
       const error = err?.message || 'DAP dataSample failed';
       return exprs.map(expression => ({ expression, value: 0, display: '', hex: '', error }));
     }
+  }
+  if (!backend.hasTargetConnection) {
+    return exprs.map(expression => ({
+      expression,
+      value: 0,
+      display: '',
+      hex: '',
+      error: 'No active Orbit debug session',
+    }));
   }
   const results: any[] = [];
   for (const expr of exprs) {
@@ -284,11 +334,12 @@ async function readWatchValues(exprs: string[], expandedExpressions: string[] = 
 
 function startWatchPolling() {
   stopWatchPolling();
+  const generation = watchPollGeneration;
   const cfg = getOrbitConfiguration();
   const baseInterval = cfg.get<number>('watchPollIntervalMs', 500);
 
   const loop = async () => {
-    if (watchPollTimer === null) return;
+    if (watchPollTimer === null || generation !== watchPollGeneration) return;
     try {
       const expressions = watchProvider?.watches.map(w => w.expression) || [];
       if (expressions.length === 0) {
@@ -300,17 +351,21 @@ function startWatchPolling() {
         return;
       }
       const results = await readWatchValues(expressions, watchWebviewProvider?.expandedExpressions || []);
+      if (watchPollTimer === null || generation !== watchPollGeneration) return;
       if (results.length > 0) {
         watchProvider?.updateResults(results);
         watchWebviewProvider?.sendWatchResults(results as any);
       }
     } catch {}
-    if (watchPollTimer !== null) watchPollTimer = setTimeout(loop, baseInterval);
+    if (watchPollTimer !== null && generation === watchPollGeneration) {
+      watchPollTimer = setTimeout(loop, baseInterval);
+    }
   };
   watchPollTimer = setTimeout(loop, baseInterval);
 }
 
 function stopWatchPolling() {
+  watchPollGeneration++;
   if (watchPollTimer) { clearTimeout(watchPollTimer); watchPollTimer = null; }
 }
 
@@ -328,7 +383,13 @@ function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
         version: 1,
         body: {
           debuggers: ["ozone"],
-          handler: (event: any) => {
+          // debug-tracker invokes the client handler and unconditionally calls
+          // `.catch` on the returned value.  Keep this callback async even for
+          // events Orbit does not need; returning `undefined` makes the tracker
+          // report `Cannot read properties of undefined (reading 'catch')` and
+          // leaves its debug-session state half-initialized, which in turn
+          // produces stale `variables` requests after the DAP session closes.
+          handler: async (event: any) => {
             if (event.event === 'first-stack-trace' && !refreshScheduled) {
               refreshScheduled = true;
 

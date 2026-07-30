@@ -5,6 +5,7 @@
 .vscode/**
 .vscode-test/**
 outputs/**
+artifacts/**
 build/**
 tmp/**
 docs/**
@@ -32,3 +33,4 @@ docs/test-rtos-views.md
 *.zip
 *.vsix
 scripts/**
+test/**

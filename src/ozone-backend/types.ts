@@ -78,6 +78,8 @@ export interface FastDataSampleSpec {
   size: number;
   pointerAddress?: number;
   pointeeOffset?: number;
+  /** Offsets applied after each pointer read, in dereference order. */
+  pointerOffsets?: number[];
   typeName?: string;
   isFloat?: boolean;
   signed?: boolean;
@@ -135,7 +137,7 @@ export type OzoneCommand =
   | { cmd: 'setBreakpoint'; file: string; line: number; type?: string; condition?: string }
   | { cmd: 'clearBreakpoint'; id: number }
   | { cmd: 'clearAllBreakpoints' }
-  | { cmd: 'getRegisters' }
+  | { cmd: 'getRegisters'; frame?: number }
   | { cmd: 'getVariable'; name: string; frame?: number }
   | { cmd: 'getLocals'; frame?: number }
   | { cmd: 'getCallStack' }

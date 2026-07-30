@@ -119,6 +119,8 @@ export class PluginApiServer implements vscode.Disposable {
         return { targetState: await this.runtime.getTargetState() };
       case 'ozone.target.getState':
         return { state: await this.runtime.getTargetState() };
+      case 'ozone.rtt.getStats':
+        return this.runtime.getRttStats();
       case 'ozone.expr.readMany':
         return { results: await this.runtime.readSignals(this.readManySignals(params as ReadManyParams)) };
       case 'ozone.expr.writeMany':

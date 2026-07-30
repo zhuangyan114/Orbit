@@ -70,4 +70,19 @@ describe('RuntimeRouter active DAP ownership', () => {
     });
     expect(backend.execute).not.toHaveBeenCalled();
   });
+
+  it('reads RTT polling stats from the active DAP session', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const stats = { readCalls: 12, receivedBytes: 4096, emptyReads: 2 };
+    const customRequest = vi.fn(async (command: string) => {
+      if (command === 'getRttStats') return stats;
+      throw new Error(`Unexpected request: ${command}`);
+    });
+    vscodeState.activeDebugSession = { type: 'ozone', customRequest };
+    const router = new RuntimeRouter(backend);
+
+    await expect(router.getRttStats()).resolves.toEqual(stats);
+    expect(customRequest).toHaveBeenCalledWith('getRttStats', {});
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
 });

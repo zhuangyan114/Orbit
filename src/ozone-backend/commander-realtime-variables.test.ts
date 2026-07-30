@@ -56,6 +56,170 @@ describe('OzoneBackend realtime variables', () => {
     expect(plan[1].spec).toBeUndefined();
   });
 
+  it('plans and reads a scalar through a nested struct array path', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as any;
+    internal.symbols = [{ name: 'chassis', address: 0x20007000, size: 4 }];
+    internal.dwarfInfo = {
+      varToType: new Map([['chassis', 'chassis-pointer-type']]),
+      typeDefs: new Map([
+        ['chassis-pointer-type', { name: 'Chassis_t*', byteSize: 4, kind: 'pointer', typeOffset: 'chassis-type' }],
+        ['chassis-type', {
+          name: 'Chassis_t', byteSize: 32, kind: 'struct',
+          fields: [{ name: 'chassis_motor', typeOffset: 'motor-array-type', byteOffset: 0 }],
+        }],
+        ['motor-array-type', { name: 'Motor_t[2]', byteSize: 32, kind: 'array', typeOffset: 'motor-type', arrayCount: 2 }],
+        ['motor-type', {
+          name: 'Motor_t', byteSize: 16, kind: 'struct',
+          fields: [
+            { name: 'target_velocity', typeOffset: 'float-type', byteOffset: 0 },
+            { name: 'message', typeOffset: 'message-type', byteOffset: 4 },
+          ],
+        }],
+        ['message-type', {
+          name: 'MotorMessage_t', byteSize: 12, kind: 'struct',
+          fields: [{ name: 'out_velocity', typeOffset: 'float-type', byteOffset: 8 }],
+        }],
+        ['float-type', { name: 'float', byteSize: 4, kind: 'base', encoding: 'float' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address: number) => {
+      if (address === 0x20007000) return Uint8Array.from([0x00, 0x10, 0x00, 0x20]);
+      if (address === 0x20001000) return Uint8Array.from([0x00, 0x00, 0xA0, 0x3F]);
+      if (address === 0x2000100C) return Uint8Array.from([0x00, 0x00, 0x20, 0x40]);
+      return null;
+    };
+
+    const planResult = await backend.execute({
+      cmd: 'prepareFastDataSampling',
+      expressions: [
+        'chassis.chassis_motor[0].target_velocity',
+        'chassis.chassis_motor[0].message.out_velocity',
+      ],
+    });
+
+    expect(planResult.ok).toBe(true);
+    if (!planResult.ok) throw new Error(planResult.error);
+    const plan = planResult.data as Array<{
+      spec?: { expression: string; address: number; pointerAddress?: number; pointeeOffset?: number; size: number };
+    }>;
+    expect(plan[0].spec).toMatchObject({
+      pointerAddress: 0x20007000,
+      pointeeOffset: 0,
+      size: 4,
+    });
+    expect(plan[1].spec).toMatchObject({
+      pointerAddress: 0x20007000,
+      pointeeOffset: 12,
+      size: 4,
+    });
+
+    const readResult = await backend.execute({
+      cmd: 'readFastDataSampling',
+      specs: plan.map(item => item.spec!),
+    });
+
+    expect(readResult.ok).toBe(true);
+    if (!readResult.ok) throw new Error(readResult.error);
+    expect(readResult.data).toEqual([
+      expect.objectContaining({
+        expression: 'chassis.chassis_motor[0].target_velocity',
+        address: 0x20001000,
+        display: '1.250000',
+      }),
+      expect.objectContaining({
+        expression: 'chassis.chassis_motor[0].message.out_velocity',
+        address: 0x2000100C,
+        display: '2.500000',
+      }),
+    ]);
+  });
+
+  it('plans and reads a scalar through an array of struct pointers', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as any;
+    internal.symbols = [{ name: 'chassis', address: 0x20007000, size: 4 }];
+    internal.dwarfInfo = {
+      varToType: new Map([['chassis', 'chassis-pointer-type']]),
+      typeDefs: new Map([
+        ['chassis-pointer-type', { name: 'Chassis_t*', byteSize: 4, kind: 'pointer', typeOffset: 'chassis-type' }],
+        ['chassis-type', {
+          name: 'Chassis_t', byteSize: 32, kind: 'struct',
+          fields: [{ name: 'chassis_motor', typeOffset: 'motor-pointer-array-type', byteOffset: 8 }],
+        }],
+        ['motor-pointer-array-type', { name: 'Motor_t*[2]', byteSize: 8, kind: 'array', typeOffset: 'motor-pointer-type', arrayCount: 2 }],
+        ['motor-pointer-type', { name: 'Motor_t*', byteSize: 4, kind: 'pointer', typeOffset: 'motor-type' }],
+        ['motor-type', {
+          name: 'Motor_t', byteSize: 32, kind: 'struct',
+          fields: [
+            { name: 'target_velocity', typeOffset: 'float-type', byteOffset: 4 },
+            { name: 'message', typeOffset: 'message-type', byteOffset: 8 },
+          ],
+        }],
+        ['message-type', {
+          name: 'MotorMessage_t', byteSize: 16, kind: 'struct',
+          fields: [{ name: 'out_velocity', typeOffset: 'float-type', byteOffset: 12 }],
+        }],
+        ['float-type', { name: 'float', byteSize: 4, kind: 'base', encoding: 'float' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address: number) => {
+      if (address === 0x20007000) return Uint8Array.from([0x00, 0x10, 0x00, 0x20]);
+      if (address === 0x20001008) return Uint8Array.from([0x00, 0x20, 0x00, 0x20]);
+      if (address === 0x20002004) return Uint8Array.from([0x00, 0x00, 0xA0, 0x3F]);
+      if (address === 0x20002014) return Uint8Array.from([0x00, 0x00, 0x20, 0x40]);
+      return null;
+    };
+
+    const planResult = await backend.execute({
+      cmd: 'prepareFastDataSampling',
+      expressions: [
+        'chassis.chassis_motor[0].target_velocity',
+        'chassis.chassis_motor[0].message.out_velocity',
+      ],
+    });
+
+    expect(planResult.ok).toBe(true);
+    if (!planResult.ok) throw new Error(planResult.error);
+    const plan = planResult.data as Array<{ spec?: {
+      pointerAddress?: number;
+      pointeeOffset?: number;
+      pointerOffsets?: number[];
+      size: number;
+    } }>;
+    expect(plan[0].spec).toMatchObject({
+      pointerAddress: 0x20007000,
+      pointerOffsets: [8, 4],
+      size: 4,
+    });
+    expect(plan[0].spec?.pointeeOffset).toBeUndefined();
+    expect(plan[1].spec).toMatchObject({
+      pointerAddress: 0x20007000,
+      pointerOffsets: [8, 20],
+      size: 4,
+    });
+
+    const readResult = await backend.execute({
+      cmd: 'readFastDataSampling',
+      specs: plan.map(item => item.spec!).filter(Boolean) as any,
+    });
+
+    expect(readResult.ok).toBe(true);
+    if (!readResult.ok) throw new Error(readResult.error);
+    expect(readResult.data).toEqual([
+      expect.objectContaining({
+        expression: 'chassis.chassis_motor[0].target_velocity',
+        address: 0x20002004,
+        display: '1.250000',
+      }),
+      expect.objectContaining({
+        expression: 'chassis.chassis_motor[0].message.out_velocity',
+        address: 0x20002014,
+        display: '2.500000',
+      }),
+    ]);
+  });
+
   it('samples a scalar field through a global struct pointer', async () => {
     const backend = new OzoneBackend();
     const internal = backend as unknown as BackendInternals;
@@ -141,6 +305,39 @@ describe('OzoneBackend realtime variables', () => {
     expect(value.children).toEqual([
       expect.objectContaining({ expression: 'yaw', display: '1.000000' }),
     ]);
+  });
+
+  it('does not advertise children for a null struct pointer', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    internal.symbols = [{ name: 'ina226_ins', address: 0x200065e0, size: 4 }];
+    internal.dwarfInfo = {
+      varToType: new Map([['ina226_ins', 'pointer-type']]),
+      typeDefs: new Map([
+        ['pointer-type', { name: 'Ina226Instance_s*', byteSize: 4, kind: 'pointer', typeOffset: 'struct-type' }],
+        ['struct-type', {
+          name: 'Ina226Instance_s',
+          byteSize: 4,
+          kind: 'struct',
+          fields: [{ name: 'init_status', typeOffset: 'uint8-type', byteOffset: 0 }],
+        }],
+        ['uint8-type', { name: 'uint8_t', byteSize: 1, kind: 'base', encoding: 'unsigned' }],
+      ]),
+    };
+    internal.targetReadMemory = async address => address === 0x200065e0
+      ? Uint8Array.from([0, 0, 0, 0])
+      : null;
+
+    const result = await backend.execute({ cmd: 'evaluateExpression', expression: 'ina226_ins', force: true });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    expect(result.data).toEqual(expect.objectContaining({
+      value: 0,
+      display: '0x00000000 (0)',
+      hasChildren: false,
+      children: undefined,
+    }));
   });
 
   it('keeps collapsed pointer Watch values shallow until their expression is expanded', async () => {

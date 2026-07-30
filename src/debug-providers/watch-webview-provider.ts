@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { WatchValue } from '../ozone-backend/types';
+import { stripHanCharacters } from '../utils/watch-expression-validation';
 
 const WATCH_EXPANDED_STATE_KEY = 'ozoneWatchExpandedExpressions';
 
@@ -18,8 +19,13 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   constructor(
     private context: vscode.ExtensionContext,
     private backend: OzoneBackend,
+    private canUseDapSession: (session: vscode.DebugSession) => boolean = () => true,
   ) {
-    this._expandedExpressions = new Set(this.context.workspaceState.get<string[]>(WATCH_EXPANDED_STATE_KEY, []));
+    this._expandedExpressions = new Set(
+      this.context.workspaceState.get<string[]>(WATCH_EXPANDED_STATE_KEY, [])
+        .map(expression => stripHanCharacters(String(expression)).trim())
+        .filter(Boolean),
+    );
   }
 
   get expressionList(): string[] {
@@ -79,7 +85,9 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   setExpressions(expressions: string[]) {
-    this._expressions = [...expressions];
+    this._expressions = expressions
+      .map(expression => stripHanCharacters(String(expression)).trim())
+      .filter(Boolean);
     this.postInit();
     if (this._onExpressionsChanged) {
       this._onExpressionsChanged(this._expressions);
@@ -90,8 +98,9 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   addExpression(expr: string) {
-    if (!expr || this._expressions.includes(expr)) return;
-    this._expressions = [...this._expressions, expr];
+    const sanitized = stripHanCharacters(String(expr || '')).trim();
+    if (!sanitized || this._expressions.includes(sanitized)) return;
+    this._expressions = [...this._expressions, sanitized];
     this.postInit();
     if (this._onExpressionsChanged) {
       this._onExpressionsChanged(this._expressions);
@@ -114,20 +123,40 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     let results: WatchValue[] | null = null;
     const session = vscode.debug.activeDebugSession;
     if (session && session.type === 'ozone') {
-      try {
-        const r: any = await session.customRequest('dataSample', {
-          expressions,
-          expandedExpressions: this.expandedExpressions,
-        });
-        if (r && r.results) {
-          results = r.results as WatchValue[];
-        } else {
-          results = expressions.map(expression => ({ expression, value: 0, display: '', hex: '', error: 'DAP dataSample returned no results' }));
+      if (!this.canUseDapSession(session)) {
+        results = expressions.map(expression => ({
+          expression,
+          value: 0,
+          display: '',
+          hex: '',
+          error: 'Debug session is not available',
+        }));
+      } else {
+        try {
+          const r: any = await session.customRequest('dataSample', {
+            expressions,
+            expandedExpressions: this.expandedExpressions,
+          });
+          if (r && r.results) {
+            results = r.results as WatchValue[];
+          } else {
+            results = expressions.map(expression => ({ expression, value: 0, display: '', hex: '', error: 'DAP dataSample returned no results' }));
+          }
+        } catch (err: any) {
+          const error = err?.message || 'DAP dataSample failed';
+          results = expressions.map(expression => ({ expression, value: 0, display: '', hex: '', error }));
         }
-      } catch (err: any) {
-        const error = err?.message || 'DAP dataSample failed';
-        results = expressions.map(expression => ({ expression, value: 0, display: '', hex: '', error }));
       }
+    }
+
+    if (!results && !this.backend.hasTargetConnection) {
+      results = expressions.map(expression => ({
+        expression,
+        value: 0,
+        display: '',
+        hex: '',
+        error: 'No active Orbit debug session',
+      }));
     }
 
     if (!results) {
@@ -151,7 +180,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
 
   private setExpandedExpressions(expressions: unknown) {
     const next = Array.isArray(expressions)
-      ? expressions.map(e => String(e)).filter(Boolean)
+      ? expressions.map(e => stripHanCharacters(String(e)).trim()).filter(Boolean)
       : [];
     this._expandedExpressions = new Set(next);
     this.context.workspaceState.update(WATCH_EXPANDED_STATE_KEY, next);
@@ -163,14 +192,20 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     // Route through active DAP session when debugging, same as readWatchValues
     const session = vscode.debug.activeDebugSession;
     if (session && session.type === 'ozone') {
-      try {
-        const r: any = await session.customRequest('setWatchValue', { expression, value, address, typeName });
-        result = r && r.ok !== undefined ? r : { ok: true, data: r };
-      } catch (e: any) {
-        result = { ok: false, error: e.message || 'DAP setWatchValue failed' };
+      if (!this.canUseDapSession(session)) {
+        result = { ok: false, error: 'Debug session is not available' };
+      } else {
+        try {
+          const r: any = await session.customRequest('setWatchValue', { expression, value, address, typeName });
+          result = r && r.ok !== undefined ? r : { ok: true, data: r };
+        } catch (e: any) {
+          result = { ok: false, error: e.message || 'DAP setWatchValue failed' };
+        }
       }
-    } else {
+    } else if (this.backend.hasTargetConnection) {
       result = await this.backend.execute({ cmd: 'setWatchValue', expression, value, address, typeName });
+    } else {
+      result = { ok: false, error: 'No active Orbit debug session' };
     }
     this.postMessage({
       command: 'watchValueSet',

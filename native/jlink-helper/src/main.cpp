@@ -1212,6 +1212,10 @@ class JLinkChannel {
     const int result = rttControl_(0, configPointer);
     if (result < 0) return callError("JLINK_RTTERMINAL_Control(start)", result, started);
     rttStarted_ = true;
+    rttReadCalls_ = 0;
+    rttReceivedBytes_ = 0;
+    rttEmptyReads_ = 0;
+    rttReadErrors_ = 0;
     return success("{}", "RTT started", started);
   }
 
@@ -1236,11 +1240,27 @@ class JLinkChannel {
     if (!bufferIndex || !size || *size == 0 || *size > 1024 * 1024) {
       return error("ProtocolError", "readRtt requires bufferIndex and size", started);
     }
+    if (!rttStarted_) return error("NotStarted", "RTT must be started before read", started);
+    rttReadCalls_++;
     std::vector<std::uint8_t> bytes(*size);
     const int result = rttRead_(*bufferIndex, bytes.data(), *size);
-    if (result < 0) return callError("JLINK_RTTERMINAL_Read", result, started);
+    if (result < 0) {
+      rttReadErrors_++;
+      return callError("JLINK_RTTERMINAL_Read", result, started);
+    }
     bytes.resize(static_cast<std::size_t>(result));
-    return success("{\"bytesBase64\":\"" + base64Encode(bytes) + "\"}", "RTT read", started);
+    rttReceivedBytes_ += static_cast<std::uint64_t>(result);
+    if (result == 0) rttEmptyReads_++;
+    std::ostringstream data;
+    data << "{\"bytesBase64\":\"" << base64Encode(bytes) << "\",\"stats\":{"
+         << "\"requestedSize\":" << *size
+         << ",\"returnedSize\":" << result
+         << ",\"empty\":" << (result == 0 ? "true" : "false")
+         << ",\"readCalls\":" << rttReadCalls_
+         << ",\"receivedBytes\":" << rttReceivedBytes_
+         << ",\"emptyReads\":" << rttEmptyReads_
+         << ",\"readErrors\":" << rttReadErrors_ << "}}";
+    return success(data.str(), "RTT read", started);
   }
 
   std::string disconnect() {
@@ -1385,6 +1405,10 @@ class JLinkChannel {
   bool symbolsReady_ = false;
   bool wasOpened_ = false;
   bool rttStarted_ = false;
+  std::uint64_t rttReadCalls_ = 0;
+  std::uint64_t rttReceivedBytes_ = 0;
+  std::uint64_t rttEmptyReads_ = 0;
+  std::uint64_t rttReadErrors_ = 0;
   bool targetLinkProbeEnabled_ = false;
   std::string missingSymbol_;
   std::string loadedPath_;

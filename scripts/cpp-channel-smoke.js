@@ -49,7 +49,7 @@ async function main() {
   const hello = await request('hello', {
     clientProtocol: 2,
     extensionVersion: 'cpp-channel-smoke',
-    requiredCapabilities: ['basicDebug', 'readRegister', 'readMemory', 'writeMemory', 'readMemoryBatch', 'hardwareBreakpoints', 'reset'],
+    requiredCapabilities: ['basicDebug', 'readRegister', 'readMemory', 'writeMemory', 'readMemoryBatch', 'hardwareBreakpoints', 'reset', 'rtt'],
   });
   if (!hello.ok) throw new Error(hello.message);
   console.log(`hello: protocol=${hello.data.protocol}, helper=${hello.data.helperVersion}`);
@@ -95,11 +95,19 @@ async function main() {
         throw new Error(`readMemoryBatch failed: ${JSON.stringify(batch)}`);
       }
 
+      const rttBeforeStart = await request('readRtt', { bufferIndex: 0, size: 16 });
+      if (rttBeforeStart.ok || rttBeforeStart.errorCode !== 'NotStarted') {
+        throw new Error(`RTT not-started guard failed: ${JSON.stringify(rttBeforeStart)}`);
+      }
       const rttStart = await request('startRtt', {});
       const rttRead = await request('readRtt', { bufferIndex: 0, size: 16 });
       const rttStop = await request('stopRtt', {});
       if (!rttStart.ok || !rttRead.ok || !rttStop.ok
-          || Buffer.from(rttRead.data.bytesBase64, 'base64').toString('utf8') !== 'RTT') {
+          || Buffer.from(rttRead.data.bytesBase64, 'base64').toString('utf8') !== 'RTT'
+          || rttRead.data.stats?.returnedSize !== 3
+          || rttRead.data.stats?.empty !== false
+          || rttRead.data.stats?.readCalls < 1
+          || rttRead.data.stats?.receivedBytes < 3) {
         throw new Error(`RTT lifecycle failed: ${JSON.stringify({ rttStart, rttRead, rttStop })}`);
       }
 

@@ -14,6 +14,7 @@
 - `npm run typecheck` runs `tsc --noEmit`; `npm test` runs Vitest.
 - `npm run build:native` builds `out/native/win32-x64/orbit-jlink-helper.exe`.
 - `npm run test:cpp-channel:mock` exercises the helper channel against the mock DLL. It is not hardware validation.
+- Watch/Timeline and stopped-state DAP changes have focused coverage in `src/debug/dap-session-realtime-variables.test.ts`, `src/debug/dap-session-scopes.test.ts`, `src/ozone-backend/native-scheduler.test.ts`, and `src/utils/watch-expression-validation.test.ts`; run the focused tests before the full suite when iterating on those paths.
 - `npm run watch`, `npm run dev`, and `npm run mcp` respectively watch bundles, launch Extension Development Host, and start the local MCP client.
 - Do not run target-mutating hardware commands without explicit user authorization.
 
@@ -36,18 +37,26 @@
 - `OzoneBackend` dispatches the `OzoneCommand` union. Every `OzoneCommandResult` consumer must test `.ok` before reading `.data` or using success-only fields.
 - DAP owns target access while an `ozone` debug session is active. `SessionManager` must not connect its extension-host backend in that state.
 - `RuntimeRouter` must send target state, reads, and writes to the active `ozone` session through `session.customRequest(...)`: `getTargetState`, `dataSample`, and `setWatchValue`. If that request is malformed or fails, return an error for that operation. Never fall back to the extension-host backend while the active DAP session exists.
+- Treat the active `vscode.DebugSession` identity as part of the routing contract, not just `session.type === 'ozone'`. Watch polling, Watch webview requests, and remote Timeline sampling must stop or return an explicit unavailable-session error when that exact session terminates, is replaced, or is still starting; stale async completions must not publish results into a newer session.
+- Guard asynchronous Watch polling and remote sampling start/stop transitions with a generation/session check. Do not start local sampling without an active target connection, and do not accept `ozoneDataSamples` from an inactive session.
 - Watch and Timeline webviews persist expressions in `ozoneWatchExpressions` and `ozoneDataSamplingExpressions`. Their reads, writes, and sampling must observe the DAP owner rather than a duplicate backend.
+- Normalize expressions at every boundary (`Watch` UI, persisted Watch expressions, DAP `setWatches`, `watchEvaluate`, and `dataSample`): strip Han characters, trim, and drop empty entries. Preserve the remaining punctuation and expression syntax; do not silently invent a different expression.
 - RTT start/stop/read must use the selected owner and preserve the configured buffer, polling, target, and ANSI behavior.
 
 ## Concurrency and Realtime Data
 
-- `NativeScheduler` serializes native-owner access. Its dequeue order is `control > watch > timeline`; queued watch/timeline reads may be coalesced or cancelled, but control work is never bypassed.
-- Steps, continue/halt/reset, breakpoint changes, and variable writes are control work. They must exclude or pause concurrent Watch and Timeline native reads for their complete critical section, then allow sampling to resume.
-- Do not fix a step issue by disabling, bypassing, or corrupting Watch, Timeline, `evaluate`, `variables`, or variable writes. Treat sampling cadence and point retention as performance-sensitive behavior.
+- `NativeScheduler` serializes native-owner access. Its dequeue order is `control > watch > timeline > background`; queued Watch/Timeline/background reads may be coalesced or cancelled, but control work is never bypassed.
+- RTT polling is background work. `startRtt`, `stopRtt`, and `readRtt` must not compete with Watch/Timeline as an equal-priority stream; a control request pauses both `timeline` and `background` work for its complete critical section.
+- Steps, continue/halt/reset, breakpoint changes, and variable writes are control work. They must exclude or pause concurrent Watch, Timeline, and RTT-background reads for their complete critical section, then allow sampling to resume.
+- A Watch batch must release the target-read gate between small slices (currently one top-level expression per slice) so Timeline can make progress between Watch reads. Do not repair a step or latency issue by disabling Watch, Timeline, `evaluate`, `variables`, or variable writes.
+- Fast Timeline sampling pauses best-effort RTT text polling while active and restores it after sampling stops. Keep RTT Log, Timeline sampling, and future RTOS Trace as distinct logical consumers even when they share the selected physical owner.
+- Treat sampling cadence, generation/termination fences, and point retention as performance-sensitive behavior.
 
 ## DAP Compatibility Invariants
 
 - Preserve standard DAP `evaluate`, `variables`, expandable `variablesReference` trees, struct/array/pointer children, and `memoryReference` values for RTOS Views.
+- Stopped-state `variables` requests for Local and Registers may wait for the control/read handoff (bounded at 1200 ms) instead of returning an immediate empty list. On session termination or an unavailable target read, return a safe empty/error result and never issue a new native read.
+- Runtime Watch/Timeline sampling is allowed to read while the target is running through the explicit realtime path; avoid an extra target-state query in that forced path because it serializes the owner and can block Timeline. Ordinary stopped-state DAP Watch refreshes must still respect target state and return cached/running values when reads are deferred.
 - Keep `initialize.supportsReadMemoryRequest`, base64 byte-oriented `readMemory`/`writeMemory`, and valid DAP `memoryReference` behavior for MemoryView and Peripheral Viewer. Preserve `deviceName`, `svdFile`, and `svdPath` launch aliases.
 - A native source-level `stepInto` must scan/enter calls within the current source-line bounds, rather than regressing to repeated instruction-only UI clicks.
 - A native `stepOut` source hint may improve displayed location but must not replace the trusted native PC. The first subsequent source-level step must advance visibly beyond that hint, not consume a visual empty step.

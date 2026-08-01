@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { extractEditableWatchValue, parseWatchValueInput } from '../watch-value-input';
+import { stripHanCharacters } from '../../utils/watch-expression-validation';
 
 interface VSCODE_API { postMessage(message: any): void; }
 declare function acquireVsCodeApi(): VSCODE_API;
@@ -105,7 +106,7 @@ export function WatchApp() {
   }, []);
 
   const addWatch = () => {
-    const expr = newExpr.trim();
+    const expr = stripHanCharacters(newExpr).trim();
     if (!expr) return;
     vscode.postMessage({ command: 'addExpression', expression: expr });
     setNewExpr('');
@@ -279,7 +280,7 @@ export function WatchApp() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontSize: '12px' }}>
       <div style={{ display: 'flex', gap: '4px', padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
-        <input value={newExpr} onChange={e => setNewExpr(e.target.value)}
+        <input value={newExpr} onChange={e => setNewExpr(stripHanCharacters(e.target.value))}
           onKeyDown={e => { if (e.key === 'Enter') addWatch(); }}
           placeholder="变量名或表达式"
           style={{ flex: 1, ...inputStyle }} />

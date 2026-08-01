@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { WatchValue } from '../ozone-backend/types';
+import { stripHanCharacters } from '../utils/watch-expression-validation';
 
 const MIN_CHANGE_DISPLAY_MS = 500;
 
@@ -162,7 +163,10 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem>, vscode
   }
 
   setExpressions(expressions: string[]) {
-    this._watches = expressions.map(expr => ({
+    const sanitizedExpressions = expressions
+      .map(expr => stripHanCharacters(String(expr)).trim())
+      .filter(Boolean);
+    this._watches = sanitizedExpressions.map(expr => ({
       expression: expr, value: 0, display: '', hex: '',
     }));
     this._prevValues.clear();
@@ -170,7 +174,7 @@ export class WatchProvider implements vscode.TreeDataProvider<WatchItem>, vscode
     this._onDidChangeTreeData.fire(undefined);
     this._onDidChangeFileDecorations.fire(undefined);
     if (this.onExpressionsChanged) {
-      this.onExpressionsChanged(expressions);
+      this.onExpressionsChanged(sanitizedExpressions);
     }
   }
 }

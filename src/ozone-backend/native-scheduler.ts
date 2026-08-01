@@ -1,4 +1,4 @@
-export type NativeTaskPriority = 'control' | 'watch' | 'timeline';
+export type NativeTaskPriority = 'control' | 'watch' | 'timeline' | 'background';
 
 export interface NativeScheduleOptions {
   priority: NativeTaskPriority;
@@ -22,7 +22,7 @@ interface ScheduledTask<T> {
   abortListener?: () => void;
 }
 
-const PRIORITY_ORDER: NativeTaskPriority[] = ['control', 'watch', 'timeline'];
+const PRIORITY_ORDER: NativeTaskPriority[] = ['control', 'watch', 'timeline', 'background'];
 
 export class NativeSchedulerCancelledError extends Error {
   constructor(message: string) {
@@ -37,11 +37,13 @@ export class NativeScheduler {
     control: [],
     watch: [],
     timeline: [],
+    background: [],
   };
   private readonly pauseCounts: Record<NativeTaskPriority, number> = {
     control: 0,
     watch: 0,
     timeline: 0,
+    background: 0,
   };
   private nextId = 1;
   private running = false;
@@ -111,6 +113,7 @@ export class NativeScheduler {
         control: this.queues.control.length,
         watch: this.queues.watch.length,
         timeline: this.queues.timeline.length,
+        background: this.queues.background.length,
       },
     };
   }

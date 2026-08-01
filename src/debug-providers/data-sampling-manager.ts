@@ -23,6 +23,7 @@ export class DataSamplingManager {
   private sendIntervalMs = DEFAULT_SEND_INTERVAL_MS;
   private remoteSession: vscode.DebugSession | null = null;
   private remoteSampling = false;
+  private samplingGeneration = 0;
   private readonly disposables: vscode.Disposable[] = [];
 
   onExpressionsChanged: ((exprs: { expression: string; color: string }[]) => void) | null = null;
@@ -43,14 +44,17 @@ export class DataSamplingManager {
     }));
     this.disposables.push(vscode.debug.onDidChangeActiveDebugSession(() => void this.syncSamplingMode()));
     this.disposables.push(vscode.debug.onDidTerminateDebugSession(session => {
+      if (session.type !== 'ozone') return;
       if (this.remoteSession === session) {
         this.remoteSession = null;
         this.remoteSampling = false;
-        void this.syncSamplingMode();
       }
+      void this.syncSamplingMode();
     }));
     this.disposables.push(vscode.debug.onDidReceiveDebugSessionCustomEvent(event => {
-      if (event.session === this.remoteSession && event.event === 'ozoneDataSamples') {
+      if (event.session === this.remoteSession
+        && event.session === vscode.debug.activeDebugSession
+        && event.event === 'ozoneDataSamples') {
         this.acceptRemoteSamples(event.body?.snapshots || []);
       }
     }));
@@ -135,6 +139,7 @@ export class DataSamplingManager {
   private _stopped = false;
 
   private async syncSamplingMode() {
+    const generation = ++this.samplingGeneration;
     if (this.entries.length === 0) {
       await this.stopRemoteSampling();
       this.stopLocalSampling();
@@ -144,15 +149,19 @@ export class DataSamplingManager {
     const session = vscode.debug.activeDebugSession;
     if (session && session.type === 'ozone') {
       this.stopLocalSampling();
-      await this.startRemoteSampling(session);
+      await this.startRemoteSampling(session, generation);
       return;
     }
 
     await this.stopRemoteSampling();
+    if (!this.backend.hasTargetConnection) {
+      this.stopLocalSampling();
+      return;
+    }
     if (!this.timer) this.startSampling();
   }
 
-  private async startRemoteSampling(session: vscode.DebugSession) {
+  private async startRemoteSampling(session: vscode.DebugSession, generation: number) {
     try {
       const response: any = await session.customRequest('dataSamplingStart', {
         entries: this.entries.map(e => ({ expression: e.expression, color: e.color })),
@@ -160,6 +169,10 @@ export class DataSamplingManager {
         sendIntervalMs: this.sendIntervalMs,
       });
       if (response?.ok === false) throw new Error(response?.message || 'remote sampler rejected expressions');
+      if (generation !== this.samplingGeneration || vscode.debug.activeDebugSession !== session) {
+        try { await session.customRequest('dataSamplingStop', {}); } catch {}
+        return;
+      }
       this.remoteSession = session;
       this.remoteSampling = true;
     } catch {
@@ -191,12 +204,17 @@ export class DataSamplingManager {
   }
 
   stopSampling() {
+    this.samplingGeneration++;
     void this.stopRemoteSampling();
     this.stopLocalSampling();
   }
 
   private async sampleLoop() {
     if (this._stopped) return;
+    if (!this.backend.hasTargetConnection) {
+      this.stopLocalSampling();
+      return;
+    }
     const started = Date.now();
     await this.sample();
     if (this._stopped) return;
@@ -231,6 +249,7 @@ export class DataSamplingManager {
   }
 
   private async sample() {
+    if (!this.backend.hasTargetConnection) return;
     if (await this.isHalted()) return;
     if (this.entries.length === 0) return;
     const now = Date.now();

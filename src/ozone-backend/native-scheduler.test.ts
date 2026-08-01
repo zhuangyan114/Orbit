@@ -8,18 +8,19 @@ function deferred<T>() {
 }
 
 describe('NativeScheduler', () => {
-  it('serializes native work and chooses control before queued watch and timeline work', async () => {
+  it('serializes native work and keeps background work behind Timeline', async () => {
     const scheduler = new NativeScheduler();
     const gate = deferred<void>();
     const order: string[] = [];
     const running = scheduler.schedule(async () => { order.push('running'); await gate.promise; }, { priority: 'watch' });
     const timeline = scheduler.schedule(async () => { order.push('timeline'); }, { priority: 'timeline' });
     const watch = scheduler.schedule(async () => { order.push('watch'); }, { priority: 'watch' });
+    const background = scheduler.schedule(async () => { order.push('background'); }, { priority: 'background' });
     const control = scheduler.schedule(async () => { order.push('control'); }, { priority: 'control' });
 
     gate.resolve();
-    await Promise.all([running, timeline, watch, control]);
-    expect(order).toEqual(['running', 'control', 'watch', 'timeline']);
+    await Promise.all([running, timeline, watch, background, control]);
+    expect(order).toEqual(['running', 'control', 'watch', 'timeline', 'background']);
   });
 
   it('does not let sustained timeline sampling starve a setWatchValue control task', async () => {
@@ -50,17 +51,18 @@ describe('NativeScheduler', () => {
     const scheduler = new NativeScheduler();
     const order: string[] = [];
     const stepGate = deferred<void>();
-    const step = scheduler.withPaused(['timeline'], () =>
+    const step = scheduler.withPaused(['timeline', 'background'], () =>
       scheduler.schedule(async () => { order.push('step'); await stepGate.promise; }, { priority: 'control' }),
     );
     const timeline = scheduler.schedule(async () => { order.push('timeline'); }, { priority: 'timeline' });
+    const background = scheduler.schedule(async () => { order.push('background'); }, { priority: 'background' });
     const watch = scheduler.schedule(async () => { order.push('watch'); }, { priority: 'watch' });
 
     expect(order).toEqual(['step']);
     expect(scheduler.snapshot().pausedPriorities).toContain('timeline');
     stepGate.resolve();
-    await Promise.all([step, watch, timeline]);
-    expect(order).toEqual(['step', 'watch', 'timeline']);
+    await Promise.all([step, watch, timeline, background]);
+    expect(order).toEqual(['step', 'watch', 'timeline', 'background']);
     expect(scheduler.snapshot().pausedPriorities).not.toContain('timeline');
   });
 
@@ -69,7 +71,7 @@ describe('NativeScheduler', () => {
     const stepGate = deferred<void>();
     const order: string[] = [];
     const stepError = new Error('step failed');
-    const step = scheduler.withPaused(['timeline'], () =>
+    const step = scheduler.withPaused(['timeline', 'background'], () =>
       scheduler.schedule(async () => {
         order.push('step');
         await stepGate.promise;
@@ -78,12 +80,13 @@ describe('NativeScheduler', () => {
     );
     const stepAssertion = expect(step).rejects.toBe(stepError);
     const timeline = scheduler.schedule(async () => { order.push('timeline'); }, { priority: 'timeline' });
+    const background = scheduler.schedule(async () => { order.push('background'); }, { priority: 'background' });
 
     expect(scheduler.snapshot().pausedPriorities).toContain('timeline');
     stepGate.resolve();
     await stepAssertion;
-    await timeline;
-    expect(order).toEqual(['step', 'timeline']);
+    await Promise.all([timeline, background]);
+    expect(order).toEqual(['step', 'timeline', 'background']);
     expect(scheduler.snapshot().pausedPriorities).not.toContain('timeline');
   });
 
@@ -95,12 +98,13 @@ describe('NativeScheduler', () => {
       scheduler.schedule(async () => 'control', { priority: 'control' }),
       scheduler.schedule(async () => 'watch', { priority: 'watch' }),
       scheduler.schedule(async () => 'timeline', { priority: 'timeline' }),
+      scheduler.schedule(async () => 'background', { priority: 'background' }),
     ];
     const assertions = queued.map(task => expect(task).rejects.toBeInstanceOf(NativeSchedulerCancelledError));
 
     scheduler.dispose();
     await Promise.all(assertions);
-    expect(scheduler.snapshot().queued).toEqual({ control: 0, watch: 0, timeline: 0 });
+    expect(scheduler.snapshot().queued).toEqual({ control: 0, watch: 0, timeline: 0, background: 0 });
     gate.resolve();
     await running;
   });

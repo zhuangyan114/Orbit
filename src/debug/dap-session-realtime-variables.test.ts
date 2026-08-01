@@ -12,7 +12,51 @@ function request(seq: number, command: string, args: Record<string, unknown> = {
 }
 
 describe('DapSession realtime variable arbitration', () => {
-  it('splits Watch batches and lets Timeline read between slices', async () => {
+  it('strips Han characters before Watch target reads', async () => {
+    const evaluated: string[] = [];
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'evaluateExpression') {
+          evaluated.push(command.expression);
+          return { ok: true, data: { expression: command.expression, value: 1, display: '1', hex: '0x1' } };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+
+    await (session as any).handleDataSample(request(1, 'dataSample', {
+      expressions: ['p6啊', '中文', 'p6,~@"/'],
+    }));
+
+    expect(evaluated).toEqual(['p6', 'p6,~@"/']);
+  });
+
+  it('does not query target state for forced runtime Watch/Timeline samples', async () => {
+    let targetStateQueries = 0;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'getTargetState') {
+          targetStateQueries++;
+          return { ok: true, data: 'running' };
+        }
+        if (command.cmd === 'evaluateExpression') {
+          return { ok: true, data: { expression: command.expression, value: 1, display: '1', hex: '0x1' } };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).setTargetRunning(true);
+
+    await (session as any).handleDataSample(request(1, 'dataSample', { expressions: ['counter'] }));
+
+    expect(targetStateQueries).toBe(0);
+  });
+
+  it('splits Watch batches and lets Timeline read between every slice', async () => {
     const order: string[] = [];
     const forwardedExpanded: string[][] = [];
     let session: DapSession;
@@ -23,7 +67,7 @@ describe('DapSession realtime variable arbitration', () => {
         if (command.cmd === 'evaluateExpression') {
           order.push(`watch:${command.expression}`);
           forwardedExpanded.push(command.expandedExpressions);
-          if (command.expression === 'b') {
+          if (command.expression === 'a') {
             setImmediate(() => {
               timelineRead = (session as any).captureFastDataSample();
             });
@@ -50,9 +94,28 @@ describe('DapSession realtime variable arbitration', () => {
     }));
     if (timelineRead) await timelineRead;
 
-    expect(order).toEqual(['watch:a', 'watch:b', 'timeline', 'watch:c']);
+    expect(order).toEqual(['watch:a', 'timeline', 'watch:b', 'watch:c']);
     expect(forwardedExpanded).toEqual([['a'], ['a'], ['a']]);
     expect(sent.find(message => message.request_seq === 1)?.body?.results).toHaveLength(3);
+  });
+
+  it('does not start a new Watch target read while the DAP session is terminating', async () => {
+    let evaluateCount = 0;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'evaluateExpression') evaluateCount++;
+        return { ok: true, data: { expression: command.expression, value: 1, display: '1', hex: '0x1' } };
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).phase = 'terminating';
+
+    const results = await (session as any).readWatchExpressions(['counter'], true);
+
+    expect(evaluateCount).toBe(0);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ expression: 'counter', error: expect.any(String) });
   });
 
   it('flushes pending Timeline data on the configured send interval without waiting for another target read', async () => {

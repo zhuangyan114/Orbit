@@ -86,6 +86,17 @@ export class OzoneBackend {
     return this.state;
   }
 
+  get hasTargetConnection(): boolean {
+    if (this.sessionTarget) {
+      return 'ownerKind' in this.sessionTarget
+        ? this.sessionTarget.ownerKind !== 'none'
+        : true;
+    }
+    return this.jlink.connected
+      && this.state !== TargetState.Disconnected
+      && this.state !== TargetState.Error;
+  }
+
   private async targetHalt(): Promise<boolean> {
     if (!this.sessionTarget) return this.jlink.halt();
     const result = await this.sessionTarget.halt();

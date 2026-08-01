@@ -7,6 +7,7 @@ import {
 } from '../ozone-backend/types';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
+import { stripHanCharacters } from '../utils/watch-expression-validation';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -31,6 +32,7 @@ export class DapSession extends EventEmitter {
   private pollTimer: NodeJS.Timeout | null = null;
   private connectionMonitorTimer: NodeJS.Timeout | null = null;
   private rttPollTimer: NodeJS.Timeout | null = null;
+  private rttPollGeneration = 0;
   private rttLogEnabled = true;
   private rttStarted = false;
   private rttBufferIndex = 0;
@@ -86,7 +88,10 @@ export class DapSession extends EventEmitter {
   private runtimeWatchCache = new Map<string, WatchValue>();
   private runtimeWatchCacheTime = new Map<string, number>();
   private readonly runtimeEvaluateCacheMs = 250;
-  private readonly watchReadChunkSize = 2;
+  // A target read cannot be preempted once dispatched. Keep one top-level
+  // Watch expression per slice so a slow expression cannot hold Timeline
+  // behind a second expression in the same high-priority critical section.
+  private readonly watchReadChunkSize = 1;
   private readonly watchReadBudgetMs = 8;
   private phase: 'idle' | 'flashing' | 'connecting' | 'connected' | 'terminating' | 'terminated' = 'idle';
   private targetConnectionEstablished = false;
@@ -210,7 +215,7 @@ export class DapSession extends EventEmitter {
   }
 
   private shouldDeferTargetRead(): boolean {
-    return this.controlInProgress;
+    return this.controlInProgress || this.isSessionTerminating();
   }
 
   private beginTargetRead(priority: 'high' | 'low' = 'low'): boolean {
@@ -223,7 +228,7 @@ export class DapSession extends EventEmitter {
   private async beginTargetReadWhenAvailable(priority: 'high' | 'low' = 'low', timeoutMs = 0): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (!this.beginTargetRead(priority)) {
-      if (this.controlInProgress || Date.now() >= deadline) return false;
+      if (this.isSessionTerminating() || (priority === 'low' && this.controlInProgress) || Date.now() >= deadline) return false;
       await new Promise<void>(resolve => setTimeout(resolve, 20));
     }
     return true;
@@ -231,7 +236,7 @@ export class DapSession extends EventEmitter {
 
   private async beginWatchTargetRead(timeoutMs = 250): Promise<boolean> {
     if (this.beginTargetRead('high')) return true;
-    if (this.controlInProgress) return false;
+    if (this.shouldDeferTargetRead()) return false;
     // Keep Timeline behind a Watch request only while that Watch is actually
     // queued. The timeout is a wait bound, not a post-read blackout period.
     this.pendingWatchTargetReads++;
@@ -272,6 +277,12 @@ export class DapSession extends EventEmitter {
 
   private cachedOrRunningWatchValue(expression: string): WatchValue {
     return this.runtimeWatchCache.get(expression) || this.makeRunningWatchValue(expression);
+  }
+
+  private normalizeWatchExpressions(expressions: unknown): string[] {
+    return Array.isArray(expressions)
+      ? expressions.map(expression => stripHanCharacters(String(expression)).trim()).filter(Boolean)
+      : [];
   }
 
   private sendEvaluateValue(msg: DebugProtocolMessage, value: WatchValue, allowChildren: boolean) {
@@ -467,6 +478,9 @@ export class DapSession extends EventEmitter {
     expandedExpressions?: string[],
   ): Promise<WatchValue[]> {
     if (expressions.length === 0) return [];
+    if (this.isSessionTerminating()) {
+      return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
+    }
     if (forceRuntimeRead && this.runtimeWatchReadInFlight) {
       return expressions.map(expr => this.cachedOrRunningWatchValue(expr));
     }
@@ -474,11 +488,24 @@ export class DapSession extends EventEmitter {
     const epoch = this.readCancelEpoch;
     const results: WatchValue[] = [];
     const batchStarted = Date.now();
-    let halted: boolean | undefined;
+    let chunks = 0;
+    let maxChunkElapsedMs = 0;
     let index = 0;
     if (forceRuntimeRead) this.runtimeWatchReadInFlight = true;
 
     try {
+      // Runtime Watch/Timeline sampling is explicitly allowed while the target
+      // is running. Do not perform a state query for that path: the query is a
+      // serialized native-owner operation and, if it waits behind a Timeline
+      // read, holding the Watch read gate here would pause Timeline as well.
+      // The halted check is only needed for the non-forced DAP Watch refresh.
+      if (!forceRuntimeRead) {
+        if (this.shouldDeferTargetRead() || !(await this.isTargetHalted())) {
+          while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
+          return results;
+        }
+      }
+
       while (index < expressions.length) {
         if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
           while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
@@ -492,12 +519,6 @@ export class DapSession extends EventEmitter {
         const chunkStarted = Date.now();
         let chunkCount = 0;
         try {
-          if (halted === undefined) halted = await this.isTargetHalted();
-          if (!halted && !forceRuntimeRead) {
-            while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
-            break;
-          }
-
           while (index < expressions.length) {
             const expr = expressions[index++];
             if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
@@ -523,6 +544,8 @@ export class DapSession extends EventEmitter {
         } finally {
           this.endTargetRead();
         }
+        chunks++;
+        maxChunkElapsedMs = Math.max(maxChunkElapsedMs, Date.now() - chunkStarted);
 
         if (index < expressions.length) {
           // Keep each Watch slice finite. Releasing the DAP barrier and yielding
@@ -533,7 +556,11 @@ export class DapSession extends EventEmitter {
 
       const elapsed = Date.now() - batchStarted;
       if (elapsed >= 16) {
-        log.dap(`[watch] batch expressions=${expressions.length} expanded=${expandedExpressions?.length || 0} elapsedMs=${elapsed}`);
+        log.dap(
+          `[watch] batch expressions=${expressions.length}`
+          + ` expanded=${expandedExpressions?.length || 0}`
+          + ` chunks=${chunks} maxChunkMs=${maxChunkElapsedMs} elapsedMs=${elapsed}`,
+        );
       }
       return results;
     } finally {
@@ -550,6 +577,7 @@ export class DapSession extends EventEmitter {
 
   private startRttLogPolling() {
     this.stopRttLogPolling();
+    const generation = this.rttPollGeneration;
     this.rttStarted = false;
     this.rttDecoder = new StringDecoder('utf8');
     this.rttControlCarry = '';
@@ -558,13 +586,14 @@ export class DapSession extends EventEmitter {
     this.emitRttTerminalStarted();
 
     const pollLoop = async () => {
-      if (this.rttPollTimer === null) return;
+      if (this.rttPollTimer === null || generation !== this.rttPollGeneration || this.dataSamplingActive) return;
       try {
         if (!this.rttStarted) {
           const startResult = await this.backend.execute({
             cmd: 'startRtt',
             controlBlockAddress: this.rttControlBlockAddress,
           });
+          if (this.rttPollTimer === null || generation !== this.rttPollGeneration) return;
           this.rttStarted = startResult.ok;
         }
 
@@ -574,6 +603,7 @@ export class DapSession extends EventEmitter {
             bufferIndex: this.rttBufferIndex,
             size: this.rttReadSize,
           });
+          if (this.rttPollTimer === null || generation !== this.rttPollGeneration) return;
           if (readResult.ok) {
             const bytes = (readResult.data as any)?.bytes;
             if (Array.isArray(bytes) && bytes.length > 0) {
@@ -596,6 +626,7 @@ export class DapSession extends EventEmitter {
   }
 
   private stopRttLogPolling() {
+    this.rttPollGeneration++;
     if (this.rttPollTimer) {
       clearTimeout(this.rttPollTimer);
       this.rttPollTimer = null;
@@ -812,7 +843,7 @@ export class DapSession extends EventEmitter {
         case 'watchEvaluate':
           return this.handleWatchEvaluate(msg);
         case 'setWatches':
-          this.watchExpressions = msg.arguments?.expressions || [];
+          this.watchExpressions = this.normalizeWatchExpressions(msg.arguments?.expressions);
           return this.sendResponse(msg);
         case 'dataSample':
           return this.handleDataSample(msg);
@@ -1070,13 +1101,10 @@ export class DapSession extends EventEmitter {
     try {
       const args = msg.arguments || {};
       const ref = args.variablesReference;
-      if (this.shouldDeferTargetRead()) {
-        this.sendResponse(msg, { variables: [] });
-        return;
-      }
 
       if (ref === 1) {
-        if (!this.beginTargetRead('high')) {
+        if (!(await this.beginTargetReadWhenAvailable('high', 1200))) {
+          log.dap('variables scope=locals target read unavailable');
           this.sendResponse(msg, { variables: [] });
           return;
         }
@@ -1094,7 +1122,8 @@ export class DapSession extends EventEmitter {
           this.endTargetRead();
         }
       } else if (ref === 2) {
-        if (!this.beginTargetRead('high')) {
+        if (!(await this.beginTargetReadWhenAvailable('high', 1200))) {
+          log.dap('variables scope=registers target read unavailable');
           this.sendResponse(msg, { variables: [] });
           return;
         }
@@ -1122,6 +1151,7 @@ export class DapSession extends EventEmitter {
         this.sendResponse(msg, { variables: [] });
       }
     } catch (err: any) {
+      log.dap(`variables request failed: ${err?.message || String(err)}`);
       this.sendResponse(msg, { variables: [] });
     }
   }
@@ -1488,7 +1518,7 @@ export class DapSession extends EventEmitter {
 
   private async handleWatchEvaluate(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
-    const expressions: string[] = args.expressions || [];
+    const expressions = this.normalizeWatchExpressions(args.expressions);
     if (this.shouldDeferTargetRead()) {
       this.sendResponse(msg, { results: expressions.map(expr => this.cachedOrRunningWatchValue(expr)) });
       return;
@@ -1499,7 +1529,7 @@ export class DapSession extends EventEmitter {
 
   private async handleDataSample(msg: DebugProtocolMessage) {
     const args = msg.arguments || {};
-    const expressions: string[] = args.expressions || [];
+    const expressions = this.normalizeWatchExpressions(args.expressions);
     const results = await this.readWatchExpressions(expressions, true, args.expandedExpressions);
     this.sendResponse(msg, { results });
   }
@@ -1547,6 +1577,10 @@ export class DapSession extends EventEmitter {
     const now = this.nowMs();
     this.dataSamplingNextSampleMs = now;
     this.dataSamplingActive = true;
+    // RTT logging is best-effort background traffic. A single RTT DLL call
+    // cannot be preempted, so keep it completely out of the target path while
+    // high-rate Timeline sampling is active.
+    this.stopRttLogPolling();
     const rejected = plan.filter(item => !item.spec).map(item => item.expression);
     log.dap(
       `[timeline] start fast=${this.dataSamplingEntries.map(entry => entry.expression).join(',')}`
@@ -1564,6 +1598,9 @@ export class DapSession extends EventEmitter {
 
   private handleDataSamplingStop(msg: DebugProtocolMessage) {
     this.stopDataSampling();
+    if (this.rttLogEnabled && this.phase === 'connected') {
+      this.startRttLogPolling();
+    }
     this.sendResponse(msg, { ok: true });
   }
 

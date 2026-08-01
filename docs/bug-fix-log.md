@@ -11,6 +11,29 @@
 
 ## 修改记录
 
+### Bug: Watch 输入汉字导致界面卡顿，调试控制请求异常
+
+- **日期**: 2026-07-30
+- **问题描述**: 在调试会话中向 Watch 输入汉字后，Watch 会持续异常刷新并出现 `dataSample` 请求错误，可能进一步影响暂停、重启和退出调试控制；逗号、波浪号、`@`、引号和斜杠等字符不触发同样问题。
+- **根因分析**:
+  1. Watch 输入、保存/恢复、Provider 和 DAP 请求边界均可能将 Han 字符送入 ELF/DWARF 表达式求值路径，触发无效表达式及异常刷新。
+  2. Watch 轮询与 Ozone DAP 会话生命周期存在竞争；会话切换或终止后，旧轮询可能继续发送 `dataSample`，与调试控制共用 target-read 通道。
+- **修改方案**:
+  1. 新增 `stripHanCharacters`，仅过滤 Han 字符并保留其他表达式语法。
+  2. 在 Watch 输入框、表达式恢复/添加、Watch Provider 以及 DAP `setWatches`、`watchEvaluate`、`dataSample` 边界统一过滤。
+  3. 使用活动 Ozone DAP 会话和轮询 generation 约束 Watch 请求；会话终止或切换后停止旧轮询，DAP terminating 阶段不再启动新的 Watch target read。
+- **涉及文件**:
+  - `src/utils/watch-expression-validation.ts:1` - `stripHanCharacters`
+  - `src/webview/watch/app.tsx:3,109,283` - Watch 输入过滤
+  - `src/debug-providers/watch-provider.ts:3,165` - Provider 表达式边界过滤
+  - `src/debug-providers/watch-webview-provider.ts:4,24,87,100,181` - 恢复、添加及展开状态过滤
+  - `src/extension.ts:16,73,77,85,335` - 活动会话与轮询失效
+  - `src/debug/dap-session.ts:10,282,845,1521,1530` - DAP 表达式边界与 terminating 保护
+  - `src/utils/watch-expression-validation.test.ts:1`、`src/debug/dap-session-realtime-variables.test.ts:14` - 回归测试
+- **验证结果**:
+  - **Mock/自动化**: 聚焦测试 16 项通过；全量 Vitest 19 个文件、93 项通过；`npm run typecheck`、`npm run build` 和 `git diff --check` 通过。
+  - **真实硬件**: 尚未验证。用户当前不方便进行目标板测试，待后续在实际调试会话中确认汉字输入后 Watch、暂停、重启和退出均正常。
+
 ### Bug: 多行函数参数逐步调试边界异常及函数调用逐过程缓慢
 
 - **日期**: 2026-07-18

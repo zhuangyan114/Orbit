@@ -66,6 +66,28 @@ describe('NativeScheduler', () => {
     expect(scheduler.snapshot().pausedPriorities).not.toContain('timeline');
   });
 
+  it('pauses Watch, Timeline, and background while a control request owns the critical section', async () => {
+    const scheduler = new NativeScheduler();
+    const controlGate = deferred<void>();
+    const order: string[] = [];
+    const control = scheduler.withPaused(['watch', 'timeline', 'background'], () =>
+      scheduler.schedule(async () => {
+        order.push('control');
+        await controlGate.promise;
+      }, { priority: 'control', label: 'CMSIS-DAP control' }),
+    );
+    const watch = scheduler.schedule(async () => { order.push('watch'); }, { priority: 'watch' });
+    const timeline = scheduler.schedule(async () => { order.push('timeline'); }, { priority: 'timeline' });
+    const background = scheduler.schedule(async () => { order.push('background'); }, { priority: 'background' });
+
+    expect(order).toEqual(['control']);
+    expect(scheduler.snapshot().pausedPriorities).toEqual(['watch', 'timeline', 'background']);
+    controlGate.resolve();
+    await Promise.all([control, watch, timeline, background]);
+    expect(order).toEqual(['control', 'watch', 'timeline', 'background']);
+    expect(scheduler.snapshot().pausedPriorities).toEqual([]);
+  });
+
   it('releases the timeline pause token when step fails', async () => {
     const scheduler = new NativeScheduler();
     const stepGate = deferred<void>();

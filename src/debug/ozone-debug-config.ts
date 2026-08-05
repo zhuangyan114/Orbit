@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 export class OzoneDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
   resolveDebugConfiguration(
@@ -16,6 +17,14 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
       config.request = 'launch';
       config.name = 'Orbit Debug';
     }
+
+    const targetConfig = normalizeDapLaunchConfig({
+      ...config,
+      flashBeforeDebug: config.flashBeforeDebug === undefined
+        ? cfg.get<boolean>('flashBeforeDebug', true)
+        : config.flashBeforeDebug,
+    });
+    applyNormalizedDapLaunchConfig(config, targetConfig);
 
     if (!config.device) {
       config.device = cfg.get<string>('defaultDevice', 'STM32F407VG');
@@ -45,9 +54,6 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     }
     if (config.rtos === undefined) {
       config.rtos = cfg.get<string>('defaultRtos', '');
-    }
-    if (config.flashBeforeDebug === undefined) {
-      config.flashBeforeDebug = cfg.get<boolean>('flashBeforeDebug', true);
     }
     if (config.rttLogEnabled === undefined) {
       config.rttLogEnabled = cfg.get<boolean>('rttLogEnabled', true);

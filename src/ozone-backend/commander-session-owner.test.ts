@@ -59,4 +59,144 @@ describe('OzoneBackend extension-host ownership guard', () => {
       errorCode: 'NativeOwnerLost',
     });
   });
+
+  it('rejects a direct CMSIS-DAP flash command when no CMSIS-DAP owner exists', async () => {
+    const backend = new OzoneBackend();
+
+    const result = await backend.execute({
+      cmd: 'flash',
+      elfPath: 'firmware.elf',
+      device: 'STM32F407VET6',
+      interface: 'SWD',
+      speedKHz: 4000,
+      probe: 'cmsis-dap',
+      flashBeforeDebug: true,
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'OwnerUnavailable' });
+    if (!result.ok) expect(result.error).toContain('CMSIS-DAP target owner');
+  });
+
+  it('returns OwnerUnavailable for CMSIS-DAP without a selector and never opens J-Link', async () => {
+    const backend = new OzoneBackend();
+    const jlink = {
+      open: vi.fn(() => true),
+      connect: vi.fn(() => true),
+    };
+    (backend as any).jlink = jlink;
+
+    const result = await backend.execute({
+      cmd: 'connect',
+      config: {
+        probe: 'cmsis-dap',
+        flashBeforeDebug: false,
+        device: 'STM32F407VET6',
+        interface: 'SWD',
+        speedKHz: 4000,
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'OwnerUnavailable' });
+    if (!result.ok) expect(result.error).toContain('CMSIS-DAP');
+    expect(jlink.open).not.toHaveBeenCalled();
+    expect(jlink.connect).not.toHaveBeenCalled();
+  });
+
+  it('returns InvalidConfiguration for an invalid probe at the backend boundary', async () => {
+    const backend = new OzoneBackend();
+    const jlink = {
+      open: vi.fn(() => true),
+      connect: vi.fn(() => true),
+    };
+    (backend as any).jlink = jlink;
+
+    const result = await backend.execute({
+      cmd: 'connect',
+      config: {
+        probe: 'foo',
+        flashBeforeDebug: false,
+        device: 'STM32F407VET6',
+        interface: 'SWD',
+        speedKHz: 4000,
+      } as any,
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
+    if (!result.ok) expect(result.error).toContain('probe must be one of jlink or cmsis-dap');
+    expect(jlink.open).not.toHaveBeenCalled();
+    expect(jlink.connect).not.toHaveBeenCalled();
+  });
+
+  it('returns InvalidConfiguration for an invalid CMSIS-DAP transport at the backend boundary', async () => {
+    const backend = new OzoneBackend();
+    const jlink = {
+      open: vi.fn(() => true),
+      connect: vi.fn(() => true),
+    };
+    (backend as any).jlink = jlink;
+
+    const result = await backend.execute({
+      cmd: 'connect',
+      config: {
+        probe: 'jlink',
+        cmsisDapTransport: 'usb',
+        device: 'STM32F407VET6',
+        interface: 'SWD',
+        speedKHz: 4000,
+      } as any,
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
+    if (!result.ok) expect(result.error).toContain('cmsisDapTransport must be one of auto, hid, or winusb');
+    expect(jlink.open).not.toHaveBeenCalled();
+    expect(jlink.connect).not.toHaveBeenCalled();
+  });
+
+  it('keeps a same-probe reconnect idempotent for an already selected J-Link owner', async () => {
+    const jlinkOwner = {
+      kind: 'jlink-legacy' as const,
+      usingNative: false,
+      connect: vi.fn(),
+    } as unknown as SessionTargetOwner;
+    const backend = new OzoneBackend(undefined, jlinkOwner);
+    (backend as any).state = 'connected';
+
+    const result = await backend.execute({
+      cmd: 'connect',
+      config: {
+        probe: 'jlink',
+        device: 'STM32F407VET6',
+        interface: 'SWD',
+        speedKHz: 4000,
+      },
+    });
+
+    expect(result).toEqual({ ok: true, data: { state: 'connected' } });
+    expect(jlinkOwner.connect).not.toHaveBeenCalled();
+  });
+
+  it('rejects a CMSIS-DAP reconnect when a J-Link owner is already selected', async () => {
+    const jlinkOwner = {
+      kind: 'jlink-legacy' as const,
+      usingNative: false,
+      connect: vi.fn(),
+    } as unknown as SessionTargetOwner;
+    const backend = new OzoneBackend(undefined, jlinkOwner);
+    (backend as any).state = 'connected';
+
+    const result = await backend.execute({
+      cmd: 'connect',
+      config: {
+        probe: 'cmsis-dap',
+        flashBeforeDebug: false,
+        device: 'STM32F407VET6',
+        interface: 'SWD',
+        speedKHz: 4000,
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'ProbeMismatch' });
+    if (!result.ok) expect(result.error).toContain('J-Link');
+    expect(jlinkOwner.connect).not.toHaveBeenCalled();
+  });
 });

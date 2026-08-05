@@ -1,0 +1,23 @@
+{
+  "skill_name": "daplink-debug-fix",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "DAP_Connect succeeds but a DP IDCODE read returns NO_ACK. Diagnose it and give the next step.",
+      "expected_output": "Places the failure in SWD, power, VTref, SWJ, or target state; requests a raw trace; does not call CoreDebug or mock success hardware proof; avoids unauthorized target actions.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Add default CMSIS-DAP Flash support for STM32F407VET6 and use OpenOCD as a reference.",
+      "expected_output": "Uses the DAP-02A scope, CMSIS-Pack or an owned algorithm, ELF p_vaddr/p_paddr rules, sector validation, one owner, flashBeforeDebug semantics, and license boundaries; treats OpenOCD only as a reference.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "DAPLink Watch and Timeline reads intermittently hang. What should change?",
+      "expected_output": "Checks the active DAP owner, NativeScheduler priority, generation fence, control exclusion, cancellation, and coalescing without creating another owner or falling back to the extension-host backend.",
+      "files": []
+    }
+  ]
+}

@@ -1,10 +1,12 @@
 import {
   OzoneCommand, OzoneCommandResult,
   DebugSessionConfig, RegisterValue, Variable,
+  DebugProbe,
   StackFrame, MemoryBlock, TargetState, WatchValue,
   FastDataSamplePlanItem, FastDataSampleSpec,
 } from './types';
 import { cancelActiveFlashes, flashElf } from './flasher';
+import { CmsisDapFlashOptions } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
 import { readElfSymbols, SymbolInfo, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress } from './jlink-symbols';
@@ -50,6 +52,15 @@ interface WatchEvaluationContext {
 interface SourceStatementRange {
   startLine: number;
   endLine: number;
+}
+
+function invalidConfiguration(field: string, allowed: string, value: unknown): OzoneCommandResult {
+  const received = typeof value === 'string' ? `"${value}"` : String(value);
+  return {
+    ok: false,
+    errorCode: 'InvalidConfiguration',
+    error: `InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`,
+  };
 }
 
 export class OzoneBackend {
@@ -103,6 +114,17 @@ export class OzoneBackend {
     return result.ok;
   }
 
+  private async targetHaltResult(): Promise<CppJLinkResult> {
+    if (this.sessionTarget) return this.sessionTarget.halt();
+    const ok = this.jlink.halt();
+    return {
+      ok,
+      message: ok ? 'J-Link target halted' : 'J-Link halt failed',
+      targetState: ok ? 'Halted' : 'Error',
+      elapsedMs: 0,
+    };
+  }
+
   private async targetRun(): Promise<boolean> {
     if (!this.sessionTarget) return this.jlink.run();
     const result = await this.sessionTarget.run();
@@ -127,14 +149,48 @@ export class OzoneBackend {
     return result.ok && result.data ? result.data.value : null;
   }
 
+  private targetRegisterSource(): string {
+    if (!this.sessionTarget) return 'legacyJLinkDLL';
+    const ownerKind = 'ownerKind' in this.sessionTarget
+      ? this.sessionTarget.ownerKind
+      : this.sessionTarget.kind;
+    return `sessionTarget/${ownerKind}`;
+  }
+
   private async targetReadMemory(
     address: number,
     size: number,
     priority: 'watch' | 'timeline' = 'watch',
   ): Promise<Uint8Array | null> {
-    if (!this.sessionTarget) return this.jlink.readMemory(address, size);
-    const result = await this.sessionTarget.readMemory(address, size, { priority });
+    const result = await this.targetReadMemoryResult(address, size, priority);
     return result.ok && result.data ? result.data.bytes : null;
+  }
+
+  private async targetReadMemoryResult(
+    address: number,
+    size: number,
+    priority: 'watch' | 'timeline' = 'watch',
+  ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
+    if (this.sessionTarget) return this.sessionTarget.readMemory(address, size, { priority });
+    const started = Date.now();
+    const bytes = this.jlink.readMemory(address, size);
+    if (bytes) {
+      return {
+        ok: true,
+        message: 'J-Link memory read',
+        targetState: 'Unknown',
+        elapsedMs: Date.now() - started,
+        data: { bytes },
+      };
+    }
+    return {
+      ok: false,
+      message: `J-Link failed to read ${size} bytes at 0x${address.toString(16)}`,
+      errorCode: 'MemoryReadFailed',
+      targetState: 'Unknown',
+      elapsedMs: Date.now() - started,
+      diagnostics: { ownerKind: 'jlink-legacy', operation: 'readMemory', phase: 'targetRead' },
+    };
   }
 
   private async targetWriteMemory(address: number, bytes: Uint8Array): Promise<boolean> {
@@ -214,24 +270,30 @@ export class OzoneBackend {
           return this.doDisconnect();
         case 'halt':
           this.clearNativeStopInfo('legacy halt requested');
+          if (this.isCmsisDapOwner()) return this.ownerControlResult(await this.sessionTarget!.halt(), 'Halted', 'halt');
           return (await this.targetHalt())
             ? (this.state = TargetState.Halted, { ok: true, data: 'Halted' })
             : { ok: false, error: 'Halt failed' };
         case 'run':
           this.clearNativeStopInfo('legacy run requested');
+          if (this.isCmsisDapOwner()) return this.ownerControlResult(await this.sessionTarget!.run(), 'Running', 'run');
           return (await this.targetRun())
             ? (this.state = TargetState.Running, { ok: true, data: 'Running' })
             : { ok: false, error: 'Run failed' };
         case 'stepOver':
+          if (this.isCmsisDapOwner()) return this.unsupportedSessionCapability('stepOver');
           return await this.profileStepCommand('stepOver', () => this.doStepOver());
         case 'stepInto':
+          if (this.isCmsisDapOwner()) return await this.doStepIntoInstruction();
           return await this.profileStepCommand('stepInto', () => this.doStepInto());
         case 'stepIntoInstruction':
           return await this.doStepIntoInstruction();
         case 'stepOut':
+          if (this.isCmsisDapOwner()) return this.unsupportedSessionCapability('stepOut');
           return await this.profileStepCommand('stepOut', () => this.doStepOut());
         case 'reset':
           this.clearNativeStopInfo('reset requested');
+          if (this.isCmsisDapOwner()) return this.ownerControlResult(await this.sessionTarget!.reset(), 'Reset', 'reset');
           return (await this.targetReset())
             ? { ok: true, data: 'Reset' }
             : { ok: false, error: 'Reset failed' };
@@ -283,7 +345,8 @@ export class OzoneBackend {
           return { ok: true, data: halted ? TargetState.Halted : this.state };
         }
         case 'flash':
-          return await this.doFlash(command.elfPath, command.device, command.interface, command.speedKHz, command.signal);
+          return await this.doFlash(command.elfPath, command.device, command.interface, command.speedKHz,
+            command.signal, command.probe, command.flashBeforeDebug, command.cmsisDapFlashAlgorithmPath);
 case 'readVariableRuntime':
           return await this.readVariableAtRuntime(command.name);
         case 'clearBreakpointAtAddr':
@@ -401,8 +464,33 @@ case 'readVariableRuntime':
 
   private async doConnect(config: DebugSessionConfig): Promise<OzoneCommandResult> {
     this.clearNativeStopInfo('new connect');
+    if (config.probe !== undefined && config.probe !== 'jlink' && config.probe !== 'cmsis-dap') {
+      return invalidConfiguration('probe', 'jlink or cmsis-dap', config.probe);
+    }
+    if (config.cmsisDapTransport !== undefined
+      && config.cmsisDapTransport !== 'auto'
+      && config.cmsisDapTransport !== 'hid'
+      && config.cmsisDapTransport !== 'winusb') {
+      return invalidConfiguration('cmsisDapTransport', 'auto, hid, or winusb', config.cmsisDapTransport);
+    }
+    const requestedProbe: DebugProbe = config.probe === undefined ? 'jlink' : config.probe;
+    const selectedProbe = this.selectedProbe();
+    if (selectedProbe && selectedProbe !== requestedProbe) {
+      return {
+        ok: false,
+        errorCode: 'ProbeMismatch',
+        error: `ProbeMismatch: ${selectedProbe === 'jlink' ? 'J-Link' : 'CMSIS-DAP'} owner is already selected; cannot connect with ${requestedProbe === 'jlink' ? 'J-Link' : 'CMSIS-DAP'}.`,
+      };
+    }
     if (this.state === TargetState.Connected) {
       return { ok: true, data: { state: TargetState.Connected } };
+    }
+    if (requestedProbe === 'cmsis-dap' && !this.sessionTarget) {
+      return {
+        ok: false,
+        errorCode: 'OwnerUnavailable',
+        error: 'OwnerUnavailable: CMSIS-DAP target owner requires a SessionTargetSelector; J-Link fallback is disabled.',
+      };
     }
     const nativeMode = config.nativeDebugEngineMode === 'native'
       ? 'native'
@@ -415,7 +503,13 @@ case 'readVariableRuntime':
       const connected = this.sessionTarget instanceof SessionTargetSelector
         ? await this.sessionTarget.connect(config, nativeMode)
         : await this.sessionTarget.connect(config);
-      if (!connected.ok) return { ok: false, error: connected.message };
+      if (!connected.ok) {
+        return {
+          ok: false,
+          errorCode: connected.errorCode,
+          error: `${connected.errorCode ? `${connected.errorCode}: ` : ''}${connected.message}`,
+        };
+      }
     } else {
       if (!this.jlink.open()) return { ok: false, error: 'Failed to load JLink DLL' };
       if (!this.jlink.connect(config.device, config.speedKHz)) {
@@ -426,13 +520,25 @@ case 'readVariableRuntime':
 
     this.configureNativeSteps();
     if (config.nativeDebugEngineEnabled && !this.nativeStepExecutor?.usingNative) {
-      log.step('Native step paths requested but no connected exclusive native executor is available; using legacy paths');
+      if (this.isCmsisDapOwner()) {
+        log.step('Native J-Link source-step executor unavailable owner=cmsis-dap; instruction steps remain on sessionTarget/cmsis-dap');
+      } else {
+        log.step('Native step paths requested but no connected exclusive native executor is available; using legacy paths');
+      }
     }
-    if (!(await this.targetHalt())) {
+    if (this.isCmsisDapOwner()) {
+      const haltResult = await this.targetHaltResult();
+      if (!haltResult.ok) {
+        if (this.sessionTarget) await this.sessionTarget.dispose(false);
+        return this.ownerControlResult(haltResult, 'Halted', 'halt');
+      }
+    } else if (!(await this.targetHalt())) {
       if (this.sessionTarget) await this.sessionTarget.dispose(false);
       return { ok: false, error: 'Connected target could not be halted' };
     }
-    if (!(await this.targetClearAllBreakpoints())) {
+    // DAP-04 deliberately has no CMSIS-DAP breakpoint owner yet. Do not turn
+    // that unsupported capability into a failed connection.
+    if (!this.isCmsisDapOwner() && !(await this.targetClearAllBreakpoints())) {
       if (this.sessionTarget) await this.sessionTarget.dispose(false);
       return { ok: false, error: 'Connected target breakpoints could not be initialized' };
     }
@@ -440,6 +546,71 @@ case 'readVariableRuntime':
     this.state = TargetState.Connected;
 
     return { ok: true, data: { state: TargetState.Connected } };
+  }
+
+  private selectedProbe(): DebugProbe | null {
+    if (this.sessionTarget) {
+      const ownerKind = 'ownerKind' in this.sessionTarget
+        ? this.sessionTarget.ownerKind
+        : this.sessionTarget.kind;
+      if (ownerKind === 'cmsis-dap') return 'cmsis-dap';
+      if (ownerKind === 'jlink-native' || ownerKind === 'jlink-legacy') return 'jlink';
+      return null;
+    }
+    return this.state === TargetState.Connected || this.jlink.connected ? 'jlink' : null;
+  }
+
+  private isCmsisDapOwner(): boolean {
+    if (!this.sessionTarget) return false;
+    const ownerKind = 'ownerKind' in this.sessionTarget
+      ? this.sessionTarget.ownerKind
+      : this.sessionTarget.kind;
+    return ownerKind === 'cmsis-dap';
+  }
+
+  private ownerControlResult(
+    result: CppJLinkResult,
+    fallbackData: string,
+    operation: 'halt' | 'run' | 'reset',
+  ): OzoneCommandResult {
+    if (!result.ok) {
+      const errorCode = result.errorCode || 'TargetControlFailed';
+      return {
+        ok: false,
+        errorCode,
+        error: `${errorCode}: ${result.message}`,
+        diagnostics: result.diagnostics,
+      };
+    }
+    const resultState = result.data && typeof result.data === 'object' && 'state' in result.data
+      ? String((result.data as unknown as { state: unknown }).state)
+      : result.targetState;
+    if ((operation === 'halt' && resultState !== 'Halted')
+      || (operation === 'run' && resultState !== 'Running')
+      || (operation === 'reset' && resultState !== 'Halted' && resultState !== 'Running')) {
+      const errorCode = 'TargetStateInvalid';
+      return {
+        ok: false,
+        errorCode,
+        error: `${errorCode}: ${operation} returned ${resultState || 'unknown'}`,
+        diagnostics: { operation, targetState: resultState },
+      };
+    }
+    this.state = operation === 'halt' || (operation === 'reset' && resultState === 'Halted')
+      ? TargetState.Halted
+      : operation === 'run'
+        ? TargetState.Running
+        : TargetState.Connected;
+    return { ok: true, data: result.data ?? fallbackData };
+  }
+
+  private unsupportedSessionCapability(capability: string): OzoneCommandResult {
+    return {
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+      error: `UnsupportedCapability: CMSIS-DAP ${capability} is not implemented in DAP-04`,
+      diagnostics: { capability, ownerKind: 'cmsis-dap' },
+    };
   }
 
   private async doDisconnect(): Promise<OzoneCommandResult> {
@@ -551,7 +722,7 @@ case 'readVariableRuntime':
     }
     await new Promise<void>(r => setTimeout(r, 100));
     const val = await this.targetReadRegister(idx);
-    log.dap(`readRegister ${name.toUpperCase()} source=sessionTarget value=${val === null ? 'null' : `0x${val.toString(16)}`}`);
+    log.dap(`readRegister ${name.toUpperCase()} source=${this.targetRegisterSource()} value=${val === null ? 'null' : `0x${val.toString(16)}`}`);
     if (val === null) return { ok: false, error: `Failed to read ${name}` };
     return { ok: true, data: { name, value: val, hex: `0x${val.toString(16).toUpperCase().padStart(8, '0')}` } };
   }
@@ -621,7 +792,11 @@ case 'readVariableRuntime':
         : await this.targetReadRegister(REG_INDEXES.LR);
     }
 
-    log.dap(`getCallStack PC source=${nativeOwner && this.lastNativeStopInfo ? 'nativeStopInfo/helper' : 'legacyJLinkDLL'} pc=${pc === null ? 'null' : `0x${pc.toString(16)}`}`);
+    const registerSource = nativeOwner && this.lastNativeStopInfo
+      ? 'nativeStopInfo/helper'
+      : this.targetRegisterSource();
+    log.dap(`getCallStack PC source=${registerSource} pc=${pc === null ? 'null' : `0x${pc.toString(16)}`}`
+      + ` LR source=${registerSource} lr=${lr === null ? 'null' : `0x${lr.toString(16)}`}`);
     log.step(`doGetCallStack pc=${pc !== null ? '0x' + pc.toString(16) : 'null'} lr=${lr !== null ? '0x' + lr.toString(16) : 'null'}`);
 
     if (pc === null) {
@@ -645,7 +820,7 @@ case 'readVariableRuntime':
       ? { file: sourceHint.file, line: sourceHint.line, func: this.resolveSymbolName(pc) || `0x${pc.toString(16)}` }
       : this.resolveAddressLoc(pc);
     log.step(
-      `stackTrace frame0 pc=0x${pc.toString(16)} pcSource=${nativeOwner && this.lastNativeStopInfo ? 'native' : 'legacy'}`
+      `stackTrace frame0 pc=0x${pc.toString(16)} pcSource=${registerSource}`
       + ` sourceSource=${sourceHint ? sourceHint.reason : 'addressMapping'}`
       + ` source=${pcLoc?.file || 'unknown'}:${pcLoc?.line || 0}`,
     );
@@ -691,7 +866,7 @@ case 'readVariableRuntime':
       return null;
     }
     const value = await this.targetReadRegister(index);
-    log.dap(`readRegister ${name} source=sessionTarget value=${value === null ? 'null' : `0x${value.toString(16)}`}`);
+    log.dap(`readRegister ${name} source=${this.targetRegisterSource()} value=${value === null ? 'null' : `0x${value.toString(16)}`}`);
     return value;
   }
 
@@ -814,6 +989,32 @@ case 'readVariableRuntime':
   }
 
   private async doStepIntoInstruction(): Promise<OzoneCommandResult> {
+    if (this.isCmsisDapOwner() && this.sessionTarget) {
+      const result = await this.sessionTarget.step();
+      if (!result.ok) {
+        const errorCode = result.errorCode || 'TargetControlFailed';
+        return {
+          ok: false,
+          errorCode,
+          error: `${errorCode}: ${result.message}`,
+          diagnostics: result.diagnostics,
+        };
+      }
+      if (result.targetState !== 'Halted') {
+        return {
+          ok: false,
+          errorCode: 'TargetStateInvalid',
+          error: `TargetStateInvalid: CMSIS-DAP instruction step returned ${result.targetState}`,
+          diagnostics: { ownerKind: 'cmsis-dap', targetState: result.targetState },
+        };
+      }
+      this.state = TargetState.Halted;
+      const data = result.data && typeof result.data === 'object' ? result.data : {};
+      return {
+        ok: true,
+        data: { mode: 'cmsis-dap', helperElapsedMs: result.elapsedMs, ...data },
+      };
+    }
     if (this.nativeStepsEnabled.stepInto && this.nativeStepExecutor?.usingNative) {
       return this.executeNativeStep('stepInto', () => this.nativeStepExecutor!.stepIntoInstruction());
     }
@@ -1825,9 +2026,41 @@ case 'readVariableRuntime':
       await new Promise<void>(r => setTimeout(r, 50));
     }
 
-    const raw = await this.readMemoryChunked(address, size);
-    if (wasRunning) await this.targetRun();
-    if (!raw || raw.length === 0) return { ok: false, error: 'Failed to read memory' };
+    const readResult = await this.readMemoryChunked(address, size);
+    const resumed = wasRunning ? await this.targetRun() : false;
+    const currentTargetState = wasRunning
+      ? (resumed ? 'Running' : readResult.targetState)
+      : 'Halted';
+    if (!readResult.ok) {
+      const errorCode = readResult.errorCode || 'MemoryReadFailed';
+      log.dap(`readMemory failed owner=${this.targetRegisterSource()} errorCode=${errorCode}`
+        + ` targetState=${currentTargetState} elapsedMs=${readResult.elapsedMs}`
+        + ` diagnostics=${JSON.stringify(readResult.diagnostics || {})}`);
+      return {
+        ok: false,
+        errorCode,
+        error: `${errorCode}: ${readResult.message}`,
+        diagnostics: {
+          ...readResult.diagnostics,
+          helperTargetState: readResult.targetState,
+          targetState: currentTargetState,
+        },
+        targetState: currentTargetState,
+        elapsedMs: readResult.elapsedMs,
+      };
+    }
+
+    const raw = readResult.data?.bytes;
+    if (!raw || raw.length === 0) {
+      return {
+        ok: false,
+        errorCode: 'MalformedResponse',
+        error: 'MalformedResponse: memory read returned no bytes',
+        diagnostics: { operation: 'readMemory', phase: 'decode', address, size },
+        targetState: readResult.targetState,
+        elapsedMs: readResult.elapsedMs,
+      };
+    }
 
     const data = Array.from(raw);
     const ascii = data.map(b => (b >= 0x20 && b <= 0x7E) ? String.fromCharCode(b) : '.').join('');
@@ -1835,16 +2068,48 @@ case 'readVariableRuntime':
     return { ok: true, data: block };
   }
 
-  private async readMemoryChunked(address: number, size: number): Promise<Uint8Array | null> {
+  private async readMemoryChunked(
+    address: number,
+    size: number,
+  ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
     const chunkSize = 256;
     const chunks: number[] = [];
+    let elapsedMs = 0;
+    let targetState: CppJLinkResult['targetState'] = 'Unknown';
     for (let offset = 0; offset < size; offset += chunkSize) {
       const count = Math.min(chunkSize, size - offset);
-      const chunk = await this.targetReadMemory(address + offset, count);
-      if (!chunk) break;
-      chunks.push(...Array.from(chunk));
+      const chunkAddress = address + offset;
+      const result = await this.targetReadMemoryResult(chunkAddress, count);
+      elapsedMs += result.elapsedMs;
+      targetState = result.targetState;
+      if (!result.ok || !result.data) {
+        return {
+          ...result,
+          ok: false,
+          elapsedMs,
+          diagnostics: {
+            ...result.diagnostics,
+            operation: 'readMemory',
+            phase: typeof result.diagnostics?.phase === 'string'
+              ? result.diagnostics.phase
+              : 'targetRead',
+            address,
+            size,
+            chunkAddress,
+            chunkSize: count,
+            chunkOffset: offset,
+          },
+        };
+      }
+      chunks.push(...Array.from(result.data.bytes));
     }
-    return chunks.length > 0 ? Uint8Array.from(chunks) : null;
+    return {
+      ok: true,
+      message: 'memory read',
+      targetState,
+      elapsedMs,
+      data: { bytes: Uint8Array.from(chunks) },
+    };
   }
 
   private async doFlash(
@@ -1853,8 +2118,38 @@ case 'readVariableRuntime':
     interface_: string,
     speedKHz: number,
     signal?: AbortSignal,
+    probe: DebugProbe = 'jlink',
+    flashBeforeDebug = true,
+    algorithmPath?: string,
   ): Promise<OzoneCommandResult> {
-    const result = await flashElf(elfPath, device, interface_, speedKHz, { signal });
+    if (flashBeforeDebug === false) return { ok: true, data: { skipped: true, reason: 'flashBeforeDebug=false' } };
+    let result: { success: boolean; message: string; elfPath?: string };
+    if (probe === 'cmsis-dap') {
+      if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'CMSIS-DAP target owner is unavailable' };
+      const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000 };
+      const flashResult = 'ownerKind' in this.sessionTarget
+        ? await this.sessionTarget.flash(elfPath, device, options)
+        : this.sessionTarget.flash
+          ? await this.sessionTarget.flash(elfPath, device, options)
+          : {
+            ok: false,
+            errorCode: 'UnsupportedCapability',
+            message: 'CMSIS-DAP owner does not implement Flash Algorithm',
+            targetState: 'Error' as const,
+            elapsedMs: 0,
+          };
+      if (!flashResult.ok) {
+        return {
+          ok: false,
+          errorCode: flashResult.errorCode,
+          error: `${flashResult.errorCode ? `${flashResult.errorCode}: ` : ''}${flashResult.message}`,
+          diagnostics: flashResult.diagnostics,
+        };
+      }
+      result = { success: true, message: flashResult.message, elfPath };
+    } else {
+      result = await flashElf(elfPath, device, interface_, speedKHz, { signal });
+    }
     if (result.success) {
        this.elfPath = elfPath;
        this.symbols = await readElfSymbols(elfPath);

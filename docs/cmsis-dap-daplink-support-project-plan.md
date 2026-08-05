@@ -1,8 +1,8 @@
 # Orbit CMSIS-DAP / DAPLink 支持项目计划
 
 - **状态**: 未开始
-- **版本**: v0.1
-- **日期**: 2026-08-01
+- **版本**: v0.2
+- **日期**: 2026-08-03
 - **适用项目**: Orbit for VS Code
 - **目标**: 在保留 J-Link 链路的前提下，新增 CMSIS-DAP / DAPLink 调试链路
 
@@ -14,6 +14,17 @@
 2. **第二阶段再使用无线 DAPLink 测试**，验证同一套上层 owner/DAP/Watch/Timeline/RTT/Viewer 是否能适应无线延迟、抖动、丢包和设备私有 transport。
 
 有线设备是第一版功能完成和发布的硬件门槛。无线设备测试属于后续兼容性和性能阶段，不得在无线设备尚未确定、协议尚未确认时阻塞有线主线，也不能用有线通过推断无线通过。
+
+### 0.1 烧录策略
+
+有线 CMSIS-DAP/DAPLink 调试会话默认执行烧录；用户可以在 launch 配置中显式关闭烧录，仅连接并调试目标板上已经存在的固件。
+
+- `flashBeforeDebug` 缺省值为 `true`；
+- `flashBeforeDebug: false` 时不得执行擦除、下载、校验或为了烧录而触发的额外 reset；
+- 默认烧录流程必须在创建 CMSIS-DAP target owner 后执行，烧录、校验和调试连接不能各自创建第二个物理 owner；
+- 第一阶段只要求使用 CMSIS-DAP 访问目标完成烧录，不要求兼容 OpenOCD、GDB Server 或厂商命令行烧录器；
+- 芯片 Flash Algorithm、芯片型号识别、擦除策略、下载进度和校验属于独立的小目标，不能用“预烧录调试通过”替代默认烧录验收；
+- J-Link 的默认烧录行为保持不变，`flashBeforeDebug` 的兼容语义不得破坏现有 J-Link launch 配置。
 
 ## 1. 项目目标
 
@@ -41,6 +52,19 @@
 4. 查看目标通过 SEGGER RTT 输出的日志；
 5. 使用 RTOS View、MemoryView、Peripheral Viewer 读取目标信息；
 6. 在 Watch、Timeline、RTT 运行时执行暂停、继续、单步、复位、断点和变量写入。
+
+有线 CMSIS-DAP 的最小配置语义如下，未填写 `flashBeforeDebug` 时按默认值 `true` 处理：
+
+```json
+{
+  "probe": "cmsis-dap",
+  "cmsisDapTransport": "auto",
+  "cmsisDapSerial": "optional",
+  "flashBeforeDebug": true
+}
+```
+
+用户需要调试目标板上已有固件时，显式设置 `"flashBeforeDebug": false`。跳过烧录只改变启动阶段，不改变后续基本调试能力。
 
 ### 2.2 非目标
 
@@ -190,6 +214,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - 确认有线设备与目标板之间是 SWD 还是 JTAG；
 - 将无线 DAPLink 的设备型号、连接方式和协议状态登记为第二阶段输入，不在 DAP-00 中猜测其私有无线链路；
 - 确认目标 MCU、SWD 时钟范围、供电方式和 reset 连接；
+- 收集该目标 MCU 对应的 CMSIS-Pack 或其他受支持 Flash Algorithm、算法版本和授权状态；
 - 准备一个带 ELF/DWARF 的 Cortex-M 测试工程；
 - 准备基本全局变量、结构体、FreeRTOS 任务、MemoryView 区域、SVD 文件和 RTT 输出；
 - 记录 J-Link 当前基线，作为性能和功能对照，不修改其现有路径。
@@ -206,6 +231,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - 能明确回答有线设备是标准 CMSIS-DAP v1 还是 CMSIS-DAP v2；
 - 确定第一款正式支持的有线设备和第一款目标 MCU；
 - 生成无线设备待测清单，但无线设备不作为有线 MVP 的前置条件；
+- 已确认默认烧录所需的 Flash Algorithm 来源；若尚未具备，必须把该状态标记为 DAP-02A 的阻塞项；
 - 没有执行未授权的 target-mutating 操作。
 
 ### DAP-01：通用 owner 和配置骨架
@@ -214,6 +240,10 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 - 扩展 `SessionTargetOwnerKind`，增加 CMSIS-DAP owner 表达；
 - 增加 `probe` 或等价 launch 字段，例如 `jlink` / `cmsis-dap`；
+- 增加 CMSIS-DAP 配置字段：`cmsisDapTransport`、`cmsisDapSerial`、可选 `cmsisDapVid`/`cmsisDapPid` 和 `flashBeforeDebug`；
+- `flashBeforeDebug` 对所有 probe 的缺省值为 `true`，但 CMSIS-DAP 与 J-Link 必须分别走各自 owner 的烧录实现；
+- `flashBeforeDebug: false` 必须在 launch、DAP session、owner 和 UI 状态中保持一致，不允许由下层自行恢复默认烧录；
+- 当 `flashBeforeDebug` 为 `true` 且 CMSIS-DAP 烧录能力尚未实现时，必须返回明确的 `UnsupportedCapability`，不能静默跳过烧录；
 - 保留现有 `nativeDebugEngineMode` 语义，不把 CMSIS-DAP 混进 J-Link fallback；
 - owner 类型建议最终表达为 `jlink-native`、`jlink-legacy`、`cmsis-dap`，但可以先保持兼容别名；
 - `SessionTargetSelector` 继续保证一 session 一个 physical owner；
@@ -234,17 +264,22 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - CMSIS-DAP 模式可以被解析但在 helper 尚未完成时给出明确的 `UnsupportedCapability`；
 - `dll.log`/`dap.log` 能区分 J-Link 与 CMSIS-DAP owner；
 - 测试证明同一 session 不会同时创建两个 physical owner。
+- 测试证明默认配置会请求 CMSIS-DAP 烧录，`flashBeforeDebug: false` 会明确跳过烧录，且 J-Link 原有默认行为不回归。
 
 ### DAP-02：CMSIS-DAP helper 握手和 transport
 
+**状态（2026-08-03）**: `DAP-02-HID 子阶段完成`。已实现 Windows CMSIS-DAP v1 HID transport、独立 helper、JSON-lines RPC、framing、`DAP_Info`/`DAP_Connect`/`DAP_Disconnect` 握手和 mock transport；WinUSB/v2、`DAP_Transfer`、DP/AP、Cortex-M 控制、内存访问、烧录等属于后续阶段，仍为未实现。证据见 `docs/daplink-hardware-matrix.md` 第 16 节与最终阶段报告；真实硬件验证结果在授权执行后补充登记。
+
+**返工记录（2026-08-03）**: 协议层按官方规范返工：(1) DAP_Info ID 修正为 Capabilities=0xF0、Packet Count=0xFE、Packet Size=0xFF；(2) DAP_Info 解析改为官方布局 `[0x00][len][data]`（无 info id 回显，length=0=无信息，字符串含 NUL，Packet Count 按 BYTE、Packet Size 按 little-endian SHORT）；(3) DAP_Connect 改为官方 `[0x02][Port]`（0=初始化失败、1=SWD、2=JTAG），删除虚构的 3 字节 status 分支（vendor-echo 仅保留未启用的 mock）；(4) DAP_Disconnect 按官方 v2 `[0x03][Status]` 并兼容 v1 单字节；(5) DAP_ERROR 修正为 0xFF；(6) HID 超时取消复核：CancelIoEx 后等待取消完成才允许 control-transfer 重发，否则返回错误不重发。返工后硬件重验确认设备真实提供 packet size=64（此前用错误 ID 查询误判为未提供）。
+
 **技术方向**:
 
-- 创建 `native/cmsis-dap-helper/`；
-- 实现 Windows HID v1；
-- 实现 Windows WinUSB v2；
-- 读取设备 packet size、packet count、protocol version、capabilities、vendor/product/serial；
-- 实现 request id、超时、取消、设备移除、helper 进程退出；
-- 建立可注入的 mock transport，不依赖真实 USB 才能测试 framing。
+- 创建 `native/cmsis-dap-helper/`（已完成：`CMakeLists.txt`、`src/main.cpp`、`src/json_rpc.{h,cpp}`、`src/cmsis_dap_transport.h`、`src/cmsis_dap_hid_transport.{h,cpp}`、`src/mock_transport.{h,cpp}`、`src/cmsis_dap_protocol.{h,cpp}`）；
+- 实现 Windows HID v1（已完成：SetupAPI 枚举、HidD report capabilities、overlapped I/O、超时取消、设备拔出检测、report ID framing、短包接受/空读拒绝/长包 `PacketTooLarge` 拒绝）；
+- 实现 Windows WinUSB v2（未开始；`cmsisDapTransport: winusb` 明确返回 `UnsupportedCapability`）；
+- 读取设备 packet size、packet count、protocol version、capabilities、vendor/product/serial（已完成：`DAP_Info` 逐项查询，空字段按"设备未提供"记录；packet size 来源标记 `protocol-info`/`hid-report-capability`/`unavailable`，不把 HID report 长度冒充协议 packet size）；
+- 实现 request id、超时、取消、设备移除、helper 进程退出（已完成：helper 侧结构化错误码 + TypeScript 侧 `CmsisDapHelperClient` 生命周期）；
+- 建立可注入的 mock transport，不依赖真实 USB 才能测试 framing（已完成：5 种行为设备，`npm run test:cmsis-dap:mock`）。
 
 **边界**:
 
@@ -256,12 +291,42 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 **验收**:
 
-- Mock 能验证 v1/v2 packet framing、短包、长包、超时、错误 response 和设备断开；
-- 经过授权的真实硬件能够完成 `DAP_Info`、`DAP_Connect`、`DAP_Disconnect`；
-- 记录设备 VID/PID、协议版本、packet size、transport 和 helper PID；
-- `npm run build:native` 和相应 helper mock 测试通过。
+- Mock 能验证 v1/v2 packet framing、短包、长包、超时、错误 response 和设备断开（已完成：mock 矩阵覆盖 reportId 0/非 0、65/33 字节 report、短读、超长拒绝、错误 command id、错误长度、status 错误、read timeout、设备拔出后 `DeviceRemoved`、helper 异常退出）；
+- 经过授权的真实硬件能够完成 `DAP_Info`、`DAP_Connect`、`DAP_Disconnect`（用户已授权 `D:\STM32\project\vet6_led` 开发板；验证结果在阶段报告登记）；
+- 记录设备 VID/PID、协议版本、packet size、transport 和 helper PID（硬件验证后登记）；
+- `npm run build:native` 和相应 helper mock 测试通过（已通过：`npm run build:native` 产出 `orbit-cmsis-dap-helper.exe`；`npm run test:cmsis-dap:mock` 全部断言通过；`npm test` 112 项、`npm run typecheck`、`npm run build`、`npm run test:cpp-channel:mock` 均通过）。
+
+### DAP-02A：CMSIS-DAP 默认烧录
+
+**目的**: 使用已经建立的 CMSIS-DAP owner 完成默认烧录；`flashBeforeDebug: false` 是明确的预烧录调试分支，而不是烧录失败后的静默降级。
+
+**技术方向**:
+
+- 第一版只支持 DAP-00 确定的第一款目标 MCU 和对应 Flash Algorithm；不在首版承诺任意 Cortex-M 自动识别和烧录；
+- 优先接入 CMSIS-Pack Flash Algorithm，使用 CMSIS-DAP 的 DP/AP、寄存器和内存访问作为底层目标通道；
+- 支持 ELF 可加载段解析、算法初始化、擦除、编程、校验和反初始化；
+- `flashBeforeDebug: true` 时烧录、校验成功后才能进入正常调试状态；
+- `flashBeforeDebug: false` 时完全跳过烧录、校验和烧录专用 reset；
+- 烧录过程必须复用当前 CMSIS-DAP physical owner，不得通过第二个 OpenOCD、GDB Server、命令行工具或 J-Link owner 绕过；
+- Flash Algorithm 缺失、目标不匹配、校验失败和算法异常都必须返回结构化错误。
+
+**边界**:
+
+- CMSIS-DAP 协议本身不提供通用 Flash 命令，烧录能力由目标 MCU 对应的 Flash Algorithm 提供；
+- 首版不实现完整 CMSIS-Pack 生态的所有器件族，只冻结一个真实硬件目标；
+- 不把“预烧录后能调试”作为“默认烧录已通过”的替代证据。
+
+**验收**:
+
+- 默认配置下，能够烧录测试 ELF，并通过版本号、校验值或目标变量变化确认新固件生效；
+- `flashBeforeDebug: false` 下，烧录计数为零，启动日志明确记录 `flash skipped`，目标已有固件可以直接进入调试；
+- Flash Algorithm 缺失或烧录失败时，launch 失败并给出可诊断原因，不进入误导性的“烧录成功后状态”；
+- 连续至少 5 次执行默认烧录，均使用同一个 CMSIS-DAP owner，不创建第二个物理连接；
+- J-Link 默认烧录和 `flashBeforeDebug` 兼容行为无回归。
 
 ### DAP-03：DP/AP 和内存访问
+
+**状态（2026-08-03）**: `协议层返工中`。验收被退回：mock 与 production 共同使用了错误的 Transfer/TransferBlock 线协议定义（命令 ID 0x06/0x07、RnW/AP 位域错位、response 单状态字节/16 位 count 布局错误）。返工已修正为官方布局（DAP_Transfer=0x05、DAP_TransferBlock=0x06，request 位 bit0=APnDP/bit1=RnW/bit3:2=A[3:2]，response=[count][Transfer Response][data]，block count 为 16 位小端），mock 改为独立 oracle（自持常量、拒绝未支持的 Match/Mask/Timestamp 位）。已追加 Transfer Response status 严格校验：未知/保留位（Transfer 的 bit5..7、TransferBlock 的 bit4..7）在解析 ACK 前一律拒绝为 `MalformedResponse`，杜绝 status=0x21 等被 `&0x07` 静默降级为 ACK_OK；bit3 协议错误与 Transfer bit4 mismatch 维持显式 `ProtocolError`；写路径未知 status 保持“完成状态未知、不重试”（writeCalls=1）；读路径错误时不向上层输出任何未确认数据。raw-frame golden 测试覆盖 0x01/0x02/0x04/0x07/0x09/0x11/0x21/0x41/0x81（helper selftest 128 项，全部通过）。真实硬件验证未授权未执行；正式验收证据待用户确认后补充。
 
 **技术方向**:
 
@@ -288,6 +353,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - 实现 `getState`、halt、run、reset；
 - 实现 Cortex-M 通用寄存器读取；
 - 实现单条指令 step；
+- P0 只要求可靠的 instruction step；源码级 Step Over/Into/Out 不得作为基本调试控制的隐式前置条件；
 - 控制请求使用 `control` 优先级，暂停 `watch`、`timeline` 和 `background`；
 - 控制结束后恢复被暂停的采样；
 - 将 PC/state 作为可信目标事实来源，不使用旧 owner 或缓存覆盖。
@@ -299,6 +365,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - Step response 在 stopped event 之前，且没有重复 stopped event；
 - 控制期间 Watch、Timeline、RTT background 不发出并发 target read；
 - 任何一次失败都能进入明确的 error/owner-loss 路径，不留下第二 owner。
+- `flashBeforeDebug: true` 时，烧录失败必须阻止进入“烧录成功后的调试状态”并报告原因；`flashBeforeDebug: false` 时，启动日志必须表明已跳过烧录。
 
 ### DAP-05：硬件断点和源码级 Step
 
@@ -308,7 +375,8 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - 维护用户断点槽和临时断点槽；
 - 支持当前 PC 位于用户断点时的 continue-at-current-PC；
 - 实现单步越过当前断点、临时断点清理和用户断点恢复；
-- 复用现有 ELF/DWARF 行号范围和源码 Step 算法；
+- 先完成硬件断点和 instruction step 的稳定配合，再复用现有 ELF/DWARF 行号范围实现源码 Step；
+- 源码 Step 分为 Step Over、Step Into、Step Out 三个独立能力，任何一种暂不支持时单独返回 capability error；
 - CMSIS-DAP owner 提供与 `SessionTargetOwner` 一致的控制结果；
 - 若第一版某类源码 Step 暂不支持，必须返回 capability error，不能静默退化成第二 owner 或重复点击式指令步进。
 
@@ -316,7 +384,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 - 至少覆盖 6 个 FPB 硬件断点槽；实际槽数量以目标报告为准；
 - 设置、命中、清除、重新设置断点后槽位和 PC 一致；
-- Step Over、Step Into、Step Out 各 20 次，包含函数调用、循环、条件分支和当前 PC 命中断点；
+- instruction step 和断点配合先各执行 20 次；Step Over、Step Into、Step Out 在源码 Step 能力启用后各执行 20 次，包含函数调用、循环、条件分支和当前 PC 命中断点；
 - 用户断点在临时断点完成后恢复到原槽；
 - timeout、取消、断线和异常路径都清理临时断点；
 - 记录 `step.log` 中的 PC before/after、槽位、耗时、错误码和清理结果。
@@ -409,7 +477,8 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 **技术方向**:
 
-- 先支持 FreeRTOS、Cortex-M、ELF/DWARF 可用的目标；
+- 第一版只支持明确版本范围内的 FreeRTOS、Cortex-M、ELF/DWARF 可用目标；其他 RTOS 标记为未支持，不通过猜测结构体布局兼容；
+- 首个硬件验收固定使用一个已知 FreeRTOS 工程和固定编译配置，记录 FreeRTOS 版本、优化级别和相关内核配置；
 - 复用现有 `rtosInfo`、`stackTrace`、`evaluate`、`variables`、`readMemory`；
 - 以 TCB 地址作为任务稳定 key；
 - 使用批量内存读取，但必须走活动 DAP owner；
@@ -424,6 +493,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 - RTOS View refresh 与 Watch/Timeline 并行时控制仍可用；
 - 停止、继续、reset、disconnect 后不残留旧任务数据；
 - 目标优化级别和 ELF 信息记录在验收报告中。
+- 首版验收必须记录 FreeRTOS 版本、目标 ABI、内核配置和任务结构体读取依据。
 
 ### DAP-10：MemoryView
 
@@ -500,6 +570,15 @@ npm run test:cmsis-dap:mock
 - 硬件报告必须独立于 Mock、单元测试、构建和离线解析报告；
 - 未执行的项目明确标记为“未验证”，不能用代码通过代替硬件通过。
 
+**有线 MVP 建议最低门槛**:
+
+- CMSIS-DAP v2：3 个标量变量连续运行采样 60 秒，至少 95% 请求返回有效值或明确错误；
+- CMSIS-DAP v2：Timeline 有效采样率至少达到 2 Hz；若实际设备低于该值，必须降级为“功能可用、性能受限”并记录原因；
+- CMSIS-DAP v1 HID：允许低于 2 Hz，但必须完成 Watch/Timeline 功能路径并记录有效采样率；
+- 任意有线 transport：Step/Halt/Continue 控制请求的 P95 延迟必须单独记录，且 Timeline 不得无限期占用控制通道；
+- 默认烧录：连续 5 次烧录、校验和启动成功；跳过烧录：连续 5 次确认没有烧录请求且已有固件可调试；
+- 所有性能数字只适用于完成测试的具体 probe、目标 MCU、SWD 速度和 ELF，不外推到无线设备。
+
 ## 6. 统一工程规范
 
 ### 6.1 Owner 规范
@@ -533,8 +612,10 @@ control > watch > timeline > background
 - `initialize.supportsReadMemoryRequest` 保持有效；
 - 所有 success-only 字段读取前检查 `.ok`；
 - 活动 DAP session 存在时，RuntimeRouter 只能通过 `customRequest` 访问目标；
+- 活动 DAP session 存在时，MemoryView、Peripheral Viewer 和 RTOS View 的目标读写失败必须返回明确错误，不得静默回退到 extension-host backend；
 - `deviceName`、`svdFile`、`svdPath` launch aliases 保持兼容；
 - Watch、Timeline、RTOS View、MemoryView、Peripheral Viewer 不得创建 duplicate backend。
+- 所有 Watch、Timeline、RTT、RTOS 和 Viewer 异步结果必须检查 active session identity 与 generation，旧 session 结果不得发布到新 session。
 
 ### 6.4 日志规范
 
@@ -564,11 +645,12 @@ control > watch > timeline > background
 
 ### MVP-1：可用调试器
 
-必须包含 DAP-00 至 DAP-04，并且以有线设备验收：
+必须包含 DAP-00 至 DAP-04，并且以有线设备验收；其中 DAP-02A 是默认烧录的必要前置：
 
 - 第一款有线标准 CMSIS-DAP v2 设备；如果实际设备只有 v1，则明确记录 HID 性能限制；
 - 连接、halt、run、reset、register、memory、基本 instruction step；
 - 基础硬件断点；
+- 默认烧录成功；`flashBeforeDebug: false` 跳过烧录后仍可调试；
 - J-Link 旧路径无回归。
 
 ### MVP-2：可观测变量
@@ -606,6 +688,7 @@ control > watch > timeline > background
 整个项目只有同时满足以下条件才可标记为完成：
 
 - [ ] 0. 基本调试功能在目标硬件上通过；
+- [ ] 默认 `flashBeforeDebug: true` 的烧录、校验和启动通过，且显式 `false` 时确认跳过烧录；
 - [ ] 1. Watch 实时变量在目标运行和停止状态均通过；
 - [ ] 2. Timeline 在目标设备支持的合理频率下通过，实际频率有记录；
 - [ ] 3. RTT 日志在明确声明的吞吐和丢失边界内通过；

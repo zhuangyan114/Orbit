@@ -8,6 +8,7 @@ import {
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
+import { normalizeDapLaunchConfig } from './dap-launch-config';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -68,7 +69,9 @@ export class DapSession extends EventEmitter {
   private _device = '';
   private _interface = 'SWD';
   private _speedKHz = 4000;
+  private _probe: 'jlink' | 'cmsis-dap' = 'jlink';
   private _flashEnabled = true;
+  private _cmsisDapFlashAlgorithmPath = '';
   private dataSamplingActive = false;
   private dataSamplingTimer: NodeJS.Immediate | null = null;
   private dataSamplingSendTimer: NodeJS.Timeout | null = null;
@@ -789,7 +792,7 @@ export class DapSession extends EventEmitter {
             supportsDisassembleRequest: false,
             supportsCancelRequest: false,
             supportsBreakpointLocationsRequest: false,
-            supportsSteppingGranularity: false,
+            supportsSteppingGranularity: true,
             supportsInstructionBreakpoints: false,
             supportsRTOS: true,
             rtosName: this._rtos || '',
@@ -829,9 +832,9 @@ export class DapSession extends EventEmitter {
         case 'continue':
           return this.handleContinue(msg);
         case 'next':
-          return this.handleStep(msg, 'stepOver');
+          return this.handleStep(msg, msg.arguments?.granularity === 'instruction' ? 'stepIntoInstruction' : 'stepOver');
         case 'stepIn':
-          return this.handleStep(msg, 'stepInto');
+          return this.handleStep(msg, msg.arguments?.granularity === 'instruction' ? 'stepIntoInstruction' : 'stepInto');
         case 'stepOut':
           return this.handleStep(msg, 'stepOut');
         case 'pause':
@@ -872,6 +875,7 @@ export class DapSession extends EventEmitter {
   private async handleLaunch(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
+      const targetConfig = normalizeDapLaunchConfig(args);
       configureLogger({
         enabled: args.loggingEnabled !== false,
         clearOnStart: args.clearLogsOnStart !== false,
@@ -881,7 +885,7 @@ export class DapSession extends EventEmitter {
       const speedKHz = args.speedKHz || 4000;
       this._rtos = args.rtos || args.defaultRtos || '';
       const elfPath = args.program || args.elfPath || '';
-      const flashEnabled = args.flashBeforeDebug !== false;
+      const flashEnabled = targetConfig.flashBeforeDebug;
       this.rttLogEnabled = args.rttLogEnabled !== false;
       this.rttBufferIndex = Math.floor(this.clampNumber(args.rttBufferIndex, 0, 0, 15));
       this.rttPollIntervalMs = Math.floor(this.clampNumber(args.rttPollIntervalMs, 50, 10, 5000));
@@ -897,10 +901,24 @@ export class DapSession extends EventEmitter {
       this._device = device;
       this._interface = interface_;
       this._speedKHz = speedKHz;
+      this._probe = targetConfig.probe;
       this._flashEnabled = flashEnabled;
+      this._cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath || '';
       this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connecting';
       log.dap(`Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
       this.resetVariableHandles();
+      if (flashEnabled && !elfPath) {
+        this.phase = 'idle';
+        const error = 'InvalidConfiguration: flashBeforeDebug=true requires an ELF/AXF program path';
+        log.dap(`Launch rejected capability=flashBeforeDebug errorCode=InvalidConfiguration`);
+        this.sendEvent('output', { category: 'stderr', output: `${error}\n` });
+        this.sendResponse(msg, undefined, false, error);
+        return;
+      }
+      if (!flashEnabled) {
+        log.dap('flash skipped reason=flashBeforeDebug=false');
+        this.sendEvent('output', { category: 'console', output: 'Flash skipped: flashBeforeDebug=false\n' });
+      }
       if (this.pRtLogEnabled) {
         const tokenLoad = this.pRtLogDecoder.loadTokenDatabase(elfPath);
         const output = tokenLoad.ok
@@ -909,12 +927,15 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: tokenLoad.ok ? 'console' : 'stderr', output });
       }
 
-      if (elfPath && this._flashEnabled) {
+      if (elfPath && this._flashEnabled && targetConfig.probe !== 'cmsis-dap') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
         const flashResult = await this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
+          probe: targetConfig.probe,
+          flashBeforeDebug: targetConfig.flashBeforeDebug,
+          cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,
         });
         if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
@@ -936,6 +957,13 @@ export class DapSession extends EventEmitter {
           device,
           interface: interface_,
           speedKHz,
+          probe: targetConfig.probe,
+          cmsisDapTransport: targetConfig.cmsisDapTransport,
+          cmsisDapSerial: targetConfig.cmsisDapSerial,
+          cmsisDapVid: targetConfig.cmsisDapVid,
+          cmsisDapPid: targetConfig.cmsisDapPid,
+          cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
+          flashBeforeDebug: targetConfig.flashBeforeDebug,
           nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
             ? args.nativeDebugEngineMode
             : 'auto',
@@ -950,6 +978,31 @@ export class DapSession extends EventEmitter {
       }
       this.targetConnectionEstablished = true;
       this.connectionFailureCount = 0;
+      this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connected';
+
+      if (elfPath && this._flashEnabled && targetConfig.probe === 'cmsis-dap') {
+        this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath} through the connected CMSIS-DAP owner...\n` });
+        const flashAbortController = new AbortController();
+        this.flashAbortController = flashAbortController;
+        const flashResult = await this.backend.execute({
+          cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
+          probe: targetConfig.probe,
+          flashBeforeDebug: targetConfig.flashBeforeDebug,
+          cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
+          signal: flashAbortController.signal,
+        });
+        if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
+        if (this.isSessionTerminating()) return;
+        if (!flashResult.ok) {
+          this.phase = 'idle';
+          this.targetConnectionEstablished = false;
+          this.sendEvent('output', { category: 'stderr', output: `Flash failed: ${flashResult.error}\n` });
+          await this.backend.execute({ cmd: 'disconnect' });
+          this.sendResponse(msg, undefined, false, flashResult.error);
+          return;
+        }
+        this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any)?.message || 'CMSIS-DAP Flash Algorithm completed'}\n` });
+      }
       this.phase = 'connected';
       this.startConnectionMonitor();
 
@@ -965,7 +1018,24 @@ export class DapSession extends EventEmitter {
         await this.backend.execute({ cmd: 'reset' });
         await new Promise<void>(r => setTimeout(r, 200));
       }
-      await this.backend.execute({ cmd: 'halt' });
+      const initialHalt = await this.backend.execute({ cmd: 'halt' });
+      if (!initialHalt.ok && this._probe === 'cmsis-dap') {
+        this.phase = 'idle';
+        this.sendEvent('output', { category: 'stderr', output: `Initial halt failed: ${initialHalt.error}\n` });
+        this.sendResponse(msg, undefined, false, initialHalt.error);
+        return;
+      }
+      if (this._probe === 'cmsis-dap') {
+        const stateResult = await this.queryTargetState('launch-halt-confirm');
+        if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+          this.phase = 'idle';
+          const error = stateResult.ok
+            ? `TargetStateInvalid: launch halt returned ${stateResult.data}`
+            : stateResult.error;
+          this.sendResponse(msg, undefined, false, error);
+          return;
+        }
+      }
       // Wait for CPU to actually halt before sending stopped event
       await new Promise<void>(r => setTimeout(r, 200));
       this.markStoppedForUi();
@@ -1063,8 +1133,8 @@ export class DapSession extends EventEmitter {
     await new Promise<void>(r => setTimeout(r, 100));
     this.lastHaltReason = 'entry';
     this.markStoppedForUi();
-    this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
     this.sendResponse(msg);
+    this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
   }
 
   private async handleStackTrace(msg: DebugProtocolMessage) {
@@ -1173,7 +1243,14 @@ export class DapSession extends EventEmitter {
     try {
       const result = await this.backend.execute({ cmd: 'readMemory', address, size: count });
       if (!result.ok) {
-        this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, result.error);
+        this.sendResponse(msg, {
+          address: this.formatMemoryReference(address),
+          unreadableBytes: count,
+          errorCode: result.errorCode,
+          targetState: result.targetState,
+          elapsedMs: result.elapsedMs,
+          diagnostics: result.diagnostics,
+        }, false, result.error);
         return;
       }
 
@@ -1240,10 +1317,31 @@ export class DapSession extends EventEmitter {
 
         const runResult = await this.backend.execute({ cmd: 'run' });
         log.dap(`handleContinue: run result ok=${runResult.ok}`);
-        this.setTargetRunning(runResult.ok);
-        if (runResult.ok) {
-          this.readCancelEpoch++;
+        if (!runResult.ok && this._probe === 'cmsis-dap') {
+          this.sendResponse(msg, undefined, false, runResult.error);
+          const stateResult = await this.queryTargetState('continue-failed-confirm');
+          if (stateResult.ok && stateResult.data === TargetState.Halted) {
+            this.markStoppedForUi();
+            this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
+          }
+          return;
         }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('continue-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Running) {
+            this.sendResponse(msg, undefined, false,
+              stateResult.ok
+                ? `TargetStateInvalid: continue returned ${stateResult.data}`
+                : stateResult.error);
+            if (stateResult.ok && stateResult.data === TargetState.Halted) {
+              this.markStoppedForUi();
+              this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
+            }
+            return;
+          }
+        }
+        this.setTargetRunning(runResult.ok);
+        if (runResult.ok) this.readCancelEpoch++;
         this.sendResponse(msg, { allThreadsContinued: true });
         this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
         this.lastHaltReason = 'breakpoint';
@@ -1260,7 +1358,10 @@ export class DapSession extends EventEmitter {
     });
   }
 
-  private async handleStep(msg: DebugProtocolMessage, cmd: 'stepOver' | 'stepInto' | 'stepOut') {
+  private async handleStep(
+    msg: DebugProtocolMessage,
+    cmd: 'stepOver' | 'stepInto' | 'stepOut' | 'stepIntoInstruction',
+  ) {
     const requestReceivedAt = Date.now();
     await this.withStepLock(async () => {
       const profileId = ++this.dapStepProfileSeq;
@@ -1291,7 +1392,10 @@ export class DapSession extends EventEmitter {
           log.dap(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
           log.dap(`[stepProfile#${profileId}] ${cmd} backend=${backendMs}ms attempt=${attempt + 1} ok=${result.ok}`);
           if (!result.ok) {
-            if (attempt < 2) {
+            // The CMSIS-DAP owner already reports the bounded transfer/control
+            // outcome. Reissuing a failed control request can duplicate a
+            // command whose completion is no longer knowable.
+            if (attempt < 2 && !(this._probe === 'cmsis-dap' && result.errorCode)) {
               await new Promise<void>(r => setTimeout(r, 50));
               continue;
             }
@@ -1300,6 +1404,26 @@ export class DapSession extends EventEmitter {
               responseSent = true;
             }
             return;
+          }
+
+          const stepData = result.data as {
+            mode?: string;
+            pcBefore?: number;
+            pcAfter?: number;
+            classification?: string;
+            helperElapsedMs?: number;
+            timings?: { totalMs?: number };
+          } | undefined;
+          if (stepData?.mode === 'cmsis-dap') {
+            const stateResult = await this.queryTargetState('step-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+              this.sendResponse(msg, undefined, false,
+                stateResult.ok
+                  ? `TargetStateInvalid: instruction step returned ${stateResult.data}`
+                  : stateResult.error);
+              responseSent = true;
+              return;
+            }
           }
 
           if (!responseSent) {
@@ -1313,14 +1437,15 @@ export class DapSession extends EventEmitter {
           }
           this.lastHaltReason = 'step';
 
-          const stepData = result.data as {
-            mode?: string;
-            pcBefore?: number;
-            pcAfter?: number;
-            classification?: string;
-            helperElapsedMs?: number;
-            timings?: { totalMs?: number };
-          } | undefined;
+          if (stepData?.mode === 'cmsis-dap') {
+            this.markStoppedForUi();
+            this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+            log.dap(
+              `[stepProfile#${profileId}] ${cmd} cmsis-dap halted`
+              + ` pc=0x${stepData.pcBefore?.toString(16) ?? 'unknown'}->0x${stepData.pcAfter?.toString(16) ?? 'unknown'}`,
+            );
+            return;
+          }
           if (stepData?.mode === 'native') {
             const helperElapsedMs = stepData.helperElapsedMs;
             const nativeStateMachineMs = stepData.timings?.totalMs;
@@ -1386,11 +1511,25 @@ export class DapSession extends EventEmitter {
       this.beginControl();
       this.stopPolling();
       try {
-        await this.backend.execute({ cmd: 'halt' });
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (!haltResult.ok && this._probe === 'cmsis-dap') {
+          this.sendResponse(msg, undefined, false, haltResult.error);
+          return;
+        }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('pause-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.sendResponse(msg, undefined, false,
+              stateResult.ok
+                ? `TargetStateInvalid: pause returned ${stateResult.data}`
+                : stateResult.error);
+            return;
+          }
+        }
         this.markStoppedForUi();
         this.lastHaltReason = 'pause';
-        this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
         this.sendResponse(msg);
+        this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
       } finally {
         this.endControl();
       }
@@ -1418,6 +1557,8 @@ export class DapSession extends EventEmitter {
           const flashResult = await this.backend.execute({
             cmd: 'flash', elfPath: this._elfPath, device: this._device,
             interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
+            probe: this._probe,
+            flashBeforeDebug: this._flashEnabled,
           });
           if (flashResult.ok) {
             this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
@@ -1428,17 +1569,29 @@ export class DapSession extends EventEmitter {
           }
           await new Promise<void>(r => setTimeout(r, 500));
         }
-        await this.backend.execute({ cmd: 'reset' });
-        await this.backend.execute({ cmd: 'halt' });
+        const resetResult = await this.backend.execute({ cmd: 'reset' });
+        if (!resetResult.ok && this._probe === 'cmsis-dap') {
+          this.sendResponse(msg, undefined, false, resetResult.error);
+          return;
+        }
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (!haltResult.ok && this._probe === 'cmsis-dap') {
+          this.sendResponse(msg, undefined, false, haltResult.error);
+          return;
+        }
         await new Promise<void>(r => setTimeout(r, 200));
-        await this.backend.execute({ cmd: 'clearAllBreakpoints' });
-        this.breakpoints.clear();
+        if (this._probe !== 'cmsis-dap') {
+          await this.backend.execute({ cmd: 'clearAllBreakpoints' });
+          this.breakpoints.clear();
+        }
 
-        for (const bp of savedBps) {
-          const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
-          if (result.ok) {
-            const data = result.data as any;
-            this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+        if (this._probe !== 'cmsis-dap') {
+          for (const bp of savedBps) {
+            const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
+            if (result.ok) {
+              const data = result.data as any;
+              this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+            }
           }
         }
 
@@ -1447,8 +1600,8 @@ export class DapSession extends EventEmitter {
         if (this.rttLogEnabled) {
           this.startRttLogPolling();
         }
-        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
         this.sendResponse(msg);
+        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
       } finally {
         this.endControl();
       }

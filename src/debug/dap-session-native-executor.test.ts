@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DapSession } from './dap-session';
+import { DapSession, DebugProtocolMessage } from './dap-session';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { log } from '../utils/logger';
 
@@ -45,6 +45,76 @@ describe('DapSession native executor lifecycle', () => {
 
     await (session as any).handleDisconnect({ type: 'request', seq: 2, command: 'disconnect' });
     expect(backend.configureNativeSteps).toHaveBeenLastCalledWith(false);
+  });
+
+  it('routes default CMSIS-DAP flashing through the CMSIS-DAP owner command', async () => {
+    const backend = {
+      execute: vi.fn(async () => ({ ok: true, data: {} })),
+      configureNativeSteps: vi.fn(),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleLaunch({
+      type: 'request', seq: 2, command: 'launch',
+      arguments: {
+        probe: 'cmsis-dap',
+        program: 'firmware.elf',
+        flashBeforeDebug: true,
+        rttLogEnabled: false,
+      },
+    });
+
+    expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'connect',
+      config: expect.objectContaining({ probe: 'cmsis-dap' }),
+    }));
+    expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'flash',
+      probe: 'cmsis-dap',
+      flashBeforeDebug: true,
+    }));
+    expect(backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'flash',
+      probe: 'jlink',
+    }));
+  });
+
+  it('forwards explicit CMSIS-DAP flash skip and selectors to the connect command', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'connect'
+        ? { ok: false, error: 'UnsupportedCapability: CMSIS-DAP helper is not implemented', errorCode: 'UnsupportedCapability' }
+        : { ok: true, data: {} }),
+      configureNativeSteps: vi.fn(),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+
+    await (session as any).handleLaunch({
+      type: 'request', seq: 3, command: 'launch',
+      arguments: {
+        probe: 'cmsis-dap',
+        cmsisDapTransport: 'hid',
+        cmsisDapSerial: 'CMSIS-123',
+        cmsisDapVid: 'C251',
+        cmsisDapPid: 'F001',
+        flashBeforeDebug: false,
+        rttLogEnabled: false,
+      },
+    });
+
+    expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'connect',
+      config: expect.objectContaining({
+        probe: 'cmsis-dap',
+        cmsisDapTransport: 'hid',
+        cmsisDapSerial: 'CMSIS-123',
+        cmsisDapVid: 'C251',
+        cmsisDapPid: 'F001',
+        flashBeforeDebug: false,
+      }),
+    }));
+    expect(backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({ cmd: 'flash' }));
   });
 
   it('sends the step response before the stopped event once native reports halted', async () => {

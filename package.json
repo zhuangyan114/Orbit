@@ -146,6 +146,38 @@
                 "description": "Target device name alias used by external MCU debug views",
                 "default": "STM32F407VG"
               },
+              "probe": {
+                "type": "string",
+                "description": "Physical debug probe owner",
+                "enum": ["jlink", "cmsis-dap"],
+                "default": "jlink"
+              },
+              "cmsisDapTransport": {
+                "type": "string",
+                "description": "CMSIS-DAP transport preference; current wired hardware uses HID",
+                "enum": ["auto", "hid", "winusb"],
+                "default": "auto"
+              },
+              "cmsisDapSerial": {
+                "type": "string",
+                "description": "Optional CMSIS-DAP serial selector",
+                "default": ""
+              },
+              "cmsisDapVid": {
+                "type": "string",
+                "description": "Optional CMSIS-DAP USB vendor ID selector",
+                "default": ""
+              },
+              "cmsisDapPid": {
+                "type": "string",
+                "description": "Optional CMSIS-DAP USB product ID selector",
+                "default": ""
+              },
+              "cmsisDapFlashAlgorithmPath": {
+                "type": "string",
+                "description": "Optional path to a user-provided licensed CMSIS-DAP Flash Algorithm binary or manifest",
+                "default": ""
+              },
               "program": {
                 "type": "string",
                 "description": "Path to ELF/AXF file (烧录文件)",
@@ -174,6 +206,11 @@
                 "type": "number",
                 "description": "Interface speed in kHz",
                 "default": 4000
+              },
+              "flashBeforeDebug": {
+                "type": "boolean",
+                "description": "Flash the current ELF before debugging; CMSIS-DAP flashing is unavailable until DAP-02A",
+                "default": true
               },
               "rtos": {
                 "type": "string",
@@ -434,6 +471,8 @@
     "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
     "test:cpp-channel": "node scripts/cpp-channel-smoke.js",
     "test:cpp-channel:mock": "node scripts/cpp-channel-smoke.js --mock",
+    "test:cmsis-dap:mock": "node scripts/cmsis-dap-smoke.js --mock",
+    "test:cmsis-dap:algorithm": "node scripts/cmsis-dap/verify-flash-algorithm.js",
     "watch": "node esbuild.config.js --watch",
     "mcp": "node Releases/mcp/orbit-mcp-server.js",
     "lint": "eslint src --ext ts,tsx",

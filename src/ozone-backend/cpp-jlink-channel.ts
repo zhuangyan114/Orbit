@@ -340,7 +340,7 @@ export class CppJLinkHelperClient {
 }
 
 export class ExperimentalCppJLinkChannel {
-  readonly kind = 'native' as const;
+  readonly kind = 'jlink-native' as const;
   private readonly helper: CppJLinkHelperClient;
   private nativeConnected = false;
 

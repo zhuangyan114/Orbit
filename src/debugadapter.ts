@@ -1,7 +1,7 @@
 import { OzoneBackend } from './ozone-backend/commander';
 import { DapSession, DebugProtocolMessage } from './debug/dap-session';
 import { ExperimentalCppJLinkChannel } from './ozone-backend/cpp-jlink-channel';
-import { LegacyJLinkTargetChannel, SessionTargetSelector } from './ozone-backend/session-target-channel';
+import { CmsisDapTargetChannel, LegacyJLinkTargetChannel, SessionTargetSelector } from './ozone-backend/session-target-channel';
 import { log } from './utils/logger';
 
 try {
@@ -13,6 +13,9 @@ try {
       },
     }),
     () => new LegacyJLinkTargetChannel(),
+    () => new CmsisDapTargetChannel({
+      onDiagnostic: message => log.dll(message),
+    }),
   );
   const backend = new OzoneBackend(target, target);
   const session = new DapSession(backend);

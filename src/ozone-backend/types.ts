@@ -1,4 +1,17 @@
-export interface DebugSessionConfig {
+export type DebugProbe = 'jlink' | 'cmsis-dap';
+export type CmsisDapTransport = 'auto' | 'hid' | 'winusb';
+
+export interface DebugProbeLaunchConfig {
+  probe?: DebugProbe;
+  cmsisDapTransport?: CmsisDapTransport;
+  cmsisDapSerial?: string;
+  cmsisDapVid?: string;
+  cmsisDapPid?: string;
+  cmsisDapFlashAlgorithmPath?: string;
+  flashBeforeDebug?: boolean;
+}
+
+export interface DebugSessionConfig extends DebugProbeLaunchConfig {
   device: string;
   interface: 'SWD' | 'JTAG';
   speedKHz: number;
@@ -143,7 +156,17 @@ export type OzoneCommand =
   | { cmd: 'writeMemory'; address: number; data: number[] }
   | { cmd: 'readRegister'; name: string }
   | { cmd: 'getTargetState' }
-  | { cmd: 'flash'; elfPath: string; device: string; interface: 'SWD' | 'JTAG'; speedKHz: number; signal?: AbortSignal }
+  | {
+    cmd: 'flash';
+    elfPath: string;
+    device: string;
+    interface: 'SWD' | 'JTAG';
+    speedKHz: number;
+    signal?: AbortSignal;
+    probe?: DebugProbe;
+    flashBeforeDebug?: boolean;
+    cmsisDapFlashAlgorithmPath?: string;
+  }
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
@@ -158,4 +181,11 @@ export type OzoneCommand =
 
 export type OzoneCommandResult =
   | { ok: true; data: unknown }
-  | { ok: false; error: string; errorCode?: string };
+  | {
+    ok: false;
+    error: string;
+    errorCode?: string;
+    diagnostics?: Record<string, unknown>;
+    targetState?: string;
+    elapsedMs?: number;
+  };

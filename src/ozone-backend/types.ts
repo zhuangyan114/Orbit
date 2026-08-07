@@ -55,12 +55,15 @@ export interface StackFrame {
 export interface WatchValue {
   expression: string;
   evaluateName?: string;
-  value: number;
+  value: number | string;
   display: string;
   hex: string;
   address?: number;
   error?: string;
+  errorCode?: string;
   typeName?: string;
+  exactValue?: string;
+  numericValueExact?: boolean;
   hasChildren?: boolean;
   children?: WatchValue[];
 }
@@ -145,12 +148,13 @@ export type OzoneCommand =
   | { cmd: 'stepOver' }
   | { cmd: 'stepOut' }
   | { cmd: 'reset' }
+  | { cmd: 'runToEntryPoint'; symbol: string; reset: boolean }
   | { cmd: 'setBreakpoint'; file: string; line: number; type?: string; condition?: string }
   | { cmd: 'clearBreakpoint'; id: number }
   | { cmd: 'clearAllBreakpoints' }
-  | { cmd: 'getRegisters' }
+  | { cmd: 'getRegisters'; signal?: AbortSignal }
   | { cmd: 'getVariable'; name: string; frame?: number }
-  | { cmd: 'getLocals'; frame?: number }
+  | { cmd: 'getLocals'; frame?: number; signal?: AbortSignal }
   | { cmd: 'getCallStack' }
   | { cmd: 'readMemory'; address: number; size: number }
   | { cmd: 'writeMemory'; address: number; data: number[] }
@@ -171,7 +175,7 @@ export type OzoneCommand =
   | { cmd: 'loadSymbols'; elfPath: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
-  | { cmd: 'evaluateExpression'; expression: string; force?: boolean; expandedExpressions?: string[] }
+  | { cmd: 'evaluateExpression'; expression: string; force?: boolean; expandedExpressions?: string[]; signal?: AbortSignal }
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[] }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }

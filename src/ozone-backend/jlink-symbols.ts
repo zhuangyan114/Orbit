@@ -99,11 +99,17 @@ export interface DwarfField {
   byteOffset: number;
 }
 
+export interface DwarfEnumerator {
+  name: string;
+  value: string;
+}
+
 export interface DwarfTypeInfo {
   name: string;
   byteSize: number;
-  kind: 'struct' | 'typedef' | 'base' | 'pointer' | 'array' | 'enum' | 'const' | 'volatile' | 'restrict' | 'unspecified';
+  kind: 'struct' | 'union' | 'typedef' | 'base' | 'pointer' | 'array' | 'enum' | 'subroutine' | 'const' | 'volatile' | 'restrict' | 'unspecified';
   fields?: DwarfField[];
+  enumerators?: DwarfEnumerator[];
   typeOffset?: string;
   arrayCount?: number;
   encoding?: string;
@@ -112,7 +118,24 @@ export interface DwarfTypeInfo {
 export interface DwarfInfo {
   varToType: Map<string, string>;
   typeDefs: Map<string, DwarfTypeInfo>;
+  localVariables?: DwarfLocalVariable[];
+  cfaRows?: DwarfCfaRow[];
   _diag?: string;
+}
+
+export interface DwarfLocalVariable {
+  name: string;
+  typeOffset: string;
+  lowPc: number;
+  highPc: number;
+  fbregOffset: number;
+}
+
+export interface DwarfCfaRow {
+  lowPc: number;
+  highPc: number;
+  registerIndex: number;
+  offset: number;
 }
 
 function parseDwarfOutput(stdout: string): { dies: any[]; errors: string[] } {
@@ -156,6 +179,110 @@ function parseDwarfOutput(stdout: string): { dies: any[]; errors: string[] } {
     }
   }
   return { dies, errors };
+}
+
+function parseDwarfAddress(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const match = value.match(/0x([0-9a-fA-F]+)/);
+  if (!match) return null;
+  const parsed = parseInt(match[1], 16);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function dwarfRange(die: any, inherited?: { lowPc: number; highPc: number }): { lowPc: number; highPc: number } | null {
+  const lowPc = parseDwarfAddress(die.attrs.DW_AT_low_pc);
+  const highPcValue = parseDwarfAddress(die.attrs.DW_AT_high_pc);
+  if (lowPc === null) return inherited || null;
+  if (highPcValue === null) return inherited || null;
+  return {
+    lowPc,
+    highPc: highPcValue > lowPc ? highPcValue : lowPc + highPcValue,
+  };
+}
+
+export function parseDwarfLocalMetadata(
+  infoOutput: string,
+  framesOutput: string,
+): Pick<DwarfInfo, 'localVariables' | 'cfaRows'> {
+  const { dies } = parseDwarfOutput(infoOutput);
+  const localVariables: DwarfLocalVariable[] = [];
+
+  const visit = (
+    die: any,
+    scope: { lowPc: number; highPc: number; usesCfa: boolean } | null,
+  ) => {
+    let nextScope = scope;
+    if (die.tag === 'DW_TAG_subprogram') {
+      const range = dwarfRange(die);
+      nextScope = range ? {
+        ...range,
+        usesCfa: /DW_OP_call_frame_cfa/.test(die.attrs.DW_AT_frame_base || ''),
+      } : null;
+    } else if (die.tag === 'DW_TAG_lexical_block' && scope) {
+      const range = dwarfRange(die, scope);
+      nextScope = range ? { ...range, usesCfa: scope.usesCfa } : scope;
+    }
+
+    if ((die.tag === 'DW_TAG_variable' || die.tag === 'DW_TAG_formal_parameter')
+      && nextScope?.usesCfa && die.attrs.DW_AT_name && die.attrs.DW_AT_type) {
+      const location = String(die.attrs.DW_AT_location || '');
+      const fbreg = location.match(/DW_OP_fbreg:\s*(-?\d+)/);
+      if (fbreg) {
+        localVariables.push({
+          name: die.attrs.DW_AT_name,
+          typeOffset: die.attrs.DW_AT_type,
+          lowPc: nextScope.lowPc,
+          highPc: nextScope.highPc,
+          fbregOffset: parseInt(fbreg[1], 10),
+        });
+      }
+    }
+
+    for (const child of die.children || []) visit(child, nextScope);
+  };
+  for (const die of dies) visit(die, null);
+
+  const cfaRows: DwarfCfaRow[] = [];
+  let fdeEnd: number | null = null;
+  let pendingRows: Array<{ lowPc: number; registerIndex: number; offset: number }> = [];
+  const flushRows = () => {
+    if (fdeEnd === null) return;
+    for (let index = 0; index < pendingRows.length; index++) {
+      const row = pendingRows[index];
+      const highPc = pendingRows[index + 1]?.lowPc ?? fdeEnd;
+      if (highPc > row.lowPc) cfaRows.push({ ...row, highPc });
+    }
+    pendingRows = [];
+    fdeEnd = null;
+  };
+
+  for (const line of framesOutput.split(/\r?\n/)) {
+    const fde = line.match(/\bFDE\b.*\bpc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)/);
+    if (fde) {
+      flushRows();
+      fdeEnd = parseInt(fde[2], 16);
+      continue;
+    }
+    if (/\bCIE\b/.test(line)) {
+      flushRows();
+      continue;
+    }
+    if (fdeEnd === null) continue;
+    const row = line.match(/^\s*([0-9a-fA-F]+)\s+r(\d+)([+-]\d+)\b/);
+    if (!row) continue;
+    pendingRows.push({
+      lowPc: parseInt(row[1], 16),
+      registerIndex: parseInt(row[2], 10),
+      offset: parseInt(row[3], 10),
+    });
+  }
+  flushRows();
+
+  const uniqueRows = new Map<string, DwarfCfaRow>();
+  for (const row of cfaRows) {
+    uniqueRows.set(`${row.lowPc}:${row.highPc}:${row.registerIndex}:${row.offset}`, row);
+  }
+  return { localVariables, cfaRows: [...uniqueRows.values()] };
 }
 
 function resolveType(offset: string, typeDefs: Map<string, DwarfTypeInfo>, visited: Set<string> = new Set()): DwarfTypeInfo | null {
@@ -211,21 +338,22 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
     const allDies: any[] = [];
     for (const d of dies) visitDie(d, d2 => allDies.push(d2));
 
-    let nStruct = 0, nTypedef = 0, nBase = 0, nVar = 0;
+    let nStruct = 0, nUnion = 0, nTypedef = 0, nBase = 0, nVar = 0;
     for (const d of allDies) {
       if (d.tag === 'DW_TAG_structure_type') nStruct++;
+      else if (d.tag === 'DW_TAG_union_type') nUnion++;
       else if (d.tag === 'DW_TAG_typedef') nTypedef++;
       else if (d.tag === 'DW_TAG_base_type') nBase++;
       else if (d.tag === 'DW_TAG_variable') nVar++;
     }
-    diagParts.push(`struct=${nStruct}, typedef=${nTypedef}, base=${nBase}, var=${nVar}`);
+    diagParts.push(`struct=${nStruct}, union=${nUnion}, typedef=${nTypedef}, base=${nBase}, var=${nVar}`);
 
     for (const die of allDies) {
       if (die.tag === 'DW_TAG_variable' && die.attrs.DW_AT_name && die.attrs.DW_AT_type) {
         varToType.set(die.attrs.DW_AT_name, die.attrs.DW_AT_type);
       }
 
-      if (die.tag === 'DW_TAG_structure_type') {
+      if (die.tag === 'DW_TAG_structure_type' || die.tag === 'DW_TAG_union_type') {
         const fields: DwarfField[] = [];
         for (const child of die.children) {
           if (child.tag === 'DW_TAG_member' && child.attrs.DW_AT_name) {
@@ -244,8 +372,34 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
         typeDefs.set(die.offset, {
           name: die.attrs.DW_AT_name || '',
           byteSize: parseInt(die.attrs.DW_AT_byte_size) || 0,
-          kind: 'struct',
+          kind: die.tag === 'DW_TAG_union_type' ? 'union' : 'struct',
           fields,
+        });
+      }
+
+      if (die.tag === 'DW_TAG_enumeration_type') {
+        const enumerators: DwarfEnumerator[] = [];
+        for (const child of die.children || []) {
+          if (child.tag !== 'DW_TAG_enumerator' || !child.attrs.DW_AT_name || child.attrs.DW_AT_const_value === undefined) continue;
+          enumerators.push({
+            name: child.attrs.DW_AT_name,
+            value: String(child.attrs.DW_AT_const_value),
+          });
+        }
+        typeDefs.set(die.offset, {
+          name: die.attrs.DW_AT_name || '',
+          byteSize: parseInt(die.attrs.DW_AT_byte_size) || 0,
+          kind: 'enum',
+          enumerators,
+        });
+      }
+
+      if (die.tag === 'DW_TAG_subroutine_type') {
+        typeDefs.set(die.offset, {
+          name: die.attrs.DW_AT_name || '',
+          byteSize: parseInt(die.attrs.DW_AT_byte_size) || 0,
+          kind: 'subroutine',
+          typeOffset: die.attrs.DW_AT_type,
         });
       }
 
@@ -302,6 +456,22 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
         });
       }
     }
+
+    const framesOutput = await new Promise<string>((resolve) => {
+      execFile(OBJDUMP_EXE, [
+        '--dwarf=frames-interp', elfPath,
+      ], {
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: 30000,
+        windowsHide: true,
+      }, (error, framesStdout) => {
+        if (error) { log.eval('readDwarfFrames error: ' + error); resolve(''); }
+        else resolve(framesStdout);
+      });
+    });
+    const localMetadata = parseDwarfLocalMetadata(stdout, framesOutput);
+    diagParts.push(`locals=${localMetadata.localVariables?.length || 0}, cfaRows=${localMetadata.cfaRows?.length || 0}`);
+    return { varToType, typeDefs, ...localMetadata, _diag: diagParts.join(' | ') };
   } catch (e: any) {
     diagParts.push(`ERROR: ${e.message}`);
   }

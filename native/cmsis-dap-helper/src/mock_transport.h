@@ -54,14 +54,22 @@ constexpr uint32_t kMockCoreDebugDcrdr = 0xE000EDF8u;
 constexpr uint32_t kMockCoreDebugAircr = 0xE000ED0Cu;
 constexpr uint32_t kMockCoreDebugSHalt = 1u << 17;
 constexpr uint32_t kMockCoreDebugSRegReady = 1u << 16;
+constexpr uint32_t kMockCoreDebugSRetireSt = 1u << 24;
 constexpr uint32_t kMockCoreDebugRegWrite = 1u << 16;
 constexpr uint32_t kMockCoreDebugCDebugEn = 1u << 0;
 constexpr uint32_t kMockCoreDebugCHalt = 1u << 1;
 constexpr uint32_t kMockCoreDebugCStep = 1u << 2;
+constexpr uint32_t kMockCoreDebugCMaskInts = 1u << 3;
 constexpr uint32_t kMockCoreDebugDbgKey = 0xA05Fu << 16;
 constexpr uint32_t kMockCoreDebugVectKey = 0x5FAu << 16;
 constexpr uint32_t kMockCoreDebugSysResetReq = 1u << 2;
 constexpr uint32_t kMockResetPc = 0x080001C0u;
+constexpr uint32_t kMockStartupEntryPc = 0x080001E0u;
+constexpr uint32_t kMockPostStartupPc = 0x08000220u;
+constexpr uint32_t kMockFpbCtrl = 0xE0002000u;
+constexpr uint32_t kMockFpbComp0 = 0xE0002008u;
+constexpr uint32_t kMockFpbCodeComparators = 6u;
+constexpr uint32_t kMockFpbCtrlReset = (2u << 8) | (kMockFpbCodeComparators << 4);
 constexpr uint32_t kMockCtrlStatCsyspwrupreq = 1u << 30;
 constexpr uint32_t kMockCtrlStatCsyspwrupack = 1u << 31;
 constexpr uint32_t kMockCtrlStatCdbgpwrupreq = 1u << 28;
@@ -106,7 +114,13 @@ struct MockSwdState {
   uint32_t aircr = 0;
   uint32_t lastDhcsrWrite = 0;
   uint32_t lastAircrWrite = 0;
-  std::array<uint32_t, 17> registers{};
+  uint32_t pendingStepDhcsrReads = 0;
+  uint32_t pendingStepDhcsrWrite = 0;
+  bool stepInterrupted = false;
+  uint32_t interruptedStepPc = 0;
+  std::array<uint32_t, 21> registers{};
+  uint32_t fpCtrl = kMockFpbCtrlReset;
+  std::array<uint32_t, kMockFpbCodeComparators> fpComp{};
 };
 
 // Per-device error injection knobs, enabled by vid:pid.
@@ -125,6 +139,13 @@ struct MockInjection {
   bool verifyCorruption = false;   // 1234:5689 - program corrupts a byte before verify
   bool flashRemoved = false;       // 1234:568A - device disappears during algorithm
   bool flashAlgorithmStuck = false; // 1234:568B - algorithm remains running
+  bool fpbNeverHits = false;        // 1234:568C - run ignores enabled FPB comparators
+  uint32_t stepDhcsrLagReads = 0;   // 1234:568D - C_STEP completion is not immediately visible
+  bool fpbHitsCurrentPc = false;    // 1234:568D - restored current-PC comparator re-halts
+  bool interruptOnUnmaskedStep = false;  // 1234:568E - timer IRQ steals an unmasked C_STEP
+  bool interruptOnUnmaskedAlgorithmStart = false;  // 1234:568E - IRQ steals Flash entry
+  bool resetRunsPastStartupEntry = false;  // 1234:568F - reset reaches post-startup code before returning
+  bool algorithmInterruptMaskAtEntry = false;
   bool removalConsumed = false;
   uint32_t transferCount = 0;   // DAP_Transfer commands seen
   uint32_t blockReadCount = 0;  // DAP_TransferBlock read commands seen
@@ -201,7 +222,18 @@ struct MockFlashAlgorithmRequest {
   //  - 1234:5686 "control-stuck" CoreDebug writes are accepted but do not
   //                              change DHCSR/AIRCR state, exercising the
   //                              bounded DapControlTimeout path
-  //  - 1234:5687..568A flash algorithm busy/protected/corrupt/removed cases
+//  - 1234:5687..568A flash algorithm busy/protected/corrupt/removed cases
+//  - 1234:568C "fpb-no-hit"    FPB writes/readback work, but run never
+//                              reports a comparator hit (step timeout oracle)
+//  - 1234:568D "step-retire-lag" C_STEP initially reads as the old halted
+//                              state; restoring the current-PC comparator
+//                              before instruction retirement re-halts it
+//  - 1234:568E "step-interrupt" an unmasked C_STEP enters a timer ISR, then
+//                              returns to the still-armed current-PC breakpoint;
+//                              an unmasked Flash Algorithm resume is likewise
+//                              preempted before its first instruction
+//  - 1234:568F "reset-race" reset passes the startup entry unless its FPB
+//                              comparator was armed before SYSRESETREQ
 class MockCmsisDapTransport : public CmsisDapTransport {
  public:
   MockCmsisDapTransport();
@@ -248,6 +280,9 @@ class MockCmsisDapTransport : public CmsisDapTransport {
   void prepareFlashAlgorithm(const std::string& operation, uint32_t address, uint32_t size,
                              const std::vector<uint8_t>& data, uint32_t bkptAddress);
   void prepareRamStub(uint32_t entry, uint32_t bkptAddress);
+  void prepareExceptionReturn(uint32_t handlerPc, uint32_t excReturn,
+                              uint32_t frameSp, uint32_t stackedPc);
+  void prepareSourceInstruction(uint32_t pc, const std::vector<uint8_t>& bytes);
 
  private:
   struct TransferOutcome {
@@ -276,7 +311,7 @@ class MockCmsisDapTransport : public CmsisDapTransport {
   TransferOutcome accessItem(uint8_t header, uint32_t writeValue);
   TransferOutcome accessDp(uint8_t regAddr, bool rnw, uint32_t value);
   TransferOutcome accessAp(uint8_t regAddr, bool rnw, uint32_t value);
-  uint32_t readMemWord(uint32_t address) const;
+  uint32_t readMemWord(uint32_t address);
   void writeMemWord(uint32_t address, uint32_t value);
   void setSticky(uint32_t bit) { state_.dpCtrlStat |= bit; }
   static uint32_t autoIncrementTar(uint32_t tar);

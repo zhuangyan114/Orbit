@@ -170,7 +170,23 @@ Result CortexMDebug::waitForHalt(bool halted, uint32_t& dhcsr,
 Result CortexMDebug::readRegister(uint32_t index, uint32_t& value,
                                   DapTransferDiagnostics& diag,
                                   std::chrono::milliseconds timeout) {
-  if (index > 16) return invalidRegister(index);
+  if (index > 20 || index == 19) return invalidRegister(index);
+
+  uint32_t dhcsr = 0;
+  Result result = readDhcsr(dhcsr, diag, timeout);
+  if (!result.ok) return result;
+  return readRegisterWithDhcsr(index, value, dhcsr, diag, timeout);
+}
+
+Result CortexMDebug::readRegisters(const std::vector<uint32_t>& indices,
+                                   std::vector<uint32_t>& values,
+                                   DapTransferDiagnostics& diag,
+                                   std::chrono::milliseconds timeout) {
+  values.clear();
+  for (const uint32_t index : indices) {
+    if (index > 20 || index == 19) return invalidRegister(index);
+  }
+  if (indices.empty()) return Result::success();
 
   uint32_t dhcsr = 0;
   Result result = readDhcsr(dhcsr, diag, timeout);
@@ -180,6 +196,30 @@ Result CortexMDebug::readRegister(uint32_t index, uint32_t& value,
                          "Cortex-M core registers require a halted target");
   }
 
+  values.reserve(indices.size());
+  for (const uint32_t index : indices) {
+    uint32_t value = 0;
+    result = readRegisterWithDhcsr(index, value, dhcsr, diag, timeout);
+    if (!result.ok) {
+      values.clear();
+      return result;
+    }
+    values.push_back(value);
+  }
+  return Result::success();
+}
+
+Result CortexMDebug::readRegisterWithDhcsr(uint32_t index, uint32_t& value,
+                                           uint32_t dhcsr,
+                                           DapTransferDiagnostics& diag,
+                                           std::chrono::milliseconds timeout) {
+  if (index > 20 || index == 19) return invalidRegister(index);
+  if ((dhcsr & kCoreDebugSHalt) == 0) {
+    return Result::error(ErrorCodes::kInvalidState,
+                         "Cortex-M core registers require a halted target");
+  }
+
+  Result result;
   result = writeWord(kCoreDebugDcrsr, index & kCoreDebugRegSelMask, diag, timeout);
   if (!result.ok) return result;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -204,7 +244,7 @@ Result CortexMDebug::fillState(uint32_t dhcsr, CortexMDebugState& state,
   state.halted = (dhcsr & kCoreDebugSHalt) != 0;
   if (!state.halted) return Result::success();
   state.pcValid = true;
-  return readRegister(15, state.pc, diag, timeout);
+  return readRegisterWithDhcsr(15, state.pc, dhcsr, diag, timeout);
 }
 
 Result CortexMDebug::captureSnapshot(CortexRegisterSnapshot& snapshot,
@@ -279,6 +319,12 @@ Result CortexMDebug::run(CortexMDebugState& state, DapTransferDiagnostics& diag,
   return fillState(dhcsr, state, diag, timeout);
 }
 
+Result CortexMDebug::resume(DapTransferDiagnostics& diag,
+                            std::chrono::milliseconds timeout) {
+  return writeWord(kCoreDebugDhcsr, kCoreDebugDbgKey | kCoreDebugCDebugEn,
+                   diag, timeout);
+}
+
 Result CortexMDebug::reset(CortexMDebugState& state, DapTransferDiagnostics& diag,
                            std::chrono::milliseconds timeout) {
   Result result = writeWord(kCoreDebugAircr, kCoreDebugVectKey | kCoreDebugSysResetReq,
@@ -297,18 +343,86 @@ Result CortexMDebug::stepInstruction(CortexMDebugStepResult& step,
     return Result::error(ErrorCodes::kInvalidState,
                          "Cortex-M instruction step requires a halted target");
   }
+  return executeInstructionStep(state.pc, state.dhcsr, step, diag, timeout);
+}
+
+Result CortexMDebug::stepInstructionFromHaltedPc(
+    uint32_t pcBefore, CortexMDebugStepResult& step,
+    DapTransferDiagnostics& diag, std::chrono::milliseconds timeout) {
+  uint32_t dhcsr = 0;
+  const Result result = readDhcsr(dhcsr, diag, timeout);
+  if (!result.ok) return result;
+  if ((dhcsr & kCoreDebugSHalt) == 0) {
+    return Result::error(ErrorCodes::kInvalidState,
+                         "Cortex-M known-PC instruction step requires a halted target");
+  }
+  return executeInstructionStep(pcBefore, dhcsr, step, diag, timeout);
+}
+
+Result CortexMDebug::executeInstructionStep(
+    uint32_t pcBefore, uint32_t haltedDhcsr, CortexMDebugStepResult& step,
+    DapTransferDiagnostics& diag, std::chrono::milliseconds timeout) {
+  if ((haltedDhcsr & kCoreDebugSHalt) == 0) {
+    return Result::error(ErrorCodes::kInvalidState,
+                         "Cortex-M instruction step requires a halted DHCSR sample");
+  }
   step = CortexMDebugStepResult{};
-  step.pcBefore = state.pc;
-  result = writeWord(kCoreDebugDhcsr, kCoreDebugDbgKey | kCoreDebugCDebugEn |
-                                             kCoreDebugCStep,
-                     diag, timeout);
-  if (!result.ok) return result;
-  result = waitForHalt(true, step.dhcsr, diag, timeout);
-  if (!result.ok) return result;
-  result = readRegister(15, step.pcAfter, diag, timeout);
-  if (!result.ok) return result;
-  step.halted = true;
-  return Result::success();
+  step.pcBefore = pcBefore;
+  // ARMv7-M only permits changing C_MASKINTS while halted. Keep configurable
+  // interrupts masked for the complete C_STEP so an IRQ cannot retire in place
+  // of the instruction at a current-PC breakpoint.
+  Result result = writeWord(kCoreDebugDhcsr, kCoreDebugDbgKey | kCoreDebugCDebugEn |
+                                                kCoreDebugCHalt | kCoreDebugCMaskInts,
+                            diag, timeout);
+  uint32_t maskedDhcsr = 0;
+  if (result.ok) result = readDhcsr(maskedDhcsr, diag, timeout);
+  step.interruptMaskApplied = result.ok &&
+                              (maskedDhcsr & (kCoreDebugSHalt | kCoreDebugCMaskInts)) ==
+                                  (kCoreDebugSHalt | kCoreDebugCMaskInts);
+  if (result.ok && !step.interruptMaskApplied) {
+    result = Result::error("StepInterruptMaskFailed",
+                           "Cortex-M did not confirm C_MASKINTS while halted");
+  }
+  if (result.ok) {
+    result = writeWord(kCoreDebugDhcsr, kCoreDebugDbgKey | kCoreDebugCDebugEn |
+                                               kCoreDebugCStep | kCoreDebugCMaskInts,
+                       diag, timeout);
+  }
+  if (result.ok) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+      result = readDhcsr(step.dhcsr, diag, timeout);
+      if (!result.ok) break;
+      ++step.dhcsrPolls;
+      step.halted = (step.dhcsr & kCoreDebugSHalt) != 0;
+      step.instructionRetired = (step.dhcsr & kCoreDebugSRetireSt) != 0;
+      if (step.halted && step.instructionRetired) break;
+      if ((step.dhcsr & kCoreDebugSLockup) != 0 ||
+          std::chrono::steady_clock::now() >= deadline) {
+        result = Result::error(
+            ErrorCodes::kDapControlTimeout,
+            "Cortex-M instruction step did not retire before the control timeout");
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  if (result.ok) {
+    result = readRegisterWithDhcsr(15, step.pcAfter, step.dhcsr, diag, timeout);
+  }
+
+  // Clearing C_MASKINTS is mandatory even when the step or its reads fail.
+  // This is a distinct cleanup write, never a retry of an unknown FPB write.
+  const Result clearMask = writeWord(
+      kCoreDebugDhcsr, kCoreDebugDbgKey | kCoreDebugCDebugEn | kCoreDebugCHalt,
+      diag, timeout);
+  step.interruptMaskCleared = clearMask.ok;
+  if (!clearMask.ok) {
+    return Result::error("StepInterruptMaskCleanupFailed",
+                         "failed to clear Cortex-M C_MASKINTS after instruction step: " +
+                             clearMask.message);
+  }
+  return result;
 }
 
 Result CortexMDebug::executeFlashAlgorithm(const FlashAlgorithmRunRequest& request,
@@ -445,13 +559,44 @@ Result CortexMDebug::executeFlashAlgorithm(const FlashAlgorithmRunRequest& reque
   operation = clearFaultStatus(diag, ioTimeout(timeout));
   if (!operation.ok) return operation;
 
-  operation = writeWord(kCoreDebugDhcsr, kCoreDebugDbgKey | kCoreDebugCDebugEn, diag,
-                        ioTimeout(timeout));
+  // The target can have a configurable interrupt pending when it is halted for
+  // Flash setup. Mask it through the resume boundary so the algorithm's first
+  // instruction retires before an application ISR can consume the rewritten
+  // PC/LR/SP context. C_MASKINTS may only be changed while the core is halted.
+  operation = writeWord(kCoreDebugDhcsr,
+                        kCoreDebugDbgKey | kCoreDebugCDebugEn |
+                            kCoreDebugCHalt | kCoreDebugCMaskInts,
+                        diag, ioTimeout(timeout));
   if (!operation.ok) return operation;
   uint32_t dhcsr = 0;
+  operation = readDhcsr(dhcsr, diag, ioTimeout(timeout));
+  if (!operation.ok) return operation;
+  if ((dhcsr & (kCoreDebugSHalt | kCoreDebugCMaskInts)) !=
+      (kCoreDebugSHalt | kCoreDebugCMaskInts)) {
+    return Result::error(
+        ErrorCodes::kDapControlTimeout,
+        "Cortex-M did not confirm the Flash Algorithm interrupt mask while halted");
+  }
+
+  operation = writeWord(kCoreDebugDhcsr,
+                        kCoreDebugDbgKey | kCoreDebugCDebugEn |
+                            kCoreDebugCMaskInts,
+                        diag, ioTimeout(timeout));
+  if (!operation.ok) return operation;
   operation = waitForHalt(true, dhcsr, diag, ioTimeout(timeout),
                           request.operation.c_str(), operationDiagnostics);
   if (!operation.ok) return operation;
+  operation = writeWord(kCoreDebugDhcsr,
+                        kCoreDebugDbgKey | kCoreDebugCDebugEn | kCoreDebugCHalt,
+                        diag, ioTimeout(timeout));
+  if (!operation.ok) return operation;
+  operation = readDhcsr(dhcsr, diag, ioTimeout(timeout));
+  if (!operation.ok) return operation;
+  if ((dhcsr & kCoreDebugSHalt) == 0 || (dhcsr & kCoreDebugCMaskInts) != 0) {
+    return Result::error(
+        ErrorCodes::kDapControlTimeout,
+        "Cortex-M did not clear the Flash Algorithm interrupt mask after halt");
+  }
   CortexMDebugState stopped;
   operation = fillState(dhcsr, stopped, diag, ioTimeout(timeout));
   if (!operation.ok) return operation;

@@ -96,7 +96,7 @@ export interface NativeStepOutDiagnostics {
   lr: number;
   sp: number;
   returnAddress: number;
-  classification: 'returnBreakpoint' | 'existingReturnBreakpoint' | 'userBreakpoint';
+  classification: 'returnBreakpoint' | 'exceptionReturnBreakpoint' | 'existingReturnBreakpoint' | 'userBreakpoint';
   instructions: 0;
   cleanupOk: boolean;
   timings: NativeStepTimings;

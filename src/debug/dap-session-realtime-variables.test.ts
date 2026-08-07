@@ -56,6 +56,63 @@ describe('DapSession realtime variable arbitration', () => {
     expect(targetStateQueries).toBe(0);
   });
 
+  it('does not mask a completed backend Watch error with a stale runtime cache', async () => {
+    let reads = 0;
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd !== 'evaluateExpression') throw new Error(`Unexpected command: ${command.cmd}`);
+        reads++;
+        if (reads === 1) return { ok: true, data: { expression: 'counter', value: 1, display: '1', hex: '0x1' } };
+        return { ok: false, error: 'DeviceRemoved', errorCode: 'DeviceRemoved' };
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+
+    const first = await (session as any).readWatchExpressions(['counter'], true);
+    const second = await (session as any).readWatchExpressions(['counter'], true);
+
+    expect(first).toEqual([expect.objectContaining({ value: 1 })]);
+    expect(second).toEqual([expect.objectContaining({ expression: 'counter', error: 'DeviceRemoved' })]);
+    expect(second[0]).not.toHaveProperty('value', 1);
+  });
+
+  it('preserves the requested expression when backend returns a leaf Watch expression', async () => {
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'evaluateExpression') {
+          return {
+            ok: true,
+            data: {
+              expression: 'counter',
+              evaluateName: command.expression,
+              value: 0x11223344,
+              display: '0x11223344 (287454020)',
+              hex: '0x11223344',
+            },
+          };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    const sent: DebugProtocolMessage[] = [];
+    session.on('send', message => sent.push(message));
+
+    await (session as any).handleDataSample(request(1, 'dataSample', {
+      expressions: ['g_dap06_complex.nested.counter'],
+    }));
+
+    expect(sent.find(message => message.request_seq === 1)?.body?.results).toEqual([
+      expect.objectContaining({
+        expression: 'g_dap06_complex.nested.counter',
+        evaluateName: 'g_dap06_complex.nested.counter',
+        value: 0x11223344,
+      }),
+    ]);
+  });
+
   it('splits Watch batches and lets Timeline read between every slice', async () => {
     const order: string[] = [];
     const forwardedExpanded: string[][] = [];

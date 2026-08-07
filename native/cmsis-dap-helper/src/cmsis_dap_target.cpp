@@ -476,4 +476,38 @@ Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint
   return Result::success();
 }
 
+Result CmsisDapTarget::writeMemory(uint32_t address, const std::vector<uint8_t>& bytes,
+                                   DapTransferDiagnostics& diag,
+                                   std::chrono::milliseconds timeout) {
+  if (bytes.empty()) {
+    return Result::error(ErrorCodes::kDapInvalidRequest, "writeMemory size must be > 0");
+  }
+  const uint64_t end = static_cast<uint64_t>(address) + bytes.size();
+  if (end > 0x100000000ull) {
+    return Result::error(ErrorCodes::kDapInvalidRequest,
+                         "writeMemory range overflows the 32-bit address space");
+  }
+
+  const uint32_t firstWord = address & ~3u;
+  const uint32_t lastWord = static_cast<uint32_t>((end - 1) / 4);
+  const uint32_t wordCount = lastWord - firstWord / 4 + 1;
+  std::vector<uint32_t> words(wordCount, 0);
+  const bool partial = (address & 3u) != 0 || (end & 3u) != 0;
+  if (partial) {
+    const Result readResult = readMemoryBlock(firstWord, wordCount, words, diag, timeout);
+    if (!readResult.ok) return readResult;
+  }
+
+  for (size_t index = 0; index < bytes.size(); ++index) {
+    const uint64_t byteAddress = static_cast<uint64_t>(address) + index;
+    const size_t wordIndex = static_cast<size_t>((byteAddress - firstWord) / 4);
+    const uint32_t shift = static_cast<uint32_t>(((byteAddress - firstWord) & 3u) * 8u);
+    words[wordIndex] = (words[wordIndex] & ~(0xFFu << shift)) |
+                       (static_cast<uint32_t>(bytes[index]) << shift);
+  }
+  const Result writeResult = writeMemoryBlock(firstWord, words, diag, timeout);
+  if (!writeResult.ok) return writeResult;
+  return Result::success();
+}
+
 }  // namespace cmsis_dap_helper

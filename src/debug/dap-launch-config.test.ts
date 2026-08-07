@@ -35,7 +35,28 @@ describe('DAP launch probe configuration', () => {
       cmsisDapPid: 'F001',
       cmsisDapFlashAlgorithmPath: 'C:/licensed/stm32f407.flm',
       flashBeforeDebug: false,
+      runToEntryPoint: 'main',
     });
+  });
+
+  it('defaults CMSIS-DAP startup stops to main without changing J-Link behavior', () => {
+    expect(normalizeDapLaunchConfig({ probe: 'cmsis-dap' })).toMatchObject({
+      probe: 'cmsis-dap',
+      runToEntryPoint: 'main',
+    });
+    expect(normalizeDapLaunchConfig({ probe: 'jlink', runToEntryPoint: 'ignored' }))
+      .not.toHaveProperty('runToEntryPoint');
+  });
+
+  it('accepts a trimmed CMSIS-DAP entry symbol or explicit disable', () => {
+    expect(normalizeDapLaunchConfig({
+      probe: 'cmsis-dap',
+      runToEntryPoint: '  app_main  ',
+    })).toMatchObject({ runToEntryPoint: 'app_main' });
+    expect(normalizeDapLaunchConfig({
+      probe: 'cmsis-dap',
+      runToEntryPoint: false,
+    })).toMatchObject({ runToEntryPoint: false });
   });
 
   it('rejects an explicitly invalid probe instead of falling back to J-Link', () => {
@@ -67,6 +88,7 @@ describe('DAP launch probe configuration', () => {
       probe: 'cmsis-dap',
       cmsisDapFlashAlgorithmPath: 'C:/licensed/stm32f407.flm',
       flashBeforeDebug: true,
+      runToEntryPoint: 'main',
     });
   });
 });

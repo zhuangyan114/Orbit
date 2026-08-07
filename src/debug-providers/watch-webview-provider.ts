@@ -137,6 +137,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
             expressions,
             expandedExpressions: this.expandedExpressions,
           });
+          if (!this.canUseDapSession(session)) return;
           if (r && r.results) {
             results = r.results as WatchValue[];
           } else {
@@ -197,8 +198,10 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
       } else {
         try {
           const r: any = await session.customRequest('setWatchValue', { expression, value, address, typeName });
+          if (!this.canUseDapSession(session)) return;
           result = r && r.ok !== undefined ? r : { ok: true, data: r };
         } catch (e: any) {
+          if (!this.canUseDapSession(session)) return;
           result = { ok: false, error: e.message || 'DAP setWatchValue failed' };
         }
       }

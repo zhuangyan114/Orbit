@@ -28,6 +28,18 @@ const programMode = source.match(/static int select_program_mode\([\s\S]*?\n}\n\
 if (!programMode || !programMode[0].includes('FLASH_CR_PG | FLASH_CR_PSIZE_32')) {
   throw new Error('Program mode must set FLASH_CR.PG with 32-bit PSIZE');
 }
+const cacheFlush = source.match(/static void flush_flash_caches\([\s\S]*?\n}/);
+if (!cacheFlush
+  || !cacheFlush[0].includes('FLASH_ACR_ICRST')
+  || !cacheFlush[0].includes('FLASH_ACR_DCRST')) {
+  throw new Error('Flash Algorithm must invalidate STM32F4 instruction and data caches after erase/program');
+}
+const eraseBody = source.match(/int EraseSector\([\s\S]*?\n}\n\n__attribute__\(\(section\("\.text\.programPage"/);
+const programBody = source.match(/int ProgramPage\([\s\S]*?\n}\n\n__attribute__\(\(section\("\.text\.verify"/);
+if (!eraseBody?.[0].includes('flush_flash_caches()')
+  || !programBody?.[0].includes('flush_flash_caches()')) {
+  throw new Error('Successful erase and program operations must invalidate stale Flash cache lines before Verify');
+}
 
 const image = fs.readFileSync(imagePath);
 if (image.length <= bkptOffset + 1) {

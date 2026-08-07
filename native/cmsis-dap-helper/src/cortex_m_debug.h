@@ -21,13 +21,15 @@ constexpr uint32_t kCortexFaultMmfar = 0xE000ED34u;
 constexpr uint32_t kCortexFaultBfar = 0xE000ED38u;
 
 // DHCSR status/control fields. A write to DHCSR must carry DBGKEY in bits
-// 31:16; the low control bits are C_DEBUGEN, C_HALT and C_STEP.
+// 31:16; the low control bits are C_DEBUGEN, C_HALT, C_STEP and C_MASKINTS.
 constexpr uint32_t kCoreDebugSHalt = 1u << 17;
 constexpr uint32_t kCoreDebugSRegReady = 1u << 16;
+constexpr uint32_t kCoreDebugSRetireSt = 1u << 24;
 constexpr uint32_t kCoreDebugDbgKey = 0xA05Fu << 16;
 constexpr uint32_t kCoreDebugCDebugEn = 1u << 0;
 constexpr uint32_t kCoreDebugCHalt = 1u << 1;
 constexpr uint32_t kCoreDebugCStep = 1u << 2;
+constexpr uint32_t kCoreDebugCMaskInts = 1u << 3;
 constexpr uint32_t kCortexXpsrThumb = 1u << 24;
 constexpr uint32_t kCoreDebugSLockup = 1u << 19;
 
@@ -50,7 +52,11 @@ struct CortexMDebugState {
 
 struct CortexMDebugStepResult {
   bool halted = false;
+  bool instructionRetired = false;
+  bool interruptMaskApplied = false;
+  bool interruptMaskCleared = false;
   uint32_t dhcsr = 0;
+  uint32_t dhcsrPolls = 0;
   uint32_t pcBefore = 0;
   uint32_t pcAfter = 0;
 };
@@ -135,12 +141,20 @@ class CortexMDebug {
               std::chrono::milliseconds timeout);
   Result run(CortexMDebugState& state, DapTransferDiagnostics& diag,
              std::chrono::milliseconds timeout);
+  Result resume(DapTransferDiagnostics& diag, std::chrono::milliseconds timeout);
   Result reset(CortexMDebugState& state, DapTransferDiagnostics& diag,
                std::chrono::milliseconds timeout);
   Result stepInstruction(CortexMDebugStepResult& step, DapTransferDiagnostics& diag,
                          std::chrono::milliseconds timeout);
+  Result stepInstructionFromHaltedPc(uint32_t pcBefore, CortexMDebugStepResult& step,
+                                     DapTransferDiagnostics& diag,
+                                     std::chrono::milliseconds timeout);
   Result readRegister(uint32_t index, uint32_t& value, DapTransferDiagnostics& diag,
                       std::chrono::milliseconds timeout);
+  Result readRegisters(const std::vector<uint32_t>& indices,
+                       std::vector<uint32_t>& values,
+                       DapTransferDiagnostics& diag,
+                       std::chrono::milliseconds timeout);
   Result executeFlashAlgorithm(const FlashAlgorithmRunRequest& request,
                                FlashAlgorithmRunResult& result,
                                DapTransferDiagnostics& diag,
@@ -150,6 +164,13 @@ class CortexMDebug {
  private:
   Result readWord(uint32_t address, uint32_t& value, DapTransferDiagnostics& diag,
                   std::chrono::milliseconds timeout);
+  Result readRegisterWithDhcsr(uint32_t index, uint32_t& value, uint32_t dhcsr,
+                               DapTransferDiagnostics& diag,
+                               std::chrono::milliseconds timeout);
+  Result executeInstructionStep(uint32_t pcBefore, uint32_t haltedDhcsr,
+                                CortexMDebugStepResult& step,
+                                DapTransferDiagnostics& diag,
+                                std::chrono::milliseconds timeout);
   Result writeWord(uint32_t address, uint32_t value, DapTransferDiagnostics& diag,
                    std::chrono::milliseconds timeout);
   Result writeCoreRegister(uint32_t index, uint32_t value, DapTransferDiagnostics& diag,

@@ -27,9 +27,12 @@ interface DapSamplingEntry {
   color: string;
 }
 
+type TargetReadPriority = 'foreground' | 'watch' | 'low';
+
 export class DapSession extends EventEmitter {
   private backend: OzoneBackend;
   private seq = 1;
+  private stopGeneration = 0;
   private pollTimer: NodeJS.Timeout | null = null;
   private connectionMonitorTimer: NodeJS.Timeout | null = null;
   private rttPollTimer: NodeJS.Timeout | null = null;
@@ -60,7 +63,10 @@ export class DapSession extends EventEmitter {
   private readCancelEpoch = 0;
   private targetReadInProgress = false;
   private lowPriorityReadBlockedUntil = 0;
+  private pendingForegroundTargetReads = 0;
   private pendingWatchTargetReads = 0;
+  private activeStoppedReadAbortController: AbortController | null = null;
+  private activeEvaluateAbortController: AbortController | null = null;
 
   private breakpoints = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
@@ -71,6 +77,7 @@ export class DapSession extends EventEmitter {
   private _speedKHz = 4000;
   private _probe: 'jlink' | 'cmsis-dap' = 'jlink';
   private _flashEnabled = true;
+  private _runToEntryPoint: string | false = false;
   private _cmsisDapFlashAlgorithmPath = '';
   private dataSamplingActive = false;
   private dataSamplingTimer: NodeJS.Immediate | null = null;
@@ -172,6 +179,7 @@ export class DapSession extends EventEmitter {
       this.connectionFailureCount = 0;
       this.controlInProgress = true;
       this.readCancelEpoch++;
+      this.cancelActiveTargetReads('target connection lost');
       this.stopDataSampling();
       this.stopRttLogPolling();
       this.stopPolling();
@@ -211,6 +219,20 @@ export class DapSession extends EventEmitter {
   private beginControl() {
     this.controlInProgress = true;
     this.readCancelEpoch++;
+    this.cancelActiveTargetReads('DAP control request started');
+  }
+
+  private cancelActiveTargetReads(reason: string) {
+    const stoppedController = this.activeStoppedReadAbortController;
+    if (stoppedController && !stoppedController.signal.aborted) {
+      log.dap(`cancel stopped target read reason=control readEpoch=${this.readCancelEpoch}`);
+      stoppedController.abort(reason);
+    }
+    const evaluateController = this.activeEvaluateAbortController;
+    if (evaluateController && !evaluateController.signal.aborted) {
+      log.dap(`cancel evaluate target read reason=control readEpoch=${this.readCancelEpoch}`);
+      evaluateController.abort(reason);
+    }
   }
 
   private endControl() {
@@ -221,30 +243,36 @@ export class DapSession extends EventEmitter {
     return this.controlInProgress || this.isSessionTerminating();
   }
 
-  private beginTargetRead(priority: 'high' | 'low' = 'low'): boolean {
+  private beginTargetRead(priority: TargetReadPriority = 'low'): boolean {
     if (this.shouldDeferTargetRead() || this.targetReadInProgress) return false;
+    if (priority !== 'foreground' && this.pendingForegroundTargetReads > 0) return false;
     if (priority === 'low' && (Date.now() < this.lowPriorityReadBlockedUntil || this.pendingWatchTargetReads > 0)) return false;
     this.targetReadInProgress = true;
     return true;
   }
 
-  private async beginTargetReadWhenAvailable(priority: 'high' | 'low' = 'low', timeoutMs = 0): Promise<boolean> {
+  private async beginTargetReadWhenAvailable(priority: TargetReadPriority = 'low', timeoutMs = 0): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (!this.beginTargetRead(priority)) {
-      if (this.isSessionTerminating() || (priority === 'low' && this.controlInProgress) || Date.now() >= deadline) return false;
-      await new Promise<void>(resolve => setTimeout(resolve, 20));
+    if (priority === 'foreground') this.pendingForegroundTargetReads++;
+    try {
+      while (!this.beginTargetRead(priority)) {
+        if (this.isSessionTerminating() || (priority === 'low' && this.controlInProgress) || Date.now() >= deadline) return false;
+        await new Promise<void>(resolve => setTimeout(resolve, 20));
+      }
+      return true;
+    } finally {
+      if (priority === 'foreground') this.pendingForegroundTargetReads--;
     }
-    return true;
   }
 
   private async beginWatchTargetRead(timeoutMs = 250): Promise<boolean> {
-    if (this.beginTargetRead('high')) return true;
+    if (this.beginTargetRead('watch')) return true;
     if (this.shouldDeferTargetRead()) return false;
     // Keep Timeline behind a Watch request only while that Watch is actually
     // queued. The timeout is a wait bound, not a post-read blackout period.
     this.pendingWatchTargetReads++;
     try {
-      return await this.beginTargetReadWhenAvailable('high', timeoutMs);
+      return await this.beginTargetReadWhenAvailable('watch', timeoutMs);
     } finally {
       this.pendingWatchTargetReads--;
     }
@@ -354,14 +382,62 @@ export class DapSession extends EventEmitter {
   }
 
   private sendResponse(msg: DebugProtocolMessage, body?: any, success = true, message?: string) {
-    this.emit('send', {
+    const response = {
       type: 'response', seq: this.seq++,
       request_seq: msg.seq, success, command: msg.command || '', body, message,
-    } as DebugProtocolMessage);
+    } as DebugProtocolMessage;
+    if (msg.command === 'stackTrace') {
+      const stackFrames = Array.isArray(body?.stackFrames) ? body.stackFrames : [];
+      const frame0 = stackFrames[0];
+      const frame0Source = frame0?.source?.path
+        ? `${frame0.source.path}:${frame0.line ?? 0}`
+        : 'unknown';
+      log.dap(
+        `[protocol] response seq=${response.seq} requestSeq=${msg.seq}`
+        + ` command=stackTrace success=${success} stopGeneration=${this.stopGeneration}`
+        + ` frameCount=${stackFrames.length} frame0Id=${frame0?.id ?? 'none'}`
+        + ` pc=${frame0?.instructionPointerReference ?? 'unknown'} source=${frame0Source}`,
+      );
+    }
+    this.emit('send', response);
+  }
+
+  private sendCommandFailure(
+    msg: DebugProtocolMessage,
+    result: OzoneCommandResult,
+    fallbackCode: string,
+  ) {
+    if (result.ok) return;
+    const errorCode = result.errorCode || fallbackCode;
+    const message = result.error.includes(errorCode)
+      ? result.error
+      : `${errorCode}: ${result.error}`;
+    this.sendResponse(msg, {
+      errorCode,
+      message: result.error,
+      diagnostics: result.diagnostics,
+      targetState: result.targetState,
+      elapsedMs: result.elapsedMs,
+    }, false, message);
   }
 
   private sendEvent(event: string, body?: any) {
-    this.emit('send', { type: 'event', seq: this.seq++, event, body } as DebugProtocolMessage);
+    if (event === 'stopped') this.stopGeneration++;
+    const message = { type: 'event', seq: this.seq++, event, body } as DebugProtocolMessage;
+    if (event === 'stopped') {
+      log.dap(
+        `[protocol] event seq=${message.seq} event=stopped stopGeneration=${this.stopGeneration}`
+        + ` reason=${body?.reason ?? 'unknown'} threadId=${body?.threadId ?? 'unknown'}`
+        + ` allThreadsStopped=${body?.allThreadsStopped ?? false}`,
+      );
+    } else if (event === 'continued') {
+      log.dap(
+        `[protocol] event seq=${message.seq} event=continued stopGeneration=${this.stopGeneration}`
+        + ` threadId=${body?.threadId ?? 'unknown'}`
+        + ` allThreadsContinued=${body?.allThreadsContinued ?? false}`,
+      );
+    }
+    this.emit('send', message);
   }
 
   private resetVariableHandles() {
@@ -392,13 +468,13 @@ export class DapSession extends EventEmitter {
   }
 
   private memoryReferenceForWatch(value: WatchValue): string | undefined {
-    if (value.typeName?.includes('*') && value.value) {
+    if (value.typeName?.includes('*') && typeof value.value === 'number' && value.value) {
       return this.formatMemoryReference(value.value);
     }
     if (typeof value.address === 'number') {
       return this.formatMemoryReference(value.address);
     }
-    if ((value.expression.startsWith('&') || /^0x[0-9a-fA-F]+$/.test(value.expression)) && Number.isFinite(value.value)) {
+    if ((value.expression.startsWith('&') || /^0x[0-9a-fA-F]+$/.test(value.expression)) && typeof value.value === 'number' && Number.isFinite(value.value)) {
       return this.formatMemoryReference(value.value);
     }
     return undefined;
@@ -425,7 +501,11 @@ export class DapSession extends EventEmitter {
         const stateResult = await this.queryTargetState('run-poll');
         if (stateResult.ok && stateResult.data === 'halted') {
           this.markStoppedForUi();
-          this.sendEvent('stopped', { reason: this.lastHaltReason, threadId: 1 });
+          this.sendEvent('stopped', {
+            reason: this.lastHaltReason,
+            threadId: 1,
+            allThreadsStopped: true,
+          });
           this.stopPolling();
           if (this.watchExpressions.length > 0) {
             setTimeout(() => {
@@ -527,18 +607,41 @@ export class DapSession extends EventEmitter {
             if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
               results.push(this.cachedOrRunningWatchValue(expr));
             } else {
-              const result = await this.backend.execute({
-                cmd: 'evaluateExpression',
-                expression: expr,
-                force: forceRuntimeRead,
-                expandedExpressions,
-              });
-              if (result.ok) {
-                const value = result.data as WatchValue;
-                this.cacheRuntimeWatchValue(expr, value);
-                results.push(value);
-              } else {
-                results.push(this.runtimeWatchCache.get(expr) || { expression: expr, value: 0, display: '', hex: '', error: result.error });
+              const controller = new AbortController();
+              this.activeEvaluateAbortController = controller;
+              try {
+                const result = await this.backend.execute({
+                  cmd: 'evaluateExpression',
+                  expression: expr,
+                  force: forceRuntimeRead,
+                  expandedExpressions,
+                  signal: controller.signal,
+                });
+                if (controller.signal.aborted || epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+                  log.dap(`[watch] discarded stale evaluate expression=${expr} readEpoch=${epoch} currentEpoch=${this.readCancelEpoch}`);
+                  results.push(this.cachedOrRunningWatchValue(expr));
+                } else if (result.ok) {
+                  const value = {
+                    ...(result.data as WatchValue),
+                    expression: expr,
+                    evaluateName: (result.data as WatchValue).evaluateName || expr,
+                  } as WatchValue;
+                  this.cacheRuntimeWatchValue(expr, value);
+                  results.push(value);
+                } else {
+                  results.push({
+                    expression: expr,
+                    value: 0,
+                    display: '',
+                    hex: '',
+                    error: result.error,
+                    errorCode: result.errorCode,
+                  });
+                }
+              } finally {
+                if (this.activeEvaluateAbortController === controller) {
+                  this.activeEvaluateAbortController = null;
+                }
               }
             }
             chunkCount++;
@@ -903,6 +1006,7 @@ export class DapSession extends EventEmitter {
       this._speedKHz = speedKHz;
       this._probe = targetConfig.probe;
       this._flashEnabled = flashEnabled;
+      this._runToEntryPoint = targetConfig.runToEntryPoint ?? false;
       this._cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath || '';
       this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connecting';
       log.dap(`Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
@@ -1006,38 +1110,70 @@ export class DapSession extends EventEmitter {
       this.phase = 'connected';
       this.startConnectionMonitor();
 
-      if (elfPath) {
-        const loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
-        if (loadResult.ok) {
-        } else {
-        }
-      }
+      let loadResult: OzoneCommandResult | undefined;
+      if (elfPath) loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
 
-      if (elfPath && this._flashEnabled) {
-        this.sendEvent('output', { category: 'console', output: 'Resetting target after flash...\n' });
-        await this.backend.execute({ cmd: 'reset' });
-        await new Promise<void>(r => setTimeout(r, 200));
-      }
-      const initialHalt = await this.backend.execute({ cmd: 'halt' });
-      if (!initialHalt.ok && this._probe === 'cmsis-dap') {
-        this.phase = 'idle';
-        this.sendEvent('output', { category: 'stderr', output: `Initial halt failed: ${initialHalt.error}\n` });
-        this.sendResponse(msg, undefined, false, initialHalt.error);
-        return;
-      }
-      if (this._probe === 'cmsis-dap') {
-        const stateResult = await this.queryTargetState('launch-halt-confirm');
-        if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+      if (this._probe === 'cmsis-dap' && this._flashEnabled && this._runToEntryPoint !== false) {
+        if (!elfPath || !loadResult?.ok) {
+          const haltResult = await this.backend.execute({ cmd: 'halt' });
           this.phase = 'idle';
-          const error = stateResult.ok
-            ? `TargetStateInvalid: launch halt returned ${stateResult.data}`
-            : stateResult.error;
-          this.sendResponse(msg, undefined, false, error);
+          if (!haltResult.ok) {
+            this.sendCommandFailure(msg, haltResult, 'EntryPointRecoveryFailed');
+            return;
+          }
+          const failure: OzoneCommandResult = {
+            ok: false,
+            errorCode: 'EntryPointUnavailable',
+            error: !elfPath
+              ? 'EntryPointUnavailable: runToEntryPoint requires an ELF/AXF program path'
+              : `EntryPointUnavailable: failed to load symbols from ${elfPath}${loadResult && !loadResult.ok ? `: ${loadResult.error}` : ''}`,
+            targetState: 'Halted',
+          };
+          this.sendCommandFailure(msg, failure, 'EntryPointUnavailable');
           return;
         }
+        const startupResult = await this.backend.execute({
+          cmd: 'runToEntryPoint',
+          symbol: this._runToEntryPoint,
+          reset: true,
+        });
+        if (!startupResult.ok) {
+          this.phase = 'idle';
+          this.sendCommandFailure(msg, startupResult, 'StartupStopFailed');
+          return;
+        }
+      } else {
+        if (elfPath && this._flashEnabled) {
+          this.sendEvent('output', { category: 'console', output: 'Resetting target after flash...\n' });
+          await this.backend.execute({ cmd: 'reset' });
+          await new Promise<void>(r => setTimeout(r, 200));
+        }
+        const initialHalt = await this.backend.execute({ cmd: 'halt' });
+        if (!initialHalt.ok && this._probe === 'cmsis-dap') {
+          this.phase = 'idle';
+          this.sendEvent('output', { category: 'stderr', output: `Initial halt failed: ${initialHalt.error}\n` });
+          this.sendCommandFailure(msg, initialHalt, 'TargetControlFailed');
+          return;
+        }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('launch-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.phase = 'idle';
+            const failure: OzoneCommandResult = stateResult.ok
+              ? {
+                ok: false,
+                errorCode: 'TargetStateInvalid',
+                error: `TargetStateInvalid: launch halt returned ${stateResult.data}`,
+                targetState: String(stateResult.data),
+              }
+              : stateResult;
+            this.sendCommandFailure(msg, failure, 'TargetStateReadFailed');
+            return;
+          }
+        }
+        // The legacy path still uses its existing settle delay after halt.
+        await new Promise<void>(r => setTimeout(r, 200));
       }
-      // Wait for CPU to actually halt before sending stopped event
-      await new Promise<void>(r => setTimeout(r, 200));
       this.markStoppedForUi();
       this.lastHaltReason = 'entry';
       if (this.rttLogEnabled) {
@@ -1095,34 +1231,128 @@ export class DapSession extends EventEmitter {
       const source = args.source || {};
       const filePath = source.path || '';
       const lines: number[] = args.lines || (args.breakpoints || []).map((b: any) => b.line);
-
-      for (const [key, bpIndex] of this.breakpoints) {
-        if (key.startsWith(filePath + ':')) {
-          log.dap(`handleSetBreakpoints: clearing old bp ${key} index=${bpIndex}`);
-          await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
-          this.breakpoints.delete(key);
+      type DapBreakpointResult = {
+        verified: boolean;
+        line?: number;
+        id?: number;
+        message?: string;
+        errorCode?: string;
+      };
+      type BreakpointFailure = {
+        error?: string;
+        message?: string;
+        errorCode?: string;
+        diagnostics?: Record<string, unknown>;
+        targetState?: string;
+        elapsedMs?: number;
+      };
+      const results: DapBreakpointResult[] = [];
+      const normalizeThrownFailure = (error: unknown): BreakpointFailure => {
+        if (!(error instanceof Error)) {
+          return { error: String(error), errorCode: 'BackendException' };
         }
+        const structured = error as Error & BreakpointFailure;
+        return {
+          error: structured.error || error.message,
+          errorCode: structured.errorCode || 'BackendException',
+          diagnostics: structured.diagnostics,
+          targetState: structured.targetState,
+          elapsedMs: structured.elapsedMs,
+        };
+      };
+      const sendFailure = (failure: BreakpointFailure, remainingLines: number[]) => {
+        const errorCode = failure.errorCode || 'BreakpointOperationFailed';
+        const message = failure.error || failure.message || 'breakpoint operation failed';
+        for (const line of remainingLines) {
+          results.push({
+            verified: false,
+            line,
+            message: `Not attempted after ${errorCode}: ${message}`,
+            errorCode: 'NotAttempted',
+          });
+        }
+        this.sendResponse(msg, {
+          breakpoints: results,
+          errorCode,
+          message,
+          diagnostics: failure.diagnostics,
+          targetState: failure.targetState,
+          elapsedMs: failure.elapsedMs,
+        }, false, `${errorCode}: ${message}`);
+      };
+
+      const sourcePrefix = `${filePath}:`;
+      const oldSlots = new Map<number, string[]>();
+      for (const [key, bpIndex] of this.breakpoints) {
+        if (!key.startsWith(sourcePrefix)) continue;
+        const keys = oldSlots.get(bpIndex) || [];
+        keys.push(key);
+        oldSlots.set(bpIndex, keys);
+      }
+      for (const [bpIndex, sourceKeys] of oldSlots) {
+        const referencedByAnotherSource = Array.from(this.breakpoints.entries())
+          .some(([key, mappedIndex]) => !key.startsWith(sourcePrefix) && mappedIndex === bpIndex);
+        if (referencedByAnotherSource) {
+          for (const key of sourceKeys) this.breakpoints.delete(key);
+          continue;
+        }
+        log.dap(`handleSetBreakpoints: clearing old slot index=${bpIndex} source=${filePath}`);
+        let clearResult;
+        try {
+          clearResult = await this.backend.execute({ cmd: 'clearBreakpoint', id: bpIndex });
+        } catch (error) {
+          sendFailure(normalizeThrownFailure(error), lines);
+          return;
+        }
+        if (!clearResult.ok) {
+          sendFailure(clearResult, lines);
+          return;
+        }
+        for (const key of sourceKeys) this.breakpoints.delete(key);
       }
 
-      const results: Array<{ verified: boolean; line?: number; id?: number; message?: string }> = [];
-
-      for (const line of lines) {
-        const result = await this.backend.execute({
-          cmd: 'setBreakpoint', file: filePath, line,
-        });
-        if (result.ok) {
-          const data = result.data as any;
-          const key = `${filePath}:${line}`;
-          this.breakpoints.set(key, data.id);
-          results.push({ verified: true, line, id: data.id });
-        } else {
-          results.push({ verified: false, line, message: result.error });
+      for (let index = 0; index < lines.length; ++index) {
+        const line = lines[index];
+        let result;
+        try {
+          result = await this.backend.execute({
+            cmd: 'setBreakpoint', file: filePath, line,
+          });
+        } catch (error) {
+          const failure = normalizeThrownFailure(error);
+          const errorCode = failure.errorCode || 'BackendException';
+          const message = failure.error || failure.message || 'backend exception';
+          results.push({ verified: false, line, message, errorCode });
+          sendFailure(failure, lines.slice(index + 1));
+          return;
         }
+        if (!result.ok) {
+          results.push({
+            verified: false,
+            line,
+            message: result.error,
+            errorCode: result.errorCode || 'BreakpointSetFailed',
+          });
+          sendFailure(result, lines.slice(index + 1));
+          return;
+        }
+        const data = result.data as { id?: unknown } | undefined;
+        if (!data || !Number.isInteger(data.id) || (data.id as number) < 0) {
+          const failure = {
+            error: 'setBreakpoint returned no valid hardware slot id',
+            errorCode: 'MalformedResponse',
+          };
+          results.push({ verified: false, line, message: failure.error, errorCode: failure.errorCode });
+          sendFailure(failure, lines.slice(index + 1));
+          return;
+        }
+        const id = data.id as number;
+        const key = `${filePath}:${line}`;
+        this.breakpoints.set(key, id);
+        results.push({ verified: true, line, id });
       }
 
       this.sendResponse(msg, { breakpoints: results });
-    } catch (err: any) {
-      this.sendResponse(msg, { breakpoints: [] });
     } finally {
       this.endControl();
     }
@@ -1138,8 +1368,12 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleStackTrace(msg: DebugProtocolMessage) {
+    log.dap(
+      `[protocol] request seq=${msg.seq} command=stackTrace stopGeneration=${this.stopGeneration}`
+      + ` threadId=${msg.arguments?.threadId ?? 'unknown'}`,
+    );
     try {
-      if (!(await this.beginTargetReadWhenAvailable('high', 700))) {
+      if (!(await this.beginTargetReadWhenAvailable('foreground', 700))) {
         this.sendResponse(msg, { stackFrames: [] });
         return;
       }
@@ -1173,33 +1407,55 @@ export class DapSession extends EventEmitter {
       const ref = args.variablesReference;
 
       if (ref === 1) {
-        if (!(await this.beginTargetReadWhenAvailable('high', 1200))) {
+        const readEpoch = this.readCancelEpoch;
+        if (!(await this.beginTargetReadWhenAvailable('foreground', 1200))) {
           log.dap('variables scope=locals target read unavailable');
           this.sendResponse(msg, { variables: [] });
           return;
         }
+        const controller = new AbortController();
         try {
-          const result = await this.backend.execute({ cmd: 'getLocals' });
-          if (result.ok) {
+          if (readEpoch !== this.readCancelEpoch || this.controlInProgress) {
+            log.dap(`variables scope=locals cancelled before dispatch readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+            this.sendResponse(msg, { variables: [] });
+            return;
+          }
+          this.activeStoppedReadAbortController = controller;
+          const result = await this.backend.execute({ cmd: 'getLocals', signal: controller.signal });
+          if (result.ok && !controller.signal.aborted && readEpoch === this.readCancelEpoch) {
             const vars = (result.data as Variable[]).map((v) => ({
               name: v.name, value: v.value, type: v.type, variablesReference: 0,
             }));
             this.sendResponse(msg, { variables: vars });
           } else {
+            if (controller.signal.aborted || readEpoch !== this.readCancelEpoch) {
+              log.dap(`variables scope=locals discarded stale result readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+            }
             this.sendResponse(msg, { variables: [] });
           }
         } finally {
+          if (this.activeStoppedReadAbortController === controller) {
+            this.activeStoppedReadAbortController = null;
+          }
           this.endTargetRead();
         }
       } else if (ref === 2) {
-        if (!(await this.beginTargetReadWhenAvailable('high', 1200))) {
+        const readEpoch = this.readCancelEpoch;
+        if (!(await this.beginTargetReadWhenAvailable('foreground', 1200))) {
           log.dap('variables scope=registers target read unavailable');
           this.sendResponse(msg, { variables: [] });
           return;
         }
+        const controller = new AbortController();
         try {
-          const regResult = await this.backend.execute({ cmd: 'getRegisters' });
-          if (regResult.ok) {
+          if (readEpoch !== this.readCancelEpoch || this.controlInProgress) {
+            log.dap(`variables scope=registers cancelled before dispatch readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+            this.sendResponse(msg, { variables: [] });
+            return;
+          }
+          this.activeStoppedReadAbortController = controller;
+          const regResult = await this.backend.execute({ cmd: 'getRegisters', signal: controller.signal });
+          if (regResult.ok && !controller.signal.aborted && readEpoch === this.readCancelEpoch) {
             const regs = (regResult.data as any[]).map((r: any) => ({
               name: r.name,
               value: r.hex,
@@ -1209,9 +1465,15 @@ export class DapSession extends EventEmitter {
             }));
             this.sendResponse(msg, { variables: regs });
           } else {
+            if (controller.signal.aborted || readEpoch !== this.readCancelEpoch) {
+              log.dap(`variables scope=registers discarded stale result readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+            }
             this.sendResponse(msg, { variables: [] });
           }
         } finally {
+          if (this.activeStoppedReadAbortController === controller) {
+            this.activeStoppedReadAbortController = null;
+          }
           this.endTargetRead();
         }
       } else if (this.variableHandles.has(ref)) {
@@ -1296,27 +1558,36 @@ export class DapSession extends EventEmitter {
       this.beginControl();
       this.stopPolling();
       try {
-        log.dap('handleContinue: reading PC');
-        const pcResult = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
-        let bpAddr: number | null = null;
-        if (pcResult.ok) {
-          const pcData = pcResult.data as any;
-          bpAddr = pcData.value as number;
-          log.dap(`handleContinue: pc=0x${bpAddr.toString(16)}`);
-        }
+        if (this._probe !== 'cmsis-dap') {
+          log.dap('handleContinue: reading PC');
+          const pcResult = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+          let bpAddr: number | null = null;
+          if (pcResult.ok) {
+            const pcData = pcResult.data as any;
+            bpAddr = pcData.value as number;
+            log.dap(`handleContinue: pc=0x${bpAddr.toString(16)}`);
+          }
 
-        if (bpAddr !== null) {
-          const clearResult = await this.backend.execute({ cmd: 'clearBreakpointAtAddr', addr: bpAddr });
-          log.dap(`handleContinue: clear bp result ok=${clearResult.ok}`);
-          if (clearResult.ok) {
-            await this.backend.execute({ cmd: 'stepIntoInstruction' });
-            await this.backend.execute({ cmd: 'setBreakpointAtAddr', addr: bpAddr });
-            log.dap('handleContinue: re-set bp after step');
+          if (bpAddr !== null) {
+            const clearResult = await this.backend.execute({ cmd: 'clearBreakpointAtAddr', addr: bpAddr });
+            log.dap(`handleContinue: clear bp result ok=${clearResult.ok}`);
+            if (clearResult.ok) {
+              await this.backend.execute({ cmd: 'stepIntoInstruction' });
+              await this.backend.execute({ cmd: 'setBreakpointAtAddr', addr: bpAddr });
+              log.dap('handleContinue: re-set bp after step');
+            }
           }
         }
 
         const runResult = await this.backend.execute({ cmd: 'run' });
         log.dap(`handleContinue: run result ok=${runResult.ok}`);
+        const runData = runResult.ok && runResult.data !== null && typeof runResult.data === 'object'
+          ? runResult.data as { state?: unknown; breakpointHitBeforeRunningObserved?: unknown }
+          : null;
+        const breakpointHitBeforeRunningObserved = this._probe === 'cmsis-dap'
+          && runResult.ok
+          && runData?.state === 'Halted'
+          && runData.breakpointHitBeforeRunningObserved === true;
         if (!runResult.ok && this._probe === 'cmsis-dap') {
           this.sendResponse(msg, undefined, false, runResult.error);
           const stateResult = await this.queryTargetState('continue-failed-confirm');
@@ -1326,7 +1597,7 @@ export class DapSession extends EventEmitter {
           }
           return;
         }
-        if (this._probe === 'cmsis-dap') {
+        if (this._probe === 'cmsis-dap' && !breakpointHitBeforeRunningObserved) {
           const stateResult = await this.queryTargetState('continue-confirm');
           if (!stateResult.ok || stateResult.data !== TargetState.Running) {
             this.sendResponse(msg, undefined, false,
@@ -1345,6 +1616,12 @@ export class DapSession extends EventEmitter {
         this.sendResponse(msg, { allThreadsContinued: true });
         this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
         this.lastHaltReason = 'breakpoint';
+        if (breakpointHitBeforeRunningObserved) {
+          log.dap('handleContinue: breakpoint hit before Running was observed');
+          this.markStoppedForUi();
+          this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1, allThreadsStopped: true });
+          return;
+        }
         if (!runResult.ok) {
           log.dap('handleContinue: run failed, sending stopped');
           this.markStoppedForUi();
@@ -1412,17 +1689,20 @@ export class DapSession extends EventEmitter {
             pcAfter?: number;
             classification?: string;
             helperElapsedMs?: number;
+            targetState?: string;
             timings?: { totalMs?: number };
           } | undefined;
           if (stepData?.mode === 'cmsis-dap') {
-            const stateResult = await this.queryTargetState('step-confirm');
-            if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
-              this.sendResponse(msg, undefined, false,
-                stateResult.ok
-                  ? `TargetStateInvalid: instruction step returned ${stateResult.data}`
-                  : stateResult.error);
-              responseSent = true;
-              return;
+            if (stepData.targetState !== 'Halted') {
+              const stateResult = await this.queryTargetState('step-confirm');
+              if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+                this.sendResponse(msg, undefined, false,
+                  stateResult.ok
+                    ? `TargetStateInvalid: instruction step returned ${stateResult.data}`
+                    : stateResult.error);
+                responseSent = true;
+                return;
+              }
             }
           }
 
@@ -1439,7 +1719,11 @@ export class DapSession extends EventEmitter {
 
           if (stepData?.mode === 'cmsis-dap') {
             this.markStoppedForUi();
-            this.sendEvent('stopped', { reason: 'step', threadId: 1 });
+            this.sendEvent('stopped', {
+              reason: 'step',
+              threadId: 1,
+              allThreadsStopped: true,
+            });
             log.dap(
               `[stepProfile#${profileId}] ${cmd} cmsis-dap halted`
               + ` pc=0x${stepData.pcBefore?.toString(16) ?? 'unknown'}->0x${stepData.pcAfter?.toString(16) ?? 'unknown'}`,
@@ -1553,6 +1837,26 @@ export class DapSession extends EventEmitter {
         }
 
         if (this._elfPath && this._flashEnabled) {
+          if (this._probe === 'cmsis-dap') {
+            const haltResult = await this.backend.execute({ cmd: 'halt' });
+            if (!haltResult.ok) {
+              this.sendCommandFailure(msg, haltResult, 'TargetControlFailed');
+              return;
+            }
+            const stateResult = await this.queryTargetState('restart-flash-halt-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+              const failure: OzoneCommandResult = stateResult.ok
+                ? {
+                  ok: false,
+                  errorCode: 'TargetStateInvalid',
+                  error: `TargetStateInvalid: restart pre-flash halt returned ${stateResult.data}`,
+                  targetState: String(stateResult.data),
+                }
+                : stateResult;
+              this.sendCommandFailure(msg, failure, 'TargetStateReadFailed');
+              return;
+            }
+          }
           this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
           const flashResult = await this.backend.execute({
             cmd: 'flash', elfPath: this._elfPath, device: this._device,
@@ -1564,22 +1868,58 @@ export class DapSession extends EventEmitter {
             this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
           } else {
             this.sendEvent('output', { category: 'stderr', output: `Restart: flash failed: ${flashResult.error}\n` });
-            this.sendResponse(msg, undefined, false, flashResult.error);
+            if (this._probe === 'cmsis-dap') {
+              const stateResult = await this.queryTargetState('restart-flash-failure-recovery');
+              const failure: OzoneCommandResult = stateResult.ok
+                ? {
+                  ...flashResult,
+                  targetState: stateResult.data === TargetState.Halted
+                    ? 'Halted'
+                    : stateResult.data === TargetState.Running
+                      ? 'Running'
+                      : String(stateResult.data),
+                }
+                : flashResult;
+              this.sendCommandFailure(msg, failure, 'FlashFailed');
+              if (stateResult.ok && stateResult.data === TargetState.Halted) {
+                this.markStoppedForUi();
+                this.lastHaltReason = 'pause';
+                if (this.rttLogEnabled) this.startRttLogPolling();
+                this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
+              } else if (stateResult.ok && stateResult.data === TargetState.Running) {
+                this.setTargetRunning(true);
+                this.startPolling();
+              }
+            } else {
+              this.sendResponse(msg, undefined, false, flashResult.error);
+            }
             return;
           }
           await new Promise<void>(r => setTimeout(r, 500));
         }
-        const resetResult = await this.backend.execute({ cmd: 'reset' });
-        if (!resetResult.ok && this._probe === 'cmsis-dap') {
-          this.sendResponse(msg, undefined, false, resetResult.error);
-          return;
+        if (this._probe === 'cmsis-dap' && this._runToEntryPoint !== false) {
+          const startupResult = await this.backend.execute({
+            cmd: 'runToEntryPoint',
+            symbol: this._runToEntryPoint,
+            reset: true,
+          });
+          if (!startupResult.ok) {
+            this.sendCommandFailure(msg, startupResult, 'StartupStopFailed');
+            return;
+          }
+        } else {
+          const resetResult = await this.backend.execute({ cmd: 'reset' });
+          if (!resetResult.ok && this._probe === 'cmsis-dap') {
+            this.sendCommandFailure(msg, resetResult, 'TargetControlFailed');
+            return;
+          }
+          const haltResult = await this.backend.execute({ cmd: 'halt' });
+          if (!haltResult.ok && this._probe === 'cmsis-dap') {
+            this.sendCommandFailure(msg, haltResult, 'TargetControlFailed');
+            return;
+          }
+          await new Promise<void>(r => setTimeout(r, 200));
         }
-        const haltResult = await this.backend.execute({ cmd: 'halt' });
-        if (!haltResult.ok && this._probe === 'cmsis-dap') {
-          this.sendResponse(msg, undefined, false, haltResult.error);
-          return;
-        }
-        await new Promise<void>(r => setTimeout(r, 200));
         if (this._probe !== 'cmsis-dap') {
           await this.backend.execute({ cmd: 'clearAllBreakpoints' });
           this.breakpoints.clear();
@@ -1621,6 +1961,7 @@ export class DapSession extends EventEmitter {
 
     const force = context === 'watch' || context === 'hover';
     const waitForConsistentEvaluate = context === 'hover' || isRTOS;
+    const readEpoch = this.readCancelEpoch;
     if (context === 'watch' && !this.watchExpressions.includes(expr)) {
       this.watchExpressions.push(expr);
     }
@@ -1649,15 +1990,34 @@ export class DapSession extends EventEmitter {
       this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
       return;
     }
+    const controller = new AbortController();
+    this.activeEvaluateAbortController = controller;
     try {
+      if (readEpoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+        this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
+        return;
+      }
       const targetHalted = force ? await this.isTargetHalted() : true;
+      if (controller.signal.aborted || readEpoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+        log.dap(`evaluate discarded before dispatch expression=${expr} readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+        this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
+        return;
+      }
       if (!targetHalted) {
         this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
         return;
       }
 
-      const result = await this.backend.execute({ cmd: 'evaluateExpression', expression: expr, force });
-      if (result.ok) {
+      const result = await this.backend.execute({
+        cmd: 'evaluateExpression',
+        expression: expr,
+        force,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted || readEpoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
+        log.dap(`evaluate discarded stale result expression=${expr} readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+        this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
+      } else if (result.ok) {
         const wv = result.data as WatchValue;
         this.cacheRuntimeWatchValue(expr, wv);
         this.sendEvaluateValue(msg, wv, true);
@@ -1665,6 +2025,9 @@ export class DapSession extends EventEmitter {
         this.sendResponse(msg, { result: result.error, variablesReference: 0 }, false, result.error);
       }
     } finally {
+      if (this.activeEvaluateAbortController === controller) {
+        this.activeEvaluateAbortController = null;
+      }
       this.endTargetRead();
     }
   }
@@ -1819,6 +2182,7 @@ export class DapSession extends EventEmitter {
       const timestamp = this.timelineNowMs();
       for (const value of values) {
         if (!value || value.error) continue;
+        if (typeof value.value !== 'number' || !Number.isFinite(value.value)) continue;
         const pending = this.dataSamplingPending.get(value.expression);
         if (!pending) continue;
         const startsNewSegment = !this.dataSamplingSeenExpressions.has(value.expression);
@@ -1935,6 +2299,9 @@ export class DapSession extends EventEmitter {
     this.disposePromise = (async () => {
       this.phase = 'terminating';
       this.targetConnectionEstablished = false;
+      this.controlInProgress = true;
+      this.readCancelEpoch++;
+      this.cancelActiveTargetReads('DAP session disposed');
       this.stopDataSampling();
       this.stopRttLogPolling();
       this.stopPolling();

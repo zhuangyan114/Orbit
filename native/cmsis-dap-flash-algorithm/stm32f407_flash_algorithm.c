@@ -10,9 +10,15 @@
 #define FLASH_END 0x08080000u
 #define FLASH_REG_BASE 0x40023C00u
 
+#define FLASH_ACR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x00u))
 #define FLASH_KEYR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x04u))
 #define FLASH_SR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x0Cu))
 #define FLASH_CR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x10u))
+
+#define FLASH_ACR_ICEN (1u << 9)
+#define FLASH_ACR_DCEN (1u << 10)
+#define FLASH_ACR_ICRST (1u << 11)
+#define FLASH_ACR_DCRST (1u << 12)
 
 #define FLASH_SR_EOP (1u << 0)
 #define FLASH_SR_OPERR (1u << 1)
@@ -87,6 +93,24 @@ static void clear_mode(void) {
   FLASH_CR &= ~(FLASH_CR_PG | FLASH_CR_SER | FLASH_CR_SNB_MASK | FLASH_CR_STRT);
 }
 
+static void flush_flash_caches(void) {
+  // STM32F4 Flash cache lines can retain pre-erase/program contents. Reset
+  // each enabled cache while this RAM algorithm owns the halted target, then
+  // restore its previous enabled state before any read-back verification.
+  if ((FLASH_ACR & FLASH_ACR_ICEN) != 0u) {
+    FLASH_ACR &= ~FLASH_ACR_ICEN;
+    FLASH_ACR |= FLASH_ACR_ICRST;
+    FLASH_ACR &= ~FLASH_ACR_ICRST;
+    FLASH_ACR |= FLASH_ACR_ICEN;
+  }
+  if ((FLASH_ACR & FLASH_ACR_DCEN) != 0u) {
+    FLASH_ACR &= ~FLASH_ACR_DCEN;
+    FLASH_ACR |= FLASH_ACR_DCRST;
+    FLASH_ACR &= ~FLASH_ACR_DCRST;
+    FLASH_ACR |= FLASH_ACR_DCEN;
+  }
+}
+
 static int select_program_mode(void) {
   FLASH_CR = (FLASH_CR & ~(FLASH_CR_PG | FLASH_CR_SER | FLASH_CR_SNB_MASK |
                            FLASH_CR_PSIZE_MASK)) |
@@ -149,7 +173,10 @@ int EraseSector(uint32_t adr) {
   const int result = wait_ready();
   clear_mode();
   if (result != 0) return result;
-  return (FLASH_SR & FLASH_SR_ERROR_MASK) != 0u ? (int)error_code(FLASH_SR) : 0;
+  const uint32_t status = FLASH_SR;
+  if ((status & FLASH_SR_ERROR_MASK) != 0u) return (int)error_code(status);
+  flush_flash_caches();
+  return 0;
 }
 
 __attribute__((section(".text.programPage"), noinline, used))
@@ -190,7 +217,10 @@ int ProgramPage(uint32_t adr, uint32_t sz, uint32_t buf) {
   const int result = wait_ready();
   clear_mode();
   if (result != 0) return result;
-  return (FLASH_SR & FLASH_SR_ERROR_MASK) != 0u ? (int)error_code(FLASH_SR) : 0;
+  const uint32_t status = FLASH_SR;
+  if ((status & FLASH_SR_ERROR_MASK) != 0u) return (int)error_code(status);
+  flush_flash_caches();
+  return 0;
 }
 
 __attribute__((section(".text.verify"), noinline, used))

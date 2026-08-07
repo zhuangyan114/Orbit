@@ -40,6 +40,13 @@ export type CmsisDapErrorCode =
   | 'DapAlgorithmHaltUnknown'
   | 'FlashProtectionError'
   | 'VerifyFailed'
+  | 'BreakpointResourceExhausted'
+  | 'FpbCleanupFailed'
+  | 'StartupStateInvalid'
+  | 'StartupStopTimeout'
+  | 'StartupUnexpectedStop'
+  | 'StartupRecoveryFailed'
+  | 'StartupEntryNotReached'
   | 'ProtocolVersionMismatch'
   | 'UnknownMethod'
   | 'HelperExited'
@@ -115,10 +122,42 @@ export interface CmsisDapMemoryBlockReadResult {
   words: number[];
 }
 
+export interface CmsisDapMemoryWriteResult {
+  address: number;
+  bytesWritten: number;
+}
+
 export interface CmsisDapCoreStateResult {
   state: 'Halted' | 'Running';
   dhcsr: number;
   pc?: number;
+  pcBefore?: number;
+  pcAfterStep?: number;
+  instructionRetired?: boolean;
+  interruptMaskApplied?: boolean;
+  interruptMaskCleared?: boolean;
+  stepDhcsr?: number;
+  stepDhcsrPolls?: number;
+  restoredSlots?: number[];
+}
+
+export interface CmsisDapRunToAddressResult {
+  state: 'Halted';
+  requestedAddress: number;
+  entryAddress: number;
+  resetRequested: boolean;
+  resetPcValid: boolean;
+  resetDhcsr: number;
+  resetPc: number;
+  resetLr: number;
+  pc: number;
+  lr: number;
+  dhcsr: number;
+  cleanupOk: boolean;
+  sharedUserSlot: boolean;
+  temporaryBreakpointCount: number;
+  temporarySlot?: number;
+  ignoredUserSlots: number[];
 }
 
 export interface CmsisDapStepInstructionResult {
@@ -126,6 +165,37 @@ export interface CmsisDapStepInstructionResult {
   dhcsr: number;
   pcBefore: number;
   pcAfter: number;
+  instructionRetired?: boolean;
+  interruptMaskApplied?: boolean;
+  interruptMaskCleared?: boolean;
+  stepDhcsr?: number;
+  stepDhcsrPolls?: number;
+}
+
+export interface CmsisDapBreakpointResult {
+  slot: number;
+  requestedAddress: number;
+  address: number;
+  fpbRevision: number;
+  codeComparators: number;
+  comparatorValue: number;
+  comparatorReadback: number;
+  duplicate: boolean;
+}
+
+export interface CmsisDapFpbInfoResult {
+  fpCtrl: number;
+  revision: number;
+  codeComparators: number;
+  literalComparators: number;
+  enabled: boolean;
+}
+
+export interface CmsisDapClearAllBreakpointsResult {
+  cleared: number;
+  enabled: boolean;
+  fpbRevision: number;
+  codeComparators: number;
 }
 
 export interface CmsisDapRegisterReadResult {
@@ -420,6 +490,7 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'halt':
     case 'run':
     case 'reset':
+    case 'runToAddress':
     case 'stepInstruction':
     case 'readRegister':
     case 'flashAlgorithm':
@@ -429,6 +500,8 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'readMemory':
     case 'readMemoryBlock':
       return 'watch';
+    case 'writeMemory':
+      return 'control';
     default:
       return 'watch';
   }

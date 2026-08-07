@@ -11,6 +11,7 @@ export interface NormalizedDapLaunchConfig {
   cmsisDapPid?: string;
   cmsisDapFlashAlgorithmPath?: string;
   flashBeforeDebug: boolean;
+  runToEntryPoint?: string | false;
 }
 
 export class DapLaunchConfigError extends Error {
@@ -49,6 +50,11 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     flashBeforeDebug: args.flashBeforeDebug !== false,
   };
 
+  if (config.probe === 'cmsis-dap') {
+    const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
+    config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
+  }
+
   for (const field of ['cmsisDapSerial', 'cmsisDapVid', 'cmsisDapPid', 'cmsisDapFlashAlgorithmPath'] as const) {
     const value = typeof args[field] === 'string' ? args[field].trim() : '';
     if (value) config[field] = value;
@@ -67,6 +73,8 @@ export function applyNormalizedDapLaunchConfig(
   config.cmsisDapPid = targetConfig.cmsisDapPid;
   config.cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath;
   config.flashBeforeDebug = targetConfig.flashBeforeDebug;
+  if (targetConfig.runToEntryPoint === undefined) delete config.runToEntryPoint;
+  else config.runToEntryPoint = targetConfig.runToEntryPoint;
 }
 
 export function cmsisDapFlashUnsupportedMessage(): string {

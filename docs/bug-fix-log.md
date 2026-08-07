@@ -11,6 +11,25 @@
 
 ## 修改记录
 
+### Bug: CMSIS-DAP 烧写成功后偶发 VerifyFailed，重复烧写又能成功
+
+- **日期**: 2026-08-06
+- **问题描述**: 使用 DAP-Link/CMSIS-DAP 烧写 STM32F407VET6 时，Flash Algorithm 偶发返回 `VerifyFailed: return code 3`，同时诊断值为 `FLASH_SR=0x0`、`FLASH_CR=0x200`；再次烧写通常可以成功进入调试。
+- **根因分析**:
+  1. `FLASH_SR=0` 排除了忙、写保护和编程错误；返回码 3 来自目标端 `Verify` 的 Flash 与 SRAM 页缓冲逐字节比较不一致。
+  2. Helper 只允许 `Verify` 复用紧邻且成功的 `ProgramPage` 页缓冲，并严格校验算法、RAM 地址、Flash 地址、长度和完整数据，因此不是错误页缓冲或双 owner 竞争。
+  3. 内置 STM32F407 RAM Flash Algorithm 在擦除和编程完成后没有复位 `FLASH_ACR` 的指令/数据缓存。Flash 实际写入成功，但紧接着的 Verify 可能命中烧写前的旧缓存行；前一次写入和后续复位改变缓存状态后，重复烧写因而通常成功。
+- **修改方案**:
+  1. 增加 `flush_flash_caches()`，仅在擦除或编程明确成功且 Flash 状态无错误后，按 STM32F4 要求暂时关闭已启用的 I/D Cache、触发 `ICRST`/`DCRST`，再恢复原启用状态。
+  2. 保持单 CMSIS-DAP helper owner、立即 Verify 页缓冲复用和未知完成状态不重试等安全规则不变。
+  3. Flash Algorithm 验证脚本增加缓存失效契约，防止以后删除擦除/编程后的缓存复位。
+- **涉及文件**:
+  - `native/cmsis-dap-flash-algorithm/stm32f407_flash_algorithm.c:13,96,173,217` - Flash ACR 定义、I/D Cache 复位以及擦除/编程成功路径
+  - `scripts/cmsis-dap/verify-flash-algorithm.js:31` - 缓存失效回归约束
+- **验证结果**:
+  - **Mock/自动化**: 回归约束先在旧实现上失败，修复后通过；`npm run build:native`、Flash Algorithm 镜像校验、CMSIS-DAP mock、`npm run typecheck` 和 `git diff --check` 均通过；全量 Vitest 24 个测试文件、173 项测试全部通过。
+  - **真实硬件**: 用户于 2026-08-06 手动重复测试，确认烧写和调试均正常，未再出现该 `VerifyFailed`。
+
 ### Bug: Watch 输入汉字导致界面卡顿，调试控制请求异常
 
 - **日期**: 2026-07-30

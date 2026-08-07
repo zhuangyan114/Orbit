@@ -134,12 +134,15 @@ class CmsisDapTarget {
   Result readMemory(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
                     DapTransferDiagnostics& diag);
 
-  // Writes `words` at a 4-byte aligned address. Exposed for the helper
-  // self-test only (no JSON-RPC method calls it): it exists so the
-  // "never retry a write whose completion state is unknown" policy is
-  // exercised against the mock. WAIT/FAULT writes are not accepted by the
-  // target, so retrying them after clearing is safe; malformed/unknown
-  // responses fail without a resend.
+  // Writes a byte-oriented range. Partial words are read-modify-written while
+  // the target is halted, then all writes use the bounded block-write path.
+  Result writeMemory(uint32_t address, const std::vector<uint8_t>& bytes,
+                     DapTransferDiagnostics& diag,
+                     std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
+
+  // Writes `words` at a 4-byte aligned address. WAIT/FAULT writes are not
+  // accepted by the target, so retrying them after clearing is safe;
+  // malformed/unknown responses fail without a resend.
   Result writeMemoryBlock(uint32_t address, const std::vector<uint32_t>& words,
                           DapTransferDiagnostics& diag,
                           std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));

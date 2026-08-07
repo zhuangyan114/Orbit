@@ -48,7 +48,120 @@ function cmsisOwner(overrides: Partial<SessionTargetOwner> = {}): SessionTargetO
   } as unknown as SessionTargetOwner;
 }
 
-describe('OzoneBackend CMSIS-DAP DAP-04 routing', () => {
+function addSourceLine(backend: OzoneBackend, start: number, end: number): void {
+  (backend as any).symbols = [{ name: 'source_line', address: start, size: end - start + 0x20, type: 'T' }];
+  (backend as any).addressLocCache = new Map([
+    [start, { file: 'main.c', line: 10, func: 'source_line' }],
+    [end, { file: 'main.c', line: 11, func: 'source_line' }],
+  ]);
+  (backend as any).lineEntries = [
+    { address: start, file: 'main.c', line: 10 },
+    { address: end, file: 'main.c', line: 11 },
+  ];
+}
+
+function addDisjointSourceLine(backend: OzoneBackend): void {
+  (backend as any).symbols = [{ name: 'loop', address: 0x08000100, size: 0x100, type: 'T' }];
+  (backend as any).addressLocCache = new Map([
+    [0x08000100, { file: 'main.c', line: 10, func: 'loop' }],
+    [0x08000104, { file: 'main.c', line: 11, func: 'loop' }],
+    [0x08000180, { file: 'main.c', line: 10, func: 'loop' }],
+    [0x08000184, { file: 'main.c', line: 12, func: 'loop' }],
+    [0x08000200, { file: 'callee.c', line: 20, func: 'callee' }],
+  ]);
+  (backend as any).lineEntries = [
+    { address: 0x08000100, file: 'main.c', line: 10 },
+    { address: 0x08000104, file: 'main.c', line: 11 },
+    { address: 0x08000180, file: 'main.c', line: 10 },
+    { address: 0x08000184, file: 'main.c', line: 12 },
+    { address: 0x08000200, file: 'callee.c', line: 20 },
+  ];
+}
+
+describe('OzoneBackend CMSIS-DAP routing', () => {
+  it('resolves a Thumb entry symbol and runs to its normalized instruction address', async () => {
+    const runToAddress = vi.fn(async () => ({
+      ok: true,
+      message: 'startup entry reached',
+      targetState: 'Halted' as const,
+      elapsedMs: 9,
+      data: {
+        state: 'Halted' as const,
+        requestedAddress: 0x08003a2d,
+        entryAddress: 0x08003a2c,
+        pc: 0x08003a2c,
+        cleanupOk: true,
+      },
+    }));
+    const owner = cmsisOwner({ runToAddress } as any);
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).symbols = [{ name: 'main', address: 0x08003a2d, size: 0x30, type: 'T' }];
+
+    const result = await backend.execute({ cmd: 'runToEntryPoint', symbol: 'main', reset: true });
+
+    expect(runToAddress).toHaveBeenCalledWith(0x08003a2d, true);
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        symbol: 'main',
+        entryAddress: 0x08003a2c,
+        pc: 0x08003a2c,
+        state: 'halted',
+        cleanupOk: true,
+      },
+    });
+    expect(backend.currentState).toBe('halted');
+  });
+
+  it('halts and returns EntryPointUnavailable without running when the symbol is missing', async () => {
+    const runToAddress = vi.fn();
+    const owner = cmsisOwner({ runToAddress } as any);
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).state = 'running';
+    (backend as any).symbols = [{ name: 'Reset_Handler', address: 0x08004519, size: 0x20, type: 'T' }];
+
+    const result = await backend.execute({ cmd: 'runToEntryPoint', symbol: 'main', reset: true });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'EntryPointUnavailable',
+      targetState: 'Halted',
+    });
+    expect(owner.halt).toHaveBeenCalledOnce();
+    expect(runToAddress).not.toHaveBeenCalled();
+    expect(owner.run).not.toHaveBeenCalled();
+  });
+
+  it('accepts a trusted immediate breakpoint halt as a completed run', async () => {
+    const owner = cmsisOwner({
+      run: vi.fn(async () => ({
+        ok: true,
+        message: 'breakpoint hit before running was observed',
+        targetState: 'Halted' as const,
+        elapsedMs: 2,
+        data: {
+          state: 'Halted',
+          pc: 0x08003150,
+          breakpointHitBeforeRunningObserved: true,
+        },
+      })),
+    });
+    const backend = new OzoneBackend(owner, owner);
+    (backend as any).state = 'halted';
+
+    const result = await backend.execute({ cmd: 'run' });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        state: 'Halted',
+        pc: 0x08003150,
+        breakpointHitBeforeRunningObserved: true,
+      },
+    });
+    expect(backend.currentState).toBe('halted');
+  });
+
   it('does not describe a connected CMSIS-DAP owner as a legacy path', async () => {
     const owner = cmsisOwner({
       connect: vi.fn(async () => ({
@@ -60,6 +173,7 @@ describe('OzoneBackend CMSIS-DAP DAP-04 routing', () => {
       })),
     });
     const backend = new OzoneBackend(undefined, owner);
+    addSourceLine(backend, 0x080001C0, 0x080001C6);
     const stepLog = vi.spyOn(log, 'step');
 
     const result = await backend.execute({
@@ -80,25 +194,155 @@ describe('OzoneBackend CMSIS-DAP DAP-04 routing', () => {
     stepLog.mockRestore();
   });
 
-  it('maps stepIn to the CMSIS-DAP owner instruction primitive only', async () => {
-    const owner = cmsisOwner();
+  it('maps ordinary stepIn to the CMSIS-DAP source-step primitive', async () => {
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x080001C0 },
+      })),
+      stepIntoSourceLine: vi.fn(async () => ({
+        ok: true, message: 'source step in', targetState: 'Halted' as const, elapsedMs: 2,
+        data: {
+          pcBefore: 0x080001C0, pcAfter: 0x080001E0, classification: 'call', instructions: 2,
+          cleanupOk: true as const,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 2 },
+        },
+      })),
+    });
     const backend = new OzoneBackend(undefined, owner);
+    addSourceLine(backend, 0x080001C0, 0x080001C6);
 
     const result = await backend.execute({ cmd: 'stepInto' });
 
-    expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C2 } });
-    expect(owner.step).toHaveBeenCalledOnce();
-    expect(owner.stepIntoInstruction).not.toHaveBeenCalled();
-    expect(owner.stepIntoSourceLine).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: true,
+      data: { mode: 'cmsis-dap', targetState: 'Halted', pcAfter: 0x080001E0 },
+    });
+    expect(owner.step).not.toHaveBeenCalled();
+    expect(owner.stepIntoSourceLine).toHaveBeenCalledOnce();
   });
 
-  it.each(['stepOver', 'stepOut'] as const)('does not emulate %s through J-Link or breakpoints', async command => {
-    const owner = cmsisOwner();
+  it('routes source stepOver through the current CMSIS-DAP owner', async () => {
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x080001C0 },
+      })),
+      stepOverSourceLine: vi.fn(async () => ({
+        ok: true, message: 'source step over', targetState: 'Halted' as const, elapsedMs: 2,
+        data: {
+          pcBefore: 0x080001C0, pcAfter: 0x080001C6, classification: 'callReturnBreakpoint', instructions: 2,
+          cleanupOk: true,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 1, totalMs: 2 },
+        },
+      })),
+    });
     const backend = new OzoneBackend(undefined, owner);
+    addSourceLine(backend, 0x080001C0, 0x080001C6);
 
-    const result = await backend.execute({ cmd: command });
+    const result = await backend.execute({ cmd: 'stepOver' });
 
-    expect(result).toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C6 } });
+    expect(owner.stepOverSourceLine).toHaveBeenCalledOnce();
+    expect(owner.setBreakpoint).not.toHaveBeenCalled();
+  });
+
+  it('continues stepOver across disjoint address ranges mapped to the same source line', async () => {
+    const stepOverSourceLine = vi.fn(async (request: { lineStart?: number }) => ({
+      ok: true,
+      message: 'source step over',
+      targetState: 'Halted' as const,
+      elapsedMs: 2,
+      data: request.lineStart === 0x08000180
+        ? {
+          pcBefore: 0x08000180, pcAfter: 0x08000100, classification: 'branchSingleStep', instructions: 1,
+          cleanupOk: true,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        }
+        : {
+          pcBefore: 0x08000100, pcAfter: 0x08000104, classification: 'singleStep', instructions: 1,
+          cleanupOk: true,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        },
+    }));
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x08000180 },
+      })),
+      stepOverSourceLine,
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    addDisjointSourceLine(backend);
+
+    const result = await backend.execute({ cmd: 'stepOver' });
+
+    expect(result).toMatchObject({ ok: true, data: { pcAfter: 0x08000104 } });
+    expect(stepOverSourceLine).toHaveBeenCalledTimes(2);
+    expect(stepOverSourceLine.mock.calls.map(([request]) => request.lineStart)).toEqual([
+      0x08000180,
+      0x08000100,
+    ]);
+  });
+
+  it('continues stepInto across a loop back-edge before entering a call on the same source line', async () => {
+    const stepIntoSourceLine = vi.fn(async (request: { lineStart?: number }) => ({
+      ok: true,
+      message: 'source step in',
+      targetState: 'Halted' as const,
+      elapsedMs: 2,
+      data: request.lineStart === 0x08000180
+        ? {
+          pcBefore: 0x08000180, pcAfter: 0x08000100, classification: 'branch', instructions: 1,
+          cleanupOk: true as const,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        }
+        : {
+          pcBefore: 0x08000100, pcAfter: 0x08000200, classification: 'call', instructions: 1,
+          enteredCall: true,
+          cleanupOk: true as const,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+        },
+    }));
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x08000180 },
+      })),
+      stepIntoSourceLine,
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    addDisjointSourceLine(backend);
+
+    const result = await backend.execute({ cmd: 'stepInto' });
+
+    expect(result).toMatchObject({ ok: true, data: { pcAfter: 0x08000200, enteredCall: true } });
+    expect(stepIntoSourceLine).toHaveBeenCalledTimes(2);
+  });
+
+  it('routes source stepOut through the current CMSIS-DAP owner', async () => {
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x080001E0 },
+      })),
+      stepOut: vi.fn(async () => ({
+        ok: true, message: 'source step out', targetState: 'Halted' as const, elapsedMs: 2,
+        data: {
+          pcBefore: 0x080001E0, pcAfter: 0x080001C6, classification: 'returnBreakpoint' as const, instructions: 0 as const,
+          lr: 0x080001C7, sp: 0x20001000, returnAddress: 0x080001C6,
+          cleanupOk: true as const,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 1, waitMs: 0, cleanupMs: 1, totalMs: 2 },
+        },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).symbols = [{ name: 'callee', address: 0x080001E0, size: 0x20, type: 'T' }];
+
+    const result = await backend.execute({ cmd: 'stepOut' });
+
+    expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C6 } });
+    expect(owner.stepOut).toHaveBeenCalledOnce();
     expect(owner.step).not.toHaveBeenCalled();
     expect(owner.setBreakpoint).not.toHaveBeenCalled();
   });
@@ -124,6 +368,59 @@ describe('OzoneBackend CMSIS-DAP DAP-04 routing', () => {
       diagnostics: { operation: 'halt', phase: 'writeDhcsr' },
     });
     expect(result.ok === false && result.error).toContain('DapAckWait');
+  });
+
+  it('preserves structured source-step errors and cleanup diagnostics', async () => {
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x080001C0 },
+      })),
+      stepOverSourceLine: vi.fn(async () => ({
+        ok: false,
+        message: 'temporary breakpoint wait timed out',
+        errorCode: 'StepTimeout',
+        targetState: 'Halted' as const,
+        elapsedMs: 1000,
+        diagnostics: { operation: 'stepOverSourceLine', cleanupOk: true, restoredSlots: [0, 4] },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    addSourceLine(backend, 0x080001C0, 0x080001C6);
+
+    const result = await backend.execute({ cmd: 'stepOver' });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'StepTimeout',
+      targetState: 'Halted',
+      elapsedMs: 1000,
+      diagnostics: { cleanupOk: true, restoredSlots: [0, 4] },
+    });
+  });
+
+  it('preserves structured FPB resource exhaustion', async () => {
+    const owner = cmsisOwner({
+      setBreakpoint: vi.fn(async () => ({
+        ok: false,
+        message: 'all target-reported FPB code comparators are occupied',
+        errorCode: 'BreakpointResourceExhausted',
+        targetState: 'Halted' as const,
+        elapsedMs: 4,
+        diagnostics: { operation: 'setBreakpoint', codeComparators: 6 },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+
+    const result = await backend.execute({ cmd: 'setBreakpointAtAddr', addr: 0x080001CC });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'BreakpointResourceExhausted',
+      targetState: 'Halted',
+      elapsedMs: 4,
+      diagnostics: { codeComparators: 6 },
+    });
   });
 
   it('preserves a structured CMSIS-DAP memory-read error', async () => {
@@ -156,6 +453,136 @@ describe('OzoneBackend CMSIS-DAP DAP-04 routing', () => {
     });
     expect(result.ok === false && result.error).toContain('DapAckFault');
     expect(owner.readMemory).toHaveBeenCalledWith(0xFFFFFFFF, 4, { priority: 'watch' });
+  });
+
+  it('writes only an explicitly resolved STM32F407 SRAM Watch address', async () => {
+    const writeMemory = vi.fn(async (address: number, bytes: Uint8Array) => ({
+      ok: true,
+      message: 'memory written',
+      targetState: 'Halted' as const,
+      elapsedMs: 1,
+      data: { address, bytesWritten: bytes.length },
+    }));
+    const owner = cmsisOwner({
+      getState: vi.fn(async () => ({
+        ok: true, message: 'state', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { state: 'Halted' },
+      })),
+      writeMemory,
+    });
+    const backend = new OzoneBackend(undefined, owner);
+
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'counter', value: 42,
+      address: 0x20000004, typeName: 'uint32_t',
+    })).resolves.toMatchObject({ ok: true });
+    expect(writeMemory).toHaveBeenCalledWith(0x20000004, Uint8Array.from([42, 0, 0, 0]));
+
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'FLASH_ACR', value: 1,
+      address: 0x40023C00, typeName: 'uint32_t',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'InvalidWatchWriteAddress',
+    });
+    expect(writeMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a cancelled Locals scan after the current CMSIS-DAP memory read', async () => {
+    const controller = new AbortController();
+    const owner = cmsisOwner({
+      readMemory: vi.fn(async () => {
+        controller.abort('continue started');
+        return {
+          ok: true,
+          message: 'memory read',
+          targetState: 'Halted' as const,
+          elapsedMs: 1,
+          data: { bytes: Uint8Array.from([1, 0, 0, 0]) },
+        };
+      }),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).symbols = [
+      { name: 'first', address: 0x20000000, size: 4, type: 'D' },
+      { name: 'second', address: 0x20000004, size: 4, type: 'D' },
+    ];
+    (backend as any).dwarfInfo = { varToType: new Map(), types: new Map() };
+
+    const result = await backend.execute({ cmd: 'getLocals', signal: controller.signal });
+
+    expect(result).toEqual({ ok: true, data: [] });
+    expect(owner.readMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a cancelled Registers scan after the current CMSIS-DAP register read', async () => {
+    const controller = new AbortController();
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => {
+        controller.abort('continue started');
+        return {
+          ok: true,
+          message: 'register read',
+          targetState: 'Halted' as const,
+          elapsedMs: 1,
+          data: { value: 0x12345678 },
+        };
+      }),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+
+    const result = await backend.execute({ cmd: 'getRegisters', signal: controller.signal });
+
+    expect(result).toEqual({ ok: true, data: [] });
+    expect(owner.readRegister).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a cancelled recursive evaluate after the current CMSIS-DAP memory read', async () => {
+    const controller = new AbortController();
+    const owner = cmsisOwner({
+      readMemory: vi.fn(async (address: number) => {
+        if (address === 0x20000000) {
+          controller.abort('continue started');
+          return {
+            ok: true,
+            message: 'pointer read',
+            targetState: 'Halted' as const,
+            elapsedMs: 1,
+            data: { bytes: Uint8Array.from([0x00, 0x10, 0x00, 0x20]) },
+          };
+        }
+        return {
+          ok: true,
+          message: 'pointee read',
+          targetState: 'Halted' as const,
+          elapsedMs: 1,
+          data: { bytes: Uint8Array.from([0x00, 0x00, 0x80, 0x3f]) },
+        };
+      }),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).symbols = [{ name: 'root', address: 0x20000000, size: 4, type: 'D' }];
+    (backend as any).dwarfInfo = {
+      varToType: new Map([['root', 'root-pointer']]),
+      typeDefs: new Map([
+        ['root-pointer', { name: 'Root_t*', byteSize: 4, kind: 'pointer', typeOffset: 'root-struct' }],
+        ['root-struct', {
+          name: 'Root_t', byteSize: 4, kind: 'struct',
+          fields: [{ name: 'value', typeOffset: 'float-type', byteOffset: 0 }],
+        }],
+        ['float-type', { name: 'float', byteSize: 4, kind: 'base', encoding: 'float' }],
+      ]),
+    };
+
+    const result = await backend.execute({
+      cmd: 'evaluateExpression',
+      expression: 'root',
+      force: true,
+      signal: controller.signal,
+    });
+
+    expect(result).toMatchObject({ ok: false, errorCode: 'EvaluateCancelled' });
+    expect(owner.readMemory).toHaveBeenCalledTimes(1);
   });
 
   it('reads call-stack PC and LR through the CMSIS-DAP owner and labels the source', async () => {

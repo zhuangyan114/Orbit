@@ -258,6 +258,7 @@ export class DataSamplingManager {
     for (let i = 0; i < this.entries.length; i++) {
       const wv = values[i];
       if (!wv || wv.error) continue;
+      if (typeof wv.value !== 'number' || !Number.isFinite(wv.value)) continue;
       const entry = this.entries[i];
       const pt: DataPoint = { timestamp: now, value: wv.value, display: wv.display };
       const pts = this.dataMap.get(entry.expression);

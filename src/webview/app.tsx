@@ -70,7 +70,7 @@ function mapChildren(children: WatchValue[], parentExpr: string): WatchEntry[] {
 
 interface WatchValue {
   expression: string;
-  value: number;
+  value: number | string;
   display: string;
   hex: string;
   address?: number;

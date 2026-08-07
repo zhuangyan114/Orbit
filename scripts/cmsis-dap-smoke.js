@@ -16,6 +16,7 @@
 const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const readline = require('readline');
+const fpbOracle = require('./cmsis-dap/fpb-oracle');
 
 function argument(name, fallback = undefined) {
   const prefix = `--${name}=`;
@@ -136,7 +137,7 @@ async function runMockMatrix() {
     && hello.data.capabilities.includes('readMemoryBlock'), JSON.stringify(hello.data.capabilities));
 
   const enumAll = await request('enumDevices', { transport: 'mock' });
-  check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 20,
+  check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 24,
     JSON.stringify(enumAll));
 
   const enumFiltered = await request('enumDevices', { transport: 'mock', vid: '1234', pid: '9999' });
@@ -592,6 +593,421 @@ async function runDap04Matrix() {
   await closeDevice('dap04');
 }
 
+async function runDap05Matrix() {
+  const goldenFpCtrl = 0x00000260;
+  const goldenCapabilities = {
+    revision: 1,
+    codeComparators: 6,
+    literalComparators: 2,
+    enabled: false,
+  };
+  check('dap05: FP_CTRL 0x260 hard-coded golden decode',
+    JSON.stringify(fpbOracle.decodeFpCtrl(goldenFpCtrl)) === JSON.stringify(goldenCapabilities),
+    JSON.stringify(fpbOracle.decodeFpCtrl(goldenFpCtrl)));
+  check('dap05: FP_CTRL 0x260 hard-coded golden encode',
+    fpbOracle.makeFpCtrl(goldenCapabilities) === goldenFpCtrl,
+    `actual=0x${fpbOracle.makeFpCtrl(goldenCapabilities).toString(16)}`);
+  check('dap05: legacy NUM_LIT shift=7 fails the golden',
+    ((goldenFpCtrl >>> 7) & 0x0F) !== goldenCapabilities.literalComparators,
+    `legacyDecoded=${(goldenFpCtrl >>> 7) & 0x0F}`);
+
+  await openAndInfo('1234', '5678', 'dap05');
+  const connect = await request('connect', { port: 'SWD' });
+  check('dap05: connect', connect.ok, JSON.stringify(connect));
+  if (!connect.ok) return;
+
+  const halted = await request('halt', { timeoutMs: 100 });
+  check('dap05: halt', halted.ok, JSON.stringify(halted));
+
+  const expectedCtrl = goldenFpCtrl;
+  const fpb = await request('getFpbInfo', { timeoutMs: 100 });
+  check('dap05: FPB capability probe', fpb.ok
+    && fpb.data.revision === 1
+    && fpb.data.codeComparators === 6
+    && fpb.data.fpCtrl === expectedCtrl
+    && fpb.targetState === 'Halted', JSON.stringify(fpb));
+  check('dap05: independent FP_CTRL decode', fpb.ok
+    && JSON.stringify(fpbOracle.decodeFpCtrl(fpb.data.fpCtrl))
+      === JSON.stringify({ revision: 1, codeComparators: 6, literalComparators: 2, enabled: false }),
+  JSON.stringify(fpb));
+
+  const addresses = [0x080001C0, 0x080001C2, 0x080001C4, 0x080001C6, 0x080001C8, 0x080001CA];
+  const slots = [];
+  for (const address of addresses) {
+    const set = await request('setBreakpoint', { address, timeoutMs: 100 });
+    slots.push(set);
+    check(`dap05: set slot ${slots.length - 1}`, set.ok
+      && set.data.slot === slots.length - 1
+      && set.data.address === address
+      && set.data.fpbRevision === 1
+      && set.data.comparatorReadback === fpbOracle.encodeComparator(1, address), JSON.stringify(set));
+  }
+  const duplicate = await request('setBreakpoint', { address: addresses[2], timeoutMs: 100 });
+  check('dap05: duplicate preserves slot', duplicate.ok
+    && duplicate.data.slot === 2 && duplicate.data.duplicate === true, JSON.stringify(duplicate));
+  const exhausted = await request('setBreakpoint', { address: 0x080001CC, timeoutMs: 100 });
+  check('dap05: slot exhaustion is structured', !exhausted.ok
+    && exhausted.errorCode === 'BreakpointResourceExhausted', JSON.stringify(exhausted));
+  const cleared = await request('clearBreakpoint', { slot: 2, timeoutMs: 100 });
+  check('dap05: clear verifies comparator zero', cleared.ok
+    && cleared.data.slot === 2 && cleared.data.comparatorReadback === 0, JSON.stringify(cleared));
+  const resetSlot = await request('setBreakpoint', { address: 0x080001CC, preferredSlot: 2, timeoutMs: 100 });
+  check('dap05: cleared slot is reused exactly', resetSlot.ok
+    && resetSlot.data.slot === 2 && resetSlot.data.address === 0x080001CC, JSON.stringify(resetSlot));
+  const invalid = await request('setBreakpoint', { address: 0x20000000, timeoutMs: 100 });
+  check('dap05: FPBv1 range validation', !invalid.ok
+    && invalid.errorCode === 'InvalidBreakpointAddress', JSON.stringify(invalid));
+  const clearedAll = await request('clearAllBreakpoints', { timeoutMs: 100 });
+  check('dap05: clear-all disables FPB', clearedAll.ok
+    && clearedAll.data.cleared === 6 && clearedAll.data.enabled === false, JSON.stringify(clearedAll));
+
+  const fastBefore = await request('readRegister', { index: 15, timeoutMs: 100 });
+  const fastAddress = fastBefore.ok ? (fastBefore.data.value + 4) >>> 0 : 0;
+  const fastBreakpoint = await request('setBreakpoint', {
+    address: fastAddress, preferredSlot: 0, timeoutMs: 100,
+  });
+  const fastRun = await request('run', { timeoutMs: 100 });
+  check('dap05: run accepts a breakpoint hit before Running is observed',
+    fastBefore.ok && fastBreakpoint.ok && fastRun.ok
+      && fastRun.targetState === 'Halted'
+      && fastRun.data.state === 'Halted'
+      && fastRun.data.pc === fastAddress
+      && fastRun.data.breakpointHitBeforeRunningObserved === true,
+    JSON.stringify({ fastBefore, fastBreakpoint, fastRun }));
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+
+  let currentPcContinueRoundsOk = true;
+  let instructionBreakpointRoundsOk = true;
+  for (let round = 0; round < 20; round++) {
+    const resetRound = await request('reset', { timeoutMs: 100 });
+    const currentRound = await request('setBreakpoint', {
+      address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+    });
+    const runRound = await request('run', { timeoutMs: 100 });
+    currentPcContinueRoundsOk = currentPcContinueRoundsOk
+      && resetRound.ok && currentRound.ok && currentRound.data.slot === 0
+      && runRound.ok && runRound.data.pcBefore === 0x080001C0
+      && runRound.data.pcAfterStep !== 0x080001C0
+      && runRound.data.restoredSlots.includes(0);
+    await request('halt', { timeoutMs: 100 });
+    const clearRound = await request('clearBreakpoint', { slot: 0, timeoutMs: 100 });
+    currentPcContinueRoundsOk = currentPcContinueRoundsOk
+      && clearRound.ok && clearRound.data.comparatorReadback === 0;
+
+    await request('reset', { timeoutMs: 100 });
+    const instructionBp = await request('setBreakpoint', {
+      address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+    });
+    const instructionRound = await request('stepInstruction', { timeoutMs: 100 });
+    instructionBreakpointRoundsOk = instructionBreakpointRoundsOk
+      && instructionBp.ok && instructionRound.ok
+      && instructionRound.data.pcBefore === 0x080001C0
+      && instructionRound.data.pcAfter !== 0x080001C0
+      && instructionRound.data.restoredSlots.includes(0);
+    const clearInstructionBp = await request('clearBreakpoint', { slot: 0, timeoutMs: 100 });
+    instructionBreakpointRoundsOk = instructionBreakpointRoundsOk && clearInstructionBp.ok;
+  }
+  check('dap05: current-PC continue 20 rounds', currentPcContinueRoundsOk);
+  check('dap05: instruction step restores user breakpoint 20 rounds', instructionBreakpointRoundsOk);
+
+  const reset = await request('reset', { timeoutMs: 100 });
+  check('dap05: reset before current-PC continue', reset.ok, JSON.stringify(reset));
+  const current = await request('setBreakpoint', { address: 0x080001C0, timeoutMs: 100 });
+  check('dap05: current-PC breakpoint set', current.ok, JSON.stringify(current));
+  const continued = await request('run', { timeoutMs: 100 });
+  check('dap05: current-PC continue steps over and restores user slot', continued.ok
+    && continued.data.state === 'Running'
+    && continued.data.pcBefore === 0x080001C0
+    && continued.data.pcAfterStep !== 0x080001C0
+    && continued.data.restoredSlots.includes(current.data.slot), JSON.stringify(continued));
+  await request('halt', { timeoutMs: 100 });
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+
+  await request('reset', { timeoutMs: 100 });
+  const stepOver = await request('stepOverSourceLine', {
+    lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 100,
+  });
+  check('dap05: source step over call', stepOver.ok
+    && stepOver.data.pcBefore === 0x080001C0
+    && stepOver.data.pcAfter === 0x080001C6
+    && stepOver.data.cleanupOk === true, JSON.stringify(stepOver));
+
+  await request('reset', { timeoutMs: 100 });
+  const stepInto = await request('stepIntoSourceLine', {
+    lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 100,
+  });
+  check('dap05: source step into enters call', stepInto.ok
+    && stepInto.data.classification === 'call'
+    && stepInto.data.pcAfter === 0x080001E0, JSON.stringify(stepInto));
+  const stepOut = await request('stepOut', {
+    functionStart: 0x080001E0, functionEnd: 0x08000200, timeoutMs: 100,
+  });
+  check('dap05: source step out returns through temporary FPB', stepOut.ok
+    && stepOut.data.pcBefore === 0x080001E0
+    && stepOut.data.pcAfter === 0x080001C6
+    && stepOut.data.cleanupOk === true, JSON.stringify(stepOut));
+
+  const toConditional = await request('stepInstruction', { timeoutMs: 100 });
+  const conditional = await request('stepOverSourceLine', {
+    lineStart: 0x080001C8, lineEnd: 0x080001CA, maxInstructionSteps: 4, timeoutMs: 100,
+  });
+  check('dap05: conditional branch source step', toConditional.ok
+    && toConditional.data.pcAfter === 0x080001C8
+    && conditional.ok
+    && conditional.data.classification === 'branchSingleStep'
+    && conditional.data.pcAfter === 0x080001CA, JSON.stringify(conditional));
+  const loop = await request('stepOverSourceLine', {
+    lineStart: 0x080001CA, lineEnd: 0x080001CC, maxInstructionSteps: 3, timeoutMs: 100,
+  });
+  check('dap05: loop remains bounded with structured error', !loop.ok
+    && loop.errorCode === 'SourceLineStepLimitExceeded'
+    && loop.diagnostics.step.cleanupOk === true, JSON.stringify(loop));
+
+  let sourceStepRoundsOk = true;
+  for (let round = 0; round < 20; round++) {
+    await request('clearAllBreakpoints', { timeoutMs: 100 });
+    await request('reset', { timeoutMs: 100 });
+    const startBreakpoint = await request('setBreakpoint', {
+      address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+    });
+    const over = await request('stepOverSourceLine', {
+      lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 100,
+    });
+    sourceStepRoundsOk = sourceStepRoundsOk && startBreakpoint.ok && over.ok
+      && over.data.pcAfter === 0x080001C6 && over.data.cleanupOk
+      && over.data.restoredSlots.includes(0);
+    await request('clearAllBreakpoints', { timeoutMs: 100 });
+    await request('reset', { timeoutMs: 100 });
+    const intoStartBreakpoint = await request('setBreakpoint', {
+      address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+    });
+    const into = await request('stepIntoSourceLine', {
+      lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 100,
+    });
+    const outStartBreakpoint = into.ok ? await request('setBreakpoint', {
+      address: 0x080001E0, preferredSlot: 1, timeoutMs: 100,
+    }) : { ok: false };
+    const out = into.ok && outStartBreakpoint.ok ? await request('stepOut', {
+      functionStart: 0x080001E0, functionEnd: 0x08000200, timeoutMs: 100,
+    }) : { ok: false };
+    sourceStepRoundsOk = sourceStepRoundsOk
+      && intoStartBreakpoint.ok && into.ok && into.data.pcAfter === 0x080001E0
+      && into.data.restoredSlots.includes(0)
+      && outStartBreakpoint.ok && out.ok && out.data.pcAfter === 0x080001C6
+      && out.data.cleanupOk && out.data.restoredSlots.includes(1);
+  }
+  check('dap05: source Step Over/Into/Out 20 rounds', sourceStepRoundsOk);
+
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+  const fpbAfterTemporarySteps = await request('getFpbInfo', { timeoutMs: 100 });
+  check('dap05: temporary breakpoint cleanup disables unused FPB', fpbAfterTemporarySteps.ok
+    && fpbAfterTemporarySteps.data.enabled === false, JSON.stringify(fpbAfterTemporarySteps));
+
+  const disconnect = await request('disconnect', {});
+  check('dap05: disconnect cleanup', disconnect.ok, JSON.stringify(disconnect));
+  await closeDevice('dap05');
+}
+
+async function runDap06StartupStopMatrix() {
+  await openAndInfo('1234', '5678', 'dap06-startup');
+  const connect = await request('connect', { port: 'SWD' });
+  check('dap06: connect', connect.ok, JSON.stringify(connect));
+  if (!connect.ok) return;
+  await request('halt', { timeoutMs: 100 });
+
+  const user = await request('setBreakpoint', {
+    address: 0x080001C8, preferredSlot: 0, timeoutMs: 100,
+  });
+  const startup = await request('runToAddress', {
+    address: 0x080001E0, reset: true, timeoutMs: 100,
+  });
+  check('dap06: reset runs through an earlier user breakpoint to the startup entry',
+    user.ok && startup.ok
+      && startup.targetState === 'Halted'
+      && startup.data.state === 'Halted'
+      && startup.data.entryAddress === 0x080001E0
+      && startup.data.pc === 0x080001E0
+      && startup.data.resetPc === 0x080001C0
+      && startup.data.cleanupOk === true
+      && startup.data.temporarySlot === 1,
+    JSON.stringify({ user, startup }));
+  const preservedUser = await request('setBreakpoint', {
+    address: 0x080001C8, timeoutMs: 100,
+  });
+  const reusedTemporary = await request('setBreakpoint', {
+    address: 0x080001E2, preferredSlot: 1, timeoutMs: 100,
+  });
+  check('dap06: startup cleanup preserves users and releases its temporary comparator',
+    preservedUser.ok && preservedUser.data.duplicate === true && preservedUser.data.slot === 0
+      && reusedTemporary.ok && reusedTemporary.data.slot === 1,
+    JSON.stringify({ preservedUser, reusedTemporary }));
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+
+  const occupied = [];
+  for (const address of [0x080001C0, 0x080001C2, 0x080001C4, 0x080001C6, 0x080001C8, 0x080001CA]) {
+    occupied.push(await request('setBreakpoint', { address, timeoutMs: 100 }));
+  }
+  const exhausted = await request('runToAddress', {
+    address: 0x080001E0, reset: true, timeoutMs: 100,
+  });
+  const stateAfterExhaustion = await request('getState', { timeoutMs: 100 });
+  const preservedAfterExhaustion = await request('setBreakpoint', {
+    address: 0x080001C8, timeoutMs: 100,
+  });
+  check('dap06: comparator exhaustion does not run or discard user breakpoints',
+    occupied.every(result => result.ok)
+      && !exhausted.ok && exhausted.errorCode === 'BreakpointResourceExhausted'
+      && stateAfterExhaustion.ok && stateAfterExhaustion.data.state === 'Halted'
+      && preservedAfterExhaustion.ok && preservedAfterExhaustion.data.duplicate === true,
+    JSON.stringify({ exhausted, stateAfterExhaustion, preservedAfterExhaustion }));
+
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+  await request('disconnect', {});
+  await closeDevice('dap06-startup');
+
+  await openAndInfo('1234', '568F', 'dap06-reset-race');
+  const raceConnect = await request('connect', { port: 'SWD' });
+  check('dap06-reset-race: connect', raceConnect.ok, JSON.stringify(raceConnect));
+  if (!raceConnect.ok) return;
+  await request('halt', { timeoutMs: 100 });
+  const raceUser = await request('setBreakpoint', {
+    address: 0x080001C8, preferredSlot: 0, timeoutMs: 100,
+  });
+  const raceStartup = await request('runToAddress', {
+    address: 0x080001E0, reset: true, timeoutMs: 100,
+  });
+  const racePreservedUser = await request('setBreakpoint', {
+    address: 0x080001C8, timeoutMs: 100,
+  });
+  const raceReusedTemporary = await request('setBreakpoint', {
+    address: 0x080001E2, preferredSlot: 1, timeoutMs: 100,
+  });
+  check('dap06: pre-arms startup comparator before a reset can pass the entry',
+    raceUser.ok && raceStartup.ok
+      && raceStartup.targetState === 'Halted'
+      && raceStartup.data.pc === 0x080001E0
+      && raceStartup.data.cleanupOk === true
+      && raceStartup.data.temporarySlot === 1
+      && racePreservedUser.ok && racePreservedUser.data.duplicate === true
+      && racePreservedUser.data.slot === 0
+      && raceReusedTemporary.ok && raceReusedTemporary.data.slot === 1,
+    JSON.stringify({ raceUser, raceStartup, racePreservedUser, raceReusedTemporary }));
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+  await request('disconnect', {});
+  await closeDevice('dap06-reset-race');
+}
+
+async function runDap06StartupTimeoutMatrix() {
+  await openAndInfo('1234', '568C', 'dap06-startup-timeout');
+  const connect = await request('connect', { port: 'SWD' });
+  check('dap06-timeout: connect', connect.ok, JSON.stringify(connect));
+  if (!connect.ok) return;
+  await request('halt', { timeoutMs: 100 });
+  const user = await request('setBreakpoint', {
+    address: 0x080001C8, preferredSlot: 0, timeoutMs: 100,
+  });
+  const timedOut = await request('runToAddress', {
+    address: 0x080001E0, reset: true, timeoutMs: 10,
+  });
+  const state = await request('getState', { timeoutMs: 100 });
+  const reusedTemporary = await request('setBreakpoint', {
+    address: 0x080001E2, preferredSlot: 1, timeoutMs: 100,
+  });
+  check('dap06-timeout: timeout halts and cleans the temporary comparator',
+    user.ok && !timedOut.ok && timedOut.errorCode === 'StartupStopTimeout'
+      && timedOut.diagnostics.startup.cleanupOk === true
+      && state.ok && state.data.state === 'Halted'
+      && reusedTemporary.ok && reusedTemporary.data.slot === 1,
+    JSON.stringify({ timedOut, state, reusedTemporary }));
+  await request('clearAllBreakpoints', { timeoutMs: 100 });
+  await request('disconnect', {});
+  await closeDevice('dap06-startup-timeout');
+}
+
+async function runDap05CleanupMatrix() {
+  await openAndInfo('1234', '568C', 'dap05-cleanup');
+  const connect = await request('connect', { port: 'SWD' });
+  check('dap05-cleanup: connect', connect.ok, JSON.stringify(connect));
+  if (!connect.ok) return;
+  await request('halt', { timeoutMs: 100 });
+  await request('getFpbInfo', { timeoutMs: 100 });
+  const user = await request('setBreakpoint', {
+    address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+  });
+  const timedOut = await request('stepOverSourceLine', {
+    lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 10,
+  });
+  check('dap05-cleanup: timeout restores user and clears temporary slot', user.ok
+    && !timedOut.ok && timedOut.errorCode === 'StepTimeout'
+    && timedOut.diagnostics.step.cleanupOk === true
+    && timedOut.diagnostics.step.temporaryBreakpointCount === 1, JSON.stringify(timedOut));
+  const duplicate = await request('setBreakpoint', { address: 0x080001C0, timeoutMs: 100 });
+  const reusedTemporarySlot = await request('setBreakpoint', {
+    address: 0x080001C2, preferredSlot: 1, timeoutMs: 100,
+  });
+  check('dap05-cleanup: timeout preserves original slot and makes temporary slot reusable',
+    duplicate.ok && duplicate.data.duplicate === true && duplicate.data.slot === 0
+      && reusedTemporarySlot.ok && reusedTemporarySlot.data.slot === 1,
+    JSON.stringify({ duplicate, reusedTemporarySlot }));
+
+  const disconnect = await request('disconnect', {});
+  const reconnect = await request('connect', { port: 'SWD' });
+  await request('halt', { timeoutMs: 100 });
+  const afterReconnect = await request('getFpbInfo', { timeoutMs: 100 });
+  check('dap05-cleanup: disconnect clears all FPB comparators', disconnect.ok && reconnect.ok
+    && afterReconnect.ok && afterReconnect.data.enabled === false, JSON.stringify(afterReconnect));
+  await request('disconnect', {});
+  await closeDevice('dap05-cleanup');
+}
+
+async function runDap05StepRetireLagMatrix() {
+  await openAndInfo('1234', '568D', 'dap05-step-retire-lag');
+  const connect = await request('connect', { port: 'SWD' });
+  check('dap05-step-retire-lag: connect', connect.ok, JSON.stringify(connect));
+  if (!connect.ok) return;
+  await request('halt', { timeoutMs: 100 });
+  await request('getFpbInfo', { timeoutMs: 100 });
+  const user = await request('setBreakpoint', {
+    address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+  });
+  // Eight intentionally stale DHCSR reads require a ninth transfer to observe
+  // retirement; keep this success oracle above mock pipe/DP-AP round-trip cost.
+  const continued = await request('run', { timeoutMs: 250 });
+  check('dap05-step-retire-lag: current-PC continue waits for instruction retirement',
+    user.ok && continued.ok
+      && continued.data.state === 'Running'
+      && continued.data.pcBefore === 0x080001C0
+      && continued.data.pcAfterStep === 0x080001C2
+      && continued.data.restoredSlots.includes(0),
+    JSON.stringify(continued));
+  await request('disconnect', {});
+  await closeDevice('dap05-step-retire-lag');
+}
+
+async function runDap05InterruptMaskedStepMatrix() {
+  await openAndInfo('1234', '568E', 'dap05-step-interrupt');
+  const connect = await request('connect', { port: 'SWD' });
+  check('dap05-step-interrupt: connect', connect.ok, JSON.stringify(connect));
+  if (!connect.ok) return;
+  await request('halt', { timeoutMs: 100 });
+  await request('getFpbInfo', { timeoutMs: 100 });
+  const user = await request('setBreakpoint', {
+    address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
+  });
+  const continued = await request('run', { timeoutMs: 100 });
+  check('dap05-step-interrupt: current-PC continue masks interrupts during C_STEP',
+    user.ok && continued.ok
+      && continued.data.state === 'Running'
+      && continued.data.pcBefore === 0x080001C0
+      && continued.data.pcAfterStep === 0x080001C2
+      && continued.data.interruptMaskApplied === true
+      && continued.data.interruptMaskCleared === true
+      && continued.data.restoredSlots.includes(0),
+    JSON.stringify(continued));
+  await request('disconnect', {});
+  await closeDevice('dap05-step-interrupt');
+}
+
 async function runHardwareHandshake() {
   console.log('hardware: low-risk handshake only (enumerate/open/getInfo/connect(SWD)/disconnect/close)');
   console.log(`hardware: helper pid=${child.pid ?? 'unknown'}`);
@@ -643,6 +1059,12 @@ async function main() {
     await runDap03Matrix();
     await runDap02AMatrix();
       await runDap04Matrix();
+      await runDap05Matrix();
+      await runDap05CleanupMatrix();
+      await runDap05StepRetireLagMatrix();
+      await runDap05InterruptMaskedStepMatrix();
+      await runDap06StartupStopMatrix();
+      await runDap06StartupTimeoutMatrix();
     } else {
       await runHardwareHandshake();
     }

@@ -16,8 +16,13 @@ import {
   CmsisDapHelperClient,
   CmsisDapHelperOptions,
   CmsisDapMemoryReadResult,
+  CmsisDapMemoryWriteResult,
   CmsisDapCoreStateResult,
+  CmsisDapRunToAddressResult,
   CmsisDapStepInstructionResult,
+  CmsisDapBreakpointResult,
+  CmsisDapFpbInfoResult,
+  CmsisDapClearAllBreakpointsResult,
   CmsisDapRegisterReadResult,
   CmsisDapDpReadResult,
   CmsisDapFlashAlgorithmRpcResult,
@@ -69,6 +74,7 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   run(): Promise<CppJLinkResult<any>>;
   step(): Promise<CppJLinkResult<any>>;
   reset(): Promise<CppJLinkResult<any>>;
+  runToAddress?(address: number, reset: boolean): Promise<CppJLinkResult<CmsisDapRunToAddressResult>>;
   getState(): Promise<CppJLinkResult<{ state: string }>>;
   readRegister(index: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ value: number }>>;
   readMemory(address: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
@@ -78,8 +84,8 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   ): Promise<CppJLinkResult<{ reads: Array<{ address: number; bytes: Uint8Array }> }>>;
   writeMemory(address: number, bytes: Uint8Array): Promise<CppJLinkResult<{ address: number; bytesWritten: number }>>;
   setBreakpoint(address: number, preferredSlot?: number): Promise<CppJLinkResult<{ id: number }>>;
-  clearBreakpoint(id: number): Promise<CppJLinkResult>;
-  clearAllBreakpoints(): Promise<CppJLinkResult>;
+  clearBreakpoint(id: number): Promise<CppJLinkResult<any>>;
+  clearAllBreakpoints(): Promise<CppJLinkResult<any>>;
   startRtt(controlBlockAddress?: number): Promise<CppJLinkResult>;
   stopRtt(): Promise<CppJLinkResult>;
   readRtt(bufferIndex: number, size: number): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
@@ -92,7 +98,7 @@ export type SessionTargetOwnerFactory = () => SessionTargetOwner;
 /** Chooses exactly one physical target owner for a debug session. */
 export class SessionTargetSelector {
   private owner: SessionTargetOwner | null = null;
-  private readonly breakpointSlots: (number | null)[] = [null, null, null, null, null, null];
+  private readonly breakpointSlots: (number | null)[] = [];
   private readonly sessionId = `target-${nextSessionId++}`;
   private selectedMode: SessionTargetMode = 'legacy';
 
@@ -175,6 +181,14 @@ export class SessionTargetSelector {
   async run() { return this.call('run', owner => owner.run()); }
   async step() { return this.call('step', owner => owner.step()); }
   async reset() { return this.call('reset', owner => owner.reset()); }
+  async runToAddress(address: number, reset: boolean) {
+    return this.call('runToAddress', owner => owner.runToAddress
+      ? owner.runToAddress(address, reset)
+      : Promise.resolve(failure<CmsisDapRunToAddressResult>(
+        'selected target owner does not support run-to-address',
+        'UnsupportedCapability',
+      )));
+  }
   async getState() { return this.call('getState', owner => owner.getState()); }
   async readRegister(index: number, options?: CppJLinkReadOptions) {
     return this.call('readRegister', owner => owner.readRegister(index, options));
@@ -239,6 +253,15 @@ export class SessionTargetSelector {
       return {
         ...result,
         message: `${result.message}. Native session was terminated; restart the debug session in legacy mode or start a new auto-mode session.`,
+      };
+    }
+    if (!result.ok && result.errorCode === 'NativeOwnerLost' && owner.kind === 'cmsis-dap') {
+      this.owner = null;
+      await owner.dispose(false);
+      log.dll(`target-owner session=${this.sessionId} native command failed owner=cmsis-dap command=${command} code=NativeOwnerLost targetConnected=true action=restart-session`);
+      return {
+        ...result,
+        message: `${result.message}. CMSIS-DAP session was terminated; start a new debug session to claim and sanitize FPB comparators.`,
       };
     }
     return result;
@@ -487,8 +510,29 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         await this.helper.request('close', {}).catch(() => {});
         return this.failAndDispose(connected, 'connect');
       }
+
+      const fpb = await this.helper.controlRequest<CmsisDapFpbInfoResult>(
+        'getFpbInfo',
+        { timeoutMs: 1000 },
+      );
+      if (!fpb.ok || !fpb.data) {
+        await this.helper.request('disconnect', {}).catch(() => {});
+        await this.helper.request('close', {}).catch(() => {});
+        return this.failAndDispose(
+          fpb.ok
+            ? {
+              ...fpb,
+              ok: false,
+              errorCode: 'MalformedResponse',
+              message: 'CMSIS-DAP FPB ownership claim returned no capability data',
+            }
+            : fpb,
+          'claimFpbOwnership',
+        );
+      }
       this.state = 'connected';
-      log.dll(`[cmsis-dap] connected port=${(connected.data as { port?: string })?.port || 'unknown'} owner=cmsis-dap`);
+      log.dll(`[cmsis-dap] connected port=${(connected.data as { port?: string })?.port || 'unknown'} owner=cmsis-dap `
+        + `fpbRevision=${fpb.data.revision} codeComparators=${fpb.data.codeComparators} fpbSanitized=true`);
       return {
         ok: true,
         message: 'CMSIS-DAP connected',
@@ -499,6 +543,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
           diagnostics: {
             device: this.lastDevice,
             connectResponse: connected.data,
+            fpb: fpb.data,
             ...infoDiagnostics,
           },
         },
@@ -537,6 +582,13 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   async reset() {
     return this.controlViaHelper<CmsisDapCoreStateResult>('reset', {});
+  }
+  async runToAddress(address: number, reset: boolean) {
+    return this.controlViaHelper<CmsisDapRunToAddressResult>('runToAddress', {
+      address,
+      reset,
+      timeoutMs: 5000,
+    });
   }
   async getState() {
     return this.controlViaHelper<CmsisDapCoreStateResult>('getState', {});
@@ -657,14 +709,43 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     log.dap(`[cmsis-dap] readMemoryBatch reads=${results.length} bytes=${results.reduce((sum, item) => sum + item.bytes.length, 0)} owner=cmsis-dap`);
     return { ok: true, message: 'CMSIS-DAP memory batch read', targetState: 'Unknown' as const, elapsedMs: 0, data: { reads: results } };
   }
-  async writeMemory(_address: number, _bytes: Uint8Array) {
-    return this.unsupported<{ address: number; bytesWritten: number }>('writeMemory');
+  async writeMemory(address: number, bytes: Uint8Array) {
+    if (this.state !== 'connected') {
+      return this.invalidState<CmsisDapMemoryWriteResult>('writeMemory');
+    }
+    const result = await this.controlViaHelper<CmsisDapMemoryWriteResult>('writeMemory', {
+      address,
+      bytes: Array.from(bytes),
+    });
+    if (result.ok && (!result.data || result.data.bytesWritten !== bytes.length)) {
+      return {
+        ok: false,
+        message: 'CMSIS-DAP writeMemory returned an invalid completion count',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error' as const,
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ownerKind: this.kind, address, expectedBytes: bytes.length, data: result.data },
+      };
+    }
+    return result;
   }
-  async setBreakpoint(_address: number, _preferredSlot?: number) {
-    return this.unsupported<{ id: number }>('setBreakpoint');
+  async setBreakpoint(address: number, preferredSlot?: number) {
+    const result = await this.controlViaHelper<CmsisDapBreakpointResult>('setBreakpoint', {
+      address,
+      ...(preferredSlot === undefined ? {} : { preferredSlot }),
+    });
+    if (!result.ok || !result.data) return result as unknown as CppJLinkResult<{ id: number }>;
+    return {
+      ...result,
+      data: { id: result.data.slot, ...result.data },
+    };
   }
-  async clearBreakpoint(_id: number) { return this.unsupported('clearBreakpoint'); }
-  async clearAllBreakpoints() { return this.unsupported('clearAllBreakpoints'); }
+  async clearBreakpoint(id: number) {
+    return this.controlViaHelper<CmsisDapBreakpointResult>('clearBreakpoint', { slot: id });
+  }
+  async clearAllBreakpoints() {
+    return this.controlViaHelper<CmsisDapClearAllBreakpointsResult>('clearAllBreakpoints', {});
+  }
   async startRtt(_controlBlockAddress?: number) { return this.unsupported('startRtt'); }
   async stopRtt() { return this.unsupported('stopRtt'); }
   async readRtt(_bufferIndex: number, _size: number) {
@@ -694,14 +775,14 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       },
     };
   }
-  async stepIntoSourceLine(_request: NativeStepIntoSourceLineRequest) {
-    return this.unsupported<NativeStepIntoDiagnostics>('stepIntoSourceLine');
+  async stepIntoSourceLine(request: NativeStepIntoSourceLineRequest) {
+    return this.controlViaHelper<NativeStepIntoDiagnostics>('stepIntoSourceLine', request as unknown as Record<string, unknown>);
   }
-  async stepOverSourceLine(_request: NativeStepOverRequest) {
-    return this.unsupported<NativeStepOverDiagnostics>('stepOverSourceLine');
+  async stepOverSourceLine(request: NativeStepOverRequest) {
+    return this.controlViaHelper<NativeStepOverDiagnostics>('stepOverSourceLine', request as unknown as Record<string, unknown>);
   }
-  async stepOut(_request: NativeStepOutRequest) {
-    return this.unsupported<NativeStepOutDiagnostics>('stepOut');
+  async stepOut(request: NativeStepOutRequest) {
+    return this.controlViaHelper<NativeStepOutDiagnostics>('stepOut', request as unknown as Record<string, unknown>);
   }
   async dispose(graceful = true): Promise<void> {
     if (this.state !== 'idle') await this.disconnect().catch(() => {});
@@ -809,24 +890,54 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
           diagnostics: { ownerKind: this.kind, method },
         };
       }
-      return this.helperFailure<THelper>(method, error);
+      return this.ownerLost(method, this.helperFailure<THelper>(method, error));
     }
     log.dll(`[cmsis-dap] control method=${method} ok=${result.ok} errorCode=${result.errorCode || ''} `
       + `targetState=${result.targetState} message=${result.message} `
       + `diagnostics=${JSON.stringify(result.diagnostics || {})} data=${JSON.stringify(result.data || {})}`);
-    if (!result.ok) return result;
+    if (!result.ok) {
+      const ownerLossCodes = new Set([
+        'DeviceRemoved',
+        'HelperExited',
+        'MalformedResponse',
+        'StepCleanupFailed',
+        'FpbCleanupFailed',
+        'StartupRecoveryFailed',
+      ]);
+      return ownerLossCodes.has(result.errorCode || '')
+        ? this.ownerLost(method, result)
+        : result;
+    }
     if (!result.data) {
-      return {
+      const malformedResult: CppJLinkResult<THelper> = {
+        ...result,
         ok: false,
         message: 'CMSIS-DAP ' + method + ' returned no data',
         errorCode: 'MalformedResponse',
         targetState: 'Error',
-        elapsedMs: result.elapsedMs,
-        diagnostics: { ownerKind: this.kind, method },
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method },
       };
+      return this.ownerLost(method, malformedResult);
     }
     log.dap('[cmsis-dap] ' + method + ' control=true ok=true owner=cmsis-dap');
     return result;
+  }
+
+  private ownerLost<T>(method: string, result: CppJLinkResult<T>): CppJLinkResult<T> {
+    if (result.ok) return result;
+    const causeErrorCode = result.errorCode || 'UnknownOwnerFailure';
+    this.state = 'failed';
+    return {
+      ...result,
+      errorCode: 'NativeOwnerLost',
+      message: `CMSIS-DAP owner lost during ${method}: ${causeErrorCode}: ${result.message}`,
+      diagnostics: {
+        ...result.diagnostics,
+        ownerKind: this.kind,
+        method,
+        causeErrorCode,
+      },
+    };
   }
 
   private async failAndDispose<T>(result: CppJLinkResult<T>, stage: string): Promise<CppJLinkResult<TargetChannelInfo>> {

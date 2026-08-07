@@ -9,7 +9,7 @@ import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
-import { readElfSymbols, SymbolInfo, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress } from './jlink-symbols';
+import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress } from './jlink-symbols';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -47,6 +47,14 @@ interface NativeStopInfo {
 interface WatchEvaluationContext {
   /** Undefined preserves the eager behavior required by standard DAP evaluate/variables. */
   expandedExpressions?: ReadonlySet<string>;
+  signal?: AbortSignal;
+}
+
+class EvaluateCancelledError extends Error {
+  constructor() {
+    super('EvaluateCancelled: expression evaluation was cancelled');
+    this.name = 'EvaluateCancelledError';
+  }
 }
 
 interface SourceStatementRange {
@@ -83,7 +91,7 @@ export class OzoneBackend {
   private nativeStepsEnabled = { stepInto: false, stepOver: false, stepOut: false };
   private lastNativeStopInfo: NativeStopInfo | null = null;
   private readonly sessionTarget?: SessionTargetOwner | SessionTargetSelector;
-  private readonly sessionBreakpointSlots: (number | null)[] = [null, null, null, null, null, null];
+  private readonly sessionBreakpointSlots: (number | null)[] = [];
 
   constructor(
     private readonly nativeStepExecutor?: NativeStepExecutor,
@@ -281,15 +289,15 @@ export class OzoneBackend {
             ? (this.state = TargetState.Running, { ok: true, data: 'Running' })
             : { ok: false, error: 'Run failed' };
         case 'stepOver':
-          if (this.isCmsisDapOwner()) return this.unsupportedSessionCapability('stepOver');
+          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepOver();
           return await this.profileStepCommand('stepOver', () => this.doStepOver());
         case 'stepInto':
-          if (this.isCmsisDapOwner()) return await this.doStepIntoInstruction();
+          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepInto();
           return await this.profileStepCommand('stepInto', () => this.doStepInto());
         case 'stepIntoInstruction':
           return await this.doStepIntoInstruction();
         case 'stepOut':
-          if (this.isCmsisDapOwner()) return this.unsupportedSessionCapability('stepOut');
+          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepOut();
           return await this.profileStepCommand('stepOut', () => this.doStepOut());
         case 'reset':
           this.clearNativeStopInfo('reset requested');
@@ -297,19 +305,22 @@ export class OzoneBackend {
           return (await this.targetReset())
             ? { ok: true, data: 'Reset' }
             : { ok: false, error: 'Reset failed' };
+        case 'runToEntryPoint':
+          return await this.doRunToEntryPoint(command.symbol, command.reset);
         case 'setBreakpoint':
           return await this.doSetBreakpoint(command.file, command.line, command.condition);
         case 'clearBreakpoint':
           return await this.doClearBreakpoint(command.id);
         case 'clearAllBreakpoints':
+          if (this.isCmsisDapOwner()) return await this.doClearAllCmsisDapBreakpoints();
           if (!(await this.targetClearAllBreakpoints())) return { ok: false, error: 'Clear all breakpoints failed' };
           this.tempBreakpoint = null;
           this.stepOverClearedBps = [];
           return { ok: true, data: 'All breakpoints cleared' };
         case 'getRegisters':
-          return await this.doGetRegisters();
+          return await this.doGetRegisters(command.signal);
         case 'getLocals':
-          return await this.doGetLocals();
+          return await this.doGetLocals(command.signal);
         case 'getCallStack':
           return await this.doGetCallStack();
         case 'readMemory':
@@ -353,14 +364,29 @@ case 'readVariableRuntime':
           return this.doClearBreakpointAtAddr(command.addr);
         case 'setBreakpointAtAddr':
           return this.doSetBreakpointAtAddr(command.addr);
-        case 'evaluateExpression':
-          return await this.doEvaluateExpression(
-            command.expression,
-            command.force,
-            command.expandedExpressions === undefined
-              ? undefined
-              : { expandedExpressions: new Set(command.expandedExpressions) },
-          );
+        case 'evaluateExpression': {
+          const watchContext = command.expandedExpressions === undefined && !command.signal
+            ? undefined
+            : {
+              expandedExpressions: command.expandedExpressions === undefined
+                ? undefined
+                : new Set(command.expandedExpressions),
+              signal: command.signal,
+            };
+          try {
+            return await this.doEvaluateExpression(command.expression, command.force, watchContext);
+          } catch (error) {
+            if (error instanceof EvaluateCancelledError) {
+              return {
+                ok: false,
+                errorCode: 'EvaluateCancelled',
+                error: error.message,
+                targetState: this.state,
+              };
+            }
+            throw error;
+          }
+        }
         case 'prepareFastDataSampling':
           return { ok: true, data: this.prepareFastDataSampling(command.expressions) };
         case 'readFastDataSampling':
@@ -568,6 +594,70 @@ case 'readVariableRuntime':
     return ownerKind === 'cmsis-dap';
   }
 
+  private async doRunToEntryPoint(symbolName: string, reset: boolean): Promise<OzoneCommandResult> {
+    const symbol = symbolName.trim();
+    if (!this.isCmsisDapOwner() || !this.sessionTarget || !this.sessionTarget.runToAddress) {
+      return this.unsupportedSessionCapability('runToEntryPoint');
+    }
+
+    const entry = symbol ? findSymbol(this.symbols, symbol) : undefined;
+    if (!entry || !Number.isFinite(entry.address)) {
+      const haltResult = await this.sessionTarget.halt();
+      if (!haltResult.ok) return this.sessionOwnerFailure(haltResult, 'EntryPointRecoveryFailed');
+      this.state = TargetState.Halted;
+      return {
+        ok: false,
+        errorCode: 'EntryPointUnavailable',
+        error: `EntryPointUnavailable: symbol "${symbol || symbolName}" was not found in the loaded ELF`,
+        targetState: 'Halted',
+        diagnostics: { ownerKind: 'cmsis-dap', symbol: symbol || symbolName, symbolCount: this.symbols.length },
+      };
+    }
+
+    const requestedAddress = entry.address >>> 0;
+    const entryAddress = requestedAddress & ~1;
+    log.step(
+      `startup-stop owner=cmsis-dap symbol=${symbol} requestedAddress=0x${requestedAddress.toString(16)}`
+      + ` entryAddress=0x${entryAddress.toString(16)} thumbBit=${requestedAddress & 1} reset=${reset}`,
+    );
+    this.clearNativeStopInfo('CMSIS-DAP startup stop requested');
+    const result = await this.sessionTarget.runToAddress(requestedAddress, reset);
+    if (!result.ok) return this.sessionOwnerFailure(result, 'StartupStopFailed');
+    if (!result.data || result.targetState !== 'Halted') {
+      return {
+        ok: false,
+        errorCode: 'MalformedResponse',
+        error: 'MalformedResponse: CMSIS-DAP runToAddress did not return a halted startup result',
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: 'cmsis-dap', symbol, entryAddress },
+      };
+    }
+    const actualPc = result.data.pc & ~1;
+    if (!result.data.cleanupOk || actualPc !== entryAddress) {
+      const errorCode = !result.data.cleanupOk ? 'FpbCleanupFailed' : 'StartupEntryNotReached';
+      return {
+        ok: false,
+        errorCode,
+        error: `${errorCode}: startup stop returned PC 0x${actualPc.toString(16)} for ${symbol} at 0x${entryAddress.toString(16)}`,
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: 'cmsis-dap', symbol, entryAddress, actualPc },
+      };
+    }
+    this.state = TargetState.Halted;
+    return {
+      ok: true,
+      data: {
+        ...result.data,
+        symbol,
+        entryAddress,
+        pc: actualPc,
+        state: TargetState.Halted,
+      },
+    };
+  }
+
   private ownerControlResult(
     result: CppJLinkResult,
     fallbackData: string,
@@ -580,13 +670,21 @@ case 'readVariableRuntime':
         errorCode,
         error: `${errorCode}: ${result.message}`,
         diagnostics: result.diagnostics,
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
       };
     }
     const resultState = result.data && typeof result.data === 'object' && 'state' in result.data
       ? String((result.data as unknown as { state: unknown }).state)
       : result.targetState;
+    const breakpointHitBeforeRunningObserved = operation === 'run'
+      && resultState === 'Halted'
+      && result.data !== null
+      && typeof result.data === 'object'
+      && (result.data as unknown as { breakpointHitBeforeRunningObserved?: unknown })
+        .breakpointHitBeforeRunningObserved === true;
     if ((operation === 'halt' && resultState !== 'Halted')
-      || (operation === 'run' && resultState !== 'Running')
+      || (operation === 'run' && resultState !== 'Running' && !breakpointHitBeforeRunningObserved)
       || (operation === 'reset' && resultState !== 'Halted' && resultState !== 'Running')) {
       const errorCode = 'TargetStateInvalid';
       return {
@@ -596,12 +694,26 @@ case 'readVariableRuntime':
         diagnostics: { operation, targetState: resultState },
       };
     }
-    this.state = operation === 'halt' || (operation === 'reset' && resultState === 'Halted')
+    this.state = operation === 'halt'
+      || breakpointHitBeforeRunningObserved
+      || (operation === 'reset' && resultState === 'Halted')
       ? TargetState.Halted
       : operation === 'run'
         ? TargetState.Running
         : TargetState.Connected;
     return { ok: true, data: result.data ?? fallbackData };
+  }
+
+  private sessionOwnerFailure(result: CppJLinkResult<any>, fallbackCode: string): OzoneCommandResult {
+    const errorCode = result.errorCode || fallbackCode;
+    return {
+      ok: false,
+      errorCode,
+      error: `${errorCode}: ${result.message}`,
+      diagnostics: result.diagnostics,
+      targetState: result.targetState,
+      elapsedMs: result.elapsedMs,
+    };
   }
 
   private unsupportedSessionCapability(capability: string): OzoneCommandResult {
@@ -647,6 +759,7 @@ case 'readVariableRuntime':
     if (addr < 0x08000000 || addr >= 0x20100000) return { ok: false, error: `Resolved address 0x${addr.toString(16)} for ${file}:${line} is outside valid flash range` };
     log.step(`resolved ${file}:${line} → 0x${addr.toString(16).toUpperCase()}`);
     log.step(`setBreakpoint calling target.setBreakpoint(${addr.toString(16)})`);
+    if (this.isCmsisDapOwner()) return this.doSetCmsisDapBreakpointAtAddress(addr);
     const bpIndex = await this.targetSetBreakpoint(addr);
     log.step(`setBreakpoint target result=${bpIndex}`);
     if (bpIndex === null) return { ok: false, error: `Failed to set breakpoint at 0x${addr.toString(16)}` };
@@ -656,6 +769,12 @@ case 'readVariableRuntime':
 
   private async doClearBreakpoint(id: number): Promise<OzoneCommandResult> {
     log.step(`doClearBreakpoint id=${id}`);
+    if (this.isCmsisDapOwner() && this.sessionTarget) {
+      const result = await this.sessionTarget.clearBreakpoint(id);
+      if (!result.ok) return this.sessionOwnerFailure(result, 'BreakpointClearFailed');
+      if (id >= 0 && id < this.sessionBreakpointSlots.length) this.sessionBreakpointSlots[id] = null;
+      return { ok: true, data: result.data ?? null };
+    }
     const result = await this.targetClearBreakpoint(id);
     log.step(`doClearBreakpoint result=${result}`);
     return result
@@ -665,6 +784,12 @@ case 'readVariableRuntime':
 
   private async doClearBreakpointAtAddr(addr: number): Promise<OzoneCommandResult> {
     const index = this.currentBreakpointSlots().indexOf(addr);
+    if (this.isCmsisDapOwner() && this.sessionTarget && index >= 0) {
+      const result = await this.sessionTarget.clearBreakpoint(index);
+      if (!result.ok) return this.sessionOwnerFailure(result, 'BreakpointClearFailed');
+      this.sessionBreakpointSlots[index] = null;
+      return { ok: true, data: { index, ...(result.data || {}) } };
+    }
     if (index >= 0 && await this.targetClearBreakpoint(index)) {
       return { ok: true, data: { index } };
     }
@@ -672,6 +797,7 @@ case 'readVariableRuntime':
   }
 
   private async doSetBreakpointAtAddr(addr: number): Promise<OzoneCommandResult> {
+    if (this.isCmsisDapOwner()) return this.doSetCmsisDapBreakpointAtAddress(addr);
     const index = await this.targetSetBreakpoint(addr);
     if (index !== null) {
       return { ok: true, data: { id: index, address: addr } };
@@ -679,17 +805,58 @@ case 'readVariableRuntime':
     return { ok: false, error: `Failed to set breakpoint at 0x${addr.toString(16)}` };
   }
 
-  private async doGetRegisters(): Promise<OzoneCommandResult> {
+  private async doSetCmsisDapBreakpointAtAddress(addr: number): Promise<OzoneCommandResult> {
+    if (!this.sessionTarget) {
+      return { ok: false, errorCode: 'TargetOwnerUnavailable', error: 'TargetOwnerUnavailable: CMSIS-DAP owner is unavailable' };
+    }
+    const result = await this.sessionTarget.setBreakpoint(addr);
+    if (!result.ok) return this.sessionOwnerFailure(result, 'BreakpointSetFailed');
+    if (!result.data || !Number.isInteger(result.data.id) || result.data.id < 0) {
+      return {
+        ok: false,
+        errorCode: 'MalformedResponse',
+        error: 'MalformedResponse: CMSIS-DAP setBreakpoint returned no valid slot',
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
+      };
+    }
+    this.sessionBreakpointSlots[result.data.id] = addr;
+    return { ok: true, data: { address: addr, ...result.data } };
+  }
+
+  private async doClearAllCmsisDapBreakpoints(): Promise<OzoneCommandResult> {
+    if (!this.sessionTarget) {
+      return { ok: false, errorCode: 'TargetOwnerUnavailable', error: 'TargetOwnerUnavailable: CMSIS-DAP owner is unavailable' };
+    }
+    const result = await this.sessionTarget.clearAllBreakpoints();
+    if (!result.ok) return this.sessionOwnerFailure(result, 'BreakpointClearFailed');
+    this.sessionBreakpointSlots.fill(null);
+    this.tempBreakpoint = null;
+    this.stepOverClearedBps = [];
+    return { ok: true, data: result.data ?? 'All breakpoints cleared' };
+  }
+
+  private async doGetRegisters(signal?: AbortSignal): Promise<OzoneCommandResult> {
+    if (signal?.aborted) return { ok: true, data: [] };
     const isHalted = this.nativeStepExecutor?.usingNative && this.lastNativeStopInfo
       ? true
       : await this.targetIsHalted();
+    if (signal?.aborted) return { ok: true, data: [] };
     if (!isHalted) {
       return { ok: true, data: [] };
     }
     const registers: RegisterValue[] = [];
 
     for (const [name, idx] of Object.entries(REG_INDEXES)) {
+      if (signal?.aborted) {
+        log.dap(`getRegisters cancelled before register=${name}`);
+        return { ok: true, data: [] };
+      }
       const val = await this.readRegisterValue(idx, name);
+      if (signal?.aborted) {
+        log.dap(`getRegisters cancelled after register=${name}`);
+        return { ok: true, data: [] };
+      }
       if (val !== null) {
         registers.push({
           name,
@@ -727,21 +894,72 @@ case 'readVariableRuntime':
     return { ok: true, data: { name, value: val, hex: `0x${val.toString(16).toUpperCase().padStart(8, '0')}` } };
   }
 
-  private async doGetLocals(): Promise<OzoneCommandResult> {
+  private async doGetLocals(signal?: AbortSignal): Promise<OzoneCommandResult> {
+    if (signal?.aborted) return { ok: true, data: [] };
     const isHalted = await this.targetIsHalted();
+    if (signal?.aborted) return { ok: true, data: [] };
     if (!isHalted) {
       return { ok: true, data: [] };
     }
+    const dwarfLocals = this.dwarfInfo.localVariables;
+    const cfaRows = this.dwarfInfo.cfaRows;
+    if (dwarfLocals && cfaRows) {
+      const pcValue = await this.targetReadRegister(REG_INDEXES.PC);
+      if (signal?.aborted || pcValue === null) return { ok: true, data: [] };
+      const pc = pcValue & ~1;
+      const cfaRow = cfaRows.find(row => pc >= row.lowPc && pc < row.highPc);
+      if (!cfaRow) return { ok: true, data: [] };
+      const cfaRegister = await this.targetReadRegister(cfaRow.registerIndex);
+      if (signal?.aborted || cfaRegister === null) return { ok: true, data: [] };
+      const cfa = (cfaRegister + cfaRow.offset) >>> 0;
+      const variables: Variable[] = [];
+      const activeLocals = dwarfLocals
+        .filter(local => pc >= local.lowPc && pc < local.highPc)
+        .sort((left, right) => (left.highPc - left.lowPc) - (right.highPc - right.lowPc));
+      const seenNames = new Set<string>();
+
+      for (const local of activeLocals) {
+        if (seenNames.has(local.name)) continue;
+        seenNames.add(local.name);
+        if (signal?.aborted) return { ok: true, data: [] };
+        const resolvedType = this.resolveDwarfType(local.typeOffset);
+        const readSize = this.getScalarReadSize(undefined, resolvedType);
+        const address = (cfa + local.fbregOffset) >>> 0;
+        const raw = await this.targetReadMemory(address, readSize);
+        if (signal?.aborted) return { ok: true, data: [] };
+        if (!raw || raw.length < readSize) continue;
+        const formatted = this.isFloatType(resolvedType)
+          ? this.readBytesAsFloat(raw, readSize).toString()
+          : this.formatScalarValue(raw, readSize, resolvedType).display;
+        variables.push({
+          name: local.name,
+          type: this.getDwarfTypeName(local.typeOffset) || resolvedType?.name || 'unknown',
+          value: formatted,
+          address,
+        });
+      }
+
+      return { ok: true, data: variables };
+    }
+
     const variables: Variable[] = [];
     const localSymbols = this.symbols.filter(s =>
       s.type === 'd' || s.type === 'D' || s.type === 'B' || s.type === 'b'
     );
 
     for (const sym of localSymbols.slice(0, 50)) {
+      if (signal?.aborted) {
+        log.dap(`getLocals cancelled before symbol=${sym.name}`);
+        return { ok: true, data: [] };
+      }
       const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
       const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
       const readSize = this.getScalarReadSize(sym.size, resolvedType);
       const raw = await this.targetReadMemory(sym.address, readSize);
+      if (signal?.aborted) {
+        log.dap(`getLocals cancelled after symbol=${sym.name}`);
+        return { ok: true, data: [] };
+      }
       let value: string;
       if (raw) {
         value = this.formatScalarValue(raw, readSize, resolvedType).display;
@@ -1022,6 +1240,145 @@ case 'readVariableRuntime':
     return this.doSingleStep();
   }
 
+  private async doCmsisDapStepInto(): Promise<OzoneCommandResult> {
+    const pc = await this.readRegisterValue(REG_INDEXES.PC, 'PC');
+    if (pc === null) return this.cmsisDapSourceStepPreparationError('stepInto', 'cannot read PC');
+    const bounds = this.resolveNativeLineBounds(pc);
+    if (!bounds) return this.cmsisDapSourceStepPreparationError('stepInto', `no source-line range contains PC 0x${pc.toString(16)}`);
+    const run = (range: { start: number; end: number }) => this.executeCmsisDapSourceStep(
+      'stepInto',
+      () => this.sessionTarget!.stepIntoSourceLine({
+        lineStart: range.start,
+        lineEnd: range.end,
+        maxInstructionSteps: 32,
+      }),
+    );
+    const result = await run(bounds);
+    return this.continueCmsisDapStepAcrossSameSourceLine('stepInto', pc, bounds, result, run);
+  }
+
+  private async doCmsisDapStepOver(): Promise<OzoneCommandResult> {
+    const pc = await this.readRegisterValue(REG_INDEXES.PC, 'PC');
+    if (pc === null) return this.cmsisDapSourceStepPreparationError('stepOver', 'cannot read PC');
+    const bounds = this.resolveNativeLineBounds(pc);
+    if (!bounds) return this.cmsisDapSourceStepPreparationError('stepOver', `no source-line range contains PC 0x${pc.toString(16)}`);
+    const run = (range: { start: number; end: number }) => this.executeCmsisDapSourceStep(
+      'stepOver',
+      () => this.sessionTarget!.stepOverSourceLine({
+        lineStart: range.start,
+        lineEnd: range.end,
+        waitTimeoutMs: 1000,
+        maxInstructionSteps: 128,
+        breakpoints: this.snapshotBreakpoints(),
+      }),
+    );
+    const result = await run(bounds);
+    return this.continueCmsisDapStepAcrossSameSourceLine('stepOver', pc, bounds, result, run);
+  }
+
+  private async continueCmsisDapStepAcrossSameSourceLine(
+    kind: 'stepInto' | 'stepOver',
+    startPc: number,
+    firstBounds: { start: number; end: number },
+    result: OzoneCommandResult,
+    run: (bounds: { start: number; end: number }) => Promise<OzoneCommandResult>,
+  ): Promise<OzoneCommandResult> {
+    if (!result.ok) return result;
+    const startLoc = this.resolveAddressLoc(startPc);
+    const step = result.data as {
+      pcAfter?: number;
+      classification?: string;
+      enteredCall?: boolean;
+    } | undefined;
+    if (!startLoc || typeof step?.pcAfter !== 'number') return result;
+    if (kind === 'stepInto' && (step.enteredCall || step.classification === 'call')) return result;
+
+    const afterLoc = this.resolveAddressLoc(step.pcAfter);
+    if (!afterLoc || afterLoc.file !== startLoc.file || afterLoc.line !== startLoc.line) return result;
+    const continuationBounds = this.resolveNativeLineBounds(step.pcAfter);
+    if (!continuationBounds || continuationBounds.start === firstBounds.start) return result;
+
+    log.step(
+      `CMSIS-DAP ${kind} phase=continueSameSourceLine pc=0x${step.pcAfter.toString(16)}`
+      + ` source=${afterLoc.file}:${afterLoc.line}`
+      + ` lineRange=0x${continuationBounds.start.toString(16)}..0x${continuationBounds.end.toString(16)}`,
+    );
+    return run(continuationBounds);
+  }
+
+  private async doCmsisDapStepOut(): Promise<OzoneCommandResult> {
+    const pc = await this.readRegisterValue(REG_INDEXES.PC, 'PC');
+    if (pc === null) return this.cmsisDapSourceStepPreparationError('stepOut', 'cannot read PC');
+    const functionRange = this.resolveFunctionRange(pc);
+    if (!functionRange) return this.cmsisDapSourceStepPreparationError('stepOut', `no function contains PC 0x${pc.toString(16)}`);
+    return this.executeCmsisDapSourceStep('stepOut', () => this.sessionTarget!.stepOut({
+      functionStart: functionRange.start,
+      functionEnd: functionRange.end,
+      waitTimeoutMs: 1000,
+      breakpoints: this.snapshotBreakpoints(),
+    }));
+  }
+
+  private cmsisDapSourceStepPreparationError(capability: string, detail: string): OzoneCommandResult {
+    return {
+      ok: false,
+      errorCode: 'SourceLocationUnavailable',
+      error: `SourceLocationUnavailable: CMSIS-DAP ${capability} ${detail}`,
+      targetState: 'Halted',
+      diagnostics: { capability, ownerKind: 'cmsis-dap', detail },
+    };
+  }
+
+  private async executeCmsisDapSourceStep(
+    kind: 'stepInto' | 'stepOver' | 'stepOut',
+    run: () => Promise<CppJLinkResult<NativeStepIntoDiagnostics | NativeStepOverDiagnostics | NativeStepOutDiagnostics>>,
+  ): Promise<OzoneCommandResult> {
+    const started = Date.now();
+    const result = await run();
+    const diagnostics = result.data;
+    log.step(
+      `CMSIS-DAP ${kind} owner=cmsis-dap ok=${result.ok}`
+      + ` targetState=${result.targetState} elapsedMs=${result.elapsedMs}`
+      + (diagnostics
+        ? ` pc=0x${diagnostics.pcBefore.toString(16)}->0x${diagnostics.pcAfter.toString(16)}`
+          + ` class=${diagnostics.classification} cleanup=${diagnostics.cleanupOk}`
+        : ` errorCode=${result.errorCode || 'unknown'} diagnostics=${JSON.stringify(result.diagnostics || {})}`),
+    );
+    this.stepProfileMark('CMSIS-DAP source state machine', started, `kind=${kind}`);
+    if (!result.ok) {
+      return {
+        ok: false,
+        errorCode: result.errorCode || 'CmsisDapSourceStepFailed',
+        error: `${result.errorCode || 'CmsisDapSourceStepFailed'}: ${result.message}`,
+        diagnostics: result.diagnostics,
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
+      };
+    }
+    if (result.targetState !== 'Halted' || !diagnostics) {
+      return {
+        ok: false,
+        errorCode: result.targetState !== 'Halted' ? 'TargetStateInvalid' : 'MalformedResponse',
+        error: result.targetState !== 'Halted'
+          ? `TargetStateInvalid: CMSIS-DAP ${kind} returned ${result.targetState}`
+          : `MalformedResponse: CMSIS-DAP ${kind} returned no diagnostics`,
+        diagnostics: result.diagnostics,
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
+      };
+    }
+    this.state = TargetState.Halted;
+    return {
+      ok: true,
+      data: {
+        mode: 'cmsis-dap',
+        targetState: result.targetState,
+        helperElapsedMs: result.elapsedMs,
+        ...diagnostics,
+      },
+    };
+  }
+
   private async doStepIntoLegacy(): Promise<OzoneCommandResult> {
     const haltedBefore = await this.ensureHalted();
     if (!haltedBefore) return { ok: false, error: 'Cannot halt CPU for step into' };
@@ -1268,7 +1625,7 @@ case 'readVariableRuntime':
   private snapshotBreakpoints(): Record<string, number> {
     return Object.fromEntries(
       this.currentBreakpointSlots()
-        .map((address, slot) => address === null ? null : [String(slot), address] as const)
+        .map((address, slot) => address == null ? null : [String(slot), address] as const)
         .filter((entry): entry is readonly [string, number] => entry !== null),
     );
   }
@@ -2276,14 +2633,14 @@ case 'readVariableRuntime':
       for (let index = 0; index < segments.length; index++) {
         const [, operator, fieldName] = segments[index];
         if (operator === '->' && pointerAddress === undefined) return null;
-        if (currentType?.kind !== 'struct' || !currentType.fields) return null;
+        if ((currentType?.kind !== 'struct' && currentType?.kind !== 'union') || !currentType.fields) return null;
         const field = currentType.fields.find(candidate => candidate.name === fieldName);
         if (!field) return null;
         const fieldType = this.resolveDwarfType(field.typeOffset);
         fieldOffset += field.byteOffset;
 
         if (index < segments.length - 1) {
-          if (fieldType?.kind !== 'struct') return null;
+          if (fieldType?.kind !== 'struct' && fieldType?.kind !== 'union') return null;
           currentType = fieldType;
           continue;
         }
@@ -2326,7 +2683,7 @@ case 'readVariableRuntime':
 
   private isFastScalarType(info: { kind?: string; byteSize?: number } | null): boolean {
     if (!info) return true;
-    if (info.kind === 'struct' || info.kind === 'array') return false;
+    if (info.kind === 'struct' || info.kind === 'union' || info.kind === 'array') return false;
     const size = info.byteSize || 4;
     return size > 0 && size <= 8;
   }
@@ -2397,9 +2754,11 @@ case 'readVariableRuntime':
         continue;
       }
 
-      let value: number;
+      let value: number | string;
       let display: string;
       let hex: string;
+      let exactValue: string | undefined;
+      let numericValueExact: boolean | undefined;
       if (spec.isFloat) {
         value = this.readBytesAsFloat(raw, spec.size);
         display = spec.size === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
@@ -2409,6 +2768,8 @@ case 'readVariableRuntime':
         value = formatted.value;
         display = formatted.display;
         hex = formatted.hex;
+        exactValue = formatted.exactValue;
+        numericValueExact = formatted.numericValueExact;
       }
 
       results.push({
@@ -2416,6 +2777,8 @@ case 'readVariableRuntime':
         value,
         display,
         hex,
+        exactValue,
+        numericValueExact,
         address: resolvedAddresses[index],
         typeName: spec.typeName,
       });
@@ -2428,6 +2791,7 @@ case 'readVariableRuntime':
     force: boolean = false,
     watchContext?: WatchEvaluationContext,
   ): Promise<OzoneCommandResult> {
+    this.throwIfEvaluationCancelled(watchContext);
     expression = expression.trim();
     const isRTOS = expression === 'uxCurrentNumberOfTasks' || expression === 'pxCurrentTCB' || expression === 'pxReadyTasksLists';
 
@@ -2436,16 +2800,16 @@ case 'readVariableRuntime':
       return { ok: true, data: this.makeNumericWatchValue(expression, sizeofValue, 'size_t', false) };
     }
 
-    const derefValue = await this.evaluatePointerDereferenceExpression(expression);
+    const derefValue = await this.evaluatePointerDereferenceExpression(expression, watchContext);
     if (derefValue) return { ok: true, data: derefValue };
 
-    const charPointerValue = await this.evaluateCharPointerExpression(expression);
+    const charPointerValue = await this.evaluateCharPointerExpression(expression, watchContext);
     if (charPointerValue) return { ok: true, data: charPointerValue };
 
-    const castStructValue = await this.evaluateCastStructExpression(expression);
+    const castStructValue = await this.evaluateCastStructExpression(expression, watchContext);
     if (castStructValue) return { ok: true, data: castStructValue };
 
-    const fieldValue = await this.evaluateFieldAccessExpression(expression);
+    const fieldValue = await this.evaluateFieldAccessExpression(expression, watchContext);
     if (fieldValue) return { ok: true, data: fieldValue };
 
     const arithmeticValue = this.evaluateIntegerExpression(expression);
@@ -2485,17 +2849,21 @@ case 'readVariableRuntime':
             const elemAddr = baseSym.address + index * elemSize;
 
             if (!force && !(await this.targetIsHalted())) {
+              this.throwIfEvaluationCancelled(watchContext);
               return { ok: false, error: 'process is running' };
             }
             if (!force) {
               await new Promise<void>(r => setTimeout(r, 100));
+              this.throwIfEvaluationCancelled(watchContext);
             }
 
-            const raw = await this.targetReadMemory(elemAddr, elemSize);
+            const raw = await this.evaluateReadMemory(elemAddr, elemSize, watchContext);
             if (raw) {
               const isFloat = this.isFloatType(elemType);
-              let value: number;
+              let value: number | string;
               let display: string;
+              let exactValue: string | undefined;
+              let numericValueExact: boolean | undefined;
               if (isFloat && raw.length >= (elemType?.byteSize || 4)) {
                 value = this.readBytesAsFloat(raw, elemType!.byteSize);
                 display = elemType!.byteSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
@@ -2503,10 +2871,12 @@ case 'readVariableRuntime':
                 const formatted = this.formatScalarValue(raw, elemSize, elemType);
                 value = formatted.value;
                 display = formatted.display;
+                exactValue = formatted.exactValue;
+                numericValueExact = formatted.numericValueExact;
               }
               return {
                 ok: true,
-                data: { expression, value, display, hex: this.formatScalarValue(raw, elemSize, elemType).hex, address: elemAddr, typeName: elemTypeName } as WatchValue,
+                data: { expression, value, display, hex: this.formatScalarValue(raw, elemSize, elemType).hex, exactValue, numericValueExact, address: elemAddr, typeName: elemTypeName } as WatchValue,
               };
             }
             return { ok: false, error: `read failed at 0x${elemAddr.toString(16)}` };
@@ -2523,7 +2893,9 @@ case 'readVariableRuntime':
       const regName = expression.startsWith('$') ? expression.slice(1) : expression;
       const regIdx = REG_INDEXES[regName.toUpperCase()];
       if (regIdx !== undefined) {
+        this.throwIfEvaluationCancelled(watchContext);
         const val = await this.targetReadRegister(regIdx);
+        this.throwIfEvaluationCancelled(watchContext);
         if (val !== null) {
           return {
             ok: true,
@@ -2540,16 +2912,20 @@ case 'readVariableRuntime':
     }
 
     if (isRTOS || expression.startsWith('ux') || expression.startsWith('px') || expression.startsWith('x')) {
-      log.step(`sym=${sym.name} addr=0x${sym.address.toString(16)} size=${sym.size} type=${sym.type} isHalted=${await this.targetIsHalted()} force=${force}`);
+      const isHalted = await this.targetIsHalted();
+      this.throwIfEvaluationCancelled(watchContext);
+      log.step(`sym=${sym.name} addr=0x${sym.address.toString(16)} size=${sym.size} type=${sym.type} isHalted=${isHalted} force=${force}`);
     }
 
     if (!force && !(await this.targetIsHalted())) {
+      this.throwIfEvaluationCancelled(watchContext);
       log.eval(`doEvaluateExpression: CPU is running, returning running`);
       return { ok: false, error: 'process is running' };
     }
 
     if (!force) {
       await new Promise<void>(r => setTimeout(r, 100));
+      this.throwIfEvaluationCancelled(watchContext);
     }
 
     const varTypeOffset = this.dwarfInfo.varToType.get(sym.name);
@@ -2557,7 +2933,35 @@ case 'readVariableRuntime':
     const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
     if (varTypeOffset) {
       log.eval(`doEvaluateExpression: resolvedType kind=${resolvedType?.kind} name=${resolvedType?.name} fields=${resolvedType?.fields?.length || 0}`);
-      if (resolvedType && resolvedType.kind === 'struct' && resolvedType.fields && resolvedType.fields.length > 0) {
+      if (resolvedType?.kind === 'pointer' && resolvedType.typeOffset) {
+        const pointee = this.resolveDwarfType(resolvedType.typeOffset);
+        if (this.isCharType(pointee)) {
+          const pointerRaw = await this.evaluateReadMemory(sym.address, this.getScalarReadSize(sym.size, resolvedType), watchContext);
+          if (!pointerRaw) return { ok: false, error: `read failed at 0x${sym.address.toString(16)}` };
+          const pointerAddress = this.readUnsignedLittleEndian(pointerRaw, pointerRaw.length) >>> 0;
+          if (pointerAddress === 0) {
+            return {
+              ok: true,
+              data: { expression, value: 0, display: 'NULL', hex: '0x00000000', address: sym.address, typeName: this.getDwarfTypeName(varTypeOffset) } as WatchValue,
+            };
+          }
+          const stringValue = await this.readBoundedString(pointerAddress, 256, watchContext);
+          if (!stringValue) return { ok: false, error: `read failed at 0x${pointerAddress.toString(16)}` };
+          return {
+            ok: true,
+            data: {
+              expression,
+              value: pointerAddress,
+              display: stringValue.display,
+              hex: `0x${pointerAddress.toString(16).toUpperCase()}`,
+              address: sym.address,
+              typeName: this.getDwarfTypeName(varTypeOffset),
+              error: stringValue.error,
+            } as WatchValue,
+          };
+        }
+      }
+      if (resolvedType && (resolvedType.kind === 'struct' || resolvedType.kind === 'union') && resolvedType.fields && resolvedType.fields.length > 0) {
         const structTypeName = resolvedType.typeName || resolvedType.name || 'struct';
         if (!this.shouldExpandWatchNode(expression, watchContext)) {
           return {
@@ -2575,7 +2979,7 @@ case 'readVariableRuntime':
         }
         const readLen = resolvedType.byteSize || sym.size || 4;
         log.eval(`doEvaluateExpression: reading struct memory at 0x${sym.address.toString(16)} len=${readLen}`);
-        const raw = await this.targetReadMemory(sym.address, readLen);
+        const raw = await this.evaluateReadMemory(sym.address, readLen, watchContext);
         if (raw) {
           log.eval(`doEvaluateExpression: raw bytes length=${raw.length}`);
           const children = await this.evaluateStructFields(raw, resolvedType.fields, resolvedType.typeDefs || this.dwarfInfo.typeDefs, sym.address, expression, 0, watchContext);
@@ -2606,7 +3010,9 @@ case 'readVariableRuntime':
         const elemSize = elemType?.byteSize || 4;
         const totalBytes = count * elemSize;
         const readLen = Math.max(totalBytes, sym.size || 4);
-        if (!this.shouldExpandWatchNode(expression, watchContext)) {
+        const isCharArray = this.isCharType(elemType);
+        const expanded = this.shouldExpandWatchNode(expression, watchContext);
+        if (!expanded && !isCharArray) {
           return {
             ok: true,
             data: {
@@ -2621,13 +3027,30 @@ case 'readVariableRuntime':
           };
         }
         log.eval(`doEvaluateExpression: reading array memory at 0x${sym.address.toString(16)} count=${count} elemSize=${elemSize} len=${readLen}`);
-        const raw = await this.targetReadMemory(sym.address, readLen);
+        const raw = await this.evaluateReadMemory(sym.address, readLen, watchContext);
         if (raw) {
+          const stringValue = isCharArray ? this.formatBoundedString(raw.slice(0, totalBytes)) : undefined;
+          if (isCharArray && !expanded) {
+            return {
+              ok: true,
+              data: {
+                expression,
+                value: sym.address,
+                display: stringValue!.display,
+                hex: `0x${sym.address.toString(16).toUpperCase()}`,
+                address: sym.address,
+                typeName: arrayTypeName,
+                hasChildren: count > 0,
+                error: stringValue!.error,
+              } as WatchValue,
+            };
+          }
           const children: WatchValue[] = [];
           for (let i = 0; i < count; i++) {
+            this.throwIfEvaluationCancelled(watchContext);
             const elemAddr = sym.address + i * elemSize;
             const elemRawOffset = i * elemSize;
-            if (elemType?.kind === 'struct' && elemType.fields) {
+            if ((elemType?.kind === 'struct' || elemType?.kind === 'union') && elemType.fields) {
               const childRaw = raw.slice(elemRawOffset, elemRawOffset + elemSize);
               const elementExpression = `${expression}[${i}]`;
               const structChildren = this.shouldExpandWatchNode(elementExpression, watchContext)
@@ -2654,6 +3077,8 @@ case 'readVariableRuntime':
                 value: formatted.value,
                 display: formatted.display,
                 hex: formatted.hex,
+                exactValue: formatted.exactValue,
+                numericValueExact: formatted.numericValueExact,
                 address: elemAddr,
                 typeName: elemTypeName,
               });
@@ -2664,14 +3089,15 @@ case 'readVariableRuntime':
             data: {
               expression,
               value: children[0]?.value ?? 0,
-              display: children.length > 0
+              display: stringValue?.display || (children.length > 0
                 ? `${count} elems [${children.slice(0, 3).map(c => c.display).join(', ')}${children.length > 3 ? ', ...' : ''}]`
-                : `${count} elems`,
+                : `${count} elems`),
               hex: '',
               address: sym.address,
               typeName: arrayTypeName,
               hasChildren: count > 0,
               children,
+              error: stringValue?.error,
             } as WatchValue,
           };
         } else {
@@ -2688,7 +3114,7 @@ case 'readVariableRuntime':
     if (isRTOS || expression.startsWith('ux') || expression.startsWith('px') || expression.startsWith('x')) {
       log.eval(`reading mem addr=0x${sym.address.toString(16)} size=${readSize}`);
     }
-    const raw = await this.targetReadMemory(sym.address, readSize);
+    const raw = await this.evaluateReadMemory(sym.address, readSize, watchContext);
 
     if (!raw) {
       if (isRTOS) log.eval(`memory read failed for "${expression}" at 0x${sym.address.toString(16)}`);
@@ -2697,8 +3123,10 @@ case 'readVariableRuntime':
 
     const isFloat = this.isFloatType(resolvedType);
 
-    let value: number;
+    let value: number | string;
     let display: string;
+    let exactValue: string | undefined;
+    let numericValueExact: boolean | undefined;
     if (isFloat && raw.length >= (resolvedType?.byteSize || 4)) {
       value = this.readBytesAsFloat(raw, resolvedType!.byteSize);
       if (resolvedType!.byteSize === 8) display = `${value.toExponential(6)}`;
@@ -2707,6 +3135,11 @@ case 'readVariableRuntime':
       const formatted = this.formatScalarValue(raw, readSize, resolvedType);
       value = formatted.value;
       display = formatted.display;
+      exactValue = formatted.exactValue;
+      numericValueExact = formatted.numericValueExact;
+    }
+    if (this.isFunctionPointerType(resolvedType) && typeof value === 'number') {
+      display = this.formatFunctionPointer(value);
     }
     let typeName = '';
     if (varTypeOffset) {
@@ -2714,7 +3147,7 @@ case 'readVariableRuntime':
       if (tn) typeName = tn;
     }
 
-    if (this.shouldUnwrapRuntimeCounter(expression)) {
+    if (this.shouldUnwrapRuntimeCounter(expression) && typeof value === 'number') {
       const counter = this.formatRuntimeCounterValue(expression, value, sym.address, typeName || 'uint32_t');
       value = counter.value;
       display = counter.display;
@@ -2726,11 +3159,12 @@ case 'readVariableRuntime':
     const pointerHasChildren = resolvedType?.kind === 'pointer'
       && !!resolvedType.typeOffset
       && this.pointerTargetHasChildren(resolvedType.typeOffset);
-    const pointerChildren = pointerHasChildren && value && this.shouldExpandWatchNode(expression, watchContext)
-      ? await this.evaluatePointerChildren(value, resolvedType!.typeOffset!, expression, 1, watchContext)
+    const pointerValue = typeof value === 'number' ? value : null;
+    const pointerChildren = pointerHasChildren && pointerValue && this.shouldExpandWatchNode(expression, watchContext)
+      ? await this.evaluatePointerChildren(pointerValue, resolvedType!.typeOffset!, expression, 1, watchContext)
       : undefined;
 
-    const hexValue = this.shouldUnwrapRuntimeCounter(expression)
+    const hexValue = this.shouldUnwrapRuntimeCounter(expression) && typeof value === 'number'
       ? `0x${(this.readUnsignedLittleEndian(raw, readSize) >>> 0).toString(16).toUpperCase().padStart(readSize * 2, '0')}`
       : isFloat
       ? `0x${Array.from(raw.slice(0, readSize)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
@@ -2741,6 +3175,8 @@ case 'readVariableRuntime':
       data: {
         expression, value, display,
         hex: hexValue,
+        exactValue,
+        numericValueExact,
         address: sym.address,
         typeName,
         hasChildren: pointerHasChildren,
@@ -2858,18 +3294,21 @@ case 'readVariableRuntime':
     return resolved?.byteSize || null;
   }
 
-  private async evaluatePointerDereferenceExpression(expression: string): Promise<WatchValue | null> {
+  private async evaluatePointerDereferenceExpression(
+    expression: string,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<WatchValue | null> {
     const match = expression.match(/^\*\s*\(\s*([^)]+?)\s*\*\s*\)\s*(.+)$/);
     if (!match) return null;
     const typeName = this.normalizeTypeName(match[1]);
-    const address = await this.resolveAddressExpression(match[2]);
+    const address = await this.resolveAddressExpression(match[2], watchContext);
     if (address === null) return null;
 
     const builtinSize = this.getBuiltinTypeSize(typeName);
     const offset = this.findDwarfTypeOffsetByName(typeName);
     const resolved = offset ? this.resolveDwarfType(offset) : null;
     const size = builtinSize || this.getScalarReadSize(resolved?.byteSize, resolved) || 4;
-    const raw = await this.targetReadMemory(address, size);
+    const raw = await this.evaluateReadMemory(address, size, watchContext);
     if (!raw) return null;
     const formatted = this.formatScalarValue(raw, size, resolved || { kind: 'base', name: typeName });
     return {
@@ -2878,56 +3317,85 @@ case 'readVariableRuntime':
       value: formatted.value,
       display: formatted.display,
       hex: formatted.hex,
+      exactValue: formatted.exactValue,
+      numericValueExact: formatted.numericValueExact,
       address,
       typeName,
     };
   }
 
-  private async evaluateCharPointerExpression(expression: string): Promise<WatchValue | null> {
+  private formatBoundedString(raw: Uint8Array): { display: string; error?: string } {
+    const terminator = raw.indexOf(0);
+    const bytes = terminator >= 0 ? raw.slice(0, terminator) : raw;
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      text = Array.from(bytes).map(byte => {
+        if (byte >= 0x20 && byte <= 0x7E && byte !== 0x22 && byte !== 0x5C) return String.fromCharCode(byte);
+        return `\\x${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+      }).join('');
+    }
+    return {
+      display: `${JSON.stringify(text)}${terminator >= 0 ? '' : ' (unterminated)'}`,
+      ...(terminator >= 0 ? {} : { error: 'unterminated string' }),
+    };
+  }
+
+  private async readBoundedString(address: number, maxBytes: number, watchContext?: WatchEvaluationContext): Promise<{ display: string; error?: string } | null> {
+    const raw = await this.evaluateReadMemory(address, maxBytes, watchContext);
+    return raw ? this.formatBoundedString(raw) : null;
+  }
+
+  private async evaluateCharPointerExpression(
+    expression: string,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<WatchValue | null> {
     const match = expression.match(/^\(\s*(?:const\s+)?char\s*\*\s*\)\s*(.+)$/);
     if (!match) return null;
-    const address = await this.resolveAddressExpression(match[1]);
+    const address = await this.resolveAddressExpression(match[1], watchContext);
     if (address === null) return null;
-    const raw = await this.targetReadMemory(address, 128);
-    if (!raw) return null;
-    const chars: string[] = [];
-    for (const b of raw) {
-      if (b === 0) break;
-      chars.push((b >= 0x20 && b <= 0x7e) ? String.fromCharCode(b) : '.');
-    }
-    const text = chars.join('');
+    const formatted = await this.readBoundedString(address, 256, watchContext);
+    if (!formatted) return null;
     return {
       expression,
       evaluateName: expression,
       value: address,
-      display: `"${text}"`,
+      display: formatted.display,
       hex: `0x${address.toString(16).toUpperCase()}`,
       address,
       typeName: 'char *',
+      error: formatted.error,
     };
   }
 
-  private async evaluateCastStructExpression(expression: string): Promise<WatchValue | null> {
+  private async evaluateCastStructExpression(
+    expression: string,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<WatchValue | null> {
     const match = expression.match(/^\(\s*\(?\s*(?:struct\s+)?([A-Za-z_]\w*)\s*\*\s*\)?\s*\)\s*(?:\(\s*)?(.+?)(?:\s*\))?$/);
     if (!match) return null;
     const typeName = this.normalizeTypeName(match[1]);
-    const address = await this.resolveAddressExpression(match[2]);
+    const address = await this.resolveAddressExpression(match[2], watchContext);
     if (address === null) return null;
-    return this.evaluateStructAtAddress(expression, typeName, address);
+    return this.evaluateStructAtAddress(expression, typeName, address, watchContext);
   }
 
-  private async evaluateFieldAccessExpression(expression: string): Promise<WatchValue | null> {
+  private async evaluateFieldAccessExpression(
+    expression: string,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<WatchValue | null> {
     const match = expression.match(/^(.+?)(->|\.)\s*([A-Za-z_]\w*)$/);
     if (!match) return null;
     const baseExpr = match[1].trim();
     const operator = match[2];
     const fieldName = match[3];
-    let base = await this.evaluateCastStructExpression(baseExpr);
+    let base = await this.evaluateCastStructExpression(baseExpr, watchContext);
     if (!base && !/^[A-Za-z_]\w*$/.test(baseExpr)) {
       // A field chain can itself be the base of a later member access, e.g.
       // pitch->angle_pid->kp. Resolve the shorter left-hand chain first so a
       // pointer-valued intermediate field supplies its evaluated children.
-      base = await this.evaluateFieldAccessExpression(baseExpr);
+      base = await this.evaluateFieldAccessExpression(baseExpr, watchContext);
     }
     if (!base && /^[A-Za-z_]\w*$/.test(baseExpr)) {
       const sym = this.symbols.find(s => s.name === baseExpr) || this.symbols.find(s => s.name.toLowerCase() === baseExpr.toLowerCase());
@@ -2935,14 +3403,18 @@ case 'readVariableRuntime':
         const offset = this.dwarfInfo.varToType.get(sym.name);
         const resolved = offset ? this.resolveDwarfType(offset) : null;
         if (operator === '->' && resolved?.kind === 'pointer' && resolved.typeOffset) {
-          const raw = await this.targetReadMemory(sym.address, this.getScalarReadSize(sym.size, resolved));
+          const raw = await this.evaluateReadMemory(
+            sym.address,
+            this.getScalarReadSize(sym.size, resolved),
+            watchContext,
+          );
           const pointeeAddress = raw ? this.readUnsignedLittleEndian(raw, raw.length) >>> 0 : 0;
           if (pointeeAddress) {
-            base = await this.evaluateStructAtTypeOffset(baseExpr, resolved.typeOffset, pointeeAddress);
+            base = await this.evaluateStructAtTypeOffset(baseExpr, resolved.typeOffset, pointeeAddress, watchContext);
           }
         } else {
           const typeName = offset ? this.getDwarfTypeName(offset) : '';
-          base = await this.evaluateStructAtAddress(baseExpr, typeName, sym.address);
+          base = await this.evaluateStructAtAddress(baseExpr, typeName, sym.address, watchContext);
         }
       }
     }
@@ -2950,20 +3422,38 @@ case 'readVariableRuntime':
     return child || null;
   }
 
-  private async evaluateStructAtAddress(expression: string, typeName: string, address: number): Promise<WatchValue | null> {
+  private async evaluateStructAtAddress(
+    expression: string,
+    typeName: string,
+    address: number,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<WatchValue | null> {
     const offset = this.findDwarfTypeOffsetByName(typeName) || (typeName === 'TCB_t' ? this.findDwarfTypeOffsetByName('tskTaskControlBlock') : undefined);
     if (!offset) return null;
-    return this.evaluateStructAtTypeOffset(expression, offset, address);
+    return this.evaluateStructAtTypeOffset(expression, offset, address, watchContext);
   }
 
-  private async evaluateStructAtTypeOffset(expression: string, typeOffset: string, address: number): Promise<WatchValue | null> {
+  private async evaluateStructAtTypeOffset(
+    expression: string,
+    typeOffset: string,
+    address: number,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<WatchValue | null> {
     const typeName = this.getDwarfTypeName(typeOffset);
     const offset = typeOffset;
     const resolved = offset ? this.resolveDwarfType(offset) : null;
-    if (!resolved || resolved.kind !== 'struct' || !resolved.fields || !resolved.byteSize) return null;
-    const raw = await this.targetReadMemory(address, resolved.byteSize);
+    if (!resolved || (resolved.kind !== 'struct' && resolved.kind !== 'union') || !resolved.fields || !resolved.byteSize) return null;
+    const raw = await this.evaluateReadMemory(address, resolved.byteSize, watchContext);
     if (!raw) return null;
-    const children = await this.evaluateStructFields(raw, resolved.fields, resolved.typeDefs || this.dwarfInfo.typeDefs, address, expression, 0);
+    const children = await this.evaluateStructFields(
+      raw,
+      resolved.fields,
+      resolved.typeDefs || this.dwarfInfo.typeDefs,
+      address,
+      expression,
+      0,
+      watchContext,
+    );
     return {
       expression,
       evaluateName: expression,
@@ -2976,7 +3466,10 @@ case 'readVariableRuntime':
     };
   }
 
-  private async resolveAddressExpression(expression: string): Promise<number | null> {
+  private async resolveAddressExpression(
+    expression: string,
+    watchContext?: WatchEvaluationContext,
+  ): Promise<number | null> {
     const expr = expression.trim().replace(/^\((.*)\)$/, '$1').trim();
     const integer = this.evaluateIntegerExpression(expr);
     if (integer !== null) return integer;
@@ -2987,17 +3480,21 @@ case 'readVariableRuntime':
     }
     const sym = this.symbols.find(s => s.name === expr) || this.symbols.find(s => s.name.toLowerCase() === expr.toLowerCase());
     if (sym) {
-      const raw = await this.targetReadMemory(sym.address, Math.max(1, Math.min(sym.size || 4, 4)));
+      const raw = await this.evaluateReadMemory(
+        sym.address,
+        Math.max(1, Math.min(sym.size || 4, 4)),
+        watchContext,
+      );
       return raw ? this.readUnsignedLittleEndian(raw, raw.length) >>> 0 : sym.address;
     }
-    const field = await this.evaluateFieldAccessExpression(expr);
+    const field = await this.evaluateFieldAccessExpression(expr, watchContext);
     // For fields that have an address (arrays, struct members), use that memory
     // address rather than the scalar value (which for char arrays is the first
     // character, not the address of the string).
     if (field) {
       if (field.address !== undefined) return field.address >>> 0;
-      if (field.children && field.children.length > 0) return field.address ?? (field.value >>> 0);
-      return field.value >>> 0;
+      if (field.children && field.children.length > 0) return field.address ?? (typeof field.value === 'number' ? field.value >>> 0 : null);
+      return typeof field.value === 'number' ? field.value >>> 0 : null;
     }
     return null;
   }
@@ -3044,35 +3541,93 @@ case 'readVariableRuntime':
     return enc.includes('signed') || enc === '5' || enc === '0x5' || /^int\d+_t\b/.test(name) || name.includes('short') || name === 'int';
   }
 
+  private isBooleanType(info: { kind?: string; encoding?: string; name?: string; typeName?: string } | null): boolean {
+    if (!info || info.kind !== 'base') return false;
+    const name = `${info.typeName || ''} ${info.name || ''}`.trim().toLowerCase();
+    const encoding = (info.encoding || '').toLowerCase();
+    return encoding.includes('boolean') || /(^|\s)(bool|_bool)$/.test(name);
+  }
+
+  private isCharType(info: { kind?: string; encoding?: string; name?: string; typeName?: string } | null): boolean {
+    if (!info || info.kind !== 'base') return false;
+    const name = `${info.typeName || ''} ${info.name || ''}`.trim().toLowerCase();
+    return /(^|\s)char$/.test(name) && !/u?int8_t|signed char|unsigned char/.test(name);
+  }
+
   private getScalarReadSize(symbolSize: number | undefined, info: { byteSize?: number } | null): number {
     const typeSize = info?.byteSize || 0;
     const size = typeSize > 0 ? typeSize : (symbolSize && symbolSize > 0 ? symbolSize : 4);
     return Math.max(1, Math.min(size, 8));
   }
 
-  private readUnsignedLittleEndian(raw: Uint8Array, byteSize: number): number {
+  private readUnsignedLittleEndianBigInt(raw: Uint8Array, byteSize: number): bigint {
     const count = Math.min(byteSize, raw.length);
-    let value = 0;
-    let factor = 1;
+    let value = 0n;
+    let factor = 1n;
     for (let i = 0; i < count; i++) {
-      value += raw[i] * factor;
-      factor *= 256;
+      value += BigInt(raw[i]) * factor;
+      factor *= 256n;
     }
     return value;
   }
 
-  private formatScalarValue(raw: Uint8Array, byteSize: number, info: { kind?: string; encoding?: string; name?: string; typeName?: string } | null): { value: number; display: string; hex: string } {
-    const unsigned = this.readUnsignedLittleEndian(raw, byteSize);
-    let value = unsigned;
-    if (this.isSignedIntegerType(info)) {
-      const bits = byteSize * 8;
-      const signBit = 2 ** (bits - 1);
-      const range = 2 ** bits;
-      if (unsigned >= signBit) value = unsigned - range;
+  private readUnsignedLittleEndian(raw: Uint8Array, byteSize: number): number {
+    const value = this.readUnsignedLittleEndianBigInt(raw, byteSize);
+    return Number(value);
+  }
+
+  private formatChar(value: bigint): string {
+    const byte = Number(value & 0xFFn);
+    if (byte === 0x0A) return '\\n';
+    if (byte === 0x0D) return '\\r';
+    if (byte === 0x09) return '\\t';
+    if (byte === 0x5C) return '\\\\';
+    if (byte === 0x27) return "\\'";
+    if (byte >= 0x20 && byte <= 0x7E) return String.fromCharCode(byte);
+    return `\\x${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+
+  private formatScalarValue(
+    raw: Uint8Array,
+    byteSize: number,
+    info: {
+      kind?: string;
+      encoding?: string;
+      name?: string;
+      typeName?: string;
+      enumerators?: Array<{ name: string; value: string }>;
+    } | null,
+  ): { value: number | string; display: string; hex: string; exactValue?: string; numericValueExact?: boolean } {
+    const unsigned = this.readUnsignedLittleEndianBigInt(raw, byteSize);
+    const bits = BigInt(byteSize * 8);
+    const range = 1n << bits;
+    const signBit = 1n << (bits - 1n);
+    const signed = this.isSignedIntegerType(info) || info?.kind === 'enum';
+    const integer = signed && unsigned >= signBit ? unsigned - range : unsigned;
+    const exactValue = integer.toString(10);
+    const numeric = Number(integer);
+    const numericValueExact = Number.isSafeInteger(numeric);
+    const value: number | string = numericValueExact ? numeric : exactValue;
+    const hex = `0x${unsigned.toString(16).toUpperCase().padStart(byteSize * 2, '0')}`;
+    const exactSuffix = numericValueExact ? `${numeric}` : exactValue;
+
+    if (this.isBooleanType(info)) {
+      return { value, display: `${hex} (${exactSuffix}, ${integer === 0n ? 'false' : 'true'})`, hex, exactValue: numericValueExact ? undefined : exactValue, numericValueExact };
     }
 
-    const hex = `0x${unsigned.toString(16).toUpperCase().padStart(byteSize * 2, '0')}`;
-    return { value, display: `${hex} (${value})`, hex };
+    if (this.isCharType(info)) {
+      return { value, display: `'${this.formatChar(unsigned)}' (${exactSuffix}, ${hex})`, hex, exactValue: numericValueExact ? undefined : exactValue, numericValueExact };
+    }
+
+    if (info?.kind === 'enum') {
+      const enumerator = info.enumerators?.find(item => {
+        try { return BigInt(item.value) === integer; } catch { return false; }
+      });
+      const suffix = enumerator ? `${exactSuffix}, ${enumerator.name}` : exactSuffix;
+      return { value, display: `${hex} (${suffix})`, hex, exactValue: numericValueExact ? undefined : exactValue, numericValueExact };
+    }
+
+    return { value, display: `${hex} (${exactSuffix})`, hex, exactValue: numericValueExact ? undefined : exactValue, numericValueExact };
   }
 
   private readBytesAsFloat(raw: Uint8Array, byteSize: number): number {
@@ -3083,7 +3638,7 @@ case 'readVariableRuntime':
     return dv.getFloat32(0, true);
   }
 
-  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number; encoding?: string } | null {
+  private resolveDwarfType(offset: string, visited?: Set<string>): { kind: string; name: string; byteSize: number; fields?: DwarfField[]; enumerators?: Array<{ name: string; value: string }>; typeDefs?: Map<string, DwarfTypeInfo>; typeName?: string; typeOffset?: string; arrayCount?: number; encoding?: string } | null {
     if (!visited) visited = new Set();
     if (visited.has(offset)) return null;
     visited.add(offset);
@@ -3094,10 +3649,10 @@ case 'readVariableRuntime':
       if (resolved) return { ...resolved, typeName: info.name || resolved.typeName || resolved.name };
       return { kind: info.kind, name: info.name, byteSize: 0, typeName: info.name };
     }
-    if (info.kind === 'struct') {
-      return { kind: 'struct', name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
+    if (info.kind === 'struct' || info.kind === 'union') {
+      return { kind: info.kind, name: info.name, byteSize: info.byteSize, fields: info.fields, typeDefs: this.dwarfInfo.typeDefs };
     }
-    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount, encoding: info.encoding };
+    return { kind: info.kind, name: info.name, byteSize: info.byteSize, typeName: info.name, typeOffset: info.typeOffset, arrayCount: info.arrayCount, encoding: info.encoding, enumerators: info.enumerators };
   }
 
   private formatDwarfTypeName(offset?: string, visited: Set<string> = new Set()): string {
@@ -3139,9 +3694,36 @@ case 'readVariableRuntime':
     return context?.expandedExpressions === undefined || context.expandedExpressions.has(expression);
   }
 
+  private throwIfEvaluationCancelled(context?: WatchEvaluationContext): void {
+    if (context?.signal?.aborted) throw new EvaluateCancelledError();
+  }
+
+  private async evaluateReadMemory(
+    address: number,
+    size: number,
+    context?: WatchEvaluationContext,
+  ): Promise<Uint8Array | null> {
+    this.throwIfEvaluationCancelled(context);
+    const raw = await this.targetReadMemory(address, size);
+    this.throwIfEvaluationCancelled(context);
+    return raw;
+  }
+
   private pointerTargetHasChildren(typeOffset: string): boolean {
     const resolved = this.resolveDwarfType(typeOffset);
-    return resolved?.kind === 'struct' && !!resolved.fields?.length;
+    return (resolved?.kind === 'struct' || resolved?.kind === 'union') && !!resolved.fields?.length;
+  }
+
+  private isFunctionPointerType(info: { kind?: string; typeOffset?: string } | null): boolean {
+    return info?.kind === 'pointer' && !!info.typeOffset && this.resolveDwarfType(info.typeOffset)?.kind === 'subroutine';
+  }
+
+  private formatFunctionPointer(value: number): string {
+    if ((value >>> 0) === 0) return 'NULL';
+    const normalizedAddress = (value >>> 0) & ~1;
+    const symbol = this.symbols.find(item => /^(T|t|W|w)$/.test(item.type) && (item.address >>> 0) === normalizedAddress);
+    const address = this.formatAddress(value);
+    return symbol ? `${symbol.name} @ ${address}` : `${address} (<unknown>)`;
   }
 
   private async evaluateStructFields(
@@ -3155,6 +3737,7 @@ case 'readVariableRuntime':
   ): Promise<WatchValue[]> {
     const values: WatchValue[] = [];
     for (const field of fields) {
+      this.throwIfEvaluationCancelled(watchContext);
       values.push(await this.evaluateSingleField(raw, field, typeDefs, baseAddress, parentExpr, _depth, watchContext));
     }
     return values;
@@ -3170,10 +3753,11 @@ case 'readVariableRuntime':
     _depth = 1,
     watchContext?: WatchEvaluationContext,
   ): Promise<WatchValue[] | undefined> {
+    this.throwIfEvaluationCancelled(watchContext);
     if (_depth > OzoneBackend.MAX_POINTER_DEPTH) return undefined;
     const pointee = this.resolveDwarfType(typeOffset);
-    if (!pointee || pointee.kind !== 'struct' || !pointee.fields || !pointee.byteSize) return undefined;
-    const raw = await this.targetReadMemory(address, pointee.byteSize);
+    if (!pointee || (pointee.kind !== 'struct' && pointee.kind !== 'union') || !pointee.fields || !pointee.byteSize) return undefined;
+    const raw = await this.evaluateReadMemory(address, pointee.byteSize, watchContext);
     if (!raw) return undefined;
     return this.evaluateStructFields(raw, pointee.fields, pointee.typeDefs || this.dwarfInfo.typeDefs, address, parentExpr, _depth, watchContext);
   }
@@ -3187,6 +3771,7 @@ case 'readVariableRuntime':
     _depth = 0,
     watchContext?: WatchEvaluationContext,
   ): Promise<WatchValue> {
+    this.throwIfEvaluationCancelled(watchContext);
     const addr = baseAddress + field.byteOffset;
     const evaluateName = parentExpr ? `${parentExpr}.${field.name}` : field.name;
     const resolved = this.resolveDwarfType(field.typeOffset);
@@ -3195,7 +3780,7 @@ case 'readVariableRuntime':
     const resolvedByteSize = resolved?.byteSize || 0;
     const resolvedTypeName = this.getDwarfTypeName(field.typeOffset) || resolvedName;
 
-    if (resolvedKind === 'struct' && resolved?.fields) {
+    if ((resolvedKind === 'struct' || resolvedKind === 'union') && resolved?.fields) {
       const childRaw = resolvedByteSize > 0
         ? raw.slice(field.byteOffset, field.byteOffset + resolvedByteSize)
         : raw;
@@ -3244,9 +3829,10 @@ case 'readVariableRuntime':
 
       const children: WatchValue[] = [];
       for (let i = 0; i < count; i++) {
+        this.throwIfEvaluationCancelled(watchContext);
         const elemAddr = addr + i * elemSize;
         const elemRawOffset = i * elemSize;
-        if (elemType?.kind === 'struct' && elemType.fields) {
+        if ((elemType?.kind === 'struct' || elemType?.kind === 'union') && elemType.fields) {
           const childRaw = arrRaw.slice(elemRawOffset, elemRawOffset + elemSize);
           const elementExpression = `${evaluateName}[${i}]`;
           const structChildren = this.shouldExpandWatchNode(elementExpression, watchContext)
@@ -3269,9 +3855,11 @@ case 'readVariableRuntime':
           const end = Math.min(elemRawOffset + elemSize, arrRaw.length);
           const elemRaw = arrRaw.slice(elemRawOffset, end);
           const isFloatArrElem = this.isFloatType(elemType);
-          let value: number;
+          let value: number | string;
           let display: string;
           let hex: string;
+          let exactValue: string | undefined;
+          let numericValueExact: boolean | undefined;
           if (isFloatArrElem && elemRaw.length >= elemSize) {
             value = this.readBytesAsFloat(elemRaw, elemSize);
             display = elemSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
@@ -3281,20 +3869,28 @@ case 'readVariableRuntime':
             value = formatted.value;
             display = formatted.display;
             hex = formatted.hex;
+            exactValue = formatted.exactValue;
+            numericValueExact = formatted.numericValueExact;
+          }
+          if (this.isFunctionPointerType(elemType) && typeof value === 'number') {
+            display = this.formatFunctionPointer(value);
           }
           const elementExpression = `${evaluateName}[${i}]`;
           const pointerHasChildren = elemType?.kind === 'pointer'
             && !!elemType.typeOffset
             && this.pointerTargetHasChildren(elemType.typeOffset);
-          const pointerChildren = pointerHasChildren && value && this.shouldExpandWatchNode(elementExpression, watchContext)
-            ? await this.evaluatePointerChildren(value >>> 0, elemType!.typeOffset!, elementExpression, _depth + 1, watchContext)
+          const pointerValue = typeof value === 'number' ? value : null;
+          const pointerChildren = pointerHasChildren && pointerValue && this.shouldExpandWatchNode(elementExpression, watchContext)
+            ? await this.evaluatePointerChildren(pointerValue >>> 0, elemType!.typeOffset!, elementExpression, _depth + 1, watchContext)
             : undefined;
           children.push({
             expression: `[${i}]`,
             evaluateName: `${evaluateName}[${i}]`,
             value,
-            display: elemType?.kind === 'pointer' ? this.formatAddress(value) : display,
+            display: elemType?.kind === 'pointer' && !this.isFunctionPointerType(elemType) && typeof value === 'number' ? this.formatAddress(value) : display,
             hex,
+            exactValue,
+            numericValueExact,
             address: elemAddr,
             typeName: elemTypeName,
             hasChildren: pointerHasChildren,
@@ -3324,9 +3920,11 @@ case 'readVariableRuntime':
 
     const isFloat = this.isFloatType(resolved);
 
-    let value: number;
+    let value: number | string;
     let display: string;
     let hex: string;
+    let exactValue: string | undefined;
+    let numericValueExact: boolean | undefined;
     if (isFloat && fieldRaw.length >= fieldSize) {
       value = this.readBytesAsFloat(fieldRaw, fieldSize);
       display = fieldSize === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
@@ -3336,9 +3934,14 @@ case 'readVariableRuntime':
       value = formatted.value;
       display = formatted.display;
       hex = formatted.hex;
+      exactValue = formatted.exactValue;
+      numericValueExact = formatted.numericValueExact;
+    }
+    if (this.isFunctionPointerType(resolved) && typeof value === 'number') {
+      display = this.formatFunctionPointer(value);
     }
 
-    if (field.name === 'ulRunTimeCounter') {
+    if (field.name === 'ulRunTimeCounter' && typeof value === 'number') {
       const counter = this.formatRuntimeCounterValue(evaluateName, value, addr, resolvedTypeName || 'uint32_t');
       value = counter.value;
       display = counter.display;
@@ -3348,16 +3951,19 @@ case 'readVariableRuntime':
     const pointerHasChildren = resolvedKind === 'pointer'
       && !!resolved?.typeOffset
       && this.pointerTargetHasChildren(resolved.typeOffset);
-    const pointerChildren = pointerHasChildren && value && this.shouldExpandWatchNode(evaluateName, watchContext)
-      ? await this.evaluatePointerChildren(value >>> 0, resolved!.typeOffset!, evaluateName, _depth + 1, watchContext)
+    const pointerValue = typeof value === 'number' ? value : null;
+    const pointerChildren = pointerHasChildren && pointerValue && this.shouldExpandWatchNode(evaluateName, watchContext)
+      ? await this.evaluatePointerChildren(pointerValue >>> 0, resolved!.typeOffset!, evaluateName, _depth + 1, watchContext)
       : undefined;
 
     return {
       expression: field.name,
       evaluateName,
       value,
-      display: resolvedKind === 'pointer' ? this.formatAddress(value) : display,
+      display: resolvedKind === 'pointer' && !this.isFunctionPointerType(resolved) && typeof value === 'number' ? this.formatAddress(value) : display,
       hex,
+      exactValue,
+      numericValueExact,
       address: addr,
       typeName: resolvedTypeName,
       hasChildren: pointerHasChildren,
@@ -3424,6 +4030,16 @@ case 'readVariableRuntime':
     const requestedTypeSize = typeName ? this.getBuiltinTypeSize(typeName) : 0;
     const valueType = requestedType || resolvedType;
     const writeSize = Math.max(Math.min(requestedTypeSize || valueType?.byteSize || sym?.size || 4, 8), 1);
+    if (this.isCmsisDapOwner()
+      && (writeAddress < 0x20000000 || writeAddress + writeSize > 0x20020000)) {
+      return {
+        ok: false,
+        error: `CMSIS-DAP Watch writes require an STM32F407 SRAM address: 0x${writeAddress.toString(16)}`,
+        errorCode: 'InvalidWatchWriteAddress',
+        targetState: this.state,
+        diagnostics: { ownerKind: 'cmsis-dap', address: writeAddress, size: writeSize },
+      };
+    }
     const buf = new Uint8Array(writeSize);
     const isFloat = this.isFloatType(valueType) || /^(float|float32_t|fp32|double|float64_t|fp64)$/.test(normalizedTypeName);
     if (isFloat) {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <thread>
 
 namespace cmsis_dap_helper {
@@ -66,6 +67,10 @@ MockCmsisDapTransport::MockCmsisDapTransport() {
   devices_.push_back(makeDevice("1234", "5689", "MOCK-0018", 65, 65, 0));
   devices_.push_back(makeDevice("1234", "568A", "MOCK-0019", 65, 65, 0));
   devices_.push_back(makeDevice("1234", "568B", "MOCK-0020", 65, 65, 0));
+  devices_.push_back(makeDevice("1234", "568C", "MOCK-0021", 65, 65, 0));
+  devices_.push_back(makeDevice("1234", "568D", "MOCK-0022", 65, 65, 0));
+  devices_.push_back(makeDevice("1234", "568E", "MOCK-0023", 65, 65, 0));
+  devices_.push_back(makeDevice("1234", "568F", "MOCK-0024", 65, 65, 0));
 }
 
 DeviceDescriptor MockCmsisDapTransport::makeDevice(const std::string& vid, const std::string& pid,
@@ -136,6 +141,19 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
           kMockFlashVectorWord0, kMockFlashVectorWord1,
           kMockFlashVectorWord2, kMockFlashVectorWord3};
       std::memcpy(state_.flash.data(), vectorWords, sizeof(vectorWords));
+      // DAP-05 source-step fixture: NOP; BL 0x080001E0; return at 0x080001C6.
+      const uint8_t sourceStepFixture[] = {
+          0x00, 0xBF,                    // 0x080001C0 NOP
+          0x00, 0xF0, 0x0D, 0xF8,        // 0x080001C2 BL 0x080001E0
+          0x00, 0xBF,                    // 0x080001C6 NOP
+          0x00, 0xD0,                    // 0x080001C8 BEQ (not taken; Z=0)
+          0xFE, 0xE7,                    // 0x080001CA B 0x080001CA
+      };
+      std::memcpy(state_.flash.data() + (kMockResetPc - kMockFlashBase),
+                  sourceStepFixture, sizeof(sourceStepFixture));
+      const uint8_t calleeFixture[] = {0x00, 0xBF, 0x70, 0x47};
+      std::memcpy(state_.flash.data() + (0x080001E0u - kMockFlashBase),
+                  calleeFixture, sizeof(calleeFixture));
       state_.dhcsr = kMockCoreDebugCDebugEn;
       state_.dcrsr = 0;
       state_.dcrdr = 0;
@@ -148,6 +166,8 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
       state_.registers[14] = 0x08001001u;
       state_.registers[15] = kMockResetPc;
       state_.registers[16] = 0x01000000u;
+      state_.registers[17] = state_.registers[13];
+      state_.registers[18] = state_.registers[13];
       injection_ = MockInjection{};
       commandHistory_.clear();
       const std::string key = behaviorKey(candidate);
@@ -167,6 +187,16 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
       if (key == "1234:5689") injection_.verifyCorruption = true;
       if (key == "1234:568A") injection_.flashRemoved = true;
       if (key == "1234:568B") injection_.flashAlgorithmStuck = true;
+      if (key == "1234:568C") injection_.fpbNeverHits = true;
+      if (key == "1234:568D") {
+        injection_.stepDhcsrLagReads = 8;
+        injection_.fpbHitsCurrentPc = true;
+      }
+      if (key == "1234:568E") {
+        injection_.interruptOnUnmaskedStep = true;
+        injection_.interruptOnUnmaskedAlgorithmStart = true;
+      }
+      if (key == "1234:568F") injection_.resetRunsPastStartupEntry = true;
       preparedFlashAlgorithm_ = MockFlashAlgorithmRequest{};
       return Result::success();
     }
@@ -390,11 +420,28 @@ bool MockCmsisDapTransport::cswShapeOk(uint32_t csw) {
   return true;
 }
 
-uint32_t MockCmsisDapTransport::readMemWord(uint32_t address) const {
-  if (address == kMockCoreDebugDhcsr) return state_.dhcsr;
+uint32_t MockCmsisDapTransport::readMemWord(uint32_t address) {
+  if (address == kMockCoreDebugDhcsr) {
+    const uint32_t value = state_.dhcsr;
+    state_.dhcsr &= ~kMockCoreDebugSRetireSt;
+    if (state_.pendingStepDhcsrReads > 0 && --state_.pendingStepDhcsrReads == 0) {
+      const uint32_t pendingWrite = state_.pendingStepDhcsrWrite;
+      state_.pendingStepDhcsrWrite = 0;
+      const uint32_t lagReads = injection_.stepDhcsrLagReads;
+      injection_.stepDhcsrLagReads = 0;
+      writeMemWord(kMockCoreDebugDhcsr, pendingWrite);
+      injection_.stepDhcsrLagReads = lagReads;
+    }
+    return value;
+  }
   if (address == kMockCoreDebugDcrsr) return state_.dcrsr;
   if (address == kMockCoreDebugDcrdr) return state_.dcrdr;
   if (address == kMockCoreDebugAircr) return state_.aircr;
+  if (address == kMockFpbCtrl) return state_.fpCtrl;
+  if (address >= kMockFpbComp0 && address < kMockFpbComp0 + kMockFpbCodeComparators * 4u
+      && (address & 3u) == 0) {
+    return state_.fpComp[(address - kMockFpbComp0) / 4u];
+  }
   if (address == 0xE0042000u) return 0x10006413u;
   if (address == 0x1FFF7A20u) return 0x00020000u;
   const uint8_t* base = nullptr;
@@ -419,7 +466,24 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
     const bool wasHalted = (state_.dhcsr & kMockCoreDebugSHalt) != 0;
     const bool step = (value & kMockCoreDebugCStep) != 0;
     const bool halt = (value & kMockCoreDebugCHalt) != 0;
+    const bool maskInterrupts = (value & kMockCoreDebugCMaskInts) != 0;
+    if (step && injection_.stepDhcsrLagReads > 0 && state_.pendingStepDhcsrReads == 0) {
+      state_.pendingStepDhcsrReads = injection_.stepDhcsrLagReads;
+      state_.pendingStepDhcsrWrite = value;
+      return;
+    }
+    if (!step) {
+      state_.pendingStepDhcsrReads = 0;
+      state_.pendingStepDhcsrWrite = 0;
+    }
     if (preparedFlashAlgorithm_.pending && debugEnabled && !halt && !step) {
+      injection_.algorithmInterruptMaskAtEntry = maskInterrupts;
+      if (injection_.interruptOnUnmaskedAlgorithmStart && !maskInterrupts) {
+        preparedFlashAlgorithm_.pending = false;
+        ++injection_.flashAlgorithmCount;
+        state_.dhcsr = kMockCoreDebugCDebugEn;
+        return;
+      }
       if (preparedFlashAlgorithm_.ramStub) {
         runPreparedRamStub();
         return;
@@ -427,13 +491,111 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
       runPreparedFlashAlgorithm();
       return;
     }
-    state_.dhcsr = debugEnabled ? kMockCoreDebugCDebugEn : 0;
+    state_.dhcsr = debugEnabled
+                       ? kMockCoreDebugCDebugEn |
+                             (maskInterrupts ? kMockCoreDebugCMaskInts : 0u)
+                       : 0;
     if (halt || step || (wasHalted && !debugEnabled)) {
-      state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+      state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady |
+                      kMockCoreDebugSRetireSt;
     }
     if (step) {
-      state_.registers[15] += 2;
+      const uint32_t pc = state_.registers[15];
+      if (injection_.interruptOnUnmaskedStep && !maskInterrupts) {
+        state_.stepInterrupted = true;
+        state_.interruptedStepPc = pc;
+        state_.registers[15] = 0x080043B4u;
+        state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+        return;
+      }
+      const uint32_t offset = pc - kMockFlashBase;
+      const uint16_t hw1 = static_cast<uint16_t>(state_.flash[offset]) |
+                           (static_cast<uint16_t>(state_.flash[offset + 1]) << 8);
+      const uint16_t hw2 = static_cast<uint16_t>(state_.flash[offset + 2]) |
+                           (static_cast<uint16_t>(state_.flash[offset + 3]) << 8);
+      const bool isBl = (hw1 & 0xF800u) == 0xF000u && (hw2 & 0xD000u) == 0xD000u;
+      const bool isBlxReg = (hw1 & 0xFF87u) == 0x4780u;
+      const bool isConditionalBranch = (hw1 & 0xF000u) == 0xD000u
+                                    && ((hw1 >> 8) & 0x0Fu) < 0x0Eu;
+      const bool isUnconditionalBranch = (hw1 & 0xF800u) == 0xE000u;
+      if (isBl) {
+        const uint32_t s = (hw1 >> 10) & 1u;
+        const uint32_t j1 = (hw2 >> 13) & 1u;
+        const uint32_t j2 = (hw2 >> 11) & 1u;
+        const uint32_t i1 = (~(j1 ^ s)) & 1u;
+        const uint32_t i2 = (~(j2 ^ s)) & 1u;
+        uint32_t immediate = (s << 24) | (i1 << 23) | (i2 << 22)
+                           | ((hw1 & 0x03FFu) << 12) | ((hw2 & 0x07FFu) << 1);
+        if ((immediate & 0x01000000u) != 0) immediate |= 0xFE000000u;
+        state_.registers[14] = (pc + 4u) | 1u;
+        state_.registers[15] = (pc + 4u + immediate) & ~1u;
+      } else if (isBlxReg) {
+        const uint32_t rm = (hw1 >> 3) & 0x0Fu;
+        state_.registers[14] = (pc + 2u) | 1u;
+        state_.registers[15] = state_.registers[rm] & ~1u;
+      } else if (isConditionalBranch) {
+        const uint32_t condition = (hw1 >> 8) & 0x0Fu;
+        const bool n = (state_.registers[16] & (1u << 31)) != 0;
+        const bool z = (state_.registers[16] & (1u << 30)) != 0;
+        const bool c = (state_.registers[16] & (1u << 29)) != 0;
+        const bool v = (state_.registers[16] & (1u << 28)) != 0;
+        const bool baseConditions[] = {z, c, n, v, c && !z, n == v, !z && n == v};
+        const bool base = baseConditions[condition >> 1];
+        const bool taken = (condition & 1u) == 0 ? base : !base;
+        int32_t immediate = static_cast<int32_t>((hw1 & 0xFFu) << 1);
+        if ((immediate & 0x100) != 0) immediate |= ~0x1FF;
+        state_.registers[15] = taken
+            ? static_cast<uint32_t>(static_cast<int32_t>(pc + 4u) + immediate)
+            : pc + 2u;
+      } else if (isUnconditionalBranch) {
+        int32_t immediate = static_cast<int32_t>((hw1 & 0x07FFu) << 1);
+        if ((immediate & 0x800) != 0) immediate |= ~0x0FFF;
+        state_.registers[15] = static_cast<uint32_t>(static_cast<int32_t>(pc + 4u) + immediate);
+      } else {
+        const bool is32Bit = (hw1 & 0xF800u) == 0xE800u
+                          || (hw1 & 0xF800u) == 0xF000u
+                          || (hw1 & 0xF800u) == 0xF800u;
+        state_.registers[15] += is32Bit ? 4u : 2u;
+      }
       state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+    } else if (debugEnabled && !halt) {
+      // Independent FPB hit oracle: running selects the nearest enabled code
+      // comparator other than the current PC and reports a halted target.
+      const uint32_t currentPc = state_.registers[15];
+      std::optional<uint32_t> forward;
+      std::optional<uint32_t> fallback;
+      if (state_.stepInterrupted) {
+        for (uint32_t comparator : state_.fpComp) {
+          if ((comparator & 1u) == 0) continue;
+          const uint32_t replace = comparator >> 30;
+          if (replace != 1u && replace != 2u) continue;
+          const uint32_t hitAddress =
+              (comparator & 0x1FFFFFFCu) + (replace == 2u ? 2u : 0u);
+          if (hitAddress == state_.interruptedStepPc) {
+            state_.registers[15] = hitAddress;
+            state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+            state_.stepInterrupted = false;
+            return;
+          }
+        }
+      }
+      if (!injection_.fpbNeverHits && (state_.fpCtrl & 1u) != 0) {
+        for (uint32_t comparator : state_.fpComp) {
+          if ((comparator & 1u) == 0) continue;
+          const uint32_t replace = comparator >> 30;
+          if (replace != 1u && replace != 2u) continue;
+          const uint32_t hitAddress = (comparator & 0x1FFFFFFCu) + (replace == 2u ? 2u : 0u);
+          if (hitAddress == currentPc && !injection_.fpbHitsCurrentPc) continue;
+          if (hitAddress == (state_.registers[14] & ~1u)
+              && (!fallback || hitAddress < *fallback)) fallback = hitAddress;
+          if (hitAddress > currentPc && (!forward || hitAddress < *forward)) forward = hitAddress;
+        }
+      }
+      const std::optional<uint32_t> hit = forward ? forward : fallback;
+      if (hit) {
+        state_.registers[15] = *hit;
+        state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+      }
     }
     return;
   }
@@ -462,11 +624,40 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
     if (injection_.controlStuck) return;
     if ((value & 0xFFFF0000u) == kMockCoreDebugVectKey &&
         (value & kMockCoreDebugSysResetReq) != 0) {
+      if (injection_.resetRunsPastStartupEntry) {
+        state_.registers[15] = kMockPostStartupPc;
+        state_.dhcsr = kMockCoreDebugCDebugEn;
+        if ((state_.fpCtrl & 1u) != 0) {
+          for (uint32_t comparator : state_.fpComp) {
+            if ((comparator & 1u) == 0) continue;
+            const uint32_t replace = comparator >> 30;
+            if (replace != 1u && replace != 2u) continue;
+            const uint32_t hitAddress =
+                (comparator & 0x1FFFFFFCu) + (replace == 2u ? 2u : 0u);
+            if (hitAddress == kMockStartupEntryPc) {
+              state_.registers[15] = hitAddress;
+              state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+              break;
+            }
+          }
+        }
+        return;
+      }
       const bool wasHalted = (state_.dhcsr & kMockCoreDebugSHalt) != 0;
       state_.registers[15] = kMockResetPc;
       state_.dhcsr = kMockCoreDebugCDebugEn;
       if (wasHalted) state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
     }
+    return;
+  }
+  if (address == kMockFpbCtrl) {
+    // KEY is write-only; revision/count fields are read-only.
+    state_.fpCtrl = (state_.fpCtrl & ~1u) | (value & 1u);
+    return;
+  }
+  if (address >= kMockFpbComp0 && address < kMockFpbComp0 + kMockFpbCodeComparators * 4u
+      && (address & 3u) == 0) {
+    state_.fpComp[(address - kMockFpbComp0) / 4u] = value;
     return;
   }
   uint8_t* base = nullptr;
@@ -485,6 +676,35 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
   for (int index = 0; index < 4; ++index) {
     base[index] = isFlash ? static_cast<uint8_t>(base[index] & bytes[index]) : bytes[index];
   }
+}
+
+void MockCmsisDapTransport::prepareExceptionReturn(uint32_t handlerPc,
+                                                   uint32_t excReturn,
+                                                   uint32_t frameSp,
+                                                   uint32_t stackedPc) {
+  state_.registers[15] = handlerPc;
+  state_.registers[14] = excReturn;
+  state_.registers[(excReturn & 4u) != 0 ? 18u : 17u] = frameSp;
+  state_.registers[13] = frameSp;
+  state_.dhcsr = kMockCoreDebugCDebugEn | kMockCoreDebugSHalt |
+                 kMockCoreDebugSRegReady;
+  const uint32_t pcOffset = (excReturn & 0x10u) != 0 ? 24u : 96u;
+  const uint32_t address = frameSp + pcOffset;
+  if (address < kMockRamBase || address + 4u > kMockRamBase + state_.ram.size()) return;
+  const size_t offset = address - kMockRamBase;
+  state_.ram[offset] = static_cast<uint8_t>(stackedPc & 0xFFu);
+  state_.ram[offset + 1] = static_cast<uint8_t>((stackedPc >> 8) & 0xFFu);
+  state_.ram[offset + 2] = static_cast<uint8_t>((stackedPc >> 16) & 0xFFu);
+  state_.ram[offset + 3] = static_cast<uint8_t>((stackedPc >> 24) & 0xFFu);
+}
+
+void MockCmsisDapTransport::prepareSourceInstruction(
+    uint32_t pc, const std::vector<uint8_t>& bytes) {
+  if (pc < kMockFlashBase || bytes.size() > kMockFlashBase + state_.flash.size() - pc) return;
+  std::copy(bytes.begin(), bytes.end(), state_.flash.begin() + (pc - kMockFlashBase));
+  state_.registers[15] = pc;
+  state_.dhcsr = kMockCoreDebugCDebugEn | kMockCoreDebugSHalt |
+                 kMockCoreDebugSRegReady;
 }
 
 void MockCmsisDapTransport::prepareFlashAlgorithm(const std::string& operation, uint32_t address,

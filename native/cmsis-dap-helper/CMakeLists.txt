@@ -14,6 +14,9 @@ add_executable(orbit-cmsis-dap-helper
   src/cmsis_dap_protocol.cpp
   src/cmsis_dap_target.cpp
   src/cortex_m_debug.cpp
+  src/cmsis_dap_source_step.cpp
+  src/cmsis_dap_startup_stop.cpp
+  src/fpb_breakpoint.cpp
   src/trace_control.cpp
 )
 target_compile_features(orbit-cmsis-dap-helper PRIVATE cxx_std_17)

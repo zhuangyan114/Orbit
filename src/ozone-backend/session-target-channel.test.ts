@@ -77,6 +77,20 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
           elapsedMs: 0,
           data: { port: 'SWD', connectResponse: 1 },
         };
+        case 'getFpbInfo':
+          return {
+            ok: true,
+            message: 'FPB ownership claimed',
+            targetState: 'Running' as const,
+            elapsedMs: 1,
+            data: {
+              fpCtrl: 0x260,
+              revision: 1,
+              codeComparators: 6,
+              literalComparators: 0,
+              enabled: false,
+            },
+          };
         case 'getState':
           return {
             ok: true,
@@ -110,6 +124,40 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
             elapsedMs: 0,
             data: { state: 'Halted', dhcsr: 0x00030001, pcBefore: 0x080001C0, pcAfter: 0x080001C2 },
           };
+        case 'setBreakpoint':
+          return {
+            ok: true,
+            message: 'breakpoint set',
+            targetState: 'Halted' as const,
+            elapsedMs: 1,
+            data: { slot: 2, address: params.address, fpbRevision: 1, codeComparators: 6 },
+          };
+        case 'clearBreakpoint':
+        case 'clearAllBreakpoints':
+          return {
+            ok: true,
+            message: 'breakpoint cleared',
+            targetState: 'Halted' as const,
+            elapsedMs: 1,
+            data: { slot: params.slot, cleared: 1 },
+          };
+        case 'stepIntoSourceLine':
+        case 'stepOverSourceLine':
+        case 'stepOut':
+          return {
+            ok: true,
+            message: method,
+            targetState: 'Halted' as const,
+            elapsedMs: 1,
+            data: {
+              pcBefore: 0x080001C0,
+              pcAfter: 0x080001C6,
+              classification: method,
+              instructions: 2,
+              cleanupOk: true,
+              timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 0, waitMs: 0, cleanupMs: 0, totalMs: 1 },
+            },
+          };
         case 'readRegister':
           return {
             ok: true,
@@ -118,7 +166,7 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
             elapsedMs: 0,
             data: { register: params.index, value: params.index === 15 ? 0x080001C0 : 0x10000000 },
           };
-      case 'readMemory':
+        case 'readMemory':
           return {
             ok: true,
             message: 'memory read',
@@ -137,6 +185,17 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
               waitRetries: 0,
               faultClears: 0,
               packetSize: 64,
+            },
+          };
+        case 'writeMemory':
+          return {
+            ok: true,
+            message: 'memory written',
+            targetState: 'Halted' as const,
+            elapsedMs: 1,
+            data: {
+              address: (params as { address: number }).address,
+              bytesWritten: (params as { bytes: number[] }).bytes.length,
             },
           };
         case 'disconnect':
@@ -374,11 +433,171 @@ describe('SessionTargetSelector owner lifecycle', () => {
       speedKHz: 4000,
     });
 
-    expect(result).toMatchObject({ ok: true, data: { channel: 'cmsis-dap' } });
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        channel: 'cmsis-dap',
+        diagnostics: {
+          fpb: { revision: 1, codeComparators: 6, enabled: false },
+        },
+      },
+    });
     expect(helper.start).toHaveBeenCalledTimes(1);
+    expect(helper.controlRequest).toHaveBeenCalledWith('getFpbInfo', { timeoutMs: 1000 });
     expect(createNative).not.toHaveBeenCalled();
     expect(createLegacy).not.toHaveBeenCalled();
     expect(selector.ownerKind).toBe('cmsis-dap');
+  });
+
+  it.each(['DeviceRemoved', 'MalformedResponse'])(
+    'abandons a CMSIS-DAP owner after %s and requires the next owner to claim FPB again',
+    async causeErrorCode => {
+      const makeHelper = (failStep: boolean) => {
+        const controlRequest = vi.fn(async (method: string) => {
+          if (method === 'getFpbInfo') {
+            return {
+              ok: true,
+              message: 'FPB ownership claimed and comparators sanitized',
+              targetState: 'Running' as const,
+              elapsedMs: 1,
+              data: {
+                fpCtrl: 0x260,
+                revision: 1,
+                codeComparators: 6,
+                literalComparators: 2,
+                enabled: false,
+              },
+            };
+          }
+          if (failStep && method === 'stepOverSourceLine') {
+            return {
+              ok: false,
+              message: `${causeErrorCode} while cleaning a temporary comparator`,
+              errorCode: causeErrorCode,
+              targetState: 'Error' as const,
+              elapsedMs: 3,
+              diagnostics: { phase: 'temporaryBreakpointCleanup' },
+            };
+          }
+          throw new Error(`unexpected control request ${method}`);
+        });
+        return fakeCmsisDapHelper({ controlRequest: controlRequest as any });
+      };
+      const firstHelper = makeHelper(true);
+      const secondHelper = makeHelper(false);
+      const owners = [
+        new CmsisDapTargetChannel({ helperClient: firstHelper }),
+        new CmsisDapTargetChannel({ helperClient: secondHelper }),
+      ];
+      const createCmsisDap = vi.fn(() => owners.shift()!);
+      const createNative = vi.fn();
+      const createLegacy = vi.fn();
+      const selector = new SessionTargetSelector(createNative, createLegacy, createCmsisDap);
+      const config = {
+        probe: 'cmsis-dap' as const,
+        device: 'STM32F407VET6',
+        interface: 'SWD' as const,
+        speedKHz: 1000,
+        flashBeforeDebug: false,
+      };
+      expect((await selector.connect(config)).ok).toBe(true);
+
+      const failed = await selector.stepOverSourceLine({
+        lineStart: 0x080001C0,
+        lineEnd: 0x080001C6,
+      });
+
+      expect(failed).toMatchObject({
+        ok: false,
+        errorCode: 'NativeOwnerLost',
+        diagnostics: {
+          causeErrorCode,
+          phase: 'temporaryBreakpointCleanup',
+        },
+      });
+      expect(selector.ownerKind).toBe('none');
+      expect(firstHelper.dispose).toHaveBeenCalledWith(false);
+      expect(createNative).not.toHaveBeenCalled();
+      expect(createLegacy).not.toHaveBeenCalled();
+
+      expect((await selector.connect(config)).ok).toBe(true);
+      expect(secondHelper.controlRequest).toHaveBeenCalledWith('getFpbInfo', { timeoutMs: 1000 });
+      expect(selector.ownerKind).toBe('cmsis-dap');
+      await selector.dispose(false);
+    },
+  );
+
+  it('abandons a CMSIS-DAP owner when a successful control response has no data', async () => {
+    const controlRequest = vi.fn(async (method: string) => {
+      if (method === 'getFpbInfo') {
+        return {
+          ok: true,
+          message: 'FPB ownership claimed and comparators sanitized',
+          targetState: 'Running' as const,
+          elapsedMs: 1,
+          data: {
+            fpCtrl: 0x260,
+            revision: 1,
+            codeComparators: 6,
+            literalComparators: 2,
+            enabled: false,
+          },
+        };
+      }
+      if (method === 'stepOverSourceLine') {
+        return {
+          ok: true,
+          message: 'step response body omitted',
+          targetState: 'Halted' as const,
+          elapsedMs: 37,
+          diagnostics: { phase: 'decode', rawLength: 0 },
+        };
+      }
+      throw new Error(`unexpected control request ${method}`);
+    });
+    const helper = fakeCmsisDapHelper({ controlRequest: controlRequest as any });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const createCmsisDap = vi.fn(() => channel);
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const selector = new SessionTargetSelector(createNative, createLegacy, createCmsisDap);
+
+    expect((await selector.connect({
+      probe: 'cmsis-dap',
+      device: 'STM32F407VET6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      flashBeforeDebug: false,
+    })).ok).toBe(true);
+
+    const failed = await selector.stepOverSourceLine({
+      lineStart: 0x080001C0,
+      lineEnd: 0x080001C6,
+    });
+
+    expect(failed).toMatchObject({
+      ok: false,
+      errorCode: 'NativeOwnerLost',
+      targetState: 'Error',
+      elapsedMs: 37,
+      diagnostics: {
+        phase: 'decode',
+        rawLength: 0,
+        ownerKind: 'cmsis-dap',
+        method: 'stepOverSourceLine',
+        causeErrorCode: 'MalformedResponse',
+      },
+    });
+    expect(selector.ownerKind).toBe('none');
+    expect(helper.dispose).toHaveBeenCalledWith(false);
+    expect(createCmsisDap).toHaveBeenCalledTimes(1);
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+    await expect(channel.getState()).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'InvalidState',
+      diagnostics: { ownerKind: 'cmsis-dap', state: 'failed' },
+    });
   });
 
   it('uses the one selected CMSIS-DAP owner for the flash-before-debug flow', async () => {
@@ -520,18 +739,174 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(helper.dispose).toHaveBeenCalledWith(true);
   });
 
-  it('returns structured UnsupportedCapability for unimplemented CMSIS-DAP operations', async () => {
-    const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper() });
-
-    await expect(channel.stepIntoSourceLine({ lineStart: 1, lineEnd: 2 })).resolves.toMatchObject({
-      ok: false,
-      errorCode: 'UnsupportedCapability',
-      diagnostics: { ownerKind: 'cmsis-dap', capability: 'stepIntoSourceLine' },
+  it('routes DAP-05 breakpoints and all source-step primitives through the control scheduler', async () => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    await channel.connect({
+      probe: 'cmsis-dap', cmsisDapTransport: 'hid', flashBeforeDebug: false,
+      device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
     });
-    await expect(channel.writeMemory(0x20000000, new Uint8Array([0]))).resolves.toMatchObject({
+
+    await expect(channel.setBreakpoint(0x080001C4, 2)).resolves.toMatchObject({
+      ok: true, data: { id: 2, address: 0x080001C4, fpbRevision: 1 },
+    });
+    await expect(channel.clearBreakpoint(2)).resolves.toMatchObject({ ok: true });
+    await expect(channel.stepIntoSourceLine({ lineStart: 0x080001C0, lineEnd: 0x080001C6 }))
+      .resolves.toMatchObject({ ok: true, data: { cleanupOk: true } });
+    await expect(channel.stepOverSourceLine({ lineStart: 0x080001C0, lineEnd: 0x080001C6 }))
+      .resolves.toMatchObject({ ok: true, data: { cleanupOk: true } });
+    await expect(channel.stepOut({ functionStart: 0x080001E0, functionEnd: 0x08000200 }))
+      .resolves.toMatchObject({ ok: true, data: { cleanupOk: true } });
+    expect((helper.controlRequest as ReturnType<typeof vi.fn>).mock.calls.map(call => call[0]))
+      .toEqual(expect.arrayContaining([
+        'setBreakpoint', 'clearBreakpoint', 'stepIntoSourceLine', 'stepOverSourceLine', 'stepOut',
+      ]));
+  });
+
+  it('runs to a startup address through one control request on the selected CMSIS-DAP owner', async () => {
+    const base = fakeCmsisDapHelper();
+    const controlRequest = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'runToAddress') {
+        return {
+          ok: true,
+          message: 'startup entry reached',
+          targetState: 'Halted' as const,
+          elapsedMs: 12,
+          data: {
+            state: 'Halted' as const,
+            requestedAddress: 0x08003a2d,
+            entryAddress: 0x08003a2c,
+            resetRequested: true,
+            resetPcValid: true,
+            resetDhcsr: 0x03010003,
+            resetPc: 0x08004518,
+            resetLr: 0xffffffff,
+            pc: 0x08003a2c,
+            lr: 0x08004541,
+            dhcsr: 0x00030003,
+            cleanupOk: true,
+            sharedUserSlot: false,
+            temporaryBreakpointCount: 1,
+            temporarySlot: 5,
+            ignoredUserSlots: [0],
+          },
+        };
+      }
+      return (base.controlRequest as any)(method, params);
+    });
+    const helper = fakeCmsisDapHelper({ controlRequest: controlRequest as any });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    await channel.connect({
+      probe: 'cmsis-dap', cmsisDapTransport: 'hid', flashBeforeDebug: false,
+      device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    await expect(channel.runToAddress(0x08003a2d, true)).resolves.toMatchObject({
+      ok: true,
+      targetState: 'Halted',
+      data: { entryAddress: 0x08003a2c, pc: 0x08003a2c, cleanupOk: true },
+    });
+    expect(controlRequest).toHaveBeenCalledWith('runToAddress', {
+      address: 0x08003a2d,
+      reset: true,
+      timeoutMs: 5000,
+    });
+    expect(controlRequest.mock.calls.filter(call => call[0] === 'runToAddress')).toHaveLength(1);
+  });
+
+  it('keeps the CMSIS-DAP owner and user resources on startup comparator exhaustion', async () => {
+    const base = fakeCmsisDapHelper();
+    const helper = fakeCmsisDapHelper({
+      controlRequest: vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+        if (method === 'runToAddress') {
+          return {
+            ok: false,
+            message: 'all FPB comparators are occupied',
+            errorCode: 'BreakpointResourceExhausted',
+            targetState: 'Halted' as const,
+            elapsedMs: 2,
+            diagnostics: { startup: { cleanupOk: true, temporaryBreakpointCount: 0 } },
+          };
+        }
+        return (base.controlRequest as any)(method, params);
+      }) as any,
+    });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const selector = new SessionTargetSelector(
+      createNative,
+      createLegacy,
+      () => new CmsisDapTargetChannel({ helperClient: helper }),
+    );
+    await selector.connect({
+      probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    await expect(selector.runToAddress(0x08003a2d, true)).resolves.toMatchObject({
       ok: false,
-      errorCode: 'UnsupportedCapability',
-      diagnostics: { ownerKind: 'cmsis-dap', capability: 'writeMemory' },
+      errorCode: 'BreakpointResourceExhausted',
+      targetState: 'Halted',
+    });
+    expect(selector.ownerKind).toBe('cmsis-dap');
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+  });
+
+  it('terminates a lost CMSIS-DAP startup owner without constructing a J-Link fallback', async () => {
+    const base = fakeCmsisDapHelper();
+    const helper = fakeCmsisDapHelper({
+      controlRequest: vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+        if (method === 'runToAddress') {
+          return {
+            ok: false,
+            message: 'recovery halt failed after startup timeout',
+            errorCode: 'StartupRecoveryFailed',
+            targetState: 'Error' as const,
+            elapsedMs: 5001,
+            diagnostics: { startup: { cleanupOk: true } },
+          };
+        }
+        return (base.controlRequest as any)(method, params);
+      }) as any,
+    });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    await selector.connect({
+      probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    await expect(selector.runToAddress(0x08003a2d, true)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'NativeOwnerLost',
+      diagnostics: {
+        causeErrorCode: 'StartupRecoveryFailed',
+        startup: { cleanupOk: true },
+      },
+    });
+    expect(selector.ownerKind).toBe('none');
+    expect(helper.dispose).toHaveBeenCalledWith(false);
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+  });
+
+  it('routes CMSIS-DAP RAM writes through one control request on the selected owner', async () => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    await channel.connect({
+      probe: 'cmsis-dap', cmsisDapTransport: 'hid', flashBeforeDebug: false,
+      device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    await expect(channel.writeMemory(0x20000001, new Uint8Array([0x11, 0x22])))
+      .resolves.toMatchObject({
+        ok: true,
+        data: { address: 0x20000001, bytesWritten: 2 },
+      });
+    expect(helper.controlRequest).toHaveBeenCalledWith('writeMemory', {
+      address: 0x20000001,
+      bytes: [0x11, 0x22],
     });
   });
 

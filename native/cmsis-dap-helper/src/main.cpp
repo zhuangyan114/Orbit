@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -16,7 +17,10 @@
 #include "cmsis_dap_protocol.h"
 #include "cmsis_dap_target.h"
 #include "cmsis_dap_transport.h"
+#include "cmsis_dap_source_step.h"
+#include "cmsis_dap_startup_stop.h"
 #include "cortex_m_debug.h"
+#include "fpb_breakpoint.h"
 #include "json_rpc.h"
 #include "mock_transport.h"
 #include "trace_control.h"
@@ -34,6 +38,7 @@ constexpr uint32_t kStm32F4FlashCr = 0x40023C10u;
 // far below what the helper could buffer; they exist to keep the JSON
 // payload and the transfer time bounded.
 constexpr uint32_t kMaxMemoryReadBytes = 65536;
+constexpr uint32_t kMaxMemoryWriteBytes = 65536;
 constexpr uint32_t kMaxMemoryBlockWords = 16384;
 
 void diag(const std::string& message) {
@@ -157,6 +162,7 @@ struct Channel {
   DeviceDescriptor device;
   bool opened = false;
   bool connected = false;
+  bool debugPowerReady = false;
   uint16_t packetSize = 0;  // effective packet size from the last DAP_Info
   bool flashAlgorithmLoaded = false;
   uint32_t flashAlgorithmAddress = 0;
@@ -166,6 +172,7 @@ struct Channel {
   uint32_t flashPageTargetAddress = 0;
   uint32_t flashPageSize = 0;
   std::vector<uint8_t> flashPageData;
+  FpbState fpbState;
 
   void clearFlashPageBuffer() {
     flashPageBufferValid = false;
@@ -180,6 +187,11 @@ struct Channel {
     flashAlgorithmAddress = 0;
     flashAlgorithmCode.clear();
     clearFlashPageBuffer();
+  }
+
+  void clearDebugResourceState() {
+    debugPowerReady = false;
+    fpbState.reset();
   }
 
   std::string state() const {
@@ -210,6 +222,15 @@ struct Channel {
   }
 };
 
+Result ensureDebugPower(Channel& channel, CmsisDapTarget& target,
+                        DapTransferDiagnostics& diagnostics,
+                        std::chrono::milliseconds timeout) {
+  if (channel.debugPowerReady) return Result::success();
+  const Result result = target.initializeDebugPower(diagnostics, timeout);
+  channel.debugPowerReady = result.ok;
+  return result;
+}
+
 // Creates the transport for the requested name. "hid" is the real Windows
 // CMSIS-DAP v1 transport; "mock" is the in-memory transport used by mock
 // tests. WinUSB is rejected before this point with kTransportNotSupported.
@@ -233,8 +254,9 @@ std::string handleHello(const JsonValue& params) {
       "\",\"platform\":\"" + kPlatform +
       "\",\"capabilities\":[\"enumDevices\",\"hidTransport\",\"dapInfo\",\"dapConnect\","
       "\"dapDisconnect\",\"dapTransfer\",\"dapTransferBlock\",\"swDp\",\"memAp\","
-      "\"readMemory\",\"readMemoryBlock\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
-      "\"reset\",\"stepInstruction\",\"readRegister\"]}";
+      "\"readMemory\",\"readMemoryBlock\",\"writeMemory\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
+      "\"reset\",\"stepInstruction\",\"readRegister\",\"hardwareBreakpoints\",\"runToAddress\","
+       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\"]}";
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
   if (clientProtocol != static_cast<uint64_t>(kProtocolVersion)) {
@@ -397,10 +419,64 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
           std::to_string(device.reportId) + ",\"transport\":\"" + jsonEscape(transportName) + "\"}");
 }
 
+Result claimFpbOwnership(CmsisDapTarget& target, CortexMDebug& debug,
+                         FpbState& fpbState, CortexMDebugState& finalState,
+                         DapTransferDiagnostics& diagnostics,
+                         std::chrono::milliseconds timeout) {
+  CortexMDebugState initialState;
+  Result result = debug.getState(initialState, diagnostics, timeout);
+  if (!result.ok) return result;
+
+  const bool restoreRunning = !initialState.halted;
+  if (restoreRunning) {
+    CortexMDebugState haltedState;
+    result = debug.halt(haltedState, diagnostics, timeout);
+    if (!result.ok) return result;
+  }
+
+  FpbBreakpointManager fpb(&target, &fpbState);
+  FpbCapabilities capabilities;
+  result = fpb.initialize(capabilities, diagnostics, timeout);
+
+  Result restoreResult = Result::success();
+  if (restoreRunning) restoreResult = debug.resume(diagnostics, timeout);
+  if (!restoreResult.ok) {
+    return Result::error(
+        "FpbCleanupFailed",
+        "failed to restore target state after claiming FPB ownership: " +
+            restoreResult.message);
+  }
+  if (!result.ok) return result;
+  return debug.getState(finalState, diagnostics, timeout);
+}
+
+void clearFpbBestEffort(Channel& channel) {
+  if (!channel.fpbState.initialized || !channel.connected || !channel.transport
+      || !channel.transport->isOpen()) {
+    channel.clearDebugResourceState();
+    return;
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  DapTransferDiagnostics diagnostics;
+  const Result power = target.initializeDebugPower(diagnostics, std::chrono::milliseconds(500));
+  if (power.ok) {
+    FpbBreakpointManager fpb(&target, &channel.fpbState);
+    uint32_t cleared = 0;
+    const Result cleanup = fpb.clearAll(cleared, diagnostics, std::chrono::milliseconds(500));
+    if (!cleanup.ok) diag("FPB cleanup failed code=" + cleanup.errorCode + " message=" + cleanup.message);
+  } else {
+    diag("FPB cleanup power-up failed code=" + power.errorCode + " message=" + power.message);
+  }
+  channel.clearDebugResourceState();
+}
+
 std::string handleClose(Channel& channel) {
   const auto started = std::chrono::steady_clock::now();
   if (channel.transport) {
     if (channel.connected && channel.transport->isOpen()) {
+      clearFpbBestEffort(channel);
       // Symmetric lifecycle: release the target link before closing the device.
       CmsisDapProtocol protocol(channel.transport.get());
       const Result disconnectResult =
@@ -419,6 +495,7 @@ std::string handleClose(Channel& channel) {
   channel.opened = false;
   channel.connected = false;
   channel.clearFlashAlgorithmState();
+  channel.clearDebugResourceState();
   return resultJson(true, "device closed", "Disconnected", 0);
 }
 
@@ -516,13 +593,14 @@ std::string handleConnect(const JsonValue& params, Channel& channel) {
   }
 
   channel.connected = true;
+  channel.clearDebugResourceState();
   const std::string connectedName =
       connectedPort == kPortJtag ? "JTAG" : (connectedPort == kPortSwd ? "SWD" : "default");
   return resultJson(true, "DAP_Connect completed", channel.state(), elapsedMs,
-                     "{\"port\":\"" + connectedName + "\",\"connectResponse\":" +
-                         std::to_string(connectedPort) + ",\"speedKHz\":" +
-                         std::to_string(speedKHz) + ",\"swdPinInput\":" +
-                         std::to_string(protocol.lastSwjPinInput()) + "}");
+                      "{\"port\":\"" + connectedName + "\",\"connectResponse\":" +
+                          std::to_string(connectedPort) + ",\"speedKHz\":" +
+                          std::to_string(speedKHz) + ",\"swdPinInput\":" +
+                          std::to_string(protocol.lastSwjPinInput()) + "}");
 }
 
 std::string handleDisconnect(Channel& channel) {
@@ -531,6 +609,7 @@ std::string handleDisconnect(Channel& channel) {
   if (!openResult.ok) {
     return resultJson(false, openResult.message, channel.state(), 0, "{}", openResult.errorCode);
   }
+  clearFpbBestEffort(channel);
   CmsisDapProtocol protocol(channel.transport.get());
   const Result result = protocol.disconnect(std::chrono::milliseconds(2000));
   const long long elapsedMs =
@@ -541,6 +620,7 @@ std::string handleDisconnect(Channel& channel) {
   }
   channel.connected = false;
   channel.clearFlashAlgorithmState();
+  channel.clearDebugResourceState();
   return resultJson(true, "DAP_Disconnect completed", channel.state(), elapsedMs);
 }
 
@@ -757,6 +837,39 @@ std::string handleReadMemoryBlock(const JsonValue& params, Channel& channel) {
                     "", targetDiagnosticsJson(diag, channel.packetSize));
 }
 
+std::string handleWriteMemory(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result readyResult = channel.ensureReady();
+  if (!readyResult.ok) {
+    return resultJson(false, readyResult.message, channel.state(), 0, "{}", readyResult.errorCode);
+  }
+  const std::optional<uint64_t> address = uintField(params, "address");
+  const std::optional<std::vector<uint8_t>> bytes =
+      byteArrayField(params, "bytes", kMaxMemoryWriteBytes);
+  if (!address || *address > 0xFFFFFFFF || !bytes || bytes->empty()) {
+    return resultJson(false,
+                      "writeMemory requires a 32-bit address and bytes in 1.." +
+                          std::to_string(kMaxMemoryWriteBytes),
+                      channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest);
+  }
+  const std::chrono::milliseconds timeout(uintField(params, "timeoutMs").value_or(5000));
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  DapTransferDiagnostics diag;
+  const Result result = target.writeMemory(static_cast<uint32_t>(*address), *bytes, diag, timeout);
+  const long long elapsedMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedMs, "{}", result.errorCode,
+                      targetDiagnosticsJson(diag, channel.packetSize));
+  }
+  return resultJson(true, "memory written", channel.state(), elapsedMs,
+                    "{\"address\":" + std::to_string(*address) +
+                        ",\"bytesWritten\":" + std::to_string(bytes->size()) + "}",
+                    "", targetDiagnosticsJson(diag, channel.packetSize));
+}
+
 // ---------------------------------------------------------------------------
 // DAP-04: Cortex-M CoreDebug state and register access
 // ---------------------------------------------------------------------------
@@ -880,7 +993,8 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
   CmsisDapTarget target(&protocol, channel.packetSize);
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
-  const Result powerResult = target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+  const Result powerResult =
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     channel.clearFlashAlgorithmState();
     return coreFailure(powerResult, "flashAlgorithm", channel, started, *timeout, diag);
@@ -1036,6 +1150,7 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
                         uint32_t timeoutMs, const DapTransferDiagnostics& diag,
                         const std::string& extra,
                         const CortexMDebugDiagnostics* algorithm) {
+  channel.debugPowerReady = false;
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - started)
@@ -1057,6 +1172,113 @@ std::string invalidControlTimeout(const char* operation, Channel& channel) {
                     "{\"operation\":\"" + std::string(operation) + "\",\"field\":\"timeoutMs\"}");
 }
 
+std::string uintArrayJson(const std::vector<uint32_t>& values) {
+  std::ostringstream out;
+  out << '[';
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) out << ',';
+    out << values[index];
+  }
+  out << ']';
+  return out.str();
+}
+
+std::string fpbCapabilitiesJson(const FpbCapabilities& capabilities) {
+  return "{\"fpCtrl\":" + std::to_string(capabilities.fpCtrl) +
+         ",\"revision\":" + std::to_string(capabilities.revision) +
+         ",\"codeComparators\":" + std::to_string(capabilities.codeComparators) +
+         ",\"literalComparators\":" + std::to_string(capabilities.literalComparators) +
+         ",\"enabled\":" + (capabilities.enabled ? "true" : "false") + "}";
+}
+
+std::string fpbBreakpointJson(const FpbBreakpointResult& breakpoint,
+                              const FpbCapabilities& capabilities) {
+  return "{\"slot\":" + std::to_string(breakpoint.slot) +
+         ",\"requestedAddress\":" + std::to_string(breakpoint.requestedAddress) +
+         ",\"address\":" + std::to_string(breakpoint.address) +
+         ",\"fpbRevision\":" + std::to_string(capabilities.revision) +
+         ",\"codeComparators\":" + std::to_string(capabilities.codeComparators) +
+         ",\"comparatorValue\":" + std::to_string(breakpoint.comparatorValue) +
+         ",\"comparatorReadback\":" + std::to_string(breakpoint.comparatorReadback) +
+         ",\"duplicate\":" + (breakpoint.duplicate ? "true" : "false") + "}";
+}
+
+Result prepareFpbWrite(CortexMDebug& debug, CortexMDebugState& initial,
+                       bool& restoreRunning, DapTransferDiagnostics& diagnostics,
+                       std::chrono::milliseconds timeout) {
+  Result result = debug.getState(initial, diagnostics, timeout);
+  if (!result.ok) return result;
+  restoreRunning = !initial.halted;
+  if (!restoreRunning) return Result::success();
+  CortexMDebugState halted;
+  return debug.halt(halted, diagnostics, timeout);
+}
+
+Result finishFpbWrite(CortexMDebug& debug, bool restoreRunning,
+                      CortexMDebugState& finalState,
+                      DapTransferDiagnostics& diagnostics,
+                      std::chrono::milliseconds timeout) {
+  if (restoreRunning) {
+    Result result = debug.resume(diagnostics, timeout);
+    if (!result.ok) return result;
+  }
+  return debug.getState(finalState, diagnostics, timeout);
+}
+
+std::string sourceStepJson(const SourceStepResult& step) {
+  std::ostringstream out;
+  out << "{\"pcBefore\":" << step.pcBefore << ",\"pcAfter\":" << step.pcAfter
+      << ",\"classification\":\"" << jsonEscape(step.classification) << "\""
+      << ",\"stopReason\":\"" << jsonEscape(step.stopReason) << "\""
+      << ",\"instructions\":" << step.instructions
+      << ",\"cleanupOk\":" << (step.cleanupOk ? "true" : "false")
+      << ",\"enteredCall\":" << (step.enteredCall ? "true" : "false")
+      << ",\"instructionRetired\":" << (step.instructionRetired ? "true" : "false")
+      << ",\"interruptMaskApplied\":" << (step.interruptMaskApplied ? "true" : "false")
+      << ",\"interruptMaskCleared\":" << (step.interruptMaskCleared ? "true" : "false")
+      << ",\"stepDhcsr\":" << step.stepDhcsr
+      << ",\"stepDhcsrPolls\":" << step.stepDhcsrPolls
+      << ",\"temporaryBreakpointCount\":" << step.temporaryBreakpointCount
+      << ",\"restoredSlots\":" << uintArrayJson(step.restoredSlots);
+  if (step.temporarySlot) out << ",\"temporarySlot\":" << *step.temporarySlot;
+  if (step.returnAddress) out << ",\"returnAddress\":" << *step.returnAddress;
+  if (step.lr) out << ",\"lr\":" << *step.lr;
+  if (step.sp) out << ",\"sp\":" << *step.sp;
+  out << ",\"trace\":[";
+  for (size_t index = 0; index < step.trace.size(); ++index) {
+    if (index != 0) out << ',';
+    out << "{\"pc\":" << step.trace[index].pc
+        << ",\"classification\":\"" << jsonEscape(step.trace[index].classification)
+        << "\",\"call\":" << (step.trace[index].call ? "true" : "false") << '}';
+  }
+  out << "],\"timings\":{\"haltMs\":0,\"readPcMs\":0,\"decodeMs\":0,"
+      << "\"executeMs\":0,\"waitMs\":0,\"cleanupMs\":0,\"totalMs\":0}}";
+  return out.str();
+}
+
+std::string startupStopJson(const StartupStopResult& startup) {
+  std::ostringstream out;
+  out << "{\"requestedAddress\":" << startup.requestedAddress
+      << ",\"entryAddress\":" << startup.entryAddress
+      << ",\"resetRequested\":" << (startup.resetRequested ? "true" : "false")
+      << ",\"resetPcValid\":" << (startup.resetPcValid ? "true" : "false")
+      << ",\"resetDhcsr\":" << startup.resetDhcsr
+      << ",\"resetPc\":" << startup.resetPc
+      << ",\"resetLr\":" << startup.resetLr
+      << ",\"pc\":" << startup.pc
+      << ",\"lr\":" << startup.lr
+      << ",\"dhcsr\":" << startup.dhcsr
+      << ",\"cleanupOk\":" << (startup.cleanupOk ? "true" : "false")
+      << ",\"sharedUserSlot\":" << (startup.sharedUserSlot ? "true" : "false")
+      << ",\"temporaryBreakpointCount\":" << startup.temporaryBreakpointCount;
+  if (startup.temporarySlot) {
+    out << ",\"temporarySlot\":" << *startup.temporarySlot;
+  }
+  out << ",\"ignoredUserSlots\":" << uintArrayJson(startup.ignoredUserSlots)
+      << "}";
+  return out.str();
+}
+
 std::string handleCoreGetState(const JsonValue& params, Channel& channel) {
   const auto started = std::chrono::steady_clock::now();
   const Result readyResult = channel.ensureReady();
@@ -1071,7 +1293,7 @@ std::string handleCoreGetState(const JsonValue& params, Channel& channel) {
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
   const Result powerResult =
-      target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     return coreFailure(powerResult, "getState", channel, started, *timeout, diag,
                        "\"phase\":\"debugPower\"");
@@ -1103,7 +1325,7 @@ std::string handleCoreHalt(const JsonValue& params, Channel& channel) {
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
   const Result powerResult =
-      target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     return coreFailure(powerResult, "halt", channel, started, *timeout, diag,
                        "\"phase\":\"debugPower\"");
@@ -1143,25 +1365,90 @@ std::string handleCoreRun(const JsonValue& params, Channel& channel) {
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
   const Result powerResult =
-      target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     return coreFailure(powerResult, "run", channel, started, *timeout, diag,
                        "\"phase\":\"debugPower\"");
   }
   CortexMDebugState state;
-  const Result result = debug.run(state, diag, std::chrono::milliseconds(*timeout));
+  Result result = debug.getState(state, diag, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "run", channel, started, *timeout, diag);
+  SourceStepResult currentBreakpointStep;
+  bool steppedCurrentBreakpoint = false;
+  if (state.halted && state.pcValid && channel.fpbState.initialized) {
+    steppedCurrentBreakpoint = std::any_of(
+        channel.fpbState.userSlots.begin(), channel.fpbState.userSlots.end(),
+        [&](const auto& address) { return address && *address == (state.pc & ~1u); });
+    if (steppedCurrentBreakpoint) {
+      CmsisDapSourceStepper stepper(&target, &debug, &channel.fpbState);
+      result = stepper.stepInstruction(currentBreakpointStep, diag,
+                                       std::chrono::milliseconds(*timeout));
+      if (!result.ok) {
+        return coreFailure(result, "run", channel, started, *timeout, diag,
+                           "\"phase\":\"continueAtCurrentPc\",\"step\":" +
+                               sourceStepJson(currentBreakpointStep));
+      }
+    }
+  }
+  result = debug.run(state, diag, std::chrono::milliseconds(*timeout));
+  bool breakpointHitBeforeRunningObserved = false;
+  if (!result.ok && result.errorCode == ErrorCodes::kDapControlTimeout &&
+      channel.fpbState.initialized) {
+    // A nearby FPB comparator can halt the core before the HID polling loop
+    // observes even one Running sample. The resume write completed, so confirm
+    // the current owner is halted at an actually configured user comparator.
+    // Do not turn unrelated halts, lockups, or unreadable state into success.
+    CortexMDebugState immediateState;
+    const Result stateResult =
+        debug.getState(immediateState, diag, std::chrono::milliseconds(*timeout));
+    if (stateResult.ok && immediateState.halted && immediateState.pcValid) {
+      const uint32_t haltedPc = immediateState.pc & ~1u;
+      breakpointHitBeforeRunningObserved = std::any_of(
+          channel.fpbState.userSlots.begin(), channel.fpbState.userSlots.end(),
+          [&](const auto& address) { return address && *address == haltedPc; });
+      if (breakpointHitBeforeRunningObserved) {
+        state = immediateState;
+        result = Result::success();
+      }
+    }
+  }
   if (!result.ok) {
+    const std::string stepDiagnostics = steppedCurrentBreakpoint
+        ? ",\"phase\":\"resumeAfterCurrentPcStep\",\"step\":" +
+              sourceStepJson(currentBreakpointStep)
+        : "";
     return coreFailure(result, "run", channel, started, *timeout, diag,
                        "\"dhcsrWrite\":" +
-                           std::to_string(kCoreDebugDbgKey | kCoreDebugCDebugEn));
+                           std::to_string(kCoreDebugDbgKey | kCoreDebugCDebugEn) +
+                           stepDiagnostics);
   }
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - started)
           .count();
+  std::string data = "{\"state\":\"" + cortexStateName(state) + "\",\"dhcsr\":" +
+                     std::to_string(state.dhcsr);
+  if (breakpointHitBeforeRunningObserved) {
+    data += ",\"pc\":" + std::to_string(state.pc) +
+            ",\"breakpointHitBeforeRunningObserved\":true";
+  }
+  if (steppedCurrentBreakpoint) {
+    data += ",\"pcBefore\":" + std::to_string(currentBreakpointStep.pcBefore) +
+            ",\"pcAfterStep\":" + std::to_string(currentBreakpointStep.pcAfter) +
+            ",\"instructionRetired\":" +
+                (currentBreakpointStep.instructionRetired ? "true" : "false") +
+            ",\"interruptMaskApplied\":" +
+                (currentBreakpointStep.interruptMaskApplied ? "true" : "false") +
+            ",\"interruptMaskCleared\":" +
+                (currentBreakpointStep.interruptMaskCleared ? "true" : "false") +
+            ",\"stepDhcsr\":" + std::to_string(currentBreakpointStep.stepDhcsr) +
+            ",\"stepDhcsrPolls\":" +
+                std::to_string(currentBreakpointStep.stepDhcsrPolls) +
+            ",\"restoredSlots\":" + uintArrayJson(currentBreakpointStep.restoredSlots);
+  }
+  data += "}";
   return resultJson(true, "Cortex-M run confirmed", cortexStateName(state), elapsedMs,
-                    "{\"state\":\"" + cortexStateName(state) + "\",\"dhcsr\":" +
-                        std::to_string(state.dhcsr) + "}",
+                    data,
                     "",
                     cortexDiagnosticsJson("run", *timeout, diag,
                                           "\"dhcsrWrite\":" +
@@ -1184,7 +1471,7 @@ std::string handleCoreReset(const JsonValue& params, Channel& channel) {
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
   const Result powerResult =
-      target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     return coreFailure(powerResult, "reset", channel, started, *timeout, diag,
                        "\"phase\":\"debugPower\"");
@@ -1212,6 +1499,57 @@ std::string handleCoreReset(const JsonValue& params, Channel& channel) {
                                                              kCoreDebugSysResetReq)));
 }
 
+std::string handleRunToAddress(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result readyResult = channel.ensureReady();
+  if (!readyResult.ok) {
+    return coreFailure(readyResult, "runToAddress", channel, started, 0, {});
+  }
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) return invalidControlTimeout("runToAddress", channel);
+  const auto address = uintField(params, "address");
+  if (!address || *address > 0xFFFFFFFFull) {
+    return resultJson(false, "runToAddress requires a uint32 address",
+                      channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
+                      "{\"operation\":\"runToAddress\"}");
+  }
+  const bool reset = boolField(params, "reset").value_or(true);
+  if (reset) channel.clearFlashAlgorithmState();
+
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CortexMDebug debug(&target);
+  DapTransferDiagnostics diagnostics;
+  Result result = ensureDebugPower(channel, target, diagnostics,
+                                   std::chrono::milliseconds(*timeout));
+  if (!result.ok) {
+    return coreFailure(result, "runToAddress", channel, started, *timeout,
+                       diagnostics, "\"phase\":\"debugPower\"");
+  }
+
+  CmsisDapStartupStop startupStop(&target, &debug, &channel.fpbState);
+  StartupStopResult startup;
+  result = startupStop.runToAddress(static_cast<uint32_t>(*address), reset,
+                                    startup, diagnostics,
+                                    std::chrono::milliseconds(*timeout));
+  const std::string startupJson = startupStopJson(startup);
+  if (!result.ok) {
+    return coreFailure(result, "runToAddress", channel, started, *timeout,
+                       diagnostics, "\"startup\":" + startupJson);
+  }
+
+  const long long elapsedMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count();
+  return resultJson(true, "Cortex-M startup entry reached and temporary breakpoint cleaned",
+                    "Halted", elapsedMs,
+                    "{\"state\":\"Halted\"," + startupJson.substr(1), "",
+                    cortexDiagnosticsJson("runToAddress", *timeout, diagnostics,
+                                          "\"startup\":" + startupJson));
+}
+
 std::string handleCoreStepInstruction(const JsonValue& params, Channel& channel) {
   const auto started = std::chrono::steady_clock::now();
   const Result readyResult = channel.ensureReady();
@@ -1224,34 +1562,28 @@ std::string handleCoreStepInstruction(const JsonValue& params, Channel& channel)
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
   const Result powerResult =
-      target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     return coreFailure(powerResult, "stepInstruction", channel, started, *timeout, diag,
                        "\"phase\":\"debugPower\"");
   }
-  CortexMDebugStepResult step;
-  const Result result =
-      debug.stepInstruction(step, diag, std::chrono::milliseconds(*timeout));
+  CmsisDapSourceStepper stepper(&target, &debug, &channel.fpbState);
+  SourceStepResult step;
+  const Result result = stepper.stepInstruction(step, diag, std::chrono::milliseconds(*timeout));
+  const std::string stepJson = sourceStepJson(step);
   if (!result.ok) {
     return coreFailure(result, "stepInstruction", channel, started, *timeout, diag,
-                       "\"dhcsrWrite\":" +
-                           std::to_string(kCoreDebugDbgKey | kCoreDebugCDebugEn |
-                                          kCoreDebugCStep));
+                       "\"step\":" + stepJson);
   }
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - started)
           .count();
   return resultJson(true, "Cortex-M instruction step confirmed", "Halted", elapsedMs,
-                    "{\"state\":\"Halted\",\"dhcsr\":" + std::to_string(step.dhcsr) +
-                        ",\"pcBefore\":" + std::to_string(step.pcBefore) +
-                        ",\"pcAfter\":" + std::to_string(step.pcAfter) + "}",
+                    "{\"state\":\"Halted\"," + stepJson.substr(1),
                     "",
                     cortexDiagnosticsJson("stepInstruction", *timeout, diag,
-                                          "\"dhcsrWrite\":" +
-                                              std::to_string(kCoreDebugDbgKey |
-                                                             kCoreDebugCDebugEn |
-                                                             kCoreDebugCStep)));
+                                          "\"step\":" + stepJson));
 }
 
 std::string handleCoreReadRegister(const JsonValue& params, Channel& channel) {
@@ -1272,7 +1604,7 @@ std::string handleCoreReadRegister(const JsonValue& params, Channel& channel) {
   CortexMDebug debug(&target);
   DapTransferDiagnostics diag;
   const Result powerResult =
-      target.initializeDebugPower(diag, std::chrono::milliseconds(*timeout));
+      ensureDebugPower(channel, target, diag, std::chrono::milliseconds(*timeout));
   if (!powerResult.ok) {
     return coreFailure(powerResult, "readRegister", channel, started, *timeout, diag,
                        "\"phase\":\"debugPower\"");
@@ -1295,6 +1627,217 @@ std::string handleCoreReadRegister(const JsonValue& params, Channel& channel) {
                     "",
                     cortexDiagnosticsJson("readRegister", *timeout, diag,
                                           "\"register\":" + std::to_string(*index)));
+}
+
+std::string handleGetFpbInfo(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) return coreFailure(ready, "getFpbInfo", channel, started, 0, {});
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) return invalidControlTimeout("getFpbInfo", channel);
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CortexMDebug debug(&target);
+  DapTransferDiagnostics diagnostics;
+  Result result =
+      ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "getFpbInfo", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"debugPower\"");
+  CortexMDebugState finalState;
+  result = claimFpbOwnership(target, debug, channel.fpbState, finalState,
+                             diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "getFpbInfo", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"claimFpbOwnership\"");
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const FpbCapabilities& capabilities = channel.fpbState.capabilities;
+  const std::string data = fpbCapabilitiesJson(capabilities);
+  return resultJson(true, "Cortex-M FPB capability detected", cortexStateName(finalState), elapsedMs,
+                    data, "", cortexDiagnosticsJson("getFpbInfo", *timeout, diagnostics,
+                                                     "\"fpb\":" + data));
+}
+
+std::string handleSetBreakpoint(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) return coreFailure(ready, "setBreakpoint", channel, started, 0, {});
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) return invalidControlTimeout("setBreakpoint", channel);
+  const auto address = uintField(params, "address");
+  if (!address || *address > 0xFFFFFFFFull) {
+    return resultJson(false, "setBreakpoint requires a uint32 address", channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"setBreakpoint\"}");
+  }
+  const auto preferred = uintField(params, "preferredSlot");
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CortexMDebug debug(&target);
+  DapTransferDiagnostics diagnostics;
+  Result result =
+      ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "setBreakpoint", channel, started, *timeout, diagnostics);
+  CortexMDebugState initialState;
+  bool restoreRunning = false;
+  result = prepareFpbWrite(debug, initialState, restoreRunning, diagnostics,
+                           std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "setBreakpoint", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"prepareFpbWrite\"");
+  FpbBreakpointManager fpb(&target, &channel.fpbState);
+  FpbBreakpointResult breakpoint;
+  result = fpb.setUser(static_cast<uint32_t>(*address),
+                       preferred && *preferred <= 0xFFFFFFFFull
+                           ? std::optional<uint32_t>(static_cast<uint32_t>(*preferred))
+                           : std::nullopt,
+                       breakpoint, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "setBreakpoint", channel, started, *timeout, diagnostics,
+                                     "\"address\":" + std::to_string(*address));
+  CortexMDebugState finalState;
+  result = finishFpbWrite(debug, restoreRunning, finalState, diagnostics,
+                          std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "setBreakpoint", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"restoreTargetState\"");
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string data = fpbBreakpointJson(breakpoint, channel.fpbState.capabilities);
+  return resultJson(true, "FPB breakpoint set and verified", cortexStateName(finalState), elapsedMs, data, "",
+                    cortexDiagnosticsJson("setBreakpoint", *timeout, diagnostics,
+                                          "\"breakpoint\":" + data));
+}
+
+std::string handleClearBreakpoint(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) return coreFailure(ready, "clearBreakpoint", channel, started, 0, {});
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) return invalidControlTimeout("clearBreakpoint", channel);
+  auto slotValue = uintField(params, "slot");
+  if (!slotValue) slotValue = uintField(params, "id");
+  if (!slotValue || *slotValue > 0xFFFFFFFFull) {
+    return resultJson(false, "clearBreakpoint requires a comparator slot", channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest);
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CortexMDebug debug(&target);
+  DapTransferDiagnostics diagnostics;
+  Result result =
+      ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearBreakpoint", channel, started, *timeout, diagnostics);
+  CortexMDebugState initialState;
+  bool restoreRunning = false;
+  result = prepareFpbWrite(debug, initialState, restoreRunning, diagnostics,
+                           std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearBreakpoint", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"prepareFpbWrite\"");
+  FpbBreakpointManager fpb(&target, &channel.fpbState);
+  FpbBreakpointResult breakpoint;
+  result = fpb.clearUser(static_cast<uint32_t>(*slotValue), breakpoint, diagnostics,
+                         std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearBreakpoint", channel, started, *timeout, diagnostics,
+                                     "\"slot\":" + std::to_string(*slotValue));
+  CortexMDebugState finalState;
+  result = finishFpbWrite(debug, restoreRunning, finalState, diagnostics,
+                          std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearBreakpoint", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"restoreTargetState\"");
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string data = fpbBreakpointJson(breakpoint, channel.fpbState.capabilities);
+  return resultJson(true, "FPB breakpoint cleared and verified", cortexStateName(finalState), elapsedMs, data, "",
+                    cortexDiagnosticsJson("clearBreakpoint", *timeout, diagnostics,
+                                          "\"breakpoint\":" + data));
+}
+
+std::string handleClearAllBreakpoints(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) return coreFailure(ready, "clearAllBreakpoints", channel, started, 0, {});
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) return invalidControlTimeout("clearAllBreakpoints", channel);
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CortexMDebug debug(&target);
+  DapTransferDiagnostics diagnostics;
+  Result result =
+      ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearAllBreakpoints", channel, started, *timeout, diagnostics);
+  CortexMDebugState initialState;
+  bool restoreRunning = false;
+  result = prepareFpbWrite(debug, initialState, restoreRunning, diagnostics,
+                           std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearAllBreakpoints", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"prepareFpbWrite\"");
+  FpbBreakpointManager fpb(&target, &channel.fpbState);
+  FpbCapabilities capabilities;
+  result = fpb.initialize(capabilities, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearAllBreakpoints", channel, started, *timeout, diagnostics);
+  uint32_t cleared = 0;
+  result = fpb.clearAll(cleared, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearAllBreakpoints", channel, started, *timeout, diagnostics);
+  CortexMDebugState finalState;
+  result = finishFpbWrite(debug, restoreRunning, finalState, diagnostics,
+                          std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, "clearAllBreakpoints", channel, started, *timeout, diagnostics,
+                                     "\"phase\":\"restoreTargetState\"");
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string data = "{\"cleared\":" + std::to_string(cleared) +
+      ",\"enabled\":false,\"fpbRevision\":" + std::to_string(capabilities.revision) +
+      ",\"codeComparators\":" + std::to_string(capabilities.codeComparators) + "}";
+  return resultJson(true, "all FPB breakpoints cleared", cortexStateName(finalState), elapsedMs, data, "",
+                    cortexDiagnosticsJson("clearAllBreakpoints", *timeout, diagnostics,
+                                          "\"fpb\":" + data));
+}
+
+std::string handleSourceStep(const char* operation, const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) return coreFailure(ready, operation, channel, started, 0, {});
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) return invalidControlTimeout(operation, channel);
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CortexMDebug debug(&target);
+  DapTransferDiagnostics diagnostics;
+  Result result =
+      ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
+  if (!result.ok) return coreFailure(result, operation, channel, started, *timeout, diagnostics);
+  CmsisDapSourceStepper stepper(&target, &debug, &channel.fpbState);
+  SourceStepResult step;
+  if (std::string(operation) == "stepIntoSourceLine") {
+    result = stepper.stepInto(static_cast<uint32_t>(uintField(params, "lineStart").value_or(0)),
+                              static_cast<uint32_t>(uintField(params, "lineEnd").value_or(0)),
+                              static_cast<uint32_t>(uintField(params, "maxInstructionSteps").value_or(32)),
+                              step, diagnostics, std::chrono::milliseconds(*timeout));
+  } else if (std::string(operation) == "stepOverSourceLine") {
+    result = stepper.stepOver(static_cast<uint32_t>(uintField(params, "lineStart").value_or(0)),
+                              static_cast<uint32_t>(uintField(params, "lineEnd").value_or(0)),
+                              static_cast<uint32_t>(uintField(params, "maxInstructionSteps").value_or(128)),
+                              step, diagnostics, std::chrono::milliseconds(*timeout));
+  } else {
+    const uint32_t functionStart = static_cast<uint32_t>(uintField(params, "functionStart").value_or(0));
+    const uint32_t functionEnd = static_cast<uint32_t>(uintField(params, "functionEnd").value_or(0));
+    if (functionStart == 0 || functionEnd <= functionStart) {
+      return resultJson(false, "stepOut requires a non-empty function range", "Halted", 0, "{}",
+                        ErrorCodes::kDapInvalidRequest);
+    }
+    result = stepper.stepOut(functionStart, functionEnd, step, diagnostics,
+                             std::chrono::milliseconds(*timeout));
+  }
+  const std::string stepJson = sourceStepJson(step);
+  if (!result.ok) return coreFailure(result, operation, channel, started, *timeout, diagnostics,
+                                     "\"step\":" + stepJson);
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  return resultJson(true, std::string("CMSIS-DAP ") + operation + " completed", "Halted",
+                    elapsedMs, stepJson, "",
+                    cortexDiagnosticsJson(operation, *timeout, diagnostics,
+                                          "\"step\":" + stepJson));
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1864,9 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
   if (name == "hello") {
     result = handleHello(*params);
   } else if (name == "shutdown") {
+    // Shutdown is a lifecycle boundary, not just a protocol acknowledgement.
+    // Clear FPB state, disconnect SWD, and close HID before the process exits.
+    (void)handleClose(channel);
     result = handleShutdown();
   } else if (name == "enumDevices") {
     result = handleEnumDevices(*params, channel);
@@ -1346,6 +1892,8 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
     result = handleReadMemory(*params, channel);
   } else if (name == "readMemoryBlock") {
     result = handleReadMemoryBlock(*params, channel);
+  } else if (name == "writeMemory") {
+    result = handleWriteMemory(*params, channel);
   } else if (name == "flashAlgorithm") {
     result = handleFlashAlgorithm(*params, channel);
   } else if (name == "getState") {
@@ -1356,10 +1904,26 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
     result = handleCoreRun(*params, channel);
   } else if (name == "reset") {
     result = handleCoreReset(*params, channel);
+  } else if (name == "runToAddress") {
+    result = handleRunToAddress(*params, channel);
   } else if (name == "stepInstruction") {
     result = handleCoreStepInstruction(*params, channel);
   } else if (name == "readRegister") {
     result = handleCoreReadRegister(*params, channel);
+  } else if (name == "getFpbInfo") {
+    result = handleGetFpbInfo(*params, channel);
+  } else if (name == "setBreakpoint") {
+    result = handleSetBreakpoint(*params, channel);
+  } else if (name == "clearBreakpoint") {
+    result = handleClearBreakpoint(*params, channel);
+  } else if (name == "clearAllBreakpoints") {
+    result = handleClearAllBreakpoints(*params, channel);
+  } else if (name == "stepIntoSourceLine") {
+    result = handleSourceStep("stepIntoSourceLine", *params, channel);
+  } else if (name == "stepOverSourceLine") {
+    result = handleSourceStep("stepOverSourceLine", *params, channel);
+  } else if (name == "stepOut") {
+    result = handleSourceStep("stepOut", *params, channel);
   } else {
     const long long elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -1936,6 +2500,15 @@ int runSelfTest() {
     const Result writeBlock = target.writeMemoryBlock(0x20000200, writeWords, diag);
     expect(writeBlock.ok && diag.blockWrites == 3 && diag.packets == 4,
            "dap03-block-write-reuses-contiguous-tar");
+
+    const std::vector<uint8_t> writeBytes = {0x11, 0x22, 0x33, 0x44, 0x55};
+    diag = DapTransferDiagnostics{};
+    const Result writeUnaligned = target.writeMemory(0x20000201, writeBytes, diag);
+    expect(writeUnaligned.ok, "dap06-byte-write-unaligned");
+    std::vector<uint8_t> readBack;
+    diag = DapTransferDiagnostics{};
+    const Result readWritten = target.readMemory(0x20000201, 5, readBack, diag);
+    expect(readWritten.ok && readBack == writeBytes, "dap06-byte-write-readback");
   }
 
   {
@@ -2823,9 +3396,12 @@ int runSelfTest() {
     const Result stepResult = debug.stepInstruction(step, diag, timeout);
     expect(stepResult.ok && step.halted && step.pcAfter != step.pcBefore,
            "dap04-step-pc-changed-and-halted");
+    expect(step.interruptMaskApplied && step.interruptMaskCleared &&
+               (step.dhcsr & kCoreDebugCMaskInts) != 0,
+           "dap04-step-masks-interrupts-during-c-step");
     expect(mock.targetState().lastDhcsrWrite ==
-               (kCoreDebugDbgKey | kCoreDebugCDebugEn | kCoreDebugCStep),
-           "dap04-step-key-and-bits");
+               (kCoreDebugDbgKey | kCoreDebugCDebugEn | kCoreDebugCHalt),
+           "dap04-step-clears-interrupt-mask-while-halted");
 
     uint32_t value = 0;
     expect(debug.readRegister(0, value, diag, timeout).ok && value == 0x10000000u,
@@ -2838,7 +3414,7 @@ int runSelfTest() {
            "dap04-read-pc");
     expect(debug.readRegister(16, value, diag, timeout).ok && value == 0x01000000u,
            "dap04-read-xpsr");
-    const Result invalidRegister = debug.readRegister(17, value, diag, timeout);
+    const Result invalidRegister = debug.readRegister(21, value, diag, timeout);
     expect(!invalidRegister.ok && invalidRegister.errorCode == ErrorCodes::kDapInvalidRequest,
            "dap04-invalid-register");
 
@@ -2847,6 +3423,107 @@ int runSelfTest() {
     expect(mock.targetState().lastAircrWrite ==
                (kCoreDebugVectKey | kCoreDebugSysResetReq),
            "dap04-reset-key-and-bit");
+  }
+
+  {
+    // A halted state read already owns a valid DHCSR sample. Resolving the PC
+    // must reuse that sample instead of issuing a second DHCSR read.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap05-state-cache-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics setupDiag;
+    CortexMDebugState setupState;
+    expect(debug.halt(setupState, setupDiag, std::chrono::milliseconds(100)).ok,
+           "dap05-state-cache-halt");
+    DapTransferDiagnostics diag;
+    CortexMDebugState state;
+    const Result result = debug.getState(state, diag, std::chrono::milliseconds(100));
+    expect(result.ok && state.halted && state.pcValid && diag.packets == 4,
+           "dap05-state-cache-reuses-dhcsr");
+  }
+
+  {
+    // Repeated control RPCs on one connected owner must not repeat the full
+    // DP power-up sequence. Explicit resource reset invalidates the cache.
+    Channel channel;
+    auto mockTransport = std::make_unique<MockCmsisDapTransport>();
+    MockCmsisDapTransport* mock = mockTransport.get();
+    channel.transport = std::move(mockTransport);
+    DeviceSelector selector;
+    std::vector<DeviceDescriptor> devices;
+    expect(channel.transport->enumerate(selector, devices).ok && !devices.empty() &&
+               channel.transport->open(devices.front()).ok,
+           "dap05-debug-power-cache-open");
+    channel.opened = true;
+    channel.connected = true;
+    channel.packetSize = 64;
+    CmsisDapProtocol protocol(channel.transport.get());
+    protocol.setEffectivePacketSize(channel.packetSize);
+    CmsisDapTarget target(&protocol, channel.packetSize);
+    DapTransferDiagnostics firstDiag;
+    const Result first = ensureDebugPower(channel, target, firstDiag,
+                                          std::chrono::milliseconds(100));
+    const size_t afterFirst = mock->commandHistory().size();
+    DapTransferDiagnostics secondDiag;
+    const Result second = ensureDebugPower(channel, target, secondDiag,
+                                           std::chrono::milliseconds(100));
+    const size_t afterSecond = mock->commandHistory().size();
+    expect(first.ok && second.ok && afterFirst > 0 && afterSecond == afterFirst,
+           "dap05-debug-power-cache-hit");
+    channel.clearDebugResourceState();
+    DapTransferDiagnostics thirdDiag;
+    const Result third = ensureDebugPower(channel, target, thirdDiag,
+                                          std::chrono::milliseconds(100));
+    expect(third.ok && mock->commandHistory().size() > afterSecond,
+           "dap05-debug-power-cache-invalidated");
+  }
+
+  {
+    // Source-step owns the target for its complete control critical section
+    // and already has the current halted PC. The specialized step path still
+    // verifies S_HALT, but must not fetch the same PC a second time.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap05-known-pc-step-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics setupDiag;
+    CortexMDebugState halted;
+    expect(debug.halt(halted, setupDiag, std::chrono::milliseconds(100)).ok &&
+               halted.halted && halted.pcValid,
+           "dap05-known-pc-step-halt");
+    DapTransferDiagnostics diag;
+    CortexMDebugStepResult step;
+    const Result result = debug.stepInstructionFromHaltedPc(
+        halted.pc, step, diag, std::chrono::milliseconds(100));
+    expect(result.ok && step.pcBefore == halted.pc && step.pcAfter != step.pcBefore &&
+               step.instructionRetired && step.interruptMaskCleared && diag.packets == 9,
+           "dap05-known-pc-step-skips-duplicate-pc-read");
+  }
+
+  {
+    // Step-out needs PC/LR/SP from one stopped state. Read the initial DHCSR
+    // once, then perform the architecturally required DCRSR/DCRDR sequence for
+    // each register without repeating the halted-state query.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap05-register-batch-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics setupDiag;
+    CortexMDebugState halted;
+    expect(debug.halt(halted, setupDiag, std::chrono::milliseconds(100)).ok,
+           "dap05-register-batch-halt");
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    const Result result = debug.readRegisters(
+        {15u, 14u, 13u}, values, diag, std::chrono::milliseconds(100));
+    expect(result.ok && values == std::vector<uint32_t>({halted.pc, 0x08001001u,
+                                                         0x20001000u}) &&
+               diag.packets == 10,
+           "dap05-register-batch-one-halt-check");
   }
 
   {
@@ -3053,6 +3730,51 @@ int runSelfTest() {
   }
 
   {
+    // A configurable interrupt can be pending when the helper rewrites the
+    // halted core registers for a RAM Flash Algorithm. The launch primitive
+    // must mask it before resume, rather than relying on the algorithm's first
+    // instruction to execute CPSID I before the interrupt is taken.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "568E", mock), "dap02a-algorithm-interrupt-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics diag;
+    CortexMDebugState state;
+    expect(debug.halt(state, diag, std::chrono::milliseconds(100)).ok && state.halted,
+           "dap02a-algorithm-interrupt-halted-precondition");
+    std::vector<uint8_t> code(0x600, 0xBF);
+    code[0x500] = 0x00;
+    code[0x501] = 0xBE;
+    std::vector<uint8_t> noData;
+    FlashAlgorithmRunRequest request;
+    request.operation = "init";
+    request.code = &code;
+    request.data = &noData;
+    request.algorithmAddress = 0x20000000u;
+    request.entry = 0x20000000u;
+    request.bkptAddress = 0x20000500u;
+    request.stackPointer = 0x2001F000u;
+    request.stackSize = 0x1000u;
+    request.pageBufferAddress = 0x20000600u;
+    request.targetAddress = 0x08000000u;
+    request.r0 = request.targetAddress;
+    request.r1 = 4000000u;
+    mock.prepareFlashAlgorithm("init", request.targetAddress, 0, noData,
+                               request.bkptAddress);
+    FlashAlgorithmRunResult algorithmResult;
+    const Result algorithm = debug.executeFlashAlgorithm(
+        request, algorithmResult, diag, std::chrono::milliseconds(20));
+    expect(algorithm.ok && algorithmResult.returnCode == 0,
+           "dap02a-algorithm-interrupt-window-masked");
+    expect(mock.injection().algorithmInterruptMaskAtEntry,
+           "dap02a-algorithm-interrupt-mask-present-at-entry");
+    expect((mock.targetState().lastDhcsrWrite & kMockCoreDebugCMaskInts) == 0 &&
+               (mock.targetState().lastDhcsrWrite & kMockCoreDebugCHalt) != 0,
+           "dap02a-algorithm-interrupt-mask-cleared-after-halt");
+  }
+
+  {
     MockCmsisDapTransport mock;
     expect(openMock("1234", "5683", mock), "dap04-open-control-wait");
     CmsisDapProtocol protocol(&mock);
@@ -3164,8 +3886,92 @@ int runSelfTest() {
     }
   }
 
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap05-exc-return-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics diag;
+    expect(target.initializeDebugPower(diag, std::chrono::milliseconds(100)).ok,
+           "dap05-exc-return-debug-power");
+    mock.prepareExceptionReturn(0x080001E0u, 0xFFFFFFF9u,
+                                0x20001000u, 0x080001F1u);
+    FpbState fpbState;
+    CmsisDapSourceStepper stepper(&target, &debug, &fpbState);
+    SourceStepResult step;
+    const Result result = stepper.stepOut(0x080001E0u, 0x080001E4u, step, diag,
+                                          std::chrono::milliseconds(100));
+    expect(result.ok && step.classification == "exceptionReturnBreakpoint" &&
+               step.lr == 0xFFFFFFF9u && step.returnAddress == 0x080001F0u &&
+               step.pcAfter == 0x080001F0u && step.cleanupOk,
+           "dap05-step-out-exc-return-basic-msp");
+  }
+
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap05-wide-branch-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics diag;
+    expect(target.initializeDebugPower(diag, std::chrono::milliseconds(100)).ok,
+           "dap05-wide-branch-debug-power");
+    mock.prepareSourceInstruction(0x080001C0u, {0x00, 0xF0, 0x00, 0x80});
+    FpbState fpbState;
+    CmsisDapSourceStepper stepper(&target, &debug, &fpbState);
+    SourceStepResult step;
+    const Result result = stepper.stepInto(0x080001C0u, 0x080001C2u, 1u, step, diag,
+                                           std::chrono::milliseconds(100));
+    expect(result.ok && step.classification == "branch" && !step.enteredCall &&
+               step.trace.size() == 1 && !step.trace.front().call,
+           "dap05-wide-conditional-branch-is-not-call");
+  }
+
+  {
+    // A helper can be terminated after programming FPB but before its normal
+    // cleanup runs. The next owner must not trust its empty in-memory slot map:
+    // it claims the hardware by clearing every target-reported comparator.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap05-stale-fpb-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics diag;
+    FpbState lostOwnerState;
+    FpbBreakpointManager lostOwner(&target, &lostOwnerState);
+    FpbCapabilities goldenCapabilities;
+    const Result goldenProbe = lostOwner.initialize(goldenCapabilities, diag,
+                                                    std::chrono::milliseconds(100));
+    expect(goldenProbe.ok && goldenCapabilities.fpCtrl == 0x00000260u &&
+               goldenCapabilities.revision == 1u &&
+               goldenCapabilities.codeComparators == 6u &&
+               goldenCapabilities.literalComparators == 2u &&
+               !goldenCapabilities.enabled,
+           "dap05-fp-ctrl-0x260-hard-coded-golden");
+    FpbBreakpointResult staleBreakpoint;
+    const auto timeout = std::chrono::milliseconds(100);
+    const Result staleSet = lostOwner.setUser(kMockResetPc, 0u, staleBreakpoint,
+                                              diag, timeout);
+    expect(staleSet.ok && (mock.targetState().fpCtrl & 1u) != 0 &&
+               mock.targetState().fpComp[0] != 0,
+           "dap05-stale-fpb-precondition");
+
+    lostOwnerState.reset();
+    FpbState newOwnerState;
+    CortexMDebugState finalState;
+    const Result claim = claimFpbOwnership(target, debug, newOwnerState,
+                                           finalState, diag, timeout);
+    const bool comparatorsCleared = std::all_of(
+        mock.targetState().fpComp.begin(), mock.targetState().fpComp.end(),
+        [](uint32_t value) { return value == 0; });
+    expect(claim.ok && newOwnerState.initialized && comparatorsCleared &&
+               (mock.targetState().fpCtrl & 1u) == 0 && !finalState.halted,
+           "dap05-new-owner-clears-stale-fpb-and-restores-running");
+  }
+
   std::cout << "{\"selftest\":\"" << (failures == 0 ? "ok" : "fail")
-            << "\",\"cases\":" << 163 << ",\"failures\":" << failures << "}\n"
+            << "\",\"cases\":" << 185 << ",\"failures\":" << failures << "}\n"
             << std::flush;
   return failures == 0 ? 0 : 1;
 }
@@ -3192,14 +3998,22 @@ int run(int argc, char** argv) {
   while (std::getline(std::cin, line)) {
     if (line.empty()) continue;
     std::string response;
+    bool shutdownRequested = false;
     try {
       const JsonValue request = JsonParser(line).parse();
+      const JsonValue* method = request.get("method");
+      shutdownRequested = method && method->kind == JsonValue::Kind::String &&
+                          method->string == "shutdown";
       response = dispatch(request, channel);
     } catch (const std::exception& error) {
       response = protocolError(line, error.what());
     }
     std::cout << response << '\n' << std::flush;
+    if (shutdownRequested) break;
   }
+  // Parent loss closes stdin without a shutdown request. Best-effort cleanup
+  // still restores/removes FPB resources before releasing the HID handle.
+  if (channel.opened || channel.transport) (void)handleClose(channel);
   diag("stdin closed, exiting");
   return 0;
 }

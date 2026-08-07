@@ -48,11 +48,13 @@ export interface WriteManyParams {
 export interface RuntimeReadValue {
   alias: string;
   expression: string;
-  value: number;
+  value: number | string;
   display: string;
   hex?: string;
   address?: number;
   typeName?: string;
+  exactValue?: string;
+  numericValueExact?: boolean;
   error?: string;
 }
 

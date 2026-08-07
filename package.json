@@ -212,6 +212,20 @@
                 "description": "Flash the current ELF before debugging; CMSIS-DAP flashing is unavailable until DAP-02A",
                 "default": true
               },
+              "runToEntryPoint": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "boolean",
+                    "enum": [false]
+                  }
+                ],
+                "description": "CMSIS-DAP startup symbol to stop at after Launch or Restart; false disables run-to-entry",
+                "default": "main"
+              },
               "rtos": {
                 "type": "string",
                 "description": "Optional RTOS name for RTOS Views, for example FreeRTOS",

@@ -2,14 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { OzoneBackend } from './commander';
 
 type BackendInternals = {
-  symbols: Array<{ name: string; address: number; size: number }>;
+  symbols: Array<{ name: string; address: number; size: number; type?: string }>;
   dwarfInfo: {
     varToType: Map<string, string>;
     typeDefs: Map<string, {
       name: string;
       byteSize: number;
-      kind: 'struct' | 'base' | 'pointer' | 'array';
+      kind: 'struct' | 'union' | 'base' | 'pointer' | 'array' | 'enum' | 'subroutine';
       fields?: Array<{ name: string; typeOffset: string; byteOffset: number }>;
+      enumerators?: Array<{ name: string; value: string }>;
       typeOffset?: string;
       arrayCount?: number;
       encoding?: string;
@@ -37,7 +38,194 @@ function setupInsDataBackend(): OzoneBackend {
   return backend;
 }
 
+function formatScalar(backend: OzoneBackend, raw: number[], byteSize: number, info: Record<string, unknown>) {
+  return (backend as any).formatScalarValue(Uint8Array.from(raw), byteSize, info) as {
+    value: number | string;
+    display: string;
+    hex: string;
+    exactValue?: string;
+    numericValueExact?: boolean;
+  };
+}
+
 describe('OzoneBackend realtime variables', () => {
+  it('formats enum values with the integer and enumerator name', () => {
+    const value = formatScalar(new OzoneBackend(), [2, 0, 0, 0], 4, {
+      kind: 'enum',
+      name: 'Dap06Mode',
+      enumerators: [{ name: 'DAP06_RUN', value: '2' }],
+    });
+
+    expect(value).toMatchObject({ value: 2, display: '0x00000002 (2, DAP06_RUN)' });
+  });
+
+  it('keeps int64 and uint64 values exact beyond the JavaScript safe range', () => {
+    const signed = formatScalar(new OzoneBackend(), [1, 0, 0, 0, 0, 0, 0x00, 0x80], 8, {
+      kind: 'base', name: 'int64_t', encoding: 'signed',
+    });
+    const unsigned = formatScalar(new OzoneBackend(), [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 8, {
+      kind: 'base', name: 'uint64_t', encoding: 'unsigned',
+    });
+
+    expect(signed).toMatchObject({
+      value: '-9223372036854775807',
+      exactValue: '-9223372036854775807',
+      numericValueExact: false,
+      hex: '0x8000000000000001',
+    });
+    expect(unsigned).toMatchObject({
+      value: '18446744073709551615',
+      exactValue: '18446744073709551615',
+      numericValueExact: false,
+      hex: '0xFFFFFFFFFFFFFFFF',
+    });
+  });
+
+  it('preserves exact 64-bit metadata through evaluateExpression', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    internal.symbols = [{ name: 'g_u64', address: 0x20000100, size: 8 }];
+    internal.dwarfInfo = {
+      varToType: new Map([['g_u64', 'u64-type']]),
+      typeDefs: new Map([
+        ['u64-type', { name: 'uint64_t', byteSize: 8, kind: 'base', encoding: 'unsigned' }],
+      ]),
+    };
+    internal.targetReadMemory = async () => Uint8Array.from([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+
+    const result = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_u64', force: true });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        value: '18446744073709551615',
+        exactValue: '18446744073709551615',
+        numericValueExact: false,
+      },
+    });
+  });
+
+  it('formats bool and char with numeric and semantic text', () => {
+    const bool = formatScalar(new OzoneBackend(), [1], 1, { kind: 'base', name: '_Bool', encoding: 'boolean' });
+    const char = formatScalar(new OzoneBackend(), [0x41], 1, { kind: 'base', name: 'char', encoding: 'signed char' });
+
+    expect(bool.display).toBe('0x01 (1, true)');
+    expect(char.display).toBe("'A' (65, 0x41)");
+  });
+
+  it('keeps uint8_t numeric instead of classifying it as char', () => {
+    const value = formatScalar(new OzoneBackend(), [0xFF], 1, { kind: 'base', name: 'uint8_t', encoding: 'unsigned char' });
+
+    expect(value).toMatchObject({ value: 255, display: '0xFF (255)', hex: '0xFF' });
+  });
+
+  it('reads bounded char arrays and UTF-8 text without changing uint8_t arrays', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    const asciiAddress = 0x20000100;
+    const utf8Address = 0x20000120;
+    const unterminatedAddress = 0x20000140;
+    const u8Address = 0x20000160;
+    const textPointerAddress = 0x20000180;
+    const nullPointerAddress = 0x20000184;
+    internal.symbols = [
+      { name: 'g_ascii', address: asciiAddress, size: 6 },
+      { name: 'g_utf8', address: utf8Address, size: 13 },
+      { name: 'g_unterminated', address: unterminatedAddress, size: 4 },
+      { name: 'g_u8_array', address: u8Address, size: 4 },
+      { name: 'g_text_ptr', address: textPointerAddress, size: 4 },
+      { name: 'g_null_ptr', address: nullPointerAddress, size: 4 },
+    ];
+    internal.dwarfInfo = {
+      varToType: new Map([
+        ['g_ascii', 'char-array'],
+        ['g_utf8', 'utf8-array'],
+        ['g_unterminated', 'unterminated-array'],
+        ['g_u8_array', 'u8-array'],
+      ]),
+      typeDefs: new Map([
+        ['char-type', { name: 'char', byteSize: 1, kind: 'base', encoding: 'signed char' }],
+        ['char-array', { name: 'char[6]', byteSize: 6, kind: 'array', typeOffset: 'char-type', arrayCount: 6 }],
+        ['utf8-array', { name: 'char[13]', byteSize: 13, kind: 'array', typeOffset: 'char-type', arrayCount: 13 }],
+        ['unterminated-array', { name: 'char[4]', byteSize: 4, kind: 'array', typeOffset: 'char-type', arrayCount: 4 }],
+        ['u8-type', { name: 'uint8_t', byteSize: 1, kind: 'base', encoding: 'unsigned char' }],
+        ['u8-array', { name: 'uint8_t[4]', byteSize: 4, kind: 'array', typeOffset: 'u8-type', arrayCount: 4 }],
+        ['char-pointer', { name: 'char *', byteSize: 4, kind: 'pointer', typeOffset: 'char-type' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address, size) => {
+      const bytes = address === asciiAddress
+        ? [0x4F, 0x72, 0x62, 0x69, 0x74, 0x00]
+        : address === utf8Address
+          ? [0xE8, 0xBD, 0xA8, 0xE9, 0x81, 0x93, 0xE8, 0xB0, 0x83, 0xE8, 0xAF, 0x95, 0x00]
+          : address === unterminatedAddress
+            ? [0x4E, 0x4F, 0x50, 0x21]
+            : address === u8Address ? [0x00, 0x7F, 0x80, 0xFF]
+              : address === textPointerAddress ? [0x00, 0x01, 0x00, 0x20]
+                : address === nullPointerAddress ? [0x00, 0x00, 0x00, 0x00] : [];
+      if (address === 0x20000100 && size === 256) return Uint8Array.from([...bytes, ...new Array(250).fill(0)]);
+      return bytes.length >= size ? Uint8Array.from(bytes.slice(0, size)) : null;
+    };
+
+    const ascii = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_ascii', force: true });
+    const utf8 = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_utf8', force: true });
+    const unterminated = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_unterminated', force: true });
+    const numeric = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_u8_array', force: true, expandedExpressions: ['g_u8_array'] });
+    internal.dwarfInfo.varToType.set('g_text_ptr', 'char-pointer');
+    internal.dwarfInfo.varToType.set('g_null_ptr', 'char-pointer');
+    const textPointer = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_text_ptr', force: true });
+    const nullPointer = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_null_ptr', force: true });
+
+    expect(ascii).toMatchObject({ ok: true, data: { display: '"Orbit"' } });
+    expect(utf8).toMatchObject({ ok: true, data: { display: '"轨道调试"' } });
+    expect(unterminated).toMatchObject({ ok: true, data: { error: expect.stringContaining('unterminated') } });
+    expect(textPointer).toMatchObject({ ok: true, data: { display: '"Orbit"' } });
+    expect(nullPointer).toMatchObject({ ok: true, data: { display: 'NULL' } });
+    expect(numeric).toMatchObject({ ok: true, data: { children: [
+      expect.objectContaining({ value: 0 }),
+      expect.objectContaining({ value: 127 }),
+      expect.objectContaining({ value: 128 }),
+      expect.objectContaining({ value: 255 }),
+    ] } });
+  });
+
+  it('resolves function-pointer addresses to ELF names without calling them', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    const functionPointerType = 'function-pointer';
+    internal.symbols = [
+      { name: 'g_dap06_function', address: 0x200001A0, size: 4 },
+      { name: 'g_dap06_null_function', address: 0x200001A4, size: 4 },
+      { name: 'g_dap06_unknown_function', address: 0x200001A8, size: 4 },
+      { name: 'dap06_transform', address: 0x08001234, size: 20, type: 'T' },
+    ];
+    internal.dwarfInfo = {
+      varToType: new Map([
+        ['g_dap06_function', functionPointerType],
+        ['g_dap06_null_function', functionPointerType],
+        ['g_dap06_unknown_function', functionPointerType],
+      ]),
+      typeDefs: new Map([
+        [functionPointerType, { name: 'Dap06Function', byteSize: 4, kind: 'pointer', typeOffset: 'function-type' }],
+        ['function-type', { name: 'uint32_t (uint32_t)', byteSize: 4, kind: 'subroutine' }],
+      ]),
+    };
+    internal.targetReadMemory = async address => {
+      if (address === 0x200001A0) return Uint8Array.from([0x35, 0x12, 0x00, 0x08]);
+      if (address === 0x200001A4) return Uint8Array.from([0, 0, 0, 0]);
+      if (address === 0x200001A8) return Uint8Array.from([0x01, 0x20, 0x00, 0x08]);
+      return null;
+    };
+
+    const named = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_dap06_function', force: true });
+    const nullFunction = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_dap06_null_function', force: true });
+    const unknown = await backend.execute({ cmd: 'evaluateExpression', expression: 'g_dap06_unknown_function', force: true });
+
+    expect(named).toMatchObject({ ok: true, data: { display: expect.stringContaining('dap06_transform'), hex: '0x08001235' } });
+    expect(nullFunction).toMatchObject({ ok: true, data: { display: 'NULL' } });
+    expect(unknown).toMatchObject({ ok: true, data: { display: expect.stringContaining('<unknown>') } });
+  });
+
   it('plans a scalar struct field for fast Timeline sampling', async () => {
     const backend = setupInsDataBackend();
 
@@ -286,6 +474,118 @@ describe('OzoneBackend realtime variables', () => {
       display: '0x20003000',
       children: [expect.objectContaining({ expression: 'velocity', display: '2.000000' })],
     }));
+  });
+
+  it('expands unions nested in struct arrays and through a struct pointer', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    const rootAddress = 0x20004000;
+    const rootBytes = Uint8Array.from([
+      0x34, 0x12, 0xFE, 0xFF, 0x00, 0x00, 0x80, 0x3F,
+      0xCD, 0xAB, 0x85, 0xFF, 0xDB, 0x0F, 0x49, 0x40,
+      0x08, 0x40, 0x00, 0x20, 0x88, 0x77, 0x66, 0x55,
+      0x44, 0x33, 0x22, 0x11,
+    ]);
+    internal.symbols = [{ name: 'g_dap06_complex', address: rootAddress, size: rootBytes.length }];
+    internal.dwarfInfo = {
+      varToType: new Map([['g_dap06_complex', 'root-type']]),
+      typeDefs: new Map([
+        ['root-type', {
+          name: 'Dap06Root', byteSize: 28, kind: 'struct', fields: [
+            { name: 'leaves', typeOffset: 'leaf-array', byteOffset: 0 },
+            { name: 'selected', typeOffset: 'leaf-pointer', byteOffset: 16 },
+            { name: 'nested', typeOffset: 'nested-type', byteOffset: 20 },
+          ],
+        }],
+        ['leaf-array', { name: 'Dap06Leaf[2]', byteSize: 16, kind: 'array', typeOffset: 'leaf-type', arrayCount: 2 }],
+        ['leaf-pointer', { name: 'Dap06Leaf*', byteSize: 4, kind: 'pointer', typeOffset: 'leaf-type' }],
+        ['nested-type', {
+          name: 'Dap06Nested', byteSize: 8, kind: 'struct', fields: [
+            { name: 'counter', typeOffset: 'u32-type', byteOffset: 0 },
+            { name: 'state', typeOffset: 'payload-union', byteOffset: 4 },
+          ],
+        }],
+        ['leaf-type', {
+          name: 'Dap06Leaf', byteSize: 8, kind: 'struct', fields: [
+            { name: 'id', typeOffset: 'u16-type', byteOffset: 0 },
+            { name: 'signed_value', typeOffset: 'i16-type', byteOffset: 2 },
+            { name: 'payload', typeOffset: 'payload-union', byteOffset: 4 },
+          ],
+        }],
+        ['payload-union', {
+          name: 'Dap06Union', byteSize: 4, kind: 'union', fields: [
+            { name: 'raw', typeOffset: 'u32-type', byteOffset: 0 },
+            { name: 'as_float', typeOffset: 'float-type', byteOffset: 0 },
+            { name: 'bytes', typeOffset: 'byte-array', byteOffset: 0 },
+          ],
+        }],
+        ['byte-array', { name: 'uint8_t[4]', byteSize: 4, kind: 'array', typeOffset: 'u8-type', arrayCount: 4 }],
+        ['u8-type', { name: 'uint8_t', byteSize: 1, kind: 'base', encoding: 'unsigned char' }],
+        ['u16-type', { name: 'uint16_t', byteSize: 2, kind: 'base', encoding: 'unsigned' }],
+        ['i16-type', { name: 'int16_t', byteSize: 2, kind: 'base', encoding: 'signed' }],
+        ['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }],
+        ['float-type', { name: 'float', byteSize: 4, kind: 'base', encoding: 'float' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address, size) => {
+      const offset = address - rootAddress;
+      if (offset < 0 || offset + size > rootBytes.length) return null;
+      return rootBytes.slice(offset, offset + size);
+    };
+
+    const result = await backend.execute({
+      cmd: 'evaluateExpression', expression: 'g_dap06_complex', force: true,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    const root = result.data as any;
+    const secondLeaf = root.children[0].children[1];
+    expect(secondLeaf).toEqual(expect.objectContaining({
+      evaluateName: 'g_dap06_complex.leaves[1]',
+      address: rootAddress + 8,
+      hasChildren: true,
+    }));
+    expect(secondLeaf.children[1]).toEqual(expect.objectContaining({
+      evaluateName: 'g_dap06_complex.leaves[1].signed_value',
+      value: -123,
+    }));
+    expect(secondLeaf.children[2]).toEqual(expect.objectContaining({
+      evaluateName: 'g_dap06_complex.leaves[1].payload',
+      typeName: 'Dap06Union',
+      hasChildren: true,
+    }));
+    expect(secondLeaf.children[2].children).toEqual([
+      expect.objectContaining({ expression: 'raw', value: 0x40490FDB }),
+      expect.objectContaining({ expression: 'as_float', display: '3.141593' }),
+      expect.objectContaining({
+        expression: 'bytes',
+        children: [
+          expect.objectContaining({ expression: '[0]', value: 0xDB }),
+          expect.objectContaining({ expression: '[1]', value: 0x0F }),
+          expect.objectContaining({ expression: '[2]', value: 0x49 }),
+          expect.objectContaining({ expression: '[3]', value: 0x40 }),
+        ],
+      }),
+    ]);
+    expect(root.children[1]).toEqual(expect.objectContaining({
+      expression: 'selected',
+      display: '0x20004008',
+      hasChildren: true,
+      children: expect.arrayContaining([
+        expect.objectContaining({ expression: 'id', value: 0xABCD }),
+        expect.objectContaining({ expression: 'payload', hasChildren: true }),
+      ]),
+    }));
+    expect(root.children[2].children[1].children[0]).toEqual(expect.objectContaining({
+      evaluateName: 'g_dap06_complex.nested.state.raw',
+      value: 0x11223344,
+    }));
+
+    const direct = await backend.execute({
+      cmd: 'evaluateExpression', expression: 'g_dap06_complex.nested.state.raw', force: true,
+    });
+    expect(direct).toMatchObject({ ok: true, data: expect.objectContaining({ value: 0x11223344 }) });
   });
 
   it('writes a floating-point child value using its declared type', async () => {

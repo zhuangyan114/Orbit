@@ -667,6 +667,41 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     });
   });
 
+  it('does not schedule getState for a standard RTOS background evaluate without force', async () => {
+    const controller = new AbortController();
+    const owner = cmsisOwner({
+      readMemory: vi.fn(async () => ({
+        ok: true,
+        message: 'memory read',
+        targetState: 'Halted' as const,
+        elapsedMs: 1,
+        data: { bytes: Uint8Array.from([3, 0, 0, 0]) },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).state = 'halted';
+    (backend as any).symbols = [{ name: 'uxCurrentNumberOfTasks', address: 0x20000000, size: 4, type: 'D' }];
+    (backend as any).dwarfInfo = {
+      varToType: new Map([['uxCurrentNumberOfTasks', 'u32-type']]),
+      typeDefs: new Map([['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }]]),
+    };
+
+    const result = await backend.execute({
+      cmd: 'evaluateExpression',
+      expression: 'uxCurrentNumberOfTasks',
+      expandedExpressions: [],
+      priority: 'background',
+      signal: controller.signal,
+    });
+
+    expect(result).toMatchObject({ ok: true, data: expect.objectContaining({ value: 3 }) });
+    expect(owner.getState).not.toHaveBeenCalled();
+    expect(owner.readMemory).toHaveBeenCalledWith(0x20000000, 4, {
+      priority: 'background',
+      signal: controller.signal,
+    });
+  });
+
   it('reads call-stack PC and LR through the CMSIS-DAP owner and labels the source', async () => {
     const owner = cmsisOwner({
       getState: vi.fn(async () => ({

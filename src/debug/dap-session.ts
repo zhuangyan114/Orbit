@@ -264,6 +264,7 @@ export class DapSession extends EventEmitter {
       this.connectionFailureCount = 0;
       this.controlInProgress = true;
       this.advanceReadCancelEpoch();
+      this.resetVariableHandles();
       this.cancelTargetReadGateWaiters();
       this.cancelActiveTargetReads('target connection lost');
       this.stopDataSampling();
@@ -685,6 +686,33 @@ export class DapSession extends EventEmitter {
       targetState: result?.targetState || (this.targetRunning ? 'Running' : 'Halted'),
       elapsedMs: result?.elapsedMs ?? Math.max(0, this.nowMs() - startedAtMs),
       diagnostics: result?.diagnostics || { targetReadGate: this.snapshotTargetReadGateMetrics() },
+    }, false, `${errorCode}: ${message}`);
+  }
+
+  private sendRtosVariablesFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    startedAtMs: number,
+    handle: DapVariableHandle,
+    result?: OzoneCommandResult,
+  ) {
+    const targetState = result?.targetState
+      || (!this.targetConnectionEstablished || this.isSessionTerminating()
+        ? 'Disconnected'
+        : this.targetRunning ? 'Running' : 'Halted');
+    this.sendResponse(msg, {
+      variables: [],
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: result?.elapsedMs ?? Math.max(0, this.nowMs() - startedAtMs),
+      diagnostics: {
+        ...result?.diagnostics,
+        readEpoch: this.readCancelEpoch,
+        stopGeneration: this.stopGeneration,
+        handleStopGeneration: handle.stopGeneration,
+      },
     }, false, `${errorCode}: ${message}`);
   }
 
@@ -1547,6 +1575,7 @@ export class DapSession extends EventEmitter {
         expression: 'uxCurrentNumberOfTasks',
         force: true,
         signal: controller.signal,
+        priority: 'background',
       });
       const stale = controller.signal.aborted || readEpoch !== this.readCancelEpoch
         || this.controlInProgress || this.isSessionTerminating();
@@ -2048,9 +2077,20 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleRtosVariableExpansion(msg: DebugProtocolMessage, handle: DapVariableHandle) {
+    const startedAtMs = this.nowMs();
     const expansion = handle.rtosExpansion;
-    if (!expansion || handle.stopGeneration !== this.stopGeneration) {
+    if (!expansion) {
       this.sendResponse(msg, { variables: [] });
+      return;
+    }
+    if (handle.stopGeneration !== this.stopGeneration || this.shouldDeferTargetRead()) {
+      this.sendRtosVariablesFailure(
+        msg,
+        'RtosReadCancelled',
+        'RTOS variable reference is no longer valid for the active stopped target',
+        startedAtMs,
+        handle,
+      );
       return;
     }
 
@@ -2065,7 +2105,6 @@ export class DapSession extends EventEmitter {
       return;
     }
 
-    const startedAtMs = this.nowMs();
     const readEpoch = this.readCancelEpoch;
     if (!(await this.beginTargetReadWhenAvailable('background', 1200))) {
       const error = 'RTOS variable expansion could not acquire the stopped-target read gate';
@@ -2086,7 +2125,13 @@ export class DapSession extends EventEmitter {
       if (readEpoch !== this.readCancelEpoch
         || handle.stopGeneration !== this.stopGeneration
         || this.shouldDeferTargetRead()) {
-        this.sendResponse(msg, { variables: [] });
+        this.sendRtosVariablesFailure(
+          msg,
+          'RtosReadCancelled',
+          'RTOS variable expansion was cancelled before target access',
+          startedAtMs,
+          handle,
+        );
         return;
       }
       const result = await this.backend.execute({
@@ -2095,6 +2140,7 @@ export class DapSession extends EventEmitter {
         force: true,
         expandedExpressions,
         signal: controller.signal,
+        priority: 'background',
       });
       if (controller.signal.aborted
         || readEpoch !== this.readCancelEpoch
@@ -2104,7 +2150,14 @@ export class DapSession extends EventEmitter {
           `RTOS variables discarded stale result expression=${expansion.rootExpression}`
           + ` readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`,
         );
-        this.sendResponse(msg, { variables: [] });
+        this.sendRtosVariablesFailure(
+          msg,
+          'RtosReadCancelled',
+          'RTOS variable expansion result became stale',
+          startedAtMs,
+          handle,
+          result,
+        );
         return;
       }
       if (!result.ok) {
@@ -2227,6 +2280,10 @@ export class DapSession extends EventEmitter {
         const handle = this.variableHandles.get(ref)!;
         if (Array.isArray(handle)) {
           this.sendResponse(msg, { variables: handle.map(value => this.toDapVariable(value)) });
+        } else if (!handle.rtosExpansion) {
+          this.sendResponse(msg, {
+            variables: (handle.children || []).map(value => this.toDapVariable(value)),
+          });
         } else {
           await this.handleRtosVariableExpansion(msg, handle);
         }
@@ -2829,6 +2886,7 @@ export class DapSession extends EventEmitter {
         force,
         expandedExpressions: isRTOS ? [] : undefined,
         signal: controller.signal,
+        priority: isRTOS ? 'background' : undefined,
       });
       if (controller.signal.aborted || readEpoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
         log.dap(`evaluate discarded stale result expression=${expr} readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);

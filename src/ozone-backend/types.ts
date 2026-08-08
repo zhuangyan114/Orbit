@@ -184,7 +184,14 @@ export type OzoneCommand =
   | { cmd: 'resolveSymbol'; name: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
-  | { cmd: 'evaluateExpression'; expression: string; force?: boolean; expandedExpressions?: string[]; signal?: AbortSignal }
+  | {
+    cmd: 'evaluateExpression';
+    expression: string;
+    force?: boolean;
+    expandedExpressions?: string[];
+    signal?: AbortSignal;
+    priority?: 'watch' | 'timeline' | 'background';
+  }
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[]; priority?: 'watch' | 'timeline' }
   | { cmd: 'getPerformanceDiagnostics' }

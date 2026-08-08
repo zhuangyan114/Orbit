@@ -1186,7 +1186,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
       body: {
         variables: [],
         errorCode: 'RtosReadCancelled',
-        targetState: 'Running',
+        targetState: 'Halted',
         elapsedMs: expect.any(Number),
         diagnostics: expect.objectContaining({
           readEpoch: expect.any(Number),

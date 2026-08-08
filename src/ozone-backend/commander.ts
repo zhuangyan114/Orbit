@@ -49,6 +49,7 @@ interface WatchEvaluationContext {
   /** Undefined preserves the eager behavior required by standard DAP evaluate/variables. */
   expandedExpressions?: ReadonlySet<string>;
   signal?: AbortSignal;
+  priority?: 'watch' | 'timeline' | 'background';
 }
 
 class EvaluateCancelledError extends Error {
@@ -177,8 +178,9 @@ export class OzoneBackend {
     address: number,
     size: number,
     priority: 'watch' | 'timeline' | 'background' = 'watch',
+    signal?: AbortSignal,
   ): Promise<Uint8Array | null> {
-    const result = await this.targetReadMemoryResult(address, size, priority);
+    const result = await this.targetReadMemoryResult(address, size, priority, signal);
     return result.ok && result.data ? result.data.bytes : null;
   }
 
@@ -392,13 +394,14 @@ case 'readVariableRuntime':
         case 'setBreakpointAtAddr':
           return this.doSetBreakpointAtAddr(command.addr);
         case 'evaluateExpression': {
-          const watchContext = command.expandedExpressions === undefined && !command.signal
+          const watchContext = command.expandedExpressions === undefined && !command.signal && !command.priority
             ? undefined
             : {
               expandedExpressions: command.expandedExpressions === undefined
                 ? undefined
                 : new Set(command.expandedExpressions),
               signal: command.signal,
+              priority: command.priority,
             };
           try {
             return await this.doEvaluateExpression(command.expression, command.force, watchContext);
@@ -3941,7 +3944,7 @@ case 'readVariableRuntime':
     context?: WatchEvaluationContext,
   ): Promise<Uint8Array | null> {
     this.throwIfEvaluationCancelled(context);
-    const raw = await this.targetReadMemory(address, size);
+    const raw = await this.targetReadMemory(address, size, context?.priority, context?.signal);
     this.throwIfEvaluationCancelled(context);
     return raw;
   }

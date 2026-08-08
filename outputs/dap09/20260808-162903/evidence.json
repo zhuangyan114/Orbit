@@ -1,0 +1,49 @@
+{
+  "dap": "DAP-09",
+  "timestamp": "2026-08-08T16:29:03+08:00",
+  "branch": "codex/dap09-rtos-view",
+  "hardware": {
+    "authorized": false,
+    "mcu": "STM32F407VET6",
+    "probe": "CMSIS-DAP_LU",
+    "probeId": "C251:F001/LU_2022_8888",
+    "transport": "wired CMSIS-DAP HID",
+    "project": "D:\\STM32\\project\\vet6_led",
+    "rtos": "FreeRTOS 10.3.1, CMSIS-RTOS v1 wrapper",
+    "targetMutatingOperations": []
+  },
+  "verification": {
+    "typecheck": "passed",
+    "unitTests": { "status": "passed", "tests": 288, "files": 31 },
+    "focusedTests": { "status": "passed", "tests": 93, "files": 5 },
+    "build": "passed",
+    "buildNative": "passed",
+    "cmsisDapMock": "passed",
+    "cppChannelMock": "passed",
+    "cmsisDapAlgorithm": "passed",
+    "helperSelftest": { "status": "passed", "cases": 200, "failures": 0 },
+    "gitDiffCheck": "passed",
+    "distStatus": "clean"
+  },
+  "rtosContract": {
+    "initializeSupportsRTOS": true,
+    "rtosInfoSymbolProbe": "uxCurrentNumberOfTasks",
+    "expandableVariables": true,
+    "byteOrientedReadMemory": true,
+    "staleReadCancellation": true,
+    "controlPriority": "control > watch > timeline > background"
+  },
+  "owner": {
+    "probeCmsisDapUniqueOwner": true,
+    "jlinkFallback": false,
+    "legacyFallback": false,
+    "residualHelperAfterDisconnect": false
+  },
+  "commits": [
+    { "hash": "d187e06", "message": "test: characterize RTOS View DAP contract", "pushed": true },
+    { "hash": "ea41517", "message": "fix: preserve RTOS stopped-state requests", "pushed": true },
+    { "hash": "3b2e2dc", "message": "fix: detect FreeRTOS through DAP rtosInfo", "pushed": true },
+    { "hash": "352d353", "message": "test: preserve RTOS background read scheduling contract", "pushed": true }
+  ],
+  "hardwareAcceptance": "pending-explicit-authorization"
+}

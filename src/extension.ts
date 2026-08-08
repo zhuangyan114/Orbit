@@ -9,6 +9,7 @@ import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
+import { createRtosViewsRefreshHandler } from './debug/rtos-views-tracker';
 import * as fs from 'fs';
 
 let backend: OzoneBackend;
@@ -371,7 +372,6 @@ function stopWatchPolling() {
 
 function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
   const diagChannel = vscode.window.createOutputChannel('Orbit RTOS Views');
-  let refreshScheduled = false;
 
   vscode.extensions.getExtension("mcu-debug.debug-tracker-vscode")?.activate().then((trackerApi: any) => {
     if (!trackerApi || typeof trackerApi.subscribe !== 'function') {
@@ -383,10 +383,7 @@ function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
         version: 1,
         body: {
           debuggers: ["ozone"],
-          handler: (event: any) => {
-            if (event.event === 'first-stack-trace' && !refreshScheduled) {
-              refreshScheduled = true;
-
+          handler: createRtosViewsRefreshHandler(() => {
               // Trigger RTOS Views detection: the 'refresh' command calls
               // RTOSTracker.update() → updateRTOSInfo() → rtosSession.refresh()
               // → onStopped(lastFrameId) → tryDetect()
@@ -401,12 +398,11 @@ function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
                       diagChannel.appendLine(`RTOS Views refresh failed: ${e2?.message || e2}`);
                     });
                   }, 500);
-                }, () => {
+              }, () => {
                   diagChannel.appendLine('RTOS Views panel not found (not installed?)');
                 });
               }, 1000);
-            }
-          },
+          }),
           wantCurrentStatus: true,
           notifyAllEvents: false,
         }

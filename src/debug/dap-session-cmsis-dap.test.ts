@@ -778,6 +778,217 @@ describe('DapSession CMSIS-DAP control routing', () => {
     });
   });
 
+  it('keeps compound RTOS variables expandable while loading one DAP level at a time', async () => {
+    const expansionCalls: string[][] = [];
+    const backend = {
+      execute: vi.fn(async (command: {
+        cmd: string;
+        expression?: string;
+        expandedExpressions?: string[];
+      }) => {
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        if (command.cmd !== 'evaluateExpression') {
+          return { ok: false, error: `unexpected ${command.cmd}` };
+        }
+
+        expect(command.expression).toBe('pxReadyTasksLists');
+        expansionCalls.push(command.expandedExpressions || []);
+        const expanded = new Set(command.expandedExpressions);
+        const list = {
+          expression: '[0]',
+          evaluateName: 'pxReadyTasksLists[0]',
+          value: 0,
+          display: 'List_t',
+          hex: '',
+          address: 0x20001000,
+          typeName: 'List_t',
+          hasChildren: true,
+          children: expanded.has('pxReadyTasksLists[0]')
+            ? [{
+              expression: 'uxNumberOfItems',
+              evaluateName: 'pxReadyTasksLists[0].uxNumberOfItems',
+              value: 3,
+              display: '3',
+              hex: '0x00000003',
+              address: 0x20001000,
+              typeName: 'UBaseType_t',
+            }]
+            : undefined,
+        };
+        return {
+          ok: true,
+          data: {
+            expression: 'pxReadyTasksLists',
+            evaluateName: 'pxReadyTasksLists',
+            value: 0x20001000,
+            display: 'List_t[40]',
+            hex: '',
+            address: 0x20001000,
+            typeName: 'List_t[40]',
+            hasChildren: true,
+            children: expanded.has('pxReadyTasksLists') ? [list] : undefined,
+          },
+        };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleEvaluate({
+      ...request(60, 'evaluate'),
+      arguments: { expression: 'pxReadyTasksLists', context: 'hover', frameId: 1 },
+    });
+    const rootReference = messages.find(message => message.request_seq === 60)?.body?.variablesReference;
+    expect(rootReference).toBeGreaterThan(0);
+
+    await (session as any).handleVariables({
+      ...request(61, 'variables'),
+      arguments: { variablesReference: rootReference },
+    });
+    const listReference = messages.find(message => message.request_seq === 61)?.body?.variables?.[0]?.variablesReference;
+    expect(listReference).toBeGreaterThan(0);
+
+    await (session as any).handleVariables({
+      ...request(62, 'variables'),
+      arguments: { variablesReference: listReference },
+    });
+    expect(messages.find(message => message.request_seq === 62)).toMatchObject({
+      success: true,
+      body: {
+        variables: [expect.objectContaining({
+          name: 'uxNumberOfItems',
+          evaluateName: 'pxReadyTasksLists[0].uxNumberOfItems',
+          value: '3',
+          variablesReference: 0,
+        })],
+      },
+    });
+    expect(expansionCalls).toEqual([
+      [],
+      ['pxReadyTasksLists'],
+      ['pxReadyTasksLists', 'pxReadyTasksLists[0]'],
+    ]);
+  });
+
+  it('runs queued Local reads before a background RTOS variable expansion', async () => {
+    const executionOrder: string[] = [];
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => {
+        if (command.cmd === 'getLocals') {
+          executionOrder.push('locals');
+          return { ok: true, data: [{ name: 'localValue', value: '7', type: 'int' }] };
+        }
+        if (command.cmd === 'evaluateExpression') {
+          executionOrder.push('rtos');
+          return {
+            ok: true,
+            data: {
+              expression: 'pxReadyTasksLists',
+              evaluateName: 'pxReadyTasksLists',
+              value: 0x20001000,
+              display: 'List_t[40]',
+              hex: '',
+              hasChildren: true,
+              children: [{
+                expression: '[0]',
+                evaluateName: 'pxReadyTasksLists[0]',
+                value: 0,
+                display: 'List_t',
+                hex: '',
+                hasChildren: true,
+              }],
+            },
+          };
+        }
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).targetReadInProgress = true;
+    (session as any).variableHandles.set(1000, {
+      rtosExpansion: {
+        rootExpression: 'pxReadyTasksLists',
+        expandedExpressions: [],
+        targetEvaluateName: 'pxReadyTasksLists',
+      },
+      stopGeneration: 0,
+    });
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    const rtosVariables = (session as any).handleVariables({
+      ...request(63, 'variables'),
+      arguments: { variablesReference: 1000 },
+    });
+    await Promise.resolve();
+    const locals = (session as any).handleVariables({
+      ...request(64, 'variables'),
+      arguments: { variablesReference: 1 },
+    });
+    await Promise.resolve();
+    (session as any).endTargetRead();
+    await Promise.all([rtosVariables, locals]);
+
+    expect(executionOrder).toEqual(['locals', 'rtos']);
+    expect(messages.find(message => message.request_seq === 64)).toMatchObject({
+      success: true,
+      body: { variables: [expect.objectContaining({ name: 'localValue', value: '7' })] },
+    });
+    expect(messages.find(message => message.request_seq === 63)).toMatchObject({
+      success: true,
+      body: { variables: [expect.objectContaining({ name: '[0]' })] },
+    });
+  });
+
+  it('returns a structured failure instead of a successful zero reference when RTOS evaluate times out', async () => {
+    vi.useFakeTimers();
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => ({ ok: false, error: `unexpected ${command.cmd}` })),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).targetReadInProgress = true;
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    try {
+      const evaluate = (session as any).handleEvaluate({
+        ...request(67, 'evaluate'),
+        arguments: { expression: 'pxReadyTasksLists', context: 'hover', frameId: 1 },
+      });
+      await vi.advanceTimersByTimeAsync(1200);
+      await evaluate;
+
+      expect(backend.execute).not.toHaveBeenCalled();
+      expect(messages.find(message => message.request_seq === 67)).toMatchObject({
+        success: false,
+        body: {
+          variablesReference: 0,
+          errorCode: 'TargetReadUnavailable',
+          targetState: 'Halted',
+          elapsedMs: expect.any(Number),
+          diagnostics: { targetReadGate: expect.any(Object) },
+        },
+      });
+      expect(messages.find(message => message.request_seq === 67)?.body?.elapsedMs).toBeGreaterThanOrEqual(0);
+    } finally {
+      (session as any).targetReadInProgress = false;
+      vi.useRealTimers();
+    }
+  });
+
   it('detects FreeRTOS through rtosInfo symbol probing and preserves diagnostics', async () => {
     const backend = {
       execute: vi.fn(async (command: { cmd: string; expression?: string; signal?: AbortSignal }) => {
@@ -850,6 +1061,71 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(messages.find(message => message.request_seq === 54)).toMatchObject({
       success: true,
       body: { variables: [] },
+    });
+  });
+
+  it('cancels an active lazy RTOS variables expansion on Continue without publishing stale children', async () => {
+    let evaluateSignal: AbortSignal | undefined;
+    let markEvaluateStarted: (() => void) | undefined;
+    const evaluateStarted = new Promise<void>(resolve => { markEvaluateStarted = resolve; });
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; signal?: AbortSignal }) => {
+        if (command.cmd === 'evaluateExpression') {
+          evaluateSignal = command.signal;
+          markEvaluateStarted?.();
+          await new Promise<void>(resolve => {
+            command.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          return {
+            ok: true,
+            data: {
+              expression: 'pxReadyTasksLists',
+              evaluateName: 'pxReadyTasksLists',
+              value: 0,
+              display: 'stale',
+              hex: '',
+              children: [{ expression: '[0]', value: 0, display: 'stale child', hex: '' }],
+            },
+          };
+        }
+        if (command.cmd === 'run') return { ok: true, data: { state: 'Running' } };
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).variableHandles.set(1000, {
+      rtosExpansion: {
+        rootExpression: 'pxReadyTasksLists',
+        expandedExpressions: [],
+        targetEvaluateName: 'pxReadyTasksLists',
+      },
+      stopGeneration: 0,
+    });
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    const variables = (session as any).handleVariables({
+      ...request(65, 'variables'),
+      arguments: { variablesReference: 1000 },
+    });
+    await evaluateStarted;
+    const continueRequest = (session as any).handleContinue(request(66, 'continue'));
+    await Promise.all([variables, continueRequest]);
+    (session as any).stopPolling();
+
+    expect(evaluateSignal?.aborted).toBe(true);
+    expect((session as any).variableHandles.size).toBe(0);
+    expect(messages.find(message => message.request_seq === 65)).toMatchObject({
+      success: true,
+      body: { variables: [] },
+    });
+    expect(messages.find(message => message.request_seq === 65)).not.toMatchObject({
+      body: { variables: [expect.objectContaining({ value: 'stale child' })] },
     });
   });
 

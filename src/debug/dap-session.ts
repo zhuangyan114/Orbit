@@ -138,6 +138,7 @@ export class DapSession extends EventEmitter {
   };
   private activeStoppedReadAbortController: AbortController | null = null;
   private activeEvaluateAbortController: AbortController | null = null;
+  private activeMemoryReadAbortController: AbortController | null = null;
 
   private breakpoints = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
@@ -338,6 +339,7 @@ export class DapSession extends EventEmitter {
   private beginControl() {
     this.controlInProgress = true;
     this.advanceReadCancelEpoch();
+    this.variableHandles.clear();
     this.cancelActiveTargetReads('DAP control request started');
   }
 
@@ -356,6 +358,11 @@ export class DapSession extends EventEmitter {
     if (evaluateController && !evaluateController.signal.aborted) {
       log.dap(`cancel evaluate target read reason=control readEpoch=${this.readCancelEpoch}`);
       evaluateController.abort(reason);
+    }
+    const memoryController = this.activeMemoryReadAbortController;
+    if (memoryController && !memoryController.signal.aborted) {
+      log.dap(`cancel memory target read reason=control readEpoch=${this.readCancelEpoch}`);
+      memoryController.abort(reason);
     }
   }
 
@@ -2008,13 +2015,30 @@ export class DapSession extends EventEmitter {
       return;
     }
 
-    if (!(await this.beginTargetReadWhenAvailable('background', 700))) {
+    const readEpoch = this.readCancelEpoch;
+    const controller = new AbortController();
+    if (!(await this.beginTargetReadWhenAvailable('background', 700, controller.signal))) {
       this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, 'Target is running');
       return;
     }
 
     try {
-      const result = await this.backend.execute({ cmd: 'readMemory', address, size: count });
+      if (readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating()) {
+        this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, 'Target read cancelled');
+        return;
+      }
+      this.activeMemoryReadAbortController = controller;
+      const result = await this.backend.execute({ cmd: 'readMemory', address, size: count, signal: controller.signal });
+      const stale = controller.signal.aborted || readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating();
+      if (stale) {
+        this.sendResponse(msg, {
+          address: this.formatMemoryReference(address),
+          unreadableBytes: count,
+          errorCode: 'TargetReadCancelled',
+          targetState: this.targetRunning ? 'Running' : 'Halted',
+        }, false, 'Target read cancelled');
+        return;
+      }
       if (!result.ok) {
         this.sendResponse(msg, {
           address: this.formatMemoryReference(address),
@@ -2035,6 +2059,9 @@ export class DapSession extends EventEmitter {
         unreadableBytes: block.unreadableBytes ?? Math.max(0, count - bytes.length),
       });
     } finally {
+      if (this.activeMemoryReadAbortController === controller) {
+        this.activeMemoryReadAbortController = null;
+      }
       this.endTargetRead();
     }
   }

@@ -164,7 +164,7 @@ export type OzoneCommand =
   | { cmd: 'getVariable'; name: string; frame?: number }
   | { cmd: 'getLocals'; frame?: number; signal?: AbortSignal }
   | { cmd: 'getCallStack' }
-  | { cmd: 'readMemory'; address: number; size: number }
+  | { cmd: 'readMemory'; address: number; size: number; signal?: AbortSignal }
   | { cmd: 'writeMemory'; address: number; data: number[] }
   | { cmd: 'readRegister'; name: string }
   | { cmd: 'getTargetState' }

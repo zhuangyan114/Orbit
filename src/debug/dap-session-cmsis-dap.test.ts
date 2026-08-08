@@ -778,6 +778,89 @@ describe('DapSession CMSIS-DAP control routing', () => {
     });
   });
 
+  it('does not publish a variablesReference tree created before Continue', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => {
+        if (command.cmd === 'run') return { ok: true, data: { state: 'Running' } };
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).variableHandles.set(1000, [{
+      expression: 'pxReadyTasksLists[0]',
+      evaluateName: 'pxReadyTasksLists[0]',
+      value: 1,
+      display: 'List_t',
+      hex: '',
+      address: 0x20001000,
+      typeName: 'List_t',
+    }]);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleContinue(request(53, 'continue'));
+    (session as any).stopPolling();
+    await (session as any).handleVariables({
+      ...request(54, 'variables'),
+      arguments: { variablesReference: 1000 },
+    });
+
+    expect(messages.find(message => message.request_seq === 54)).toMatchObject({
+      success: true,
+      body: { variables: [] },
+    });
+  });
+
+  it('cancels stale RTOS readMemory and never publishes its result after Continue', async () => {
+    let readSignal: AbortSignal | undefined;
+    let releaseRead: (() => void) | undefined;
+    let readStarted: (() => void) | undefined;
+    const started = new Promise<void>(resolve => { readStarted = resolve; });
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; signal?: AbortSignal }) => {
+        if (command.cmd === 'readMemory') {
+          readSignal = command.signal;
+          readStarted?.();
+          await new Promise<void>(resolve => {
+            releaseRead = resolve;
+            command.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          return { ok: true, data: { address: 0x20003000, data: [0x5a], ascii: 'Z' } };
+        }
+        if (command.cmd === 'run') return { ok: true, data: { state: 'Running' } };
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    const read = (session as any).handleReadMemory({
+      ...request(55, 'readMemory'),
+      arguments: { memoryReference: '0x20003000', count: 1 },
+    });
+    await started;
+    const cont = (session as any).handleContinue(request(56, 'continue'));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(readSignal?.aborted).toBe(true);
+    releaseRead?.();
+    await Promise.all([read, cont]);
+    (session as any).stopPolling();
+
+    expect(messages.find(message => message.request_seq === 55)).toMatchObject({
+      success: false,
+      body: { unreadableBytes: 1 },
+    });
+  });
+
   it('cancels stale RTOS evaluate before Continue so the next breakpoint stackTrace can refresh', async () => {
     let evaluateSignal: AbortSignal | undefined;
     let releaseEvaluate: (() => void) | undefined;

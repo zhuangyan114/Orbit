@@ -176,7 +176,7 @@ export class OzoneBackend {
   private async targetReadMemory(
     address: number,
     size: number,
-    priority: 'watch' | 'timeline' = 'watch',
+    priority: 'watch' | 'timeline' | 'background' = 'watch',
   ): Promise<Uint8Array | null> {
     const result = await this.targetReadMemoryResult(address, size, priority);
     return result.ok && result.data ? result.data.bytes : null;
@@ -185,9 +185,13 @@ export class OzoneBackend {
   private async targetReadMemoryResult(
     address: number,
     size: number,
-    priority: 'watch' | 'timeline' = 'watch',
+    priority: 'watch' | 'timeline' | 'background' = 'watch',
+    signal?: AbortSignal,
   ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
-    if (this.sessionTarget) return this.sessionTarget.readMemory(address, size, { priority });
+    if (signal?.aborted) {
+      return { ok: false, errorCode: 'TargetReadCancelled', message: 'target read cancelled', targetState: 'Unknown', elapsedMs: 0 };
+    }
+    if (this.sessionTarget) return this.sessionTarget.readMemory(address, size, { priority, signal });
     const started = Date.now();
     const bytes = this.jlink.readMemory(address, size);
     if (bytes) {
@@ -345,7 +349,7 @@ export class OzoneBackend {
         case 'getCallStack':
           return await this.doGetCallStack();
         case 'readMemory':
-          return await this.doReadMemory(command.address, command.size);
+          return await this.doReadMemory(command.address, command.size, command.signal);
         case 'readRegister':
           return await this.doReadRegister(command.name);
         case 'getTargetState': {
@@ -2474,16 +2478,22 @@ case 'readVariableRuntime':
     return null;
   }
 
-  private async doReadMemory(address: number, size: number): Promise<OzoneCommandResult> {
+  private async doReadMemory(address: number, size: number, signal?: AbortSignal): Promise<OzoneCommandResult> {
+    if (signal?.aborted) {
+      return { ok: false, errorCode: 'TargetReadCancelled', error: 'Target read cancelled', targetState: 'Unknown', elapsedMs: 0 };
+    }
     const wasRunning = !(await this.targetIsHalted());
     if (wasRunning) {
+      if (signal?.aborted) {
+        return { ok: false, errorCode: 'TargetReadCancelled', error: 'Target read cancelled', targetState: 'Running', elapsedMs: 0 };
+      }
       const halted = await this.ensureHalted();
       if (!halted) return { ok: false, error: 'halt failed' };
       await new Promise<void>(r => setTimeout(r, 50));
     }
 
-    const readResult = await this.readMemoryChunked(address, size);
-    const resumed = wasRunning ? await this.targetRun() : false;
+    const readResult = await this.readMemoryChunked(address, size, signal);
+    const resumed = wasRunning && !signal?.aborted ? await this.targetRun() : false;
     const currentTargetState = wasRunning
       ? (resumed ? 'Running' : readResult.targetState)
       : 'Halted';
@@ -2527,15 +2537,26 @@ case 'readVariableRuntime':
   private async readMemoryChunked(
     address: number,
     size: number,
+    signal?: AbortSignal,
   ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
     const chunkSize = 256;
     const chunks: number[] = [];
     let elapsedMs = 0;
     let targetState: CppJLinkResult['targetState'] = 'Unknown';
     for (let offset = 0; offset < size; offset += chunkSize) {
+      if (signal?.aborted) {
+        return {
+          ok: false,
+          errorCode: 'TargetReadCancelled',
+          message: 'target read cancelled',
+          targetState,
+          elapsedMs,
+          diagnostics: { operation: 'readMemory', phase: 'cancelled', address, size, chunkOffset: offset },
+        };
+      }
       const count = Math.min(chunkSize, size - offset);
       const chunkAddress = address + offset;
-      const result = await this.targetReadMemoryResult(chunkAddress, count);
+      const result = await this.targetReadMemoryResult(chunkAddress, count, 'background', signal);
       elapsedMs += result.elapsedMs;
       targetState = result.targetState;
       if (!result.ok || !result.data) {

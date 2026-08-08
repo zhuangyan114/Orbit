@@ -138,6 +138,31 @@ Orbit 通过 DAP capability 和外部 extension tracker 对接 RTOS Views；Orbi
 
 `orbit.rtosViewsAutoRefresh` 默认 `false`；设为 `true` 时，源码会在外部 tracker 报告首次 stack trace 后尝试 focus/refresh RTOS Views。
 
+### FreeRTOS / CMSIS-RTOS v1
+
+FreeRTOS 10.x 使用 CMSIS-RTOS v1 wrapper 时，launch 示例为：
+
+```json
+{
+  "type": "ozone",
+  "request": "launch",
+  "name": "Orbit: FreeRTOS STM32F407",
+  "program": "${workspaceFolder}/build/Debug/firmware.elf",
+  "device": "STM32F407VE",
+  "rtos": "FreeRTOS"
+}
+```
+
+`rtos` 必须写 `FreeRTOS`，不要写 `CMSIS-RTOS`。后者是 API wrapper，不是外部 RTOS Views 的识别名称。J-Link 和 CMSIS-DAP HID 均可使用此配置；CMSIS-DAP 会话必须保持唯一 CMSIS-DAP helper owner，不能与 J-Link/Legacy owner 并存。
+
+外部 RTOS Views 通过以下 DAP 请求展开信息：`initialize` 的 `supportsRTOS` / `rtosName`、`rtosInfo`、`evaluate`、`variables`、`stackTrace` 和 `readMemory`。变量树必须返回可继续请求的 `variablesReference` 与有效 `memoryReference`；`readMemory` 使用 byte-oriented 数据。FreeRTOS 链表、TCB 和 runtime counter 应在停止态取得一致快照，运行态刷新只能走受控 background 读取。
+
+固件侧至少要从同一个 active ELF 中确认 FreeRTOS 内核符号，例如 `uxCurrentNumberOfTasks`、`pxReadyTasksLists`、`xDelayedTaskList1` 和 `pxCurrentTCB`。要显示 Queue/Mux/Sem，还要启用 queue registry，并对目标对象调用 `vQueueAddToRegistry`。名称列若显示 `0x0800...`，通常是 registry 字符串指针尚未被外部视图解引用，不代表对象读取失败。
+
+`Unable to collect full RTOS information` / `No RTOS detected` 可能是停止态读取被控制操作取消、目标仍在运行或旧 session 缓存了失败结果。确认目标停止后，结束旧调试会话、Reload Window、重新启动 launch，再刷新 RTOS Views；`Busy`、`TargetReadUnavailable` 等瞬态错误应重试，符号缺失才作为永久配置错误报告。
+
+`vet6_led` 的可选验收 fixture 由 `RTT_BENCH_ENABLE=ON` 开启：它创建 `rttBench` RTT 测试任务，并注册一个容量为 4 的 `rtosViewQueue`、一个 `rtosViewMutex` 和一个 `rtosViewSemaphore`。因此该 fixture 的典型快照是 4 个任务、1 个队列和 2 个 MUX/SEM；这些数量不是通用 FreeRTOS 预期。
+
 ## RTT and P-RTLog
 
 RTT 必须由 firmware 初始化 SEGGER RTT control block，当前 J-Link DLL 还要导出 RTT control/read 函数。`rttStripAnsi` 仅影响 Debug Console；terminal 输出保留 ANSI。RTT `ESC[2J` 会触发 Debug Console 清屏行为。

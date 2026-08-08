@@ -92,6 +92,15 @@ Native owner 规则：
 
 `rtos` / `orbit.defaultRtos` 只有在 firmware 实际使用对应 RTOS 时才填写，例如 `FreeRTOS`。RTOS Views 还依赖正确的 ELF/SVD/MCU 和 firmware-side FreeRTOS symbols、trace/runtime-stat hooks；缺失时要明确报告，而不是把启动成功当作 RTOS Views 已验证。
 
+FreeRTOS 兼容性验收补充：
+
+- FreeRTOS 10.x 配合 CMSIS-RTOS v1 wrapper 时，launch 使用 `"rtos": "FreeRTOS"`；`CMSIS-RTOS` 是 API wrapper 名称，不是 RTOS Views 的识别值。
+- J-Link 和 CMSIS-DAP HID 都可以承载同一套 RTOS View DAP 合同。`probe: "cmsis-dap"` 必须由唯一 CMSIS-DAP helper owner 服务，不能创建 J-Link、Legacy 或第二个 target owner；J-Link 路径同样只能保留一个活动 owner。
+- 最低 DAP 合同包括 `initialize.supportsRTOS` / `rtosName`、`rtosInfo`、`evaluate`、可展开的 `variables` / `variablesReference`、有效 `memoryReference` 以及 byte-oriented `readMemory`。RTOS View 失败时要保留 `errorCode`、`targetState`、`elapsedMs` 和 `diagnostics`。
+- RTOS 链表和 runtime counter 必须来自同一停止态快照；Continue、Halt、Step、Reset、Disconnect 或 session replacement 时取消排队的 RTOS refresh，旧 generation 的结果不得发布。RTOS refresh 只能作为 background/低优先级读取，不能阻塞控制操作或禁用 Watch、Timeline、RTT、变量树和 Memory View。
+- 遇到 `Unable to collect full RTOS information` 或 `No RTOS detected` 时，先确认目标已停止、ELF 与实际固件一致，再终止旧 session、Reload Window 并创建新 session；外部 RTOS Views 会缓存当前 session 的检测失败。瞬态 `Busy` / `TargetReadUnavailable` 应允许重试，符号缺失等永久错误才应报告为配置问题。
+- `vet6_led` 的验收 fixture 在 `RTT_BENCH_ENABLE=ON` 时额外创建 `rttBench`，并注册 `rtosViewQueue`、`rtosViewMutex`、`rtosViewSemaphore`；看到 4 个线程、1 个队列和 2 个 MUX/SEM 只说明该 fixture 已启用，不应当作所有工程的固定期望。
+
 ### 6. Configure RTT and P-RTLog
 
 - RTT 默认 `rttLogEnabled: true`，up-buffer 默认 `0`，默认 poll interval `50 ms`，每轮默认读取 `4096 bytes`，输出默认到 `terminal`。

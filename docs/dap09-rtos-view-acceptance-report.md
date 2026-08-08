@@ -58,5 +58,6 @@ Target profile: STM32F407VET6, CMSIS-DAP_LU (`C251:F001`, `LU_2022_8888`), wired
 - `ea41517` `fix: preserve RTOS stopped-state requests` (pushed).
 - `3b2e2dc` `fix: detect FreeRTOS through DAP rtosInfo` (pushed).
 - `352d353` `test: preserve RTOS background read scheduling contract` (pushed).
+- `46bc4ff` `fix: preserve structured memory cancellation errors` (pushed).
 
 Evidence JSON: `outputs/dap09/20260808-162903/evidence.json`.

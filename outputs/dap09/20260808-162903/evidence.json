@@ -43,7 +43,8 @@
     { "hash": "d187e06", "message": "test: characterize RTOS View DAP contract", "pushed": true },
     { "hash": "ea41517", "message": "fix: preserve RTOS stopped-state requests", "pushed": true },
     { "hash": "3b2e2dc", "message": "fix: detect FreeRTOS through DAP rtosInfo", "pushed": true },
-    { "hash": "352d353", "message": "test: preserve RTOS background read scheduling contract", "pushed": true }
+    { "hash": "352d353", "message": "test: preserve RTOS background read scheduling contract", "pushed": true },
+    { "hash": "46bc4ff", "message": "fix: preserve structured memory cancellation errors", "pushed": true }
   ],
   "hardwareAcceptance": "pending-explicit-authorization"
 }

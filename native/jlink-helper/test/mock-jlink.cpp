@@ -24,6 +24,30 @@ bool haltStateError = false;
 bool targetLinkError = false;
 std::uint32_t loopIterations = 0;
 std::uint32_t hitBreakpoint = 0;
+
+void writeMemoryWord(std::uint32_t address, std::uint32_t value) {
+  for (std::uint32_t i = 0; i < 4; ++i) {
+    memory[address + i] = static_cast<std::uint8_t>((value >> (i * 8)) & 0xFFu);
+  }
+}
+
+void initializeRttMemory() {
+  static constexpr std::uint32_t controlBlock = 0x20000100u;
+  static constexpr std::uint32_t buffer = 0x20001000u;
+  static constexpr std::uint32_t descriptor = controlBlock + 24u;
+  static constexpr std::uint32_t bufferSize = 16u;
+  static constexpr char magic[] = "SEGGER RTT";
+  for (std::uint32_t i = 0; i < 10; ++i) memory[controlBlock + i] = static_cast<std::uint8_t>(magic[i]);
+  writeMemoryWord(controlBlock + 16u, 1u);
+  writeMemoryWord(controlBlock + 20u, 0u);
+  writeMemoryWord(descriptor + 4u, buffer);
+  writeMemoryWord(descriptor + 8u, bufferSize);
+  writeMemoryWord(descriptor + 12u, 3u);
+  writeMemoryWord(descriptor + 16u, 0u);
+  memory[buffer] = 'M';
+  memory[buffer + 1u] = 'E';
+  memory[buffer + 2u] = 'M';
+}
 }
 
 extern "C" {
@@ -43,6 +67,7 @@ int __cdecl JLINK_Connect() {
   if (!opened) return -1;
   connected = true;
   halted = true;
+  initializeRttMemory();
   return 0;
 }
 
@@ -164,6 +189,7 @@ int __cdecl JLINK_ReadMem(std::uint32_t address, std::uint32_t size, void* desti
     bytes[0] = 0xFE;
     bytes[1] = 0xE7;
   }
+  if (address >= 0x20000100u && address < 0x20001020u) return 0;
   return static_cast<int>(size);
 }
 
@@ -173,6 +199,7 @@ int __cdecl JLINK_WriteMem(std::uint32_t address, std::uint32_t size, const void
   if (address == 0xFFFF0000u && size > 0) haltStateError = bytes[0] != 0;
   if (address == 0xFFFF0004u && size > 0) targetLinkError = bytes[0] != 0;
   for (std::uint32_t i = 0; i < size; ++i) memory[address + i] = bytes[i];
+  if (address == 0x20000100u + 24u + 16u) return 0;
   return static_cast<int>(size);
 }
 

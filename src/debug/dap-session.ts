@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { BoundedMetric } from '../utils/bounded-metric';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
 import {
@@ -27,7 +28,52 @@ interface DapSamplingEntry {
   color: string;
 }
 
-type TargetReadPriority = 'foreground' | 'watch' | 'low';
+type TargetReadPriority = 'foreground' | 'watch' | 'timeline' | 'background';
+type TargetReadRequestPriority = TargetReadPriority | 'low';
+
+const targetReadPriorityRank: Record<TargetReadPriority, number> = {
+  foreground: 0,
+  watch: 1,
+  timeline: 2,
+  background: 3,
+};
+
+function normalizeTargetReadPriority(priority: TargetReadRequestPriority): TargetReadPriority {
+  return priority === 'low' ? 'background' : priority;
+}
+
+interface TargetReadWaiter {
+  priority: TargetReadPriority;
+  queuedAtMs: number;
+  generation: number;
+  resolve: (acquired: boolean) => void;
+  timer: NodeJS.Timeout | null;
+  signal?: AbortSignal;
+  abortListener?: () => void;
+  settled: boolean;
+}
+
+interface TargetReadDrainWaiter {
+  resolve: (drained: boolean) => void;
+  timer: NodeJS.Timeout | null;
+  signal?: AbortSignal;
+  abortListener?: () => void;
+  settled: boolean;
+}
+
+interface TargetReadMetricSet {
+  queueWaitMs: BoundedMetric;
+  gateHoldMs: BoundedMetric;
+  handoffGapMs: BoundedMetric;
+}
+
+function createTargetReadMetricSet(): TargetReadMetricSet {
+  return {
+    queueWaitMs: new BoundedMetric(8_192),
+    gateHoldMs: new BoundedMetric(8_192),
+    handoffGapMs: new BoundedMetric(8_192),
+  };
+}
 
 export class DapSession extends EventEmitter {
   private backend: OzoneBackend;
@@ -37,12 +83,15 @@ export class DapSession extends EventEmitter {
   private connectionMonitorTimer: NodeJS.Timeout | null = null;
   private rttPollTimer: NodeJS.Timeout | null = null;
   private rttPollGeneration = 0;
+  private rttPollAbortController: AbortController | null = null;
   private rttLogEnabled = true;
+  private rttAvailable = true;
   private rttStarted = false;
   private rttBufferIndex = 0;
   private rttPollIntervalMs = 50;
   private rttReadSize = 4096;
   private rttControlBlockAddress: number | undefined;
+  private rttControlBlockSource: 'elf-symbol' | 'config' = 'elf-symbol';
   private dapStepProfileSeq = 0;
   private rttStripAnsi = true;
   private _rtos = '';
@@ -65,6 +114,28 @@ export class DapSession extends EventEmitter {
   private lowPriorityReadBlockedUntil = 0;
   private pendingForegroundTargetReads = 0;
   private pendingWatchTargetReads = 0;
+  private targetReadWaiters: TargetReadWaiter[] = [];
+  private targetReadDrainWaiters: TargetReadDrainWaiter[] = [];
+  private targetReadWaiterTimerCount = 0;
+  private targetReadDrainWaiterTimerCount = 0;
+  private lowPriorityReadBlockTimer: NodeJS.Timeout | null = null;
+  private targetReadAcquiredAtMs: number | null = null;
+  private targetReadActivePriority: TargetReadPriority | null = null;
+  private readonly targetReadQueueWaitMetric = new BoundedMetric();
+  private readonly targetReadHoldMetric = new BoundedMetric();
+  private readonly targetReadHandoffGapMetric = new BoundedMetric();
+  private readonly targetReadPriorityMetrics: Record<TargetReadPriority, TargetReadMetricSet> = {
+    foreground: createTargetReadMetricSet(),
+    watch: createTargetReadMetricSet(),
+    timeline: createTargetReadMetricSet(),
+    background: createTargetReadMetricSet(),
+  };
+  private readonly targetReadAcquisitions: Record<TargetReadPriority, number> = {
+    foreground: 0,
+    watch: 0,
+    timeline: 0,
+    background: 0,
+  };
   private activeStoppedReadAbortController: AbortController | null = null;
   private activeEvaluateAbortController: AbortController | null = null;
 
@@ -178,10 +249,11 @@ export class DapSession extends EventEmitter {
       this.targetConnectionEstablished = false;
       this.connectionFailureCount = 0;
       this.controlInProgress = true;
-      this.readCancelEpoch++;
+      this.advanceReadCancelEpoch();
+      this.cancelTargetReadGateWaiters();
       this.cancelActiveTargetReads('target connection lost');
       this.stopDataSampling();
-      this.stopRttLogPolling();
+      this.stopRttLogPolling(false);
       this.stopPolling();
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('target connection lost');
@@ -189,7 +261,7 @@ export class DapSession extends EventEmitter {
       log.dap(`session-terminate reason=${reason} phase=connected`);
       this.sendEvent('output', {
         category: 'stderr',
-        output: `Target connection lost (${reason}). Ending debug session and cleaning up J-Link processes.\n`,
+        output: `Target connection lost (${reason}). Ending debug session and cleaning up the selected target owner.\n`,
       });
       try {
         await this.backend.dispose(false);
@@ -202,6 +274,53 @@ export class DapSession extends EventEmitter {
       this.emit('shutdownRequested');
     })();
     return this.terminationPromise;
+  }
+
+  private cleanupFailedLaunch(reason: string): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposePromise = (async () => {
+      const started = Date.now();
+      this.phase = 'terminating';
+      this.targetConnectionEstablished = false;
+      this.connectionFailureCount = 0;
+      this.controlInProgress = true;
+      this.advanceReadCancelEpoch();
+      this.cancelTargetReadGateWaiters();
+      this.cancelActiveTargetReads('launch failed');
+      this.stopDataSampling();
+      this.stopRttLogPolling(false);
+      this.stopPolling();
+      this.stopConnectionMonitor();
+      this.flashAbortController?.abort('launch failed');
+      this.flashAbortController = null;
+      (this.backend as any).cancelFlash?.('launch failed');
+      log.dap(`launch-cleanup reason=${reason} ownerDispose=forced`);
+      try {
+        await this.backend.dispose(false);
+      } catch (error) {
+        log.dap(`launch-cleanup error=${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.backend.configureNativeSteps(false);
+      this.controlInProgress = false;
+      this.phase = 'idle';
+      log.dap(`launch-cleanup completed reason=${reason} elapsedMs=${Date.now() - started}`);
+    })();
+    return this.disposePromise;
+  }
+
+  private async failLaunchAfterConnect(
+    msg: DebugProtocolMessage,
+    result: OzoneCommandResult,
+    fallbackCode: string,
+  ): Promise<void> {
+    const reason = result.ok ? fallbackCode : result.errorCode || fallbackCode;
+    if (!result.ok && this.isOwnerLossErrorCode(result.errorCode)) {
+      this.sendCommandFailure(msg, result, fallbackCode);
+      await this.terminateForConnectionLoss(reason);
+      return;
+    }
+    await this.cleanupFailedLaunch(reason);
+    this.sendCommandFailure(msg, result, fallbackCode);
   }
 
   private async withStepLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -218,8 +337,13 @@ export class DapSession extends EventEmitter {
 
   private beginControl() {
     this.controlInProgress = true;
-    this.readCancelEpoch++;
+    this.advanceReadCancelEpoch();
     this.cancelActiveTargetReads('DAP control request started');
+  }
+
+  private advanceReadCancelEpoch() {
+    this.readCancelEpoch++;
+    this.cancelInvalidTargetReadWaiters();
   }
 
   private cancelActiveTargetReads(reason: string) {
@@ -237,62 +361,233 @@ export class DapSession extends EventEmitter {
 
   private endControl() {
     this.controlInProgress = false;
+    this.dispatchTargetReadWaiters();
   }
 
   private shouldDeferTargetRead(): boolean {
     return this.controlInProgress || this.isSessionTerminating();
   }
 
-  private beginTargetRead(priority: TargetReadPriority = 'low'): boolean {
+  private isLowPriorityTargetRead(priority: TargetReadPriority): boolean {
+    return priority === 'timeline' || priority === 'background';
+  }
+
+  private hasQueuedTargetReadAtOrAbove(priority: TargetReadPriority): boolean {
+    const rank = targetReadPriorityRank[priority];
+    return this.targetReadWaiters.some(waiter => !waiter.settled
+      && waiter.generation === this.readCancelEpoch
+      && !waiter.signal?.aborted
+      && targetReadPriorityRank[waiter.priority] <= rank);
+  }
+
+  private canAcquireTargetRead(priority: TargetReadPriority, ignoreQueue = false): boolean {
     if (this.shouldDeferTargetRead() || this.targetReadInProgress) return false;
-    if (priority !== 'foreground' && this.pendingForegroundTargetReads > 0) return false;
-    if (priority === 'low' && (Date.now() < this.lowPriorityReadBlockedUntil || this.pendingWatchTargetReads > 0)) return false;
-    this.targetReadInProgress = true;
+    if (this.isLowPriorityTargetRead(priority) && Date.now() < this.lowPriorityReadBlockedUntil) return false;
+    if (!ignoreQueue && this.hasQueuedTargetReadAtOrAbove(priority)) return false;
     return true;
   }
 
-  private async beginTargetReadWhenAvailable(priority: TargetReadPriority = 'low', timeoutMs = 0): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    if (priority === 'foreground') this.pendingForegroundTargetReads++;
-    try {
-      while (!this.beginTargetRead(priority)) {
-        if (this.isSessionTerminating() || (priority === 'low' && this.controlInProgress) || Date.now() >= deadline) return false;
-        await new Promise<void>(resolve => setTimeout(resolve, 20));
+  private acquireTargetRead(priority: TargetReadPriority, queuedAtMs: number, handoffReadyAtMs?: number) {
+    const acquiredAtMs = this.nowMs();
+    this.targetReadInProgress = true;
+    this.targetReadAcquiredAtMs = acquiredAtMs;
+    this.targetReadActivePriority = priority;
+    this.targetReadQueueWaitMetric.record(acquiredAtMs - queuedAtMs);
+    this.targetReadPriorityMetrics[priority].queueWaitMs.record(acquiredAtMs - queuedAtMs);
+    if (handoffReadyAtMs !== undefined) {
+      this.targetReadHandoffGapMetric.record(acquiredAtMs - handoffReadyAtMs);
+      this.targetReadPriorityMetrics[priority].handoffGapMs.record(acquiredAtMs - handoffReadyAtMs);
+    }
+    this.targetReadAcquisitions[priority]++;
+  }
+
+  private beginTargetRead(priority: TargetReadPriority = 'timeline'): boolean {
+    priority = normalizeTargetReadPriority(priority as TargetReadRequestPriority);
+    this.cancelInvalidTargetReadWaiters();
+    if (!this.canAcquireTargetRead(priority)) return false;
+    const now = this.nowMs();
+    this.acquireTargetRead(priority, now);
+    return true;
+  }
+
+  private beginTargetReadWhenAvailable(
+    priority: TargetReadRequestPriority = 'timeline',
+    timeoutMs = 0,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const normalizedPriority = normalizeTargetReadPriority(priority);
+    if (signal?.aborted || this.isSessionTerminating()) return Promise.resolve(false);
+    if (this.beginTargetRead(normalizedPriority)) return Promise.resolve(true);
+    if (timeoutMs <= 0 || (this.controlInProgress && normalizedPriority !== 'foreground')) return Promise.resolve(false);
+
+    return new Promise<boolean>(resolve => {
+      const waiter: TargetReadWaiter = {
+        priority: normalizedPriority,
+        queuedAtMs: this.nowMs(),
+        generation: this.readCancelEpoch,
+        resolve,
+        timer: null,
+        signal,
+        settled: false,
+      };
+      if (normalizedPriority === 'foreground') this.pendingForegroundTargetReads++;
+      if (normalizedPriority === 'watch') this.pendingWatchTargetReads++;
+      this.targetReadWaiters.push(waiter);
+
+      waiter.timer = setTimeout(() => {
+        this.settleTargetReadWaiter(waiter, false);
+        this.dispatchTargetReadWaiters();
+      }, timeoutMs);
+      this.targetReadWaiterTimerCount++;
+
+      if (signal) {
+        waiter.abortListener = () => {
+          this.settleTargetReadWaiter(waiter, false);
+          this.dispatchTargetReadWaiters();
+        };
+        signal.addEventListener('abort', waiter.abortListener, { once: true });
       }
-      return true;
-    } finally {
-      if (priority === 'foreground') this.pendingForegroundTargetReads--;
+
+      // Re-check after registration so a release immediately before enqueue
+      // cannot be lost. Dispatch grants at most one waiter synchronously.
+      this.dispatchTargetReadWaiters();
+    });
+  }
+
+  private beginWatchTargetRead(timeoutMs = 250, signal?: AbortSignal): Promise<boolean> {
+    return this.beginTargetReadWhenAvailable('watch', timeoutMs, signal);
+  }
+
+  private settleTargetReadWaiter(waiter: TargetReadWaiter, acquired: boolean) {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    const index = this.targetReadWaiters.indexOf(waiter);
+    if (index >= 0) this.targetReadWaiters.splice(index, 1);
+    if (waiter.timer) {
+      clearTimeout(waiter.timer);
+      waiter.timer = null;
+      this.targetReadWaiterTimerCount--;
+    }
+    if (waiter.signal && waiter.abortListener) {
+      waiter.signal.removeEventListener('abort', waiter.abortListener);
+      waiter.abortListener = undefined;
+    }
+    if (waiter.priority === 'foreground') this.pendingForegroundTargetReads--;
+    if (waiter.priority === 'watch') this.pendingWatchTargetReads--;
+    if (!this.targetReadWaiters.some(item => this.isLowPriorityTargetRead(item.priority)) && this.lowPriorityReadBlockTimer) {
+      clearTimeout(this.lowPriorityReadBlockTimer);
+      this.lowPriorityReadBlockTimer = null;
+    }
+    waiter.resolve(acquired);
+  }
+
+  private cancelInvalidTargetReadWaiters() {
+    const terminating = this.isSessionTerminating();
+    for (const waiter of [...this.targetReadWaiters]) {
+      if (terminating || waiter.generation !== this.readCancelEpoch || waiter.signal?.aborted) {
+        this.settleTargetReadWaiter(waiter, false);
+      }
     }
   }
 
-  private async beginWatchTargetRead(timeoutMs = 250): Promise<boolean> {
-    if (this.beginTargetRead('watch')) return true;
-    if (this.shouldDeferTargetRead()) return false;
-    // Keep Timeline behind a Watch request only while that Watch is actually
-    // queued. The timeout is a wait bound, not a post-read blackout period.
-    this.pendingWatchTargetReads++;
-    try {
-      return await this.beginTargetReadWhenAvailable('watch', timeoutMs);
-    } finally {
-      this.pendingWatchTargetReads--;
+  private scheduleLowPriorityReadUnblock() {
+    if (this.lowPriorityReadBlockTimer || this.controlInProgress || this.isSessionTerminating()) return;
+    const hasBlockedWaiter = this.targetReadWaiters.some(waiter => this.isLowPriorityTargetRead(waiter.priority));
+    if (!hasBlockedWaiter) return;
+    const delayMs = this.lowPriorityReadBlockedUntil - Date.now();
+    if (delayMs <= 0) return;
+    this.lowPriorityReadBlockTimer = setTimeout(() => {
+      this.lowPriorityReadBlockTimer = null;
+      this.dispatchTargetReadWaiters();
+    }, delayMs);
+  }
+
+  private dispatchTargetReadWaiters(handoffReadyAtMs?: number) {
+    this.cancelInvalidTargetReadWaiters();
+    if (this.targetReadInProgress || this.controlInProgress || this.isSessionTerminating()) return;
+
+    let next: TargetReadWaiter | undefined;
+    for (const priority of ['foreground', 'watch', 'timeline', 'background'] as TargetReadPriority[]) {
+      if (this.isLowPriorityTargetRead(priority) && Date.now() < this.lowPriorityReadBlockedUntil) continue;
+      next = this.targetReadWaiters.find(waiter => waiter.priority === priority);
+      if (next) break;
     }
+    if (!next) {
+      this.scheduleLowPriorityReadUnblock();
+      return;
+    }
+
+    this.acquireTargetRead(next.priority, next.queuedAtMs, handoffReadyAtMs);
+    this.settleTargetReadWaiter(next, true);
   }
 
   private endTargetRead() {
+    const releasedAtMs = this.nowMs();
+    if (this.targetReadAcquiredAtMs !== null) {
+      this.targetReadHoldMetric.record(releasedAtMs - this.targetReadAcquiredAtMs);
+      if (this.targetReadActivePriority) {
+        this.targetReadPriorityMetrics[this.targetReadActivePriority].gateHoldMs.record(
+          releasedAtMs - this.targetReadAcquiredAtMs,
+        );
+      }
+    }
+    this.targetReadAcquiredAtMs = null;
+    this.targetReadActivePriority = null;
     this.targetReadInProgress = false;
+    for (const waiter of [...this.targetReadDrainWaiters]) {
+      this.settleTargetReadDrainWaiter(waiter, true);
+    }
+    this.dispatchTargetReadWaiters(releasedAtMs);
   }
 
-  private async beginTargetControl(timeoutMs = 1200): Promise<boolean> {
-    this.beginControl();
-    const deadline = Date.now() + timeoutMs;
-    while (this.targetReadInProgress) {
-      if (Date.now() >= deadline) {
-        this.endControl();
-        return false;
+  private waitForTargetReadDrain(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (!this.targetReadInProgress) return Promise.resolve(true);
+    if (this.isSessionTerminating() || signal?.aborted || timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise<boolean>(resolve => {
+      const waiter: TargetReadDrainWaiter = { resolve, timer: null, signal, settled: false };
+      this.targetReadDrainWaiters.push(waiter);
+      waiter.timer = setTimeout(() => this.settleTargetReadDrainWaiter(waiter, false), timeoutMs);
+      this.targetReadDrainWaiterTimerCount++;
+      if (signal) {
+        waiter.abortListener = () => this.settleTargetReadDrainWaiter(waiter, false);
+        signal.addEventListener('abort', waiter.abortListener, { once: true });
       }
-      await new Promise<void>(resolve => setTimeout(resolve, 20));
+      if (!this.targetReadInProgress) this.settleTargetReadDrainWaiter(waiter, true);
+    });
+  }
+
+  private settleTargetReadDrainWaiter(waiter: TargetReadDrainWaiter, drained: boolean) {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    const index = this.targetReadDrainWaiters.indexOf(waiter);
+    if (index >= 0) this.targetReadDrainWaiters.splice(index, 1);
+    if (waiter.timer) {
+      clearTimeout(waiter.timer);
+      waiter.timer = null;
+      this.targetReadDrainWaiterTimerCount--;
     }
-    return true;
+    if (waiter.signal && waiter.abortListener) {
+      waiter.signal.removeEventListener('abort', waiter.abortListener);
+      waiter.abortListener = undefined;
+    }
+    waiter.resolve(drained);
+  }
+
+  private cancelTargetReadGateWaiters() {
+    for (const waiter of [...this.targetReadWaiters]) this.settleTargetReadWaiter(waiter, false);
+    for (const waiter of [...this.targetReadDrainWaiters]) this.settleTargetReadDrainWaiter(waiter, false);
+    if (this.lowPriorityReadBlockTimer) clearTimeout(this.lowPriorityReadBlockTimer);
+    this.lowPriorityReadBlockTimer = null;
+  }
+
+  private async beginTargetControl(timeoutMs = 1200, signal?: AbortSignal): Promise<boolean> {
+    if (this.isSessionTerminating() || signal?.aborted) return false;
+    this.beginControl();
+    const drained = await this.waitForTargetReadDrain(timeoutMs, signal);
+    if (!drained && !this.isSessionTerminating()) {
+      this.endControl();
+    }
+    return drained;
   }
 
   private async beginTargetWrite(timeoutMs = 1200): Promise<boolean> {
@@ -304,6 +599,27 @@ export class DapSession extends EventEmitter {
   private endTargetWrite() {
     this.endTargetRead();
     this.endControl();
+  }
+
+  private snapshotTargetReadGateMetrics() {
+    return {
+      queueWaitMs: this.targetReadQueueWaitMetric.snapshot(),
+      gateHoldMs: this.targetReadHoldMetric.snapshot(),
+      handoffGapMs: this.targetReadHandoffGapMetric.snapshot(),
+      byPriority: Object.fromEntries(
+        (Object.keys(this.targetReadPriorityMetrics) as TargetReadPriority[]).map(priority => [priority, {
+          queueWaitMs: this.targetReadPriorityMetrics[priority].queueWaitMs.snapshot(),
+          gateHoldMs: this.targetReadPriorityMetrics[priority].gateHoldMs.snapshot(),
+          handoffGapMs: this.targetReadPriorityMetrics[priority].handoffGapMs.snapshot(),
+        }]),
+      ),
+      acquisitionsByPriority: { ...this.targetReadAcquisitions },
+      queuedWaiters: this.targetReadWaiters.length,
+      activeWaiterTimers: this.targetReadWaiterTimerCount + this.targetReadDrainWaiterTimerCount,
+      controlWaiters: this.targetReadDrainWaiters.length,
+      gateOwned: this.targetReadInProgress,
+      activePriority: this.targetReadActivePriority,
+    };
   }
 
   private cachedOrRunningWatchValue(expression: string): WatchValue {
@@ -327,7 +643,7 @@ export class DapSession extends EventEmitter {
 
   private markStoppedForUi() {
     this.setTargetRunning(false);
-    this.readCancelEpoch++;
+    this.advanceReadCancelEpoch();
     this.lowPriorityReadBlockedUntil = Date.now() + 150;
   }
 
@@ -574,6 +890,7 @@ export class DapSession extends EventEmitter {
     let chunks = 0;
     let maxChunkElapsedMs = 0;
     let index = 0;
+    const fastValues = new Map<string, WatchValue>();
     if (forceRuntimeRead) this.runtimeWatchReadInFlight = true;
 
     try {
@@ -589,7 +906,58 @@ export class DapSession extends EventEmitter {
         }
       }
 
+      const expanded = new Set(expandedExpressions || []);
+      const fastCandidates = forceRuntimeRead
+        ? expressions.filter(expression => !expanded.has(expression))
+        : [];
+      if (fastCandidates.length >= 2 && !this.shouldDeferTargetRead()) {
+        const planResult = await this.backend.execute({
+          cmd: 'prepareFastDataSampling',
+          expressions: fastCandidates,
+        });
+        const plan = planResult.ok ? planResult.data as FastDataSamplePlanItem[] : [];
+        const specs = plan
+          .map(item => item.spec)
+          .filter((spec): spec is FastDataSampleSpec => !!spec && spec.format?.kind !== 'pointer');
+        if (specs.length >= 2 && await this.beginWatchTargetRead()) {
+          const fastStarted = Date.now();
+          try {
+            const readResult = await this.backend.execute({
+              cmd: 'readFastDataSampling',
+              specs,
+              priority: 'watch',
+            });
+            if (readResult.ok && epoch === this.readCancelEpoch && !this.shouldDeferTargetRead()) {
+              for (const result of readResult.data as WatchValue[]) {
+                const expression = result.expression;
+                if (!expression || result.error) continue;
+                const value = {
+                  ...result,
+                  expression,
+                  evaluateName: result.evaluateName || expression,
+                } as WatchValue;
+                fastValues.set(expression, value);
+                this.cacheRuntimeWatchValue(expression, value);
+              }
+            }
+          } finally {
+            this.endTargetRead();
+          }
+          chunks++;
+          maxChunkElapsedMs = Math.max(maxChunkElapsedMs, Date.now() - fastStarted);
+          if (fastValues.size > 0 && fastValues.size < expressions.length) {
+            await new Promise<void>(resolve => setImmediate(resolve));
+          }
+        }
+      }
+
       while (index < expressions.length) {
+        const fastValue = fastValues.get(expressions[index]);
+        if (fastValue) {
+          results.push(fastValue);
+          index++;
+          continue;
+        }
         if (epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
           while (index < expressions.length) results.push(this.cachedOrRunningWatchValue(expressions[index++]));
           break;
@@ -681,9 +1049,15 @@ export class DapSession extends EventEmitter {
     }
   }
 
-  private startRttLogPolling() {
+  private startRttLogPolling(options: { retryInvalidControlBlock?: boolean } = {}) {
+    if (!this.rttLogEnabled || !this.rttAvailable) return;
     this.stopRttLogPolling();
     const generation = this.rttPollGeneration;
+    const retryInvalidControlBlock = options.retryInvalidControlBlock === true;
+    let transientStartFailureLogged = false;
+    const abortController = new AbortController();
+    this.rttPollAbortController = abortController;
+    const signal = abortController.signal;
     this.rttStarted = false;
     this.rttDecoder = new StringDecoder('utf8');
     this.rttControlCarry = '';
@@ -692,15 +1066,37 @@ export class DapSession extends EventEmitter {
     this.emitRttTerminalStarted();
 
     const pollLoop = async () => {
-      if (this.rttPollTimer === null || generation !== this.rttPollGeneration || this.dataSamplingActive) return;
+      if (this.rttPollTimer === null || generation !== this.rttPollGeneration || signal.aborted) return;
       try {
         if (!this.rttStarted) {
           const startResult = await this.backend.execute({
             cmd: 'startRtt',
             controlBlockAddress: this.rttControlBlockAddress,
           });
-          if (this.rttPollTimer === null || generation !== this.rttPollGeneration) return;
-          this.rttStarted = startResult.ok;
+          if (this.rttPollTimer === null || generation !== this.rttPollGeneration || signal.aborted) return;
+          if (!startResult.ok) {
+            if (retryInvalidControlBlock && startResult.errorCode === 'RttInvalidControlBlock') {
+              if (!transientStartFailureLogged) {
+                transientStartFailureLogged = true;
+                const diagnostics = startResult.diagnostics
+                  ? ' diagnostics=' + JSON.stringify(startResult.diagnostics)
+                  : '';
+                log.dap(
+                  '[rtt] startRtt transient errorCode=RttInvalidControlBlock'
+                  + ' error=' + startResult.error
+                  + ' action=retry'
+                  + ' intervalMs=' + this.rttPollIntervalMs
+                  + diagnostics,
+                );
+              }
+            } else {
+              this.handleRttFailure('startRtt', startResult);
+            }
+            this.rttStarted = false;
+          } else {
+            this.rttStarted = true;
+            log.dap('[rtt] startRtt ok');
+          }
         }
 
         if (this.rttStarted) {
@@ -708,22 +1104,36 @@ export class DapSession extends EventEmitter {
             cmd: 'readRtt',
             bufferIndex: this.rttBufferIndex,
             size: this.rttReadSize,
+            signal,
           });
-          if (this.rttPollTimer === null || generation !== this.rttPollGeneration) return;
+          if (this.rttPollTimer === null || generation !== this.rttPollGeneration || signal.aborted) return;
           if (readResult.ok) {
             const bytes = (readResult.data as any)?.bytes;
-            if (Array.isArray(bytes) && bytes.length > 0) {
+            log.dap('[rtt] readRtt ok bytes=' + (Array.isArray(bytes) || bytes instanceof Uint8Array ? bytes.length : 0));
+            if ((Array.isArray(bytes) || bytes instanceof Uint8Array) && bytes.length > 0) {
               this.emitRttBytes(Buffer.from(bytes));
             }
           } else {
+            this.handleRttFailure('readRtt', readResult);
             this.rttStarted = false;
           }
         }
-      } catch {
+      } catch (error) {
+        if (signal.aborted || generation !== this.rttPollGeneration || this.rttPollTimer === null) return;
+        const errorCode = typeof (error as any)?.errorCode === 'string'
+          ? (error as any).errorCode
+          : 'RttPollingException';
+        const failure: OzoneCommandResult = {
+          ok: false,
+          errorCode,
+          error: error instanceof Error ? error.message : String(error),
+          diagnostics: (error as any)?.diagnostics,
+        };
+        this.handleRttFailure('polling', failure);
         this.rttStarted = false;
       }
 
-      if (this.rttPollTimer !== null) {
+      if (this.rttPollTimer !== null && generation === this.rttPollGeneration && !signal.aborted) {
         this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
       }
     };
@@ -731,8 +1141,10 @@ export class DapSession extends EventEmitter {
     this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
   }
 
-  private stopRttLogPolling() {
+  private stopRttLogPolling(notifyOwner = true) {
     this.rttPollGeneration++;
+    this.rttPollAbortController?.abort();
+    this.rttPollAbortController = null;
     if (this.rttPollTimer) {
       clearTimeout(this.rttPollTimer);
       this.rttPollTimer = null;
@@ -756,7 +1168,70 @@ export class DapSession extends EventEmitter {
     this.rttControlCarry = '';
     this.rttLineCarry = '';
     this.rttStarted = false;
-    void this.backend.execute({ cmd: 'stopRtt' });
+    if (notifyOwner) void this.backend.execute({ cmd: 'stopRtt' });
+  }
+
+  private handleRttFailure(operation: string, result: OzoneCommandResult) {
+    if (result.ok) return;
+    if (this.isOwnerLossErrorCode(result.errorCode)) {
+      this.logRttFailure(operation, result);
+      void this.terminateForConnectionLoss(result.errorCode || 'RttOwnerLost');
+      return;
+    }
+    if (this.isRttUnavailableErrorCode(result.errorCode)) {
+      this.disableRttForSession(result, this.rttControlBlockSource);
+      return;
+    }
+    this.logRttFailure(operation, result);
+  }
+
+  private disableRttForSession(
+    result: Extract<OzoneCommandResult, { ok: false }>,
+    source: 'elf-symbol' | 'config',
+  ) {
+    if (!this.rttAvailable) return;
+    this.rttAvailable = false;
+    this.stopRttLogPolling(false);
+    const diagnostics = result.diagnostics ? ' diagnostics=' + JSON.stringify(result.diagnostics) : '';
+    log.dap(
+      '[rtt] unavailable errorCode=' + (result.errorCode || 'RttUnavailable')
+      + ' error=' + result.error
+      + ' source=' + source
+      + ' action=disabled debugContinues=true'
+      + diagnostics,
+    );
+    this.sendEvent('output', {
+      category: 'stderr',
+      output: `RTT unavailable (${result.errorCode || 'RttUnavailable'}): ${result.error}. RTT disabled; debugging continues.\n`,
+    });
+  }
+
+  private isRttUnavailableErrorCode(errorCode: string | undefined): boolean {
+    return errorCode === 'RttControlBlockUnavailable'
+      || errorCode === 'RttInvalidControlBlock'
+      || errorCode === 'RttInvalidBufferIndex'
+      || errorCode === 'RttInvalidBufferLayout'
+      || errorCode === 'RttInvalidBufferFlags';
+  }
+
+  private isOwnerLossErrorCode(errorCode: string | undefined): boolean {
+    return errorCode === 'DeviceRemoved'
+      || errorCode === 'HelperExited'
+      || errorCode === 'NativeOwnerLost'
+      || errorCode === 'RttOwnerLost'
+      || errorCode === 'TargetOwnerUnavailable'
+      || errorCode === 'TargetDisconnected';
+  }
+
+  private logRttFailure(operation: string, result: OzoneCommandResult) {
+    if (result.ok) return;
+    const diagnostics = result.diagnostics ? ' diagnostics=' + JSON.stringify(result.diagnostics) : '';
+    log.dap(
+      '[rtt] ' + operation
+      + ' failed errorCode=' + (result.errorCode || 'Unknown')
+      + ' error=' + result.error
+      + diagnostics,
+    );
   }
 
   private stripAnsi(text: string): string {
@@ -990,10 +1465,12 @@ export class DapSession extends EventEmitter {
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = targetConfig.flashBeforeDebug;
       this.rttLogEnabled = args.rttLogEnabled !== false;
+      this.rttAvailable = true;
       this.rttBufferIndex = Math.floor(this.clampNumber(args.rttBufferIndex, 0, 0, 15));
       this.rttPollIntervalMs = Math.floor(this.clampNumber(args.rttPollIntervalMs, 50, 10, 5000));
       this.rttReadSize = Math.floor(this.clampNumber(args.rttReadSize, 4096, 64, 65536));
       this.rttControlBlockAddress = this.parseOptionalAddress(args.rttControlBlockAddress);
+      this.rttControlBlockSource = this.rttControlBlockAddress === undefined ? 'elf-symbol' : 'config';
       this.rttStripAnsi = args.rttStripAnsi !== false;
       this.rttLogTarget = this.parseRttLogTarget(args.rttLogTarget);
       this.pRtLogEnabled = args.pRtLogEnabled === true;
@@ -1066,6 +1543,7 @@ export class DapSession extends EventEmitter {
           cmsisDapSerial: targetConfig.cmsisDapSerial,
           cmsisDapVid: targetConfig.cmsisDapVid,
           cmsisDapPid: targetConfig.cmsisDapPid,
+          cmsisDapPath: targetConfig.cmsisDapPath,
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           flashBeforeDebug: targetConfig.flashBeforeDebug,
           nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
@@ -1098,11 +1576,8 @@ export class DapSession extends EventEmitter {
         if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
         if (this.isSessionTerminating()) return;
         if (!flashResult.ok) {
-          this.phase = 'idle';
-          this.targetConnectionEstablished = false;
           this.sendEvent('output', { category: 'stderr', output: `Flash failed: ${flashResult.error}\n` });
-          await this.backend.execute({ cmd: 'disconnect' });
-          this.sendResponse(msg, undefined, false, flashResult.error);
+          await this.failLaunchAfterConnect(msg, flashResult, 'FlashFailed');
           return;
         }
         this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any)?.message || 'CMSIS-DAP Flash Algorithm completed'}\n` });
@@ -1113,12 +1588,38 @@ export class DapSession extends EventEmitter {
       let loadResult: OzoneCommandResult | undefined;
       if (elfPath) loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
 
+      if (this.rttLogEnabled && this.rttControlBlockAddress === undefined) {
+        const symbolResult = await this.backend.execute({ cmd: 'resolveSymbol', name: '_SEGGER_RTT' });
+        const address = symbolResult.ok && Number.isInteger((symbolResult.data as any)?.address)
+          ? Number((symbolResult.data as any).address)
+          : undefined;
+        if (address === undefined || address <= 0 || address > 0xFFFFFFFF) {
+          const failure: OzoneCommandResult = symbolResult.ok
+            ? {
+              ok: false,
+              errorCode: 'RttControlBlockUnavailable',
+              error: 'RttControlBlockUnavailable: _SEGGER_RTT has an invalid ELF address',
+            }
+            : {
+              ok: false,
+              errorCode: 'RttControlBlockUnavailable',
+              error: `RttControlBlockUnavailable: ${symbolResult.error}`,
+            };
+          this.disableRttForSession(failure, 'elf-symbol');
+        } else {
+          this.rttControlBlockAddress = address;
+          this.rttControlBlockSource = 'elf-symbol';
+          log.dap(`[rtt] control block address=0x${address.toString(16)} source=elf-symbol`);
+        }
+      } else if (this.rttControlBlockAddress !== undefined) {
+        log.dap(`[rtt] control block address=0x${this.rttControlBlockAddress.toString(16)} source=config`);
+      }
+
       if (this._probe === 'cmsis-dap' && this._flashEnabled && this._runToEntryPoint !== false) {
         if (!elfPath || !loadResult?.ok) {
           const haltResult = await this.backend.execute({ cmd: 'halt' });
-          this.phase = 'idle';
           if (!haltResult.ok) {
-            this.sendCommandFailure(msg, haltResult, 'EntryPointRecoveryFailed');
+            await this.failLaunchAfterConnect(msg, haltResult, 'EntryPointRecoveryFailed');
             return;
           }
           const failure: OzoneCommandResult = {
@@ -1129,7 +1630,7 @@ export class DapSession extends EventEmitter {
               : `EntryPointUnavailable: failed to load symbols from ${elfPath}${loadResult && !loadResult.ok ? `: ${loadResult.error}` : ''}`,
             targetState: 'Halted',
           };
-          this.sendCommandFailure(msg, failure, 'EntryPointUnavailable');
+          await this.failLaunchAfterConnect(msg, failure, 'EntryPointUnavailable');
           return;
         }
         const startupResult = await this.backend.execute({
@@ -1138,8 +1639,7 @@ export class DapSession extends EventEmitter {
           reset: true,
         });
         if (!startupResult.ok) {
-          this.phase = 'idle';
-          this.sendCommandFailure(msg, startupResult, 'StartupStopFailed');
+          await this.failLaunchAfterConnect(msg, startupResult, 'StartupStopFailed');
           return;
         }
       } else {
@@ -1150,15 +1650,13 @@ export class DapSession extends EventEmitter {
         }
         const initialHalt = await this.backend.execute({ cmd: 'halt' });
         if (!initialHalt.ok && this._probe === 'cmsis-dap') {
-          this.phase = 'idle';
           this.sendEvent('output', { category: 'stderr', output: `Initial halt failed: ${initialHalt.error}\n` });
-          this.sendCommandFailure(msg, initialHalt, 'TargetControlFailed');
+          await this.failLaunchAfterConnect(msg, initialHalt, 'TargetControlFailed');
           return;
         }
         if (this._probe === 'cmsis-dap') {
           const stateResult = await this.queryTargetState('launch-halt-confirm');
           if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
-            this.phase = 'idle';
             const failure: OzoneCommandResult = stateResult.ok
               ? {
                 ok: false,
@@ -1167,7 +1665,7 @@ export class DapSession extends EventEmitter {
                 targetState: String(stateResult.data),
               }
               : stateResult;
-            this.sendCommandFailure(msg, failure, 'TargetStateReadFailed');
+            await this.failLaunchAfterConnect(msg, failure, 'TargetStateReadFailed');
             return;
           }
         }
@@ -1176,10 +1674,10 @@ export class DapSession extends EventEmitter {
       }
       this.markStoppedForUi();
       this.lastHaltReason = 'entry';
-      if (this.rttLogEnabled) {
+      if (this.rttLogEnabled && this.rttAvailable) {
         this.startRttLogPolling();
       } else {
-        this.stopRttLogPolling();
+        this.stopRttLogPolling(false);
       }
 
       this.sendEvent('initialized', {});
@@ -1188,7 +1686,11 @@ export class DapSession extends EventEmitter {
       this.backend.configureNativeSteps(false);
       this.flashAbortController = null;
       if (this.phase !== 'terminating' && this.phase !== 'terminated') {
-        this.phase = 'idle';
+        if (this.targetConnectionEstablished) {
+          await this.cleanupFailedLaunch('LaunchException');
+        } else {
+          this.phase = 'idle';
+        }
         this.sendResponse(msg, undefined, false, err.message);
       }
     }
@@ -1199,9 +1701,18 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg);
       return;
     }
+    if (this.disposePromise) {
+      await this.disposePromise;
+      this.sendResponse(msg);
+      this.sendEvent('terminated', {});
+      this.phase = 'terminated';
+      this.emit('shutdownRequested');
+      return;
+    }
     this.phase = 'terminating';
     this.targetConnectionEstablished = false;
     this.beginControl();
+    this.cancelTargetReadGateWaiters();
     this.stopRttLogPolling();
     this.stopPolling();
     this.stopConnectionMonitor();
@@ -1497,7 +2008,7 @@ export class DapSession extends EventEmitter {
       return;
     }
 
-    if (!(await this.beginTargetReadWhenAvailable('low', 700))) {
+    if (!(await this.beginTargetReadWhenAvailable('background', 700))) {
       this.sendResponse(msg, { address: this.formatMemoryReference(address), unreadableBytes: count }, false, 'Target is running');
       return;
     }
@@ -1612,7 +2123,7 @@ export class DapSession extends EventEmitter {
           }
         }
         this.setTargetRunning(runResult.ok);
-        if (runResult.ok) this.readCancelEpoch++;
+        if (runResult.ok) this.advanceReadCancelEpoch();
         this.sendResponse(msg, { allThreadsContinued: true });
         this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
         this.lastHaltReason = 'breakpoint';
@@ -1776,7 +2287,7 @@ export class DapSession extends EventEmitter {
           }
           log.dap(`handleStep: not halted after 2000ms (soft settle attempts may have halted CPU), starting polling`);
           this.setTargetRunning(true);
-          this.readCancelEpoch++;
+          this.advanceReadCancelEpoch();
           this.startPolling();
           return;
         }
@@ -1938,7 +2449,7 @@ export class DapSession extends EventEmitter {
         this.markStoppedForUi();
         this.lastHaltReason = 'entry';
         if (this.rttLogEnabled) {
-          this.startRttLogPolling();
+          this.startRttLogPolling({ retryInvalidControlBlock: true });
         }
         this.sendResponse(msg);
         this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
@@ -1985,7 +2496,7 @@ export class DapSession extends EventEmitter {
 
     const acquiredRead = force
       ? await this.beginWatchTargetRead(waitForConsistentEvaluate ? 700 : 250)
-      : await this.beginTargetReadWhenAvailable('low', 0);
+      : await this.beginTargetReadWhenAvailable('background', 0);
     if (!acquiredRead) {
       this.sendEvaluateValue(msg, this.cachedOrRunningWatchValue(expr), false);
       return;
@@ -2093,10 +2604,6 @@ export class DapSession extends EventEmitter {
     const now = this.nowMs();
     this.dataSamplingNextSampleMs = now;
     this.dataSamplingActive = true;
-    // RTT logging is best-effort background traffic. A single RTT DLL call
-    // cannot be preempted, so keep it completely out of the target path while
-    // high-rate Timeline sampling is active.
-    this.stopRttLogPolling();
     const rejected = plan.filter(item => !item.spec).map(item => item.expression);
     log.dap(
       `[timeline] start fast=${this.dataSamplingEntries.map(entry => entry.expression).join(',')}`
@@ -2112,12 +2619,14 @@ export class DapSession extends EventEmitter {
     });
   }
 
-  private handleDataSamplingStop(msg: DebugProtocolMessage) {
+  private async handleDataSamplingStop(msg: DebugProtocolMessage) {
     this.stopDataSampling();
-    if (this.rttLogEnabled && this.phase === 'connected') {
-      this.startRttLogPolling();
-    }
-    this.sendResponse(msg, { ok: true });
+    const performanceResult = await this.backend.execute({ cmd: 'getPerformanceDiagnostics' });
+    this.sendResponse(msg, {
+      ok: true,
+      targetReadGate: this.snapshotTargetReadGateMetrics(),
+      performanceMetrics: performanceResult.ok ? performanceResult.data : null,
+    });
   }
 
   private scheduleDataSamplingLoop() {
@@ -2300,7 +2809,8 @@ export class DapSession extends EventEmitter {
       this.phase = 'terminating';
       this.targetConnectionEstablished = false;
       this.controlInProgress = true;
-      this.readCancelEpoch++;
+      this.advanceReadCancelEpoch();
+      this.cancelTargetReadGateWaiters();
       this.cancelActiveTargetReads('DAP session disposed');
       this.stopDataSampling();
       this.stopRttLogPolling();

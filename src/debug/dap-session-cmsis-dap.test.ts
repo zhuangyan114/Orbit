@@ -802,6 +802,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
     (session as any)._runToEntryPoint = 'main';
     (session as any).targetConnectionEstablished = true;
     (session as any).phase = 'connected';
+    (session as any).rttLogEnabled = false;
     const messages: DebugProtocolMessage[] = [];
     session.on('send', message => messages.push(message));
 
@@ -845,6 +846,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
     (session as any)._runToEntryPoint = 'main';
     (session as any).targetConnectionEstablished = true;
     (session as any).phase = 'connected';
+    (session as any).rttLogEnabled = false;
     const messages: DebugProtocolMessage[] = [];
     session.on('send', message => messages.push(message));
 
@@ -886,6 +888,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
     (session as any)._runToEntryPoint = 'main';
     (session as any).targetConnectionEstablished = true;
     (session as any).phase = 'connected';
+    (session as any).rttLogEnabled = false;
     const messages: DebugProtocolMessage[] = [];
     session.on('send', message => messages.push(message));
 

@@ -49,6 +49,53 @@ function formatScalar(backend: OzoneBackend, raw: number[], byteSize: number, in
 }
 
 describe('OzoneBackend realtime variables', () => {
+  it('caches planner output by ordered expressions and symbol/session generations', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals & { symbolGeneration: number; sessionGeneration: number };
+    internal.symbols = [
+      { name: 'a', address: 0x20000100, size: 4 },
+      { name: 'b', address: 0x20000104, size: 4 },
+    ];
+    internal.dwarfInfo = { varToType: new Map(), typeDefs: new Map() };
+
+    const first = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['a', 'b'] });
+    const second = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['a', 'b'] });
+    const reordered = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['b', 'a'] });
+    expect(first).toEqual(second);
+    expect(reordered).not.toEqual(first);
+
+    const beforeGeneration = await backend.execute({ cmd: 'getPerformanceDiagnostics' });
+    expect(beforeGeneration).toMatchObject({
+      ok: true,
+      data: { planner: { planCacheHit: 1, planCacheMiss: 2 } },
+    });
+    internal.symbolGeneration++;
+    const afterElfReload = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['a', 'b'] });
+    expect(afterElfReload).toEqual(first);
+    internal.sessionGeneration++;
+    await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['a', 'b'] });
+    const afterSessionReplacement = await backend.execute({ cmd: 'getPerformanceDiagnostics' });
+    expect(afterSessionReplacement).toMatchObject({
+      ok: true,
+      data: { planner: { planCacheHit: 1, planCacheMiss: 4 } },
+    });
+  });
+
+  it('keeps rejected planner entries rejected and never caches target values', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    internal.symbols = [{ name: 'root', address: 0x20000100, size: 32 }];
+    internal.dwarfInfo = { varToType: new Map(), typeDefs: new Map() };
+
+    const first = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['root'] });
+    expect(first).toMatchObject({ ok: true, data: [{ expression: 'root', error: expect.any(String) }] });
+    if (!first.ok) throw new Error(first.error);
+    (first.data as any)[0].expression = 'mutated';
+    const second = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['root'] });
+    expect(second).toMatchObject({ ok: true, data: [{ expression: 'root', error: expect.any(String) }] });
+    expect(second).not.toMatchObject({ data: [{ value: expect.anything() }] });
+  });
+
   it('formats enum values with the integer and enumerator name', () => {
     const value = formatScalar(new OzoneBackend(), [2, 0, 0, 0], 4, {
       kind: 'enum',
@@ -57,6 +104,87 @@ describe('OzoneBackend realtime variables', () => {
     });
 
     expect(value).toMatchObject({ value: 2, display: '0x00000002 (2, DAP06_RUN)' });
+  });
+
+  it('preserves enum, boolean, and character formatting through fast sampling', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    internal.symbols = [
+      { name: 'mode', address: 0x20000100, size: 4 },
+      { name: 'enabled', address: 0x20000104, size: 1 },
+      { name: 'letter', address: 0x20000105, size: 1 },
+    ];
+    internal.dwarfInfo = {
+      varToType: new Map([
+        ['mode', 'mode-type'],
+        ['enabled', 'bool-type'],
+        ['letter', 'char-type'],
+      ]),
+      typeDefs: new Map([
+        ['mode-type', { name: 'Mode', byteSize: 4, kind: 'enum', enumerators: [{ name: 'MODE_RUN', value: '2' }] }],
+        ['bool-type', { name: '_Bool', byteSize: 1, kind: 'base', encoding: 'boolean' }],
+        ['char-type', { name: 'char', byteSize: 1, kind: 'base', encoding: 'signed char' }],
+      ]),
+    };
+    internal.targetReadMemory = async address => {
+      if (address === 0x20000100) return Uint8Array.from([2, 0, 0, 0]);
+      if (address === 0x20000104) return Uint8Array.from([1]);
+      if (address === 0x20000105) return Uint8Array.from([0x41]);
+      return null;
+    };
+
+    const planned = await backend.execute({ cmd: 'prepareFastDataSampling', expressions: ['mode', 'enabled', 'letter'] });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) throw new Error(planned.error);
+    const specs = (planned.data as Array<{ spec?: any }>).map(item => item.spec).filter(Boolean);
+    const sampled = await backend.execute({ cmd: 'readFastDataSampling', specs, priority: 'watch' });
+
+    expect(sampled.ok).toBe(true);
+    if (!sampled.ok) throw new Error(sampled.error);
+    expect(sampled.data).toEqual([
+      expect.objectContaining({ expression: 'mode', display: '0x00000002 (2, MODE_RUN)' }),
+      expect.objectContaining({ expression: 'enabled', display: '0x01 (1, true)' }),
+      expect.objectContaining({ expression: 'letter', display: "'A' (65, 0x41)" }),
+    ]);
+  });
+
+  it('merges adjacent fast-sampling reads without changing expression order', async () => {
+    const backend = new OzoneBackend();
+    const batches: Array<Array<{ address: number; size: number }>> = [];
+    (backend as any).sessionTarget = {
+      async readMemoryBatch(reads: Array<{ address: number; size: number }>) {
+        batches.push(reads);
+        return {
+          ok: true,
+          data: {
+            reads: reads.map(read => ({
+              address: read.address,
+              bytes: Uint8Array.from([1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0].slice(0, read.size)),
+            })),
+          },
+        };
+      },
+    };
+
+    const sampled = await backend.execute({
+      cmd: 'readFastDataSampling',
+      priority: 'watch',
+      specs: [
+        { expression: 'a', address: 0x20000004, size: 4, format: { kind: 'base', encoding: 'unsigned' } },
+        { expression: 'c', address: 0x20000000, size: 4, format: { kind: 'base', encoding: 'unsigned' } },
+        { expression: 'b', address: 0x20000008, size: 4, format: { kind: 'base', encoding: 'unsigned' } },
+      ],
+    });
+
+    expect(batches).toEqual([[{ address: 0x20000000, size: 12 }]]);
+    expect(sampled).toMatchObject({
+      ok: true,
+      data: [
+        { expression: 'a', value: 2 },
+        { expression: 'c', value: 1 },
+        { expression: 'b', value: 3 },
+      ],
+    });
   });
 
   it('keeps int64 and uint64 values exact beyond the JavaScript safe range', () => {

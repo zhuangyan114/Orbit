@@ -261,7 +261,9 @@ Result CmsisDapProtocol::getInfo(DapInfoResult& out, std::chrono::milliseconds t
     out.packetSizeSource = PacketSizeSource::ProtocolInfo;
     out.effectivePacketSize = out.packetSize;
   } else if (transport_->payloadCapacity() > 0) {
-    out.packetSizeSource = PacketSizeSource::HidReportCapability;
+    out.packetSizeSource = transport_->transportName() == "winusb"
+                               ? PacketSizeSource::UsbDescriptor
+                               : PacketSizeSource::HidReportCapability;
     out.effectivePacketSize = static_cast<uint16_t>(transport_->payloadCapacity());
   } else {
     out.packetSizeSource = PacketSizeSource::Unavailable;

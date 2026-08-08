@@ -8,6 +8,7 @@ import {
   NativeScheduler,
   NativeTaskPriority,
 } from './native-scheduler';
+import { BoundedMetric, MetricStats } from '../utils/bounded-metric';
 
 /**
  * Stable error codes from the CMSIS-DAP helper JSON-lines protocol. Codes in
@@ -65,9 +66,15 @@ export interface CmsisDapDeviceInfo {
   usagePage: number;
   usage: number;
   transport: string;
+  interfaceNumber: number;
+  bulkInEndpoint: number;
+  bulkOutEndpoint: number;
+  bulkInMaxPacketSize: number;
+  bulkOutMaxPacketSize: number;
+  protocolPacketSize: number;
 }
 
-export type CmsisDapPacketSizeSource = 'protocol-info' | 'hid-report-capability' | 'unavailable';
+export type CmsisDapPacketSizeSource = 'protocol-info' | 'hid-report-capability' | 'usb-descriptor' | 'unavailable';
 
 export interface CmsisDapInfoResult {
   vendor: string;
@@ -98,6 +105,37 @@ export interface CmsisDapTransferDiagnostics {
   waitRetries: number;
   faultClears: number;
   packetSize: number;
+  dapTransferCount?: number;
+  dapTransferBlockCount?: number;
+  usbWriteReports?: number;
+  usbReadReports?: number;
+  usbReportBytes?: number;
+  protocolPayloadBytes?: number;
+  effectiveReadBytes?: number;
+  packedReads?: number;
+  fallbackReads?: number;
+  transport?: string;
+}
+
+export interface CmsisDapPerformanceSnapshot {
+  helperRpcElapsedMs: MetricStats;
+  helperProcessingMs: MetricStats;
+  cmsisDap: {
+    available: true;
+    rpcCount: number;
+    usbWriteReports: number;
+    usbReadReports: number;
+    usbReports: number;
+    usbReportBytes: number;
+    protocolPayloadBytes: number;
+    dapTransferCount: number;
+    dapTransferBlockCount: number;
+    effectiveReadBytes: number;
+    packedReads: number;
+    fallbackReads: number;
+    transport: string | null;
+  };
+  scheduler: ReturnType<NativeScheduler['snapshot']>;
 }
 
 export interface CmsisDapDpReadResult {
@@ -116,10 +154,34 @@ export interface CmsisDapMemoryReadResult {
   bytes: number[];
 }
 
+export interface CmsisDapMemoryBatchReadResult {
+  reads: CmsisDapMemoryReadResult[];
+}
+
 export interface CmsisDapMemoryBlockReadResult {
   address: number;
   wordCount: number;
   words: number[];
+}
+
+export interface CmsisDapRttReadResult {
+  bytes: number[];
+  controlBlockAddress: number;
+  bufferIndex: number;
+  descriptorAddress: number;
+  bufferAddress: number;
+  bufferSize: number;
+  wrOff: number;
+  rdOff: number;
+  flags: number;
+  mode: number;
+  committedRdOff: number;
+  requestedBytes: number;
+  readBytes: number;
+  committedBytes: number;
+  wrapped: boolean;
+  overrun: boolean;
+  writerAdvanced: boolean;
 }
 
 export interface CmsisDapMemoryWriteResult {
@@ -223,6 +285,8 @@ interface PendingRequest {
   resolve: (result: CppJLinkResult<any>) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  method: string;
+  sentAt: number;
 }
 
 // The helper applies timeoutMs to the bounded control operation itself. Keep
@@ -263,6 +327,21 @@ export class CmsisDapHelperClient {
   private exitPromise: Promise<void> | null = null;
   private resolveExit: (() => void) | null = null;
   private readonly scheduler = new NativeScheduler();
+  private readonly helperRpcElapsedMs = new BoundedMetric(8_192);
+  private readonly helperProcessingMs = new BoundedMetric(8_192);
+  private readonly readTotals = {
+    rpcCount: 0,
+    usbWriteReports: 0,
+    usbReadReports: 0,
+    usbReportBytes: 0,
+    protocolPayloadBytes: 0,
+    dapTransferCount: 0,
+    dapTransferBlockCount: 0,
+    effectiveReadBytes: 0,
+    packedReads: 0,
+    fallbackReads: 0,
+    transport: null as string | null,
+  };
 
   constructor(
     private readonly helperPath: string,
@@ -270,13 +349,13 @@ export class CmsisDapHelperClient {
     private readonly onDiagnostic: (message: string) => void = () => {},
   ) {}
 
-  async start(): Promise<CppJLinkResult<{ protocol: number; helperVersion: string; platform: string; capabilities: string[] }>> {
+  async start(transport: 'auto' | 'hid' | 'winusb' | 'cmsis-dap' | 'cmsis-dap-v2' = 'auto'): Promise<CppJLinkResult<{ protocol: number; helperVersion: string; platform: string; capabilities: string[] }>> {
     if (this.child) throw new Error('CMSIS-DAP helper is already started');
     this.exitError = null;
     this.intentionalStop = false;
     this.exitPromise = new Promise<void>(resolve => { this.resolveExit = resolve; });
     this.onDiagnostic(`[cmsis-dap process] spawn helper=${this.helperPath} cwd=${process.cwd()}`);
-    const child = spawn(this.helperPath, ['--transport=hid'], {
+    const child = spawn(this.helperPath, [`--transport=${transport}`], {
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -352,6 +431,19 @@ export class CmsisDapHelperClient {
 
   getSchedulerSnapshot() { return this.scheduler.snapshot(); }
 
+  getPerformanceSnapshot(): CmsisDapPerformanceSnapshot {
+    return {
+      helperRpcElapsedMs: this.helperRpcElapsedMs.snapshot(),
+      helperProcessingMs: this.helperProcessingMs.snapshot(),
+      cmsisDap: {
+        available: true,
+        ...this.readTotals,
+        usbReports: this.readTotals.usbWriteReports + this.readTotals.usbReadReports,
+      },
+      scheduler: this.scheduler.snapshot(),
+    };
+  }
+
   private sendRequest<T>(method: string, params: Record<string, unknown>): Promise<CppJLinkResult<T>> {
     if (!this.child || !this.child.stdin.writable) {
       return Promise.reject(this.exitError || new Error('CMSIS-DAP helper is not running'));
@@ -369,7 +461,7 @@ export class CmsisDapHelperClient {
         );
         reject(new Error(`CMSIS-DAP helper request timed out: ${method}`));
       }, requestTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, method, sentAt });
       const requestLine = `${JSON.stringify({ id, method, params })}\n`;
       this.child!.stdin.write(requestLine, error => {
         if (!error) return;
@@ -431,6 +523,32 @@ export class CmsisDapHelperClient {
     }
     clearTimeout(pending.timer);
     this.pending.delete(response.id);
+    const rpcElapsedMs = Date.now() - pending.sentAt;
+    if (pending.method === 'readMemory' || pending.method === 'readMemoryBatch') {
+      const result = response.result as CppJLinkResult<unknown>;
+      const diagnostics = result.diagnostics || {};
+      this.helperRpcElapsedMs.record(rpcElapsedMs);
+      this.helperProcessingMs.record(result.elapsedMs);
+      this.readTotals.rpcCount++;
+      for (const field of [
+        'usbWriteReports', 'usbReadReports', 'usbReportBytes', 'protocolPayloadBytes',
+        'dapTransferCount', 'dapTransferBlockCount', 'effectiveReadBytes',
+        'packedReads', 'fallbackReads',
+      ] as const) {
+        const value = diagnostics[field];
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+          this.readTotals[field] += value;
+        }
+      }
+      if (typeof diagnostics.transport === 'string' && diagnostics.transport) {
+        this.readTotals.transport = diagnostics.transport;
+      }
+      result.diagnostics = {
+        ...diagnostics,
+        rpcElapsedMs,
+        helperProcessingMs: result.elapsedMs,
+      };
+    }
     pending.resolve(response.result);
   }
 
@@ -494,12 +612,17 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'stepInstruction':
     case 'readRegister':
     case 'flashAlgorithm':
+    case 'startRtt':
+    case 'stopRtt':
       return 'control';
     case 'dpRead':
     case 'apRead':
     case 'readMemory':
+    case 'readMemoryBatch':
     case 'readMemoryBlock':
       return 'watch';
+    case 'readRtt':
+      return 'background';
     case 'writeMemory':
       return 'control';
     default:

@@ -30,7 +30,7 @@ describe('DAP stopped-state scopes', () => {
     const registerRead = (session as any).handleVariables({
       type: 'request', seq: 12, command: 'variables', arguments: { variablesReference: 2 },
     });
-    setTimeout(() => { (session as any).controlInProgress = false; }, 10);
+    setTimeout(() => { (session as any).endControl(); }, 10);
     await Promise.all([localRead, registerRead]);
 
     expect(messages.find(message => message.request_seq === 11)?.body.variables).toMatchObject([

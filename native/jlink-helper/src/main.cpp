@@ -14,6 +14,59 @@
 #include <string>
 #include <vector>
 
+#include "segger_rtt.h"
+
+namespace {
+
+using cmsis_dap_helper::DapTransferDiagnostics;
+using cmsis_dap_helper::Result;
+using cmsis_dap_helper::RttMemory;
+using cmsis_dap_helper::RttReadResult;
+using cmsis_dap_helper::SeggerRttReader;
+
+class JLinkRttMemory final : public RttMemory {
+ public:
+  using ReadMemoryFn = int(__cdecl*)(std::uint32_t, std::uint32_t, void*);
+  using WriteMemoryFn = int(__cdecl*)(std::uint32_t, std::uint32_t, const void*);
+
+  JLinkRttMemory(ReadMemoryFn readMemory, WriteMemoryFn writeMemory)
+      : readMemory_(readMemory), writeMemory_(writeMemory) {}
+
+  Result read(std::uint32_t address, std::uint32_t size, std::vector<std::uint8_t>& bytes,
+              DapTransferDiagnostics&) override {
+    if (!readMemory_ || size == 0) {
+      return Result::error(cmsis_dap_helper::ErrorCodes::kRttMemoryReadFailed, "JLINK_ReadMem is unavailable");
+    }
+    bytes.resize(size);
+    const int result = readMemory_(address, size, bytes.data());
+    if (result < 0) {
+      bytes.clear();
+      return Result::error(cmsis_dap_helper::ErrorCodes::kRttMemoryReadFailed,
+                           "JLINK_ReadMem returned " + std::to_string(result));
+    }
+    return Result::success();
+  }
+
+  Result write(std::uint32_t address, const std::vector<std::uint8_t>& bytes,
+               DapTransferDiagnostics&) override {
+    if (!writeMemory_ || bytes.empty()) {
+      return Result::error(cmsis_dap_helper::ErrorCodes::kRttMemoryWriteFailed, "JLINK_WriteMem is unavailable");
+    }
+    const int result = writeMemory_(address, static_cast<std::uint32_t>(bytes.size()), bytes.data());
+    if (result < 0) {
+      return Result::error(cmsis_dap_helper::ErrorCodes::kRttMemoryWriteFailed,
+                           "JLINK_WriteMem returned " + std::to_string(result));
+    }
+    return Result::success();
+  }
+
+ private:
+  ReadMemoryFn readMemory_ = nullptr;
+  WriteMemoryFn writeMemory_ = nullptr;
+};
+
+}  // namespace
+
 namespace {
 
 constexpr int kProtocolVersion = 2;
@@ -1199,55 +1252,46 @@ class JLinkChannel {
   std::string startRtt(const JsonValue& params) {
     const auto started = std::chrono::steady_clock::now();
     if (const auto unavailable = requireConnected(started)) return *unavailable;
-    if (!rttControl_) return error("UnsupportedCapability", "J-Link DLL does not export RTT control", started);
-    std::array<std::uint8_t, 16> config{};
-    void* configPointer = nullptr;
-    if (const auto address = uintField(params, "controlBlockAddress"); address && *address != 0) {
-      config[0] = static_cast<std::uint8_t>(*address & 0xFF);
-      config[1] = static_cast<std::uint8_t>((*address >> 8) & 0xFF);
-      config[2] = static_cast<std::uint8_t>((*address >> 16) & 0xFF);
-      config[3] = static_cast<std::uint8_t>((*address >> 24) & 0xFF);
-      configPointer = config.data();
+    const auto address = uintField(params, "controlBlockAddress");
+    if (!address || *address == 0) {
+      return error("RttInvalidControlBlock", "J-Link memory-backed RTT requires an explicit control block address", started);
     }
-    const int result = rttControl_(0, configPointer);
-    if (result < 0) return callError("JLINK_RTTERMINAL_Control(start)", result, started);
-    rttStarted_ = true;
-    return success("{}", "RTT started", started);
+    JLinkRttMemory memory(readMemory_, writeMemory_);
+    DapTransferDiagnostics diagnostics;
+    const Result result = rttReader_.start(memory, *address, diagnostics);
+    if (!result.ok) return error(result.errorCode, result.message, started);
+    return success("{\"controlBlockAddress\":" + std::to_string(*address) + "}", "RTT started", started);
   }
 
   std::string stopRtt() {
     const auto started = std::chrono::steady_clock::now();
     if (const auto unavailable = requireConnected(started)) return *unavailable;
-    if (!rttControl_) return error("UnsupportedCapability", "J-Link DLL does not export RTT control", started);
-    if (rttStarted_) {
-      const int result = rttControl_(1, nullptr);
-      if (result < 0) return callError("JLINK_RTTERMINAL_Control(stop)", result, started);
-    }
-    rttStarted_ = false;
+    rttReader_.stop();
     return success("{}", "RTT stopped", started);
   }
 
   std::string readRtt(const JsonValue& params) {
     const auto started = std::chrono::steady_clock::now();
     if (const auto unavailable = requireConnected(started)) return *unavailable;
-    if (!rttRead_) return error("UnsupportedCapability", "J-Link DLL does not export RTT read", started);
+    if (!rttReader_.started()) return error("RttStopped", "RTT is not started", started);
     const auto bufferIndex = uintField(params, "bufferIndex");
     const auto size = uintField(params, "size");
-    if (!bufferIndex || !size || *size == 0 || *size > 1024 * 1024) {
-      return error("ProtocolError", "readRtt requires bufferIndex and size", started);
+    if (!bufferIndex || !size || *size == 0 || *size > 65536) {
+      return error("ProtocolError", "readRtt requires bufferIndex and size in 1..65536", started);
     }
-    std::vector<std::uint8_t> bytes(*size);
-    const int result = rttRead_(*bufferIndex, bytes.data(), *size);
-    if (result < 0) return callError("JLINK_RTTERMINAL_Read", result, started);
-    bytes.resize(static_cast<std::size_t>(result));
-    return success("{\"bytesBase64\":\"" + base64Encode(bytes) + "\"}", "RTT read", started);
+    JLinkRttMemory memory(readMemory_, writeMemory_);
+    DapTransferDiagnostics diagnostics;
+    RttReadResult output;
+    const Result result = rttReader_.read(memory, *bufferIndex, *size, output, diagnostics);
+    if (!result.ok) return error(result.errorCode, result.message, started);
+    return success("{\"bytesBase64\":\"" + base64Encode(output.bytes) + "\"}",
+                   output.bytes.empty() ? "RTT empty read" : "RTT read", started);
   }
 
   std::string disconnect() {
     const auto started = std::chrono::steady_clock::now();
     if (state_ == "Disconnected") return success("{}", "already disconnected", started);
-    if (rttStarted_ && rttControl_) rttControl_(1, nullptr);
-    rttStarted_ = false;
+    rttReader_.stop();
     halt_();
     for (std::uint32_t slot = 0; slot < kBreakpointSlots; ++slot) {
       clearBreakpoint_(slot);
@@ -1282,8 +1326,6 @@ class JLinkChannel {
   using WriteMemoryFn = int(__cdecl*)(std::uint32_t, std::uint32_t, const void*);
   using BreakpointFn = int(__cdecl*)(std::uint32_t, std::uint32_t);
   using ClearBreakpointFn = int(__cdecl*)(std::uint32_t);
-  using RttControlFn = int(__cdecl*)(std::uint32_t, void*);
-  using RttReadFn = int(__cdecl*)(std::uint32_t, void*, std::uint32_t);
 
   template <typename T>
   T resolve(const char* primary, const char* alternate = nullptr) {
@@ -1339,8 +1381,6 @@ class JLinkChannel {
     writeMemory_ = resolve<WriteMemoryFn>("JLINK_WriteMem", "JLINKARM_WriteMem");
     setBreakpoint_ = resolve<BreakpointFn>("JLINK_SetBP", "JLINKARM_SetBP");
     clearBreakpoint_ = resolve<ClearBreakpointFn>("JLINK_ClrBP", "JLINKARM_ClrBP");
-    rttControl_ = resolveOptional<RttControlFn>("JLINK_RTTERMINAL_Control");
-    rttRead_ = resolveOptional<RttReadFn>("JLINK_RTTERMINAL_Read");
     symbolsReady_ = missingSymbol_.empty();
     return std::nullopt;
   }
@@ -1384,7 +1424,6 @@ class JLinkChannel {
   HMODULE module_ = nullptr;
   bool symbolsReady_ = false;
   bool wasOpened_ = false;
-  bool rttStarted_ = false;
   bool targetLinkProbeEnabled_ = false;
   std::string missingSymbol_;
   std::string loadedPath_;
@@ -1411,8 +1450,7 @@ class JLinkChannel {
   WriteMemoryFn writeMemory_ = nullptr;
   BreakpointFn setBreakpoint_ = nullptr;
   ClearBreakpointFn clearBreakpoint_ = nullptr;
-  RttControlFn rttControl_ = nullptr;
-  RttReadFn rttRead_ = nullptr;
+  SeggerRttReader rttReader_{false};
 };
 
 std::string responseEnvelope(const JsonValue& request, const std::string& result) {

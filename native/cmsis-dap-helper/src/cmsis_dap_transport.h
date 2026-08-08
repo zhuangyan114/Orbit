@@ -49,15 +49,24 @@ constexpr char kDapAlgorithmTimeout[] = "DapAlgorithmTimeout";
 constexpr char kDapAlgorithmError[] = "DapAlgorithmError";
 constexpr char kDapAlgorithmHaltUnknown[] = "DapAlgorithmHaltUnknown";
 constexpr char kFlashProtectionError[] = "FlashProtectionError";
+constexpr char kRttInvalidControlBlock[] = "RttInvalidControlBlock";
+constexpr char kRttInvalidBufferIndex[] = "RttInvalidBufferIndex";
+constexpr char kRttInvalidBufferLayout[] = "RttInvalidBufferLayout";
+constexpr char kRttInvalidBufferFlags[] = "RttInvalidBufferFlags";
+constexpr char kRttMemoryReadFailed[] = "RttMemoryReadFailed";
+constexpr char kRttMemoryWriteFailed[] = "RttMemoryWriteFailed";
+constexpr char kRttBufferOverrun[] = "RttBufferOverrun";
+constexpr char kRttOwnerLost[] = "RttOwnerLost";
+constexpr char kRttStopped[] = "RttStopped";
 }  // namespace ErrorCodes
 
 // How the effective CMSIS-DAP packet size was derived. The protocol
 // DAP_Info packet-size item may be empty on real devices (e.g. CMSIS-DAP_LU);
 // in that case the HID report capability is used and the source is marked.
-enum class PacketSizeSource { ProtocolInfo, HidReportCapability, Unavailable };
+enum class PacketSizeSource { ProtocolInfo, HidReportCapability, UsbDescriptor, Unavailable };
 
 struct DeviceDescriptor {
-  std::string path;          // Windows HID device path (SetupAPI)
+  std::string path;          // Windows device-interface path (SetupAPI)
   std::string vid;           // 4 hex chars, uppercase, e.g. "C251"
   std::string pid;           // 4 hex chars, uppercase, e.g. "F001"
   std::string manufacturer;  // may be empty
@@ -68,7 +77,14 @@ struct DeviceDescriptor {
   uint8_t reportId = 0;             // 0 means no report id / id byte still reserved
   uint16_t usagePage = 0;
   uint16_t usage = 0;
-  std::string transport;     // "hid" | "mock" | ...
+  std::string transport;     // "hid" | "winusb" | "mock" | ...
+  uint8_t interfaceNumber = 0;
+  uint8_t bulkInEndpoint = 0;
+  uint8_t bulkOutEndpoint = 0;
+  uint16_t bulkInMaxPacketSize = 0;
+  uint16_t bulkOutMaxPacketSize = 0;
+  uint16_t protocolPacketSize = 0;
+  PacketSizeSource packetSizeSource = PacketSizeSource::Unavailable;
 };
 
 // Selector filters applied during enumeration. Empty fields are wildcards.
@@ -78,6 +94,15 @@ struct DeviceSelector {
   std::string serial;
   std::string product;
   std::string path;  // exact device path; when set, all other filters are ignored
+};
+
+struct TransportIoCounters {
+  uint64_t writeReports = 0;
+  uint64_t readReports = 0;
+  uint64_t writePayloadBytes = 0;
+  uint64_t readPayloadBytes = 0;
+  uint64_t writeReportBytes = 0;
+  uint64_t readReportBytes = 0;
 };
 
 // Abstract CMSIS-DAP transport. HID and mock transports implement this
@@ -125,6 +150,10 @@ class CmsisDapTransport {
   // Device removal state: false until the transport observed a removal or
   // failed I/O after which it refuses further requests.
   virtual bool deviceLost() const = 0;
+
+  // Monotonic physical-I/O counters. Callers take deltas around one RPC;
+  // transport implementations count actual report attempts and bytes.
+  virtual TransportIoCounters ioCounters() const = 0;
 };
 
 }  // namespace cmsis_dap_helper

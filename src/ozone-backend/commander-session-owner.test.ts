@@ -3,6 +3,21 @@ import { OzoneBackend } from './commander';
 import { SessionTargetOwner } from './session-target-channel';
 
 describe('OzoneBackend extension-host ownership guard', () => {
+  it('resolves RTT symbols from loaded ELF data without target access', async () => {
+    const backend = new OzoneBackend(undefined, undefined, () => true);
+    (backend as any).elfPath = 'firmware.elf';
+    (backend as any).symbols = [{ name: '_SEGGER_RTT', address: 0x20005178, size: 0xa8, type: 'B' }];
+
+    const resolved = await backend.execute({ cmd: 'resolveSymbol', name: '_SEGGER_RTT' });
+    expect(resolved).toMatchObject({
+      ok: true,
+      data: { name: '_SEGGER_RTT', address: 0x20005178, size: 0xa8, type: 'B' },
+    });
+
+    const missing = await backend.execute({ cmd: 'resolveSymbol', name: 'missing' });
+    expect(missing).toMatchObject({ ok: false, errorCode: 'SymbolNotFound' });
+  });
+
   it('rejects target access before touching the local J-Link backend', async () => {
     const backend = new OzoneBackend(undefined, undefined, () => true);
     const legacy = {
@@ -57,6 +72,47 @@ describe('OzoneBackend extension-host ownership guard', () => {
       ok: false,
       error: 'NativeOwnerLost: helper exited',
       errorCode: 'NativeOwnerLost',
+    });
+  });
+
+  it('preserves structured RTT Flags failures from the selected owner', async () => {
+    const target = {
+      readRtt: vi.fn(async () => ({
+        ok: false,
+        message: 'RTT Up Buffer Flags contain reserved bits',
+        errorCode: 'RttInvalidBufferFlags',
+        targetState: 'Running' as const,
+        elapsedMs: 2,
+        diagnostics: {
+          rtt: {
+            bufferIndex: 0,
+            descriptorAddress: 0x20000118,
+            bufferAddress: 0x20001000,
+            bufferSize: 8,
+            wrOff: 3,
+            rdOff: 0,
+            flags: 4,
+            mode: 0,
+            bytes: [],
+          },
+        },
+      })),
+    } as unknown as SessionTargetOwner;
+    const backend = new OzoneBackend(target, target);
+
+    await expect(backend.execute({ cmd: 'readRtt', bufferIndex: 0, size: 8 })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'RttInvalidBufferFlags',
+      error: expect.stringContaining('RttInvalidBufferFlags'),
+      diagnostics: {
+        rtt: {
+          flags: 4,
+          mode: 0,
+          bufferIndex: 0,
+          descriptorAddress: 0x20000118,
+          bytes: [],
+        },
+      },
     });
   });
 
@@ -147,7 +203,7 @@ describe('OzoneBackend extension-host ownership guard', () => {
     });
 
     expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
-    if (!result.ok) expect(result.error).toContain('cmsisDapTransport must be one of auto, hid, or winusb');
+    if (!result.ok) expect(result.error).toContain('cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, or winusb');
     expect(jlink.open).not.toHaveBeenCalled();
     expect(jlink.connect).not.toHaveBeenCalled();
   });

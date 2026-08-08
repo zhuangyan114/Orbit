@@ -16,7 +16,9 @@ import {
   CmsisDapHelperClient,
   CmsisDapHelperOptions,
   CmsisDapMemoryReadResult,
+  CmsisDapMemoryBatchReadResult,
   CmsisDapMemoryWriteResult,
+  CmsisDapRttReadResult,
   CmsisDapCoreStateResult,
   CmsisDapRunToAddressResult,
   CmsisDapStepInstructionResult,
@@ -59,6 +61,7 @@ export interface SessionTargetConnectConfig extends CppJLinkConnectConfig {
   cmsisDapSerial?: string;
   cmsisDapVid?: string;
   cmsisDapPid?: string;
+  cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
   flashBeforeDebug?: boolean;
 }
@@ -86,10 +89,11 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   setBreakpoint(address: number, preferredSlot?: number): Promise<CppJLinkResult<{ id: number }>>;
   clearBreakpoint(id: number): Promise<CppJLinkResult<any>>;
   clearAllBreakpoints(): Promise<CppJLinkResult<any>>;
-  startRtt(controlBlockAddress?: number): Promise<CppJLinkResult>;
-  stopRtt(): Promise<CppJLinkResult>;
-  readRtt(bufferIndex: number, size: number): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
+  startRtt(controlBlockAddress?: number): Promise<CppJLinkResult<any>>;
+  stopRtt(): Promise<CppJLinkResult<any>>;
+  readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
   flash?(elfPath: string, device: string, options?: CmsisDapFlashOptions): Promise<CppJLinkResult<CmsisDapFlashResult>>;
+  getPerformanceDiagnostics?(): Record<string, unknown>;
   dispose(graceful?: boolean): Promise<void>;
 }
 
@@ -199,6 +203,14 @@ export class SessionTargetSelector {
   async readMemoryBatch(reads: Array<{ address: number; size: number }>, options?: CppJLinkReadOptions) {
     return this.call('readMemoryBatch', owner => owner.readMemoryBatch(reads, options));
   }
+  getPerformanceDiagnostics(): Record<string, unknown> {
+    return this.owner?.getPerformanceDiagnostics?.() || {
+      owner: this.ownerKind,
+      helperRpcElapsedMs: null,
+      helperProcessingMs: null,
+      cmsisDap: null,
+    };
+  }
   async writeMemory(address: number, bytes: Uint8Array) {
     return this.call('writeMemory', owner => owner.writeMemory(address, bytes));
   }
@@ -219,7 +231,9 @@ export class SessionTargetSelector {
   }
   async startRtt(controlBlockAddress?: number) { return this.call('startRtt', owner => owner.startRtt(controlBlockAddress)); }
   async stopRtt() { return this.call('stopRtt', owner => owner.stopRtt()); }
-  async readRtt(bufferIndex: number, size: number) { return this.call('readRtt', owner => owner.readRtt(bufferIndex, size)); }
+  async readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions) {
+    return this.call('readRtt', owner => owner.readRtt(bufferIndex, size, options));
+  }
   async flash(elfPath: string, device: string, options?: CmsisDapFlashOptions) {
     return this.call('flash', owner => owner.flash
       ? owner.flash(elfPath, device, options)
@@ -366,7 +380,7 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
     this.jlink.stopRtt();
     return this.success({}, 'RTT stopped');
   }
-  async readRtt(bufferIndex: number, size: number) {
+  async readRtt(bufferIndex: number, size: number, _options?: CppJLinkReadOptions) {
     const bytes = this.jlink.readRtt(bufferIndex, size);
     return bytes
       ? this.success({ bytes }, 'RTT read')
@@ -425,6 +439,10 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private state: 'idle' | 'opened' | 'connected' | 'failed' = 'idle';
   private lastDevice: CmsisDapDeviceInfo | null = null;
 
+  getPerformanceDiagnostics(): Record<string, unknown> {
+    return { owner: this.kind, ...this.helper.getPerformanceSnapshot() };
+  }
+
   constructor(options: CmsisDapTargetChannelOptions = {}) {
     this.helper = options.helperClient
       ?? new CmsisDapHelperClient(
@@ -436,21 +454,13 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
 
   async connect(config: SessionTargetConnectConfig): Promise<CppJLinkResult<TargetChannelInfo>> {
     const transport = config.cmsisDapTransport || 'auto';
-    if (transport === 'winusb') {
-      return this.unsupported<TargetChannelInfo>('connect', {
-        transport,
-        reason: 'CMSIS-DAP v2/WinUSB transport is not implemented in DAP-02-HID',
-      });
-    }
-    // 'auto' resolves to HID: the only transport implemented in this stage.
-    // The helper never guesses wireless or WinUSB capability.
-    const effectiveTransport = 'hid';
+    const effectiveTransport = transport;
 
     log.dll(`[cmsis-dap] connect transport=${effectiveTransport} serial=${config.cmsisDapSerial || ''} vid=${config.cmsisDapVid || ''} pid=${config.cmsisDapPid || ''}`);
 
     let hello: Awaited<ReturnType<CmsisDapHelperClient['start']>>;
     try {
-      hello = await this.helper.start();
+      hello = await this.helper.start(effectiveTransport);
     } catch (error) {
       return this.failAndDispose(this.helperFailure('start', error), 'start');
     }
@@ -469,6 +479,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     if (config.cmsisDapVid) selector.vid = config.cmsisDapVid;
     if (config.cmsisDapPid) selector.pid = config.cmsisDapPid;
     if (config.cmsisDapSerial) selector.serial = config.cmsisDapSerial;
+    if (config.cmsisDapPath) selector.path = config.cmsisDapPath;
 
     try {
       const enumeration = await this.helper.request<{ devices: CmsisDapDeviceInfo[] }>('enumDevices', selector);
@@ -476,7 +487,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       if (!enumeration.data || enumeration.data.devices.length === 0) {
         return this.failAndDispose({
           ok: false,
-          message: 'no matching CMSIS-DAP HID device found',
+            message: 'no matching CMSIS-DAP device found',
           errorCode: 'DeviceNotFound',
           targetState: 'Error' as const,
           elapsedMs: 0,
@@ -487,7 +498,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       if (!opened.ok) return this.failAndDispose(opened, 'open');
       this.lastDevice = opened.data ?? null;
       this.state = 'opened';
-      log.dll(`[cmsis-dap] opened device vid=${this.lastDevice?.vid || ''} pid=${this.lastDevice?.pid || ''} product=${this.lastDevice?.product || ''} serial=${this.lastDevice?.serial || ''} inputReportLength=${this.lastDevice?.inputReportLength ?? 0} outputReportLength=${this.lastDevice?.outputReportLength ?? 0} reportId=${this.lastDevice?.reportId ?? 0}`);
+      log.dll(`[cmsis-dap] opened device vid=${this.lastDevice?.vid || ''} pid=${this.lastDevice?.pid || ''} product=${this.lastDevice?.product || ''} serial=${this.lastDevice?.serial || ''} transport=${this.lastDevice?.transport || effectiveTransport} inputReportLength=${this.lastDevice?.inputReportLength ?? 0} outputReportLength=${this.lastDevice?.outputReportLength ?? 0} reportId=${this.lastDevice?.reportId ?? 0} bulkInEndpoint=${this.lastDevice?.bulkInEndpoint ?? 0} bulkOutEndpoint=${this.lastDevice?.bulkOutEndpoint ?? 0} bulkInMaxPacketSize=${this.lastDevice?.bulkInMaxPacketSize ?? 0} bulkOutMaxPacketSize=${this.lastDevice?.bulkOutMaxPacketSize ?? 0} protocolPacketSize=${this.lastDevice?.protocolPacketSize ?? 0}`);
 
       // DAP_Info is diagnostic: an empty or failing info item must not block
       // the connect handshake, but every structured result is surfaced.
@@ -691,23 +702,75 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     if (this.state !== 'connected') {
       return this.invalidState<{ reads: Array<{ address: number; bytes: Uint8Array }> }>('readMemoryBatch');
     }
-    const results: Array<{ address: number; bytes: Uint8Array }> = [];
-    for (const read of reads) {
-      const result = await this.readMemory(read.address, read.size, options);
-      if (!result.ok || !result.data) {
+    let result: CppJLinkResult<CmsisDapMemoryBatchReadResult>;
+    try {
+      result = await this.helper.request<CmsisDapMemoryBatchReadResult>(
+        'readMemoryBatch',
+        { reads },
+        {
+          priority: options?.priority || 'watch',
+          signal: options?.signal,
+          coalesceKey: options?.coalesceKey,
+        },
+      );
+    } catch (error) {
+      if (error instanceof NativeSchedulerCancelledError) {
         return {
           ok: false,
-          message: `CMSIS-DAP memory batch read failed at 0x${read.address.toString(16)}: ${result.message}`,
-          errorCode: result.errorCode || 'DapReadFailed',
-          targetState: 'Error' as const,
+          message: 'CMSIS-DAP readMemoryBatch was cancelled',
+          errorCode: 'RequestCancelled',
+          targetState: 'Unknown' as const,
           elapsedMs: 0,
-          diagnostics: { ownerKind: this.kind, reads: reads.length },
+          diagnostics: { ownerKind: this.kind, method: 'readMemoryBatch' },
         };
       }
-      results.push({ address: read.address, bytes: result.data.bytes });
+      return this.helperFailure<{ reads: Array<{ address: number; bytes: Uint8Array }> }>(
+        'readMemoryBatch', error,
+      );
     }
+    if (!result.ok) {
+      const { data: _partialData, ...failureResult } = result;
+      return failureResult as CppJLinkResult<{ reads: Array<{ address: number; bytes: Uint8Array }> }>;
+    }
+    const returned = result.data?.reads;
+    const malformedIndex = !Array.isArray(returned) || returned.length !== reads.length
+      ? 0
+      : returned.findIndex((item, index) =>
+        !item
+        || item.address !== reads[index].address
+        || item.size !== reads[index].size
+        || !Array.isArray(item.bytes)
+        || item.bytes.length !== reads[index].size
+        || item.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255));
+    if (malformedIndex >= 0) {
+      return {
+        ok: false,
+        message: 'CMSIS-DAP readMemoryBatch returned an incomplete, reordered, or malformed result',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error' as const,
+        elapsedMs: result.elapsedMs,
+        diagnostics: {
+          ...result.diagnostics,
+          ownerKind: this.kind,
+          expectedReads: reads.length,
+          returnedReads: Array.isArray(returned) ? returned.length : null,
+          malformedIndex,
+        },
+      };
+    }
+    const results = returned!.map(item => ({
+      address: item.address,
+      bytes: Uint8Array.from(item.bytes),
+    }));
     log.dap(`[cmsis-dap] readMemoryBatch reads=${results.length} bytes=${results.reduce((sum, item) => sum + item.bytes.length, 0)} owner=cmsis-dap`);
-    return { ok: true, message: 'CMSIS-DAP memory batch read', targetState: 'Unknown' as const, elapsedMs: 0, data: { reads: results } };
+    return {
+      ok: true,
+      message: result.message,
+      targetState: result.targetState,
+      elapsedMs: result.elapsedMs,
+      data: { reads: results },
+      diagnostics: result.diagnostics,
+    };
   }
   async writeMemory(address: number, bytes: Uint8Array) {
     if (this.state !== 'connected') {
@@ -746,10 +809,77 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   async clearAllBreakpoints() {
     return this.controlViaHelper<CmsisDapClearAllBreakpointsResult>('clearAllBreakpoints', {});
   }
-  async startRtt(_controlBlockAddress?: number) { return this.unsupported('startRtt'); }
-  async stopRtt() { return this.unsupported('stopRtt'); }
-  async readRtt(_bufferIndex: number, _size: number) {
-    return this.unsupported<{ bytes: Uint8Array }>('readRtt');
+  async startRtt(controlBlockAddress?: number) {
+    if (this.state !== 'connected') return this.invalidState('startRtt');
+    if (!Number.isInteger(controlBlockAddress) || !controlBlockAddress || controlBlockAddress < 0) {
+      return failure('CMSIS-DAP RTT requires an explicit control block address', 'RttInvalidControlBlock', {
+        ownerKind: this.kind,
+        capability: 'startRtt',
+      });
+    }
+    const result = await this.controlViaHelper<{ controlBlockAddress: number }>('startRtt', {
+      controlBlockAddress: controlBlockAddress >>> 0,
+      timeoutMs: 2000,
+    });
+    log.dap('[cmsis-dap] startRtt controlBlock=0x' + (controlBlockAddress >>> 0).toString(16)
+      + ' ok=' + result.ok + ' errorCode=' + (result.errorCode || ''));
+    return result;
+  }
+  async stopRtt() {
+    if (this.state !== 'connected') return this.invalidState('stopRtt');
+    const result = await this.controlViaHelper<{ started: boolean }>('stopRtt', {});
+    log.dap('[cmsis-dap] stopRtt ok=' + result.ok + ' errorCode=' + (result.errorCode || ''));
+    return result;
+  }
+  async readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
+    if (this.state !== 'connected') return this.invalidState<{ bytes: Uint8Array }>('readRtt');
+    let result: CppJLinkResult<CmsisDapRttReadResult>;
+    try {
+      result = await this.helper.request<CmsisDapRttReadResult>(
+        'readRtt',
+        { bufferIndex, size, timeoutMs: 2000 },
+        {
+          priority: 'background',
+          signal: options?.signal,
+          label: 'RTT background read',
+        },
+      );
+    } catch (error) {
+      if (error instanceof NativeSchedulerCancelledError) {
+        return {
+          ok: false,
+          message: 'CMSIS-DAP RTT read was cancelled',
+          errorCode: 'RequestCancelled',
+          targetState: 'Unknown',
+          elapsedMs: 0,
+          diagnostics: { ownerKind: this.kind, method: 'readRtt' },
+        };
+      }
+      return this.helperFailure<{ bytes: Uint8Array }>('readRtt', error);
+    }
+    if (!result.ok) {
+      return result as unknown as CppJLinkResult<{ bytes: Uint8Array }>;
+    }
+    if (!result.data || !Array.isArray(result.data.bytes)
+        || result.data.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+      return {
+        ok: false,
+        message: 'CMSIS-DAP RTT read returned malformed bytes',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error',
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'readRtt' },
+      };
+    }
+    const { bytes, ...metadata } = result.data;
+    const mapped = {
+      ...result,
+      data: { ...metadata, bytes: Uint8Array.from(bytes) },
+    };
+    log.dap('[cmsis-dap] readRtt buffer=' + bufferIndex + ' requested=' + size
+      + ' read=' + bytes.length + ' committedRdOff=' + metadata.committedRdOff
+      + ' wrapped=' + (metadata.wrapped ?? false) + ' overrun=' + (metadata.overrun ?? false));
+    return mapped;
   }
   async stepIntoInstruction(): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {
     const result = await this.controlViaHelper<CmsisDapStepInstructionResult>('stepInstruction', {});

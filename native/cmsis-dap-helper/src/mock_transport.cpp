@@ -198,6 +198,7 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
       }
       if (key == "1234:568F") injection_.resetRunsPastStartupEntry = true;
       preparedFlashAlgorithm_ = MockFlashAlgorithmRequest{};
+      ioCounters_ = TransportIoCounters{};
       return Result::success();
     }
   }
@@ -216,6 +217,9 @@ Result MockCmsisDapTransport::writePacket(const uint8_t* data, size_t length,
   if (!opened_) {
     return Result::error(ErrorCodes::kInvalidState, "mock device is not open");
   }
+  ++ioCounters_.writeReports;
+  ioCounters_.writePayloadBytes += length;
+  ioCounters_.writeReportBytes += selected_.outputReportLength;
   const std::string key = behaviorKey(selected_);
   if (injection_.removedOnTransfer && !injection_.removalConsumed && length > 0 &&
       data[0] == kMockCmdTransfer && !isDpidrPrimeTransfer(data, length)) {
@@ -306,6 +310,7 @@ Result MockCmsisDapTransport::readPacket(uint8_t* data, size_t capacity, size_t&
   if (!opened_) {
     return Result::error(ErrorCodes::kInvalidState, "mock device is not open");
   }
+  ++ioCounters_.readReports;
   if (lost_) {
     return Result::error(ErrorCodes::kDeviceRemoved, "mock device was removed");
   }
@@ -323,6 +328,8 @@ Result MockCmsisDapTransport::readPacket(uint8_t* data, size_t capacity, size_t&
   }
   if (!response.empty()) std::memcpy(data, response.data(), response.size());
   length = response.size();
+  ioCounters_.readPayloadBytes += response.size();
+  ioCounters_.readReportBytes += selected_.inputReportLength;
   pending_.pop_front();
   return Result::success();
 }

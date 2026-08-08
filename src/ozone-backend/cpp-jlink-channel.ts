@@ -35,7 +35,7 @@ export interface CppJLinkChannelOptions {
 }
 
 export interface CppJLinkReadOptions {
-  priority?: Extract<NativeTaskPriority, 'watch' | 'timeline'>;
+  priority?: Extract<NativeTaskPriority, 'watch' | 'timeline' | 'background'>;
   signal?: AbortSignal;
   coalesceKey?: string;
 }
@@ -436,11 +436,15 @@ export class ExperimentalCppJLinkChannel {
   async clearAllBreakpoints(): Promise<CppJLinkResult> { return this.callNative('clearAllBreakpoints', {}); }
   async startRtt(controlBlockAddress?: number): Promise<CppJLinkResult> { return this.callNative('startRtt', { controlBlockAddress }); }
   async stopRtt(): Promise<CppJLinkResult> { return this.callNative('stopRtt', {}); }
-  async readRtt(bufferIndex: number, size: number): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
+  async readRtt(
+    bufferIndex: number,
+    size: number,
+    options: CppJLinkReadOptions = {},
+  ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
     const result = await this.callNative<{ bytesBase64: string }>(
       'readRtt',
       { bufferIndex, size },
-      { priority: 'background', coalesceKey: 'rtt-read' },
+      { priority: 'background', coalesceKey: 'rtt-read', signal: options.signal },
     );
     if (!result.ok || !result.data) return withoutData(result);
     return { ...result, data: { bytes: Uint8Array.from(Buffer.from(result.data.bytesBase64, 'base64')) } };
@@ -515,9 +519,9 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'disconnect':
     case 'writeVariable':
     case 'writeMemory':
-      return 'control';
     case 'startRtt':
     case 'stopRtt':
+      return 'control';
     case 'readRtt':
       return 'background';
     case 'readFastSample':

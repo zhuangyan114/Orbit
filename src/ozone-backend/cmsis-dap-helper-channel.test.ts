@@ -3,6 +3,64 @@ import { CmsisDapHelperClient } from './cmsis-dap-helper-channel';
 import { NativeSchedulerCancelledError } from './native-scheduler';
 
 describe('CMSIS-DAP helper control critical section', () => {
+  it('publishes bounded helper RPC and real transport diagnostic aggregates', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    let nextId = 0;
+    (helper as any).child = {
+      stdin: {
+        writable: true,
+        write(line: string) {
+          const request = JSON.parse(line);
+          nextId = request.id;
+          (helper as any).handleLine(JSON.stringify({
+            id: request.id,
+            result: {
+              ok: true,
+              message: 'memory read',
+              targetState: 'Running',
+              elapsedMs: 3,
+              data: { address: 0x20000000, size: 4, bytes: [1, 2, 3, 4] },
+              diagnostics: {
+                usbWriteReports: 2,
+                usbReadReports: 2,
+                usbReportBytes: 260,
+                protocolPayloadBytes: 28,
+                dapTransferCount: 1,
+                dapTransferBlockCount: 1,
+                effectiveReadBytes: 4,
+                packedReads: 0,
+                fallbackReads: 1,
+                transport: 'hid',
+              },
+            },
+          }));
+        },
+      },
+    };
+
+    await helper.request('readMemory', { address: 0x20000000, size: 4 });
+    const snapshot = helper.getPerformanceSnapshot();
+
+    expect(nextId).toBe(1);
+    expect(snapshot.helperRpcElapsedMs).toMatchObject({ count: 1, retainedCount: 1 });
+    expect(snapshot.helperProcessingMs).toMatchObject({ count: 1, p50: 3, p95: 3, max: 3 });
+    expect(snapshot.cmsisDap).toMatchObject({
+      available: true,
+      rpcCount: 1,
+      usbWriteReports: 2,
+      usbReadReports: 2,
+      usbReports: 4,
+      usbReportBytes: 260,
+      protocolPayloadBytes: 28,
+      dapTransferCount: 1,
+      dapTransferBlockCount: 1,
+      effectiveReadBytes: 4,
+      packedReads: 0,
+      fallbackReads: 1,
+      transport: 'hid',
+    });
+  });
+
   it('allows flashAlgorithm RPC overhead beyond the algorithm control timeout', async () => {
     const helper = new CmsisDapHelperClient('unused-helper-path', 20);
     (helper as any).child = {
@@ -120,5 +178,26 @@ describe('CMSIS-DAP helper control critical section', () => {
     await expect(sourceStep).resolves.toMatchObject({
       ok: true, data: { cleanupOk: true, restoredSlots: [0] },
     });
+  });
+
+  it('gives RTT reads background priority so Timeline can run between polls', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const order: string[] = [];
+    let releaseWatch!: () => void;
+    const watchReleased = new Promise<void>(resolve => { releaseWatch = resolve; });
+    (helper as any).sendRequest = vi.fn(async (method: string) => {
+      order.push(method);
+      if (method === 'readMemory') await watchReleased;
+      return { ok: true, message: method, targetState: 'Running', elapsedMs: 0, data: {} };
+    });
+
+    const watch = helper.request('readMemory');
+    const rtt = helper.request('readRtt');
+    const timeline = helper.request('readMemoryBlock', {}, { priority: 'timeline' });
+    await Promise.resolve();
+    releaseWatch();
+    await Promise.all([watch, rtt, timeline]);
+
+    expect(order).toEqual(['readMemory', 'readMemoryBlock', 'readRtt']);
   });
 });

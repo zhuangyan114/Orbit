@@ -89,6 +89,14 @@ struct DapTransferDiagnostics {
   uint32_t packets = 0;        // DAP_Transfer/DAP_TransferBlock commands sent
   uint32_t blockReads = 0;     // DAP_TransferBlock read commands actually sent
   uint32_t blockWrites = 0;    // DAP_TransferBlock write commands actually sent
+  uint64_t usbWriteReports = 0;
+  uint64_t usbReadReports = 0;
+  uint64_t usbReportBytes = 0;
+  uint64_t protocolPayloadBytes = 0;
+  uint64_t effectiveReadBytes = 0;
+  uint32_t packedReads = 0;
+  uint32_t fallbackReads = 0;
+  std::string transport;
 };
 
 // Cortex-M DP/AP adapter over CmsisDapProtocol. Implements the minimal
@@ -133,6 +141,14 @@ class CmsisDapTarget {
   // are covered with aligned word reads and sliced on the host side.
   Result readMemory(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
                     DapTransferDiagnostics& diag);
+
+  // Reads aligned, read-only 32-bit scalars through packed DAP_Transfer
+  // requests. Caller order is preserved. On failure, `values` contains only
+  // scalars whose RDBUFF transfer completed and `completedReads` is exact.
+  Result readMemoryScattered32(
+      const std::vector<uint32_t>& addresses, std::vector<uint32_t>& values,
+      uint32_t& completedReads, DapTransferDiagnostics& diag,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
   // Writes a byte-oriented range. Partial words are read-modify-written while
   // the target is halted, then all writes use the bounded block-write path.

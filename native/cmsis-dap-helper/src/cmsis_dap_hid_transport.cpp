@@ -281,6 +281,7 @@ Result CmsisDapHidTransport::open(const DeviceDescriptor& device) {
                          : 0;
   lost_ = false;
   transportMode_ = WriteTransportMode::InterruptOut;  // per-open session mode
+  ioCounters_ = TransportIoCounters{};
   return Result::success();
 }
 
@@ -321,6 +322,9 @@ Result CmsisDapHidTransport::writePacket(const uint8_t* data, size_t length,
            " payloadLength=" + std::to_string(length) +
            " report=" + hidHexDump(report));
   if (transportMode_ == WriteTransportMode::InterruptOut) {
+    ++ioCounters_.writeReports;
+    ioCounters_.writePayloadBytes += length;
+    ioCounters_.writeReportBytes += report.size();
     const Result result = overlappedWrite(report, timeout);
     if (result.ok) {
       hidTrace("write result=ok mode=interrupt-out");
@@ -349,6 +353,9 @@ Result CmsisDapHidTransport::writePacket(const uint8_t* data, size_t length,
   if (lost_) {
     return Result::error(ErrorCodes::kDeviceRemoved, "HID device was removed");
   }
+  ++ioCounters_.writeReports;
+  ioCounters_.writePayloadBytes += length;
+  ioCounters_.writeReportBytes += report.size();
   if (io_->setOutputReport(handle_, report.data(), static_cast<DWORD>(report.size()))) {
     hidTrace("write result=ok mode=control");
     return Result::success();
@@ -377,6 +384,7 @@ Result CmsisDapHidTransport::readPacket(uint8_t* data, size_t capacity, size_t& 
   }
   std::vector<uint8_t> report(inputReportLength_, 0);
   size_t bytesRead = 0;
+  ++ioCounters_.readReports;
   const Result readResult = overlappedRead(report, bytesRead, timeout);
   if (!readResult.ok) {
     hidTrace("read result=error code=" + readResult.errorCode + " message=" + readResult.message);
@@ -394,6 +402,8 @@ Result CmsisDapHidTransport::readPacket(uint8_t* data, size_t capacity, size_t& 
                              " bytes exceeds caller capacity of " + std::to_string(capacity));
   }
   if (payload > 0) std::memcpy(data, report.data() + 1, payload);
+  ioCounters_.readPayloadBytes += payload;
+  ioCounters_.readReportBytes += bytesRead;
   length = payload;
   return Result::success();
 }

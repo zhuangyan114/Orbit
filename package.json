@@ -154,8 +154,8 @@
               },
               "cmsisDapTransport": {
                 "type": "string",
-                "description": "CMSIS-DAP transport preference; current wired hardware uses HID",
-                "enum": ["auto", "hid", "winusb"],
+                "description": "CMSIS-DAP transport preference; auto prefers v2 WinUSB and falls back to HID",
+                "enum": ["auto", "cmsis-dap-v2", "cmsis-dap", "hid", "winusb"],
                 "default": "auto"
               },
               "cmsisDapSerial": {
@@ -171,6 +171,11 @@
               "cmsisDapPid": {
                 "type": "string",
                 "description": "Optional CMSIS-DAP USB product ID selector",
+                "default": ""
+              },
+              "cmsisDapPath": {
+                "type": "string",
+                "description": "Optional CMSIS-DAP device interface path selector",
                 "default": ""
               },
               "cmsisDapFlashAlgorithmPath": {

@@ -95,11 +95,11 @@ async function main() {
         throw new Error(`readMemoryBatch failed: ${JSON.stringify(batch)}`);
       }
 
-      const rttStart = await request('startRtt', {});
+      const rttStart = await request('startRtt', { controlBlockAddress: 0x20000100 });
       const rttRead = await request('readRtt', { bufferIndex: 0, size: 16 });
       const rttStop = await request('stopRtt', {});
       if (!rttStart.ok || !rttRead.ok || !rttStop.ok
-          || Buffer.from(rttRead.data.bytesBase64, 'base64').toString('utf8') !== 'RTT') {
+          || Buffer.from(rttRead.data.bytesBase64, 'base64').toString('utf8') !== 'MEM') {
         throw new Error(`RTT lifecycle failed: ${JSON.stringify({ rttStart, rttRead, rttStop })}`);
       }
 
@@ -317,6 +317,19 @@ async function main() {
         address: 0xFFFF0004,
         bytesBase64: Buffer.from([0]).toString('base64'),
       });
+    }
+
+    const rttControlBlock = argument('rtt-control', undefined);
+    if (!useMock && rttControlBlock !== undefined) {
+      const controlBlockAddress = Number(rttControlBlock) >>> 0;
+      const rttSize = Number(argument('rtt-size', '64'));
+      const rttStart = await request('startRtt', { controlBlockAddress });
+      const rttRead = await request('readRtt', { bufferIndex: 1, size: rttSize });
+      const rttStop = await request('stopRtt', {});
+      if (!rttStart.ok || !rttRead.ok || !rttStop.ok || rttRead.elapsedMs > 1000) {
+        throw new Error(`hardware RTT lifecycle failed: ${JSON.stringify({ rttStart, rttRead, rttStop })}`);
+      }
+      console.log(`hardware RTT: start=${rttStart.elapsedMs} ms read=${rttRead.elapsedMs} ms bytes=${Buffer.from(rttRead.data.bytesBase64, 'base64').length}`);
     }
   } else {
     const unknown = await request('notARealMethod');

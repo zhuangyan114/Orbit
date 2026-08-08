@@ -256,6 +256,7 @@ class MockCmsisDapTransport : public CmsisDapTransport {
                : 0;
   }
   bool deviceLost() const override { return lost_; }
+  TransportIoCounters ioCounters() const override { return ioCounters_; }
 
   // Mock target introspection used by the helper self-test.
   const MockSwdState& targetState() const { return state_; }
@@ -329,6 +330,7 @@ class MockCmsisDapTransport : public CmsisDapTransport {
   std::vector<uint8_t> lastBlockRequest_;
   std::vector<uint8_t> commandHistory_;
   MockFlashAlgorithmRequest preparedFlashAlgorithm_;
+  TransportIoCounters ioCounters_;
 };
 
 }  // namespace cmsis_dap_helper

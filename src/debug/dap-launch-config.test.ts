@@ -73,7 +73,7 @@ describe('DAP launch probe configuration', () => {
 
   it('rejects an explicitly invalid CMSIS-DAP transport instead of falling back to auto', () => {
     expect(() => normalizeDapLaunchConfig({ cmsisDapTransport: 'usb' })).toThrowError(
-      'InvalidConfiguration: cmsisDapTransport must be one of auto, hid, or winusb; received "usb"',
+      'InvalidConfiguration: cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, or winusb; received "usb"',
     );
   });
 

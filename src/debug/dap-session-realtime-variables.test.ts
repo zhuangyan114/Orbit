@@ -16,6 +16,9 @@ describe('DapSession realtime variable arbitration', () => {
     const evaluated: string[] = [];
     const backend = {
       async execute(command: any) {
+        if (command.cmd === 'prepareFastDataSampling') {
+          return { ok: true, data: command.expressions.map((expression: string) => ({ expression, error: 'unsupported' })) };
+        }
         if (command.cmd === 'evaluateExpression') {
           evaluated.push(command.expression);
           return { ok: true, data: { expression: command.expression, value: 1, display: '1', hex: '0x1' } };
@@ -113,6 +116,144 @@ describe('DapSession realtime variable arbitration', () => {
     ]);
   });
 
+  it('batches fast scalar Watch reads without replacing expanded expressions', async () => {
+    const commands: any[] = [];
+    const backend = {
+      async execute(command: any) {
+        commands.push(command);
+        if (command.cmd === 'prepareFastDataSampling') {
+          return {
+            ok: true,
+            data: [
+              { expression: 'a', spec: { expression: 'a', address: 0x20000000, size: 4 } },
+              { expression: 'b', spec: { expression: 'b', address: 0x20000004, size: 4 } },
+            ],
+          };
+        }
+        if (command.cmd === 'readFastDataSampling') {
+          return {
+            ok: true,
+            data: command.specs.map((spec: any, index: number) => ({
+              expression: spec.expression,
+              value: index + 1,
+              display: `${index + 1}`,
+              hex: `0x${index + 1}`,
+            })),
+          };
+        }
+        if (command.cmd === 'evaluateExpression' && command.expression === 'root') {
+          return {
+            ok: true,
+            data: { expression: 'root', value: 3, display: 'root', hex: '0x3', children: [{ expression: 'child', value: 4 }] },
+          };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}:${command.expression || ''}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).setTargetRunning(true);
+
+    const results = await (session as any).readWatchExpressions(['a', 'b', 'root'], true, ['root']);
+
+    expect(commands.filter(command => command.cmd === 'readFastDataSampling')).toEqual([
+      expect.objectContaining({ cmd: 'readFastDataSampling', priority: 'watch' }),
+    ]);
+    expect(commands.filter(command => command.cmd === 'evaluateExpression').map(command => command.expression)).toEqual(['root']);
+    expect(results).toEqual([
+      expect.objectContaining({ expression: 'a', value: 1 }),
+      expect.objectContaining({ expression: 'b', value: 2 }),
+      expect.objectContaining({ expression: 'root', children: expect.any(Array) }),
+    ]);
+  });
+
+  it('keeps pointer Watch expressions on the semantic evaluator path', async () => {
+    const commands: any[] = [];
+    const backend = {
+      async execute(command: any) {
+        commands.push(command);
+        if (command.cmd === 'prepareFastDataSampling') {
+          return {
+            ok: true,
+            data: [
+              { expression: 'text', spec: { expression: 'text', address: 0x20000000, size: 4, format: { kind: 'pointer' } } },
+              { expression: 'a', spec: { expression: 'a', address: 0x20000004, size: 4, format: { kind: 'base' } } },
+              { expression: 'b', spec: { expression: 'b', address: 0x20000008, size: 4, format: { kind: 'base' } } },
+            ],
+          };
+        }
+        if (command.cmd === 'readFastDataSampling') {
+          return {
+            ok: true,
+            data: command.specs.map((spec: any, index: number) => ({
+              expression: spec.expression,
+              value: index + 1,
+              display: `${index + 1}`,
+              hex: `0x${index + 1}`,
+            })),
+          };
+        }
+        if (command.cmd === 'evaluateExpression' && command.expression === 'text') {
+          return {
+            ok: true,
+            data: { expression: 'text', value: 0x20000100, display: '"Orbit"', hex: '0x20000100' },
+          };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}:${command.expression || ''}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+
+    const results = await (session as any).readWatchExpressions(['text', 'a', 'b'], true);
+
+    expect(commands.find(command => command.cmd === 'readFastDataSampling')?.specs.map((spec: any) => spec.expression)).toEqual(['a', 'b']);
+    expect(commands.filter(command => command.cmd === 'evaluateExpression').map(command => command.expression)).toEqual(['text']);
+    expect(results[0]).toMatchObject({ expression: 'text', display: '"Orbit"' });
+  });
+
+  it('falls back to ordinary evaluation when one fast Watch item fails', async () => {
+    const evaluated: string[] = [];
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd === 'prepareFastDataSampling') {
+          return {
+            ok: true,
+            data: command.expressions.map((expression: string, index: number) => ({
+              expression,
+              spec: { expression, address: 0x20000000 + index * 4, size: 4, format: { kind: 'base' } },
+            })),
+          };
+        }
+        if (command.cmd === 'readFastDataSampling') {
+          return {
+            ok: true,
+            data: [
+              { expression: 'a', value: 0, display: '', hex: '', error: 'read failed' },
+              { expression: 'b', value: 2, display: '2', hex: '0x2' },
+            ],
+          };
+        }
+        if (command.cmd === 'evaluateExpression') {
+          evaluated.push(command.expression);
+          return { ok: true, data: { expression: command.expression, value: 7, display: '7', hex: '0x7' } };
+        }
+        throw new Error(`Unexpected command: ${command.cmd}`);
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+
+    const results = await (session as any).readWatchExpressions(['a', 'b'], true);
+
+    expect(evaluated).toEqual(['a']);
+    expect(results).toEqual([
+      expect.objectContaining({ expression: 'a', value: 7 }),
+      expect.objectContaining({ expression: 'b', value: 2 }),
+    ]);
+    expect((session as any).runtimeWatchCache.get('a')).toMatchObject({ value: 7 });
+  });
+
   it('splits Watch batches and lets Timeline read between every slice', async () => {
     const order: string[] = [];
     const forwardedExpanded: string[][] = [];
@@ -121,6 +262,9 @@ describe('DapSession realtime variable arbitration', () => {
     const backend = {
       async execute(command: any) {
         if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
+        if (command.cmd === 'prepareFastDataSampling') {
+          return { ok: true, data: command.expressions.map((expression: string) => ({ expression, error: 'unsupported' })) };
+        }
         if (command.cmd === 'evaluateExpression') {
           order.push(`watch:${command.expression}`);
           forwardedExpanded.push(command.expandedExpressions);

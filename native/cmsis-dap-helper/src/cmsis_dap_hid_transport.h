@@ -133,6 +133,7 @@ class CmsisDapHidTransport : public CmsisDapTransport {
   Result drainInput(std::chrono::milliseconds timeout) override;
   size_t payloadCapacity() const override { return payloadCapacity_; }
   bool deviceLost() const override { return lost_; }
+  TransportIoCounters ioCounters() const override { return ioCounters_; }
 
  private:
   Result markLost(Result result);
@@ -180,6 +181,7 @@ class CmsisDapHidTransport : public CmsisDapTransport {
   // provably cancelled (ERROR_OPERATION_ABORTED). open()/close() reset it.
   enum class WriteTransportMode { InterruptOut, ControlTransfer };
   WriteTransportMode transportMode_ = WriteTransportMode::InterruptOut;
+  TransportIoCounters ioCounters_;
 };
 
 }  // namespace cmsis_dap_helper

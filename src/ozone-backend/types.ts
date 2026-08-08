@@ -1,5 +1,5 @@
 export type DebugProbe = 'jlink' | 'cmsis-dap';
-export type CmsisDapTransport = 'auto' | 'hid' | 'winusb';
+export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb';
 
 export interface DebugProbeLaunchConfig {
   probe?: DebugProbe;
@@ -7,6 +7,7 @@ export interface DebugProbeLaunchConfig {
   cmsisDapSerial?: string;
   cmsisDapVid?: string;
   cmsisDapPid?: string;
+  cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
   flashBeforeDebug?: boolean;
 }
@@ -97,6 +98,13 @@ export interface FastDataSampleSpec {
   typeName?: string;
   isFloat?: boolean;
   signed?: boolean;
+  format?: {
+    kind?: string;
+    encoding?: string;
+    name?: string;
+    typeName?: string;
+    enumerators?: Array<{ name: string; value: string }>;
+  };
 }
 
 export interface FastDataSamplePlanItem {
@@ -173,18 +181,27 @@ export type OzoneCommand =
   }
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }
+  | { cmd: 'resolveSymbol'; name: string }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
   | { cmd: 'evaluateExpression'; expression: string; force?: boolean; expandedExpressions?: string[]; signal?: AbortSignal }
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
-  | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[] }
+  | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[]; priority?: 'watch' | 'timeline' }
+  | { cmd: 'getPerformanceDiagnostics' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
   | { cmd: 'startRtt'; controlBlockAddress?: number }
   | { cmd: 'stopRtt' }
-  | { cmd: 'readRtt'; bufferIndex: number; size: number };
+  | { cmd: 'readRtt'; bufferIndex: number; size: number; signal?: AbortSignal };
 
 export type OzoneCommandResult =
-  | { ok: true; data: unknown }
+  | {
+    ok: true;
+    data: unknown;
+    message?: string;
+    diagnostics?: Record<string, unknown>;
+    targetState?: string;
+    elapsedMs?: number;
+  }
   | {
     ok: false;
     error: string;

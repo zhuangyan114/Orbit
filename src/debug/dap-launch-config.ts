@@ -9,6 +9,7 @@ export interface NormalizedDapLaunchConfig {
   cmsisDapSerial?: string;
   cmsisDapVid?: string;
   cmsisDapPid?: string;
+  cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
   flashBeforeDebug: boolean;
   runToEntryPoint?: string | false;
@@ -24,7 +25,7 @@ export class DapLaunchConfigError extends Error {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'probe'
       ? 'jlink or cmsis-dap'
-      : 'auto, hid, or winusb';
+      : 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb';
     super(`InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
     this.name = 'DapLaunchConfigError';
     Object.setPrototypeOf(this, DapLaunchConfigError.prototype);
@@ -40,6 +41,8 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
   }
   if (args.cmsisDapTransport !== undefined
     && args.cmsisDapTransport !== 'auto'
+    && args.cmsisDapTransport !== 'cmsis-dap-v2'
+    && args.cmsisDapTransport !== 'cmsis-dap'
     && args.cmsisDapTransport !== 'hid'
     && args.cmsisDapTransport !== 'winusb') {
     throw new DapLaunchConfigError('cmsisDapTransport', args.cmsisDapTransport);
@@ -55,7 +58,7 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
   }
 
-  for (const field of ['cmsisDapSerial', 'cmsisDapVid', 'cmsisDapPid', 'cmsisDapFlashAlgorithmPath'] as const) {
+  for (const field of ['cmsisDapSerial', 'cmsisDapVid', 'cmsisDapPid', 'cmsisDapPath', 'cmsisDapFlashAlgorithmPath'] as const) {
     const value = typeof args[field] === 'string' ? args[field].trim() : '';
     if (value) config[field] = value;
   }
@@ -71,6 +74,7 @@ export function applyNormalizedDapLaunchConfig(
   config.cmsisDapSerial = targetConfig.cmsisDapSerial;
   config.cmsisDapVid = targetConfig.cmsisDapVid;
   config.cmsisDapPid = targetConfig.cmsisDapPid;
+  config.cmsisDapPath = targetConfig.cmsisDapPath;
   config.cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath;
   config.flashBeforeDebug = targetConfig.flashBeforeDebug;
   if (targetConfig.runToEntryPoint === undefined) delete config.runToEntryPoint;

@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -14,6 +15,7 @@
 #include <windows.h>
 
 #include "cmsis_dap_hid_transport.h"
+#include "cmsis_dap_winusb_transport.h"
 #include "cmsis_dap_protocol.h"
 #include "cmsis_dap_target.h"
 #include "cmsis_dap_transport.h"
@@ -23,6 +25,7 @@
 #include "fpb_breakpoint.h"
 #include "json_rpc.h"
 #include "mock_transport.h"
+#include "segger_rtt.h"
 #include "trace_control.h"
 
 namespace cmsis_dap_helper {
@@ -40,6 +43,9 @@ constexpr uint32_t kStm32F4FlashCr = 0x40023C10u;
 constexpr uint32_t kMaxMemoryReadBytes = 65536;
 constexpr uint32_t kMaxMemoryWriteBytes = 65536;
 constexpr uint32_t kMaxMemoryBlockWords = 16384;
+constexpr size_t kMaxMemoryBatchReads = 1024;
+constexpr uint64_t kMaxMemoryBatchBytes = 65536;
+constexpr size_t kMaxMemoryBatchRequestBytes = 131072;
 
 void diag(const std::string& message) {
   std::cerr << "[cmsis-dap-helper] " << message << std::endl;
@@ -57,7 +63,9 @@ std::optional<std::string> stringField(const JsonValue& params, const char* key)
 
 std::optional<uint64_t> uintField(const JsonValue& params, const char* key) {
   const JsonValue* value = params.get(key);
-  if (!value || value->kind != JsonValue::Kind::Number) return std::nullopt;
+  if (!value || value->kind != JsonValue::Kind::Number || !std::isfinite(value->number) ||
+      value->number < 0 || value->number > static_cast<double>(UINT64_MAX) ||
+      value->number != std::floor(value->number)) return std::nullopt;
   return static_cast<uint64_t>(value->number);
 }
 
@@ -173,6 +181,7 @@ struct Channel {
   uint32_t flashPageSize = 0;
   std::vector<uint8_t> flashPageData;
   FpbState fpbState;
+  SeggerRttReader rttReader;
 
   void clearFlashPageBuffer() {
     flashPageBufferValid = false;
@@ -192,6 +201,7 @@ struct Channel {
   void clearDebugResourceState() {
     debugPowerReady = false;
     fpbState.reset();
+    rttReader.stop();
   }
 
   std::string state() const {
@@ -231,14 +241,65 @@ Result ensureDebugPower(Channel& channel, CmsisDapTarget& target,
   return result;
 }
 
-// Creates the transport for the requested name. "hid" is the real Windows
-// CMSIS-DAP v1 transport; "mock" is the in-memory transport used by mock
-// tests. WinUSB is rejected before this point with kTransportNotSupported.
+// Creates one physical transport owner. "auto" is resolved by the handlers
+// after enumeration so WinUSB is preferred without creating two open owners.
 std::unique_ptr<CmsisDapTransport> createTransport(const std::string& name, std::string& error) {
   if (name == "hid") return std::make_unique<CmsisDapHidTransport>();
+  if (name == "winusb" || name == "cmsis-dap-v2") return std::make_unique<CmsisDapWinUsbTransport>();
   if (name == "mock") return std::make_unique<MockCmsisDapTransport>();
   error = "transport '" + name + "' is not implemented yet";
   return nullptr;
+}
+
+Result enumeratePreferred(const std::string& requested, const DeviceSelector& selector,
+                          std::unique_ptr<CmsisDapTransport>& selected,
+                          std::vector<DeviceDescriptor>& devices, std::string& chosen) {
+  const std::vector<std::string> candidates =
+      requested == "auto" ? std::vector<std::string>{"winusb", "hid"}
+                           : std::vector<std::string>{requested == "cmsis-dap-v2" ? "winusb" :
+                                                       requested == "cmsis-dap" ? "hid" : requested};
+  Result last = Result::error(ErrorCodes::kDeviceNotFound, "no matching CMSIS-DAP device found");
+  for (const std::string& name : candidates) {
+    std::string error;
+    auto candidate = createTransport(name, error);
+    if (!candidate) {
+      last = Result::error(ErrorCodes::kTransportNotSupported, error);
+      if (requested != "auto") return last;
+      continue;
+    }
+    std::vector<DeviceDescriptor> found;
+    const Result result = candidate->enumerate(selector, found);
+    if (!result.ok) {
+      last = result;
+      if (requested != "auto") return last;
+      continue;
+    }
+    if (found.empty()) {
+      last = Result::error(ErrorCodes::kDeviceNotFound, "no matching CMSIS-DAP device found");
+      continue;
+    }
+    const bool unfiltered = selector.path.empty() && selector.vid.empty() && selector.pid.empty() &&
+                            selector.serial.empty() && selector.product.empty();
+    if (requested == "auto" && unfiltered) {
+      found.erase(std::remove_if(found.begin(), found.end(), [](const DeviceDescriptor& device) {
+                    return !isCmsisDapProbeName(device.product) &&
+                           !isCmsisDapProbeName(device.manufacturer) &&
+                           !isCmsisDapProbeName(device.serial);
+                  }), found.end());
+      if (found.empty()) continue;
+    }
+    selected = std::move(candidate);
+    devices = std::move(found);
+    chosen = name;
+    return Result::success();
+  }
+  if (last.errorCode == ErrorCodes::kDeviceNotFound) {
+    chosen = requested == "auto" ? "hid" :
+             requested == "cmsis-dap-v2" ? "winusb" :
+             requested == "cmsis-dap" ? "hid" : requested;
+    return Result::success();
+  }
+  return last;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,11 +313,11 @@ std::string handleHello(const JsonValue& params) {
       "{\"protocol\":" + std::to_string(kProtocolVersion) +
       ",\"helperVersion\":\"" + kHelperVersion +
       "\",\"platform\":\"" + kPlatform +
-      "\",\"capabilities\":[\"enumDevices\",\"hidTransport\",\"dapInfo\",\"dapConnect\","
+      "\",\"capabilities\":[\"enumDevices\",\"hidTransport\",\"winusbTransport\",\"dapInfo\",\"dapConnect\","
       "\"dapDisconnect\",\"dapTransfer\",\"dapTransferBlock\",\"swDp\",\"memAp\","
-      "\"readMemory\",\"readMemoryBlock\",\"writeMemory\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
+      "\"readMemory\",\"readMemoryBatch\",\"readMemoryBlock\",\"writeMemory\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
       "\"reset\",\"stepInstruction\",\"readRegister\",\"hardwareBreakpoints\",\"runToAddress\","
-       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\"]}";
+       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\"]}";
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
   if (clientProtocol != static_cast<uint64_t>(kProtocolVersion)) {
@@ -276,17 +337,6 @@ std::string handleEnumDevices(const JsonValue& params, Channel& channel) {
   const auto started = std::chrono::steady_clock::now();
   std::string transportName = stringField(params, "transport").value_or(channel.requestedTransport);
   if (transportName.empty()) transportName = "hid";
-  if (transportName == "winusb") {
-    return resultJson(false, "CMSIS-DAP v2/WinUSB transport is not implemented in this stage",
-                      channel.state(), 0, "{}", ErrorCodes::kTransportNotSupported,
-                      "{\"transport\":\"winusb\",\"implemented\":[\"hid\"]}");
-  }
-  std::string error;
-  std::unique_ptr<CmsisDapTransport> transport = createTransport(transportName, error);
-  if (!transport) {
-    return resultJson(false, error, channel.state(), 0, "{}", ErrorCodes::kTransportNotSupported,
-                      "{\"transport\":\"" + jsonEscape(transportName) + "\"}");
-  }
   DeviceSelector selector;
   const std::optional<std::string> vid = stringField(params, "vid");
   const std::optional<std::string> pid = stringField(params, "pid");
@@ -300,7 +350,9 @@ std::string handleEnumDevices(const JsonValue& params, Channel& channel) {
   if (path) selector.path = *path;
 
   std::vector<DeviceDescriptor> devices;
-  const Result result = transport->enumerate(selector, devices);
+  std::unique_ptr<CmsisDapTransport> transport;
+  std::string chosenTransport;
+  const Result result = enumeratePreferred(transportName, selector, transport, devices, chosenTransport);
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
   if (!result.ok) {
@@ -319,11 +371,18 @@ std::string handleEnumDevices(const JsonValue& params, Channel& channel) {
         ",\"outputReportLength\":" + std::to_string(d.outputReportLength) +
         ",\"reportId\":" + std::to_string(d.reportId) +
         ",\"usagePage\":" + std::to_string(d.usagePage) + ",\"usage\":" + std::to_string(d.usage) +
-        ",\"transport\":\"" + jsonEscape(d.transport) + "\"}";
+        ",\"transport\":\"" + jsonEscape(d.transport) + "\""
+        ",\"interfaceNumber\":" + std::to_string(d.interfaceNumber) +
+        ",\"bulkInEndpoint\":" + std::to_string(d.bulkInEndpoint) +
+        ",\"bulkOutEndpoint\":" + std::to_string(d.bulkOutEndpoint) +
+        ",\"bulkInMaxPacketSize\":" + std::to_string(d.bulkInMaxPacketSize) +
+        ",\"bulkOutMaxPacketSize\":" + std::to_string(d.bulkOutMaxPacketSize) +
+        ",\"protocolPacketSize\":" + std::to_string(d.protocolPacketSize) + "}";
   }
   devicesJson += "]";
   return resultJson(true, "enumerated " + std::to_string(devices.size()) + " device(s)",
-                    channel.state(), elapsedMs, "{\"devices\":" + devicesJson + "}");
+                    channel.state(), elapsedMs, "{\"devices\":" + devicesJson + "}", "",
+                    "{\"transport\":\"" + jsonEscape(chosenTransport) + "\"}");
 }
 
 std::string handleOpen(const JsonValue& params, Channel& channel) {
@@ -334,17 +393,6 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
   }
   std::string transportName = stringField(params, "transport").value_or(channel.requestedTransport);
   if (transportName.empty()) transportName = "hid";
-  if (transportName == "winusb") {
-    return resultJson(false, "CMSIS-DAP v2/WinUSB transport is not implemented in this stage",
-                      channel.state(), 0, "{}", ErrorCodes::kTransportNotSupported,
-                      "{\"transport\":\"winusb\",\"implemented\":[\"hid\"]}");
-  }
-  std::string error;
-  std::unique_ptr<CmsisDapTransport> transport = createTransport(transportName, error);
-  if (!transport) {
-    return resultJson(false, error, channel.state(), 0, "{}", ErrorCodes::kTransportNotSupported,
-                      "{\"transport\":\"" + jsonEscape(transportName) + "\"}");
-  }
   DeviceSelector selector;
   const std::optional<std::string> vid = stringField(params, "vid");
   const std::optional<std::string> pid = stringField(params, "pid");
@@ -356,7 +404,9 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
   if (path) selector.path = *path;
 
   std::vector<DeviceDescriptor> devices;
-  Result result = transport->enumerate(selector, devices);
+  std::unique_ptr<CmsisDapTransport> transport;
+  std::string chosenTransport;
+  Result result = enumeratePreferred(transportName, selector, transport, devices, chosenTransport);
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
   if (!result.ok) {
@@ -364,7 +414,7 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
                       "{\"transport\":\"" + jsonEscape(transportName) + "\"}");
   }
   if (devices.empty()) {
-    return resultJson(false, "no matching CMSIS-DAP HID device found", channel.state(), elapsedMs, "{}",
+      return resultJson(false, "no matching CMSIS-DAP device found", channel.state(), elapsedMs, "{}",
                       ErrorCodes::kDeviceNotFound,
                       "{\"transport\":\"" + jsonEscape(transportName) + "\"}");
   }
@@ -398,6 +448,7 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
                       "{\"transport\":\"" + jsonEscape(transportName) + "\"}");
   }
   channel.transport = std::move(transport);
+  transportName = chosenTransport;
   channel.device = device;
   channel.opened = true;
   channel.connected = false;
@@ -405,7 +456,7 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
   // not flush its report buffer on open). Best-effort.
   channel.transport->drainInput(std::chrono::milliseconds(100));
   diag("opened device vid=" + device.vid + " pid=" + device.pid + " product=" + device.product +
-       " serial=" + device.serial + " inputReportLength=" + std::to_string(device.inputReportLength) +
+       " serial=" + device.serial + " transport=" + chosenTransport + " inputReportLength=" + std::to_string(device.inputReportLength) +
        " outputReportLength=" + std::to_string(device.outputReportLength) +
        " reportId=" + std::to_string(device.reportId));
   return resultJson(
@@ -416,7 +467,12 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
           "\",\"serial\":\"" + jsonEscape(device.serial) + "\",\"inputReportLength\":" +
           std::to_string(device.inputReportLength) + ",\"outputReportLength\":" +
           std::to_string(device.outputReportLength) + ",\"reportId\":" +
-          std::to_string(device.reportId) + ",\"transport\":\"" + jsonEscape(transportName) + "\"}");
+          std::to_string(device.reportId) + ",\"transport\":\"" + jsonEscape(transportName) + "\",\"interfaceNumber\":" +
+          std::to_string(device.interfaceNumber) + ",\"bulkInEndpoint\":" + std::to_string(device.bulkInEndpoint) +
+          ",\"bulkOutEndpoint\":" + std::to_string(device.bulkOutEndpoint) + ",\"bulkInMaxPacketSize\":" +
+          std::to_string(device.bulkInMaxPacketSize) + ",\"bulkOutMaxPacketSize\":" +
+          std::to_string(device.bulkOutMaxPacketSize) + ",\"protocolPacketSize\":" +
+          std::to_string(device.protocolPacketSize) + "}");
 }
 
 Result claimFpbOwnership(CmsisDapTarget& target, CortexMDebug& debug,
@@ -504,6 +560,8 @@ std::string packetSizeSourceName(PacketSizeSource source) {  switch (source) {
       return "protocol-info";
     case PacketSizeSource::HidReportCapability:
       return "hid-report-capability";
+    case PacketSizeSource::UsbDescriptor:
+      return "usb-descriptor";
     default:
       return "unavailable";
   }
@@ -629,12 +687,34 @@ std::string handleDisconnect(Channel& channel) {
 // ---------------------------------------------------------------------------
 
 std::string targetDiagnosticsJson(const DapTransferDiagnostics& diag, uint16_t packetSize) {
+  const uint32_t blockCount = diag.blockReads + diag.blockWrites;
+  const uint32_t transferCount = diag.packets >= blockCount ? diag.packets - blockCount : 0;
   return "{\"chunks\":" + std::to_string(diag.chunks) + ",\"packets\":" +
          std::to_string(diag.packets) + ",\"blockReads\":" + std::to_string(diag.blockReads) +
          ",\"blockWrites\":" + std::to_string(diag.blockWrites) +
+         ",\"dapTransferCount\":" + std::to_string(transferCount) +
+         ",\"dapTransferBlockCount\":" + std::to_string(blockCount) +
          ",\"waitRetries\":" + std::to_string(diag.waitRetries) +
          ",\"faultClears\":" + std::to_string(diag.faultClears) +
-         ",\"packetSize\":" + std::to_string(packetSize) + "}";
+         ",\"packetSize\":" + std::to_string(packetSize) +
+         ",\"usbWriteReports\":" + std::to_string(diag.usbWriteReports) +
+         ",\"usbReadReports\":" + std::to_string(diag.usbReadReports) +
+         ",\"usbReportBytes\":" + std::to_string(diag.usbReportBytes) +
+         ",\"protocolPayloadBytes\":" + std::to_string(diag.protocolPayloadBytes) +
+         ",\"effectiveReadBytes\":" + std::to_string(diag.effectiveReadBytes) +
+         ",\"packedReads\":" + std::to_string(diag.packedReads) +
+         ",\"fallbackReads\":" + std::to_string(diag.fallbackReads) +
+         ",\"transport\":\"" + jsonEscape(diag.transport) + "\"}";
+}
+
+void applyTransportDelta(const TransportIoCounters& before, const TransportIoCounters& after,
+                         DapTransferDiagnostics& diag) {
+  diag.usbWriteReports = after.writeReports - before.writeReports;
+  diag.usbReadReports = after.readReports - before.readReports;
+  diag.usbReportBytes = (after.writeReportBytes - before.writeReportBytes) +
+                        (after.readReportBytes - before.readReportBytes);
+  diag.protocolPayloadBytes = (after.writePayloadBytes - before.writePayloadBytes) +
+                              (after.readPayloadBytes - before.readPayloadBytes);
 }
 
 std::string handleDpRead(const JsonValue& params, Channel& channel) {
@@ -776,8 +856,13 @@ std::string handleReadMemory(const JsonValue& params, Channel& channel) {
   CmsisDapTarget target(&protocol, channel.packetSize);
   DapTransferDiagnostics diag;
   std::vector<uint8_t> bytes;
+  const TransportIoCounters ioBefore = channel.transport->ioCounters();
   const Result result = target.readMemory(static_cast<uint32_t>(*address),
                                           static_cast<uint32_t>(*size), bytes, diag);
+  applyTransportDelta(ioBefore, channel.transport->ioCounters(), diag);
+  diag.transport = channel.transport->transportName();
+  diag.effectiveReadBytes = bytes.size();
+  diag.fallbackReads = 1;
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
   if (!result.ok) {
@@ -794,6 +879,185 @@ std::string handleReadMemory(const JsonValue& params, Channel& channel) {
                     "{\"address\":" + std::to_string(*address) + ",\"size\":" +
                         std::to_string(*size) + ",\"bytes\":" + bytesJson + "}",
                     "", targetDiagnosticsJson(diag, channel.packetSize));
+}
+
+std::string handleReadMemoryBatch(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result readyResult = channel.ensureReady();
+  if (!readyResult.ok) {
+    return resultJson(false, readyResult.message, channel.state(), 0, "{}", readyResult.errorCode);
+  }
+  const JsonValue* readsValue = params.get("reads");
+  const size_t requestBytes = jsonSerialize(params).size();
+  if (!readsValue || readsValue->kind != JsonValue::Kind::Array || readsValue->array.empty() ||
+      readsValue->array.size() > kMaxMemoryBatchReads ||
+      requestBytes > kMaxMemoryBatchRequestBytes) {
+    return resultJson(
+        false,
+        "readMemoryBatch requires reads array in 1.." +
+            std::to_string(kMaxMemoryBatchReads) + " and request size <= " +
+            std::to_string(kMaxMemoryBatchRequestBytes),
+        channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest);
+  }
+
+  struct BatchRead {
+    uint32_t address;
+    uint32_t size;
+  };
+  std::vector<BatchRead> reads;
+  reads.reserve(readsValue->array.size());
+  uint64_t totalBytes = 0;
+  for (size_t index = 0; index < readsValue->array.size(); ++index) {
+    const JsonValue& item = readsValue->array[index];
+    const std::optional<uint64_t> address = uintField(item, "address");
+    const std::optional<uint64_t> size = uintField(item, "size");
+    if (item.kind != JsonValue::Kind::Object || !address || *address > 0xFFFFFFFFull ||
+        !size || *size == 0 || *size > kMaxMemoryReadBytes ||
+        *address + *size > 0x100000000ull || totalBytes + *size > kMaxMemoryBatchBytes) {
+      const std::string diagnostics =
+          "{\"failedIndex\":" + std::to_string(index) +
+          ",\"failedAddress\":" + std::to_string(address.value_or(0)) +
+          ",\"completedReads\":0,\"errorCode\":\"" +
+          std::string(ErrorCodes::kDapInvalidRequest) + "\"}";
+      return resultJson(false,
+                        "readMemoryBatch item " + std::to_string(index) +
+                            " has an invalid address, size, range, or total byte count",
+                        channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest, diagnostics);
+    }
+    reads.push_back({static_cast<uint32_t>(*address), static_cast<uint32_t>(*size)});
+    totalBytes += *size;
+  }
+
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  DapTransferDiagnostics diagnostics;
+  const std::chrono::milliseconds timeout(uintField(params, "timeoutMs").value_or(5000));
+  std::vector<std::vector<uint8_t>> results(reads.size());
+  size_t completedReadCount = 0;
+  const TransportIoCounters ioBefore = channel.transport->ioCounters();
+  auto safeScalar = [&reads](size_t index) {
+    return reads[index].size == 4 && (reads[index].address & 0x03u) == 0;
+  };
+  auto contiguousRunEnd = [&reads](size_t start) {
+    size_t end = start + 1;
+    while (end < reads.size() && reads[end].size == 4 &&
+           (reads[end].address & 0x03u) == 0 &&
+           reads[end].address == reads[end - 1].address + 4u) {
+      ++end;
+    }
+    return end;
+  };
+  auto failBatch = [&](size_t failedIndex, const Result& readResult) {
+    applyTransportDelta(ioBefore, channel.transport->ioCounters(), diagnostics);
+    diagnostics.transport = channel.transport->transportName();
+    failedIndex = std::min(failedIndex, reads.size() - 1);
+    uint64_t effectiveBytes = 0;
+    for (size_t i = 0; i < completedReadCount; ++i) effectiveBytes += results[i].size();
+    diagnostics.effectiveReadBytes = effectiveBytes;
+    std::string diagnosticJson = targetDiagnosticsJson(diagnostics, channel.packetSize);
+    diagnosticJson.pop_back();
+    diagnosticJson += ",\"failedIndex\":" + std::to_string(failedIndex) +
+                      ",\"failedAddress\":" + std::to_string(reads[failedIndex].address) +
+                      ",\"completedReads\":" + std::to_string(completedReadCount) +
+                      ",\"errorCode\":\"" + jsonEscape(readResult.errorCode) + "\"}";
+    const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    return resultJson(false,
+                      "readMemoryBatch failed at index " + std::to_string(failedIndex) +
+                          " address " + hexWord(reads[failedIndex].address) + ": " +
+                          readResult.message,
+                      channel.state(), elapsedMs, "{}", readResult.errorCode, diagnosticJson);
+  };
+
+  size_t index = 0;
+  while (index < reads.size()) {
+    const size_t runEnd = safeScalar(index) ? contiguousRunEnd(index) : index + 1;
+    if (runEnd - index >= 2) {
+      std::vector<uint32_t> words;
+      const Result readResult = target.readMemoryBlock(
+          reads[index].address, static_cast<uint32_t>(runEnd - index), words, diagnostics, timeout);
+      if (!readResult.ok) {
+        for (size_t word = 0; word < words.size() && index + word < runEnd; ++word) {
+          results[index + word] = {
+              static_cast<uint8_t>(words[word] & 0xFF), static_cast<uint8_t>((words[word] >> 8) & 0xFF),
+              static_cast<uint8_t>((words[word] >> 16) & 0xFF), static_cast<uint8_t>((words[word] >> 24) & 0xFF)};
+          ++completedReadCount;
+        }
+        return failBatch(index + words.size(), readResult);
+      }
+      for (size_t word = 0; word < words.size(); ++word) {
+        results[index + word] = {
+            static_cast<uint8_t>(words[word] & 0xFF), static_cast<uint8_t>((words[word] >> 8) & 0xFF),
+            static_cast<uint8_t>((words[word] >> 16) & 0xFF), static_cast<uint8_t>((words[word] >> 24) & 0xFF)};
+      }
+      completedReadCount += words.size();
+      diagnostics.fallbackReads += static_cast<uint32_t>(words.size());
+      index = runEnd;
+      continue;
+    }
+
+    if (safeScalar(index)) {
+      size_t groupEnd = index + 1;
+      while (groupEnd < reads.size() && safeScalar(groupEnd)) {
+        if (contiguousRunEnd(groupEnd) - groupEnd >= 2) break;
+        ++groupEnd;
+      }
+      if (groupEnd - index >= 2) {
+        std::vector<uint32_t> addresses;
+        addresses.reserve(groupEnd - index);
+        for (size_t item = index; item < groupEnd; ++item) addresses.push_back(reads[item].address);
+        std::vector<uint32_t> values;
+        uint32_t packedCompleted = 0;
+        const Result readResult = target.readMemoryScattered32(
+            addresses, values, packedCompleted, diagnostics, timeout);
+        for (size_t item = 0; item < values.size() && index + item < groupEnd; ++item) {
+          const uint32_t value = values[item];
+          results[index + item] = {
+              static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF),
+              static_cast<uint8_t>((value >> 16) & 0xFF), static_cast<uint8_t>((value >> 24) & 0xFF)};
+          ++completedReadCount;
+        }
+        if (!readResult.ok) return failBatch(index + packedCompleted, readResult);
+        index = groupEnd;
+        continue;
+      }
+    }
+
+    std::vector<uint8_t> bytes;
+    const Result readResult = target.readMemory(reads[index].address, reads[index].size,
+                                                bytes, diagnostics);
+    if (!readResult.ok) return failBatch(index, readResult);
+    results[index] = std::move(bytes);
+    ++completedReadCount;
+    ++diagnostics.fallbackReads;
+    ++index;
+  }
+  applyTransportDelta(ioBefore, channel.transport->ioCounters(), diagnostics);
+  diagnostics.transport = channel.transport->transportName();
+  diagnostics.effectiveReadBytes = totalBytes;
+  diagnostics.fallbackReads = std::max(diagnostics.fallbackReads,
+                                       static_cast<uint32_t>(reads.size() - diagnostics.packedReads));
+
+  std::string readsJson = "[";
+  for (size_t outputIndex = 0; outputIndex < reads.size(); ++outputIndex) {
+    if (outputIndex > 0) readsJson += ",";
+    readsJson += "{\"address\":" + std::to_string(reads[outputIndex].address) +
+                 ",\"size\":" + std::to_string(reads[outputIndex].size) + ",\"bytes\":[";
+    for (size_t byteIndex = 0; byteIndex < results[outputIndex].size(); ++byteIndex) {
+      if (byteIndex > 0) readsJson += ",";
+      readsJson += std::to_string(results[outputIndex][byteIndex]);
+    }
+    readsJson += "]}";
+  }
+  readsJson += "]";
+  std::string diagnosticJson = targetDiagnosticsJson(diagnostics, channel.packetSize);
+  diagnosticJson.pop_back();
+  diagnosticJson += ",\"completedReads\":" + std::to_string(reads.size()) + "}";
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  return resultJson(true, "memory batch read", channel.state(), elapsedMs,
+                    "{\"reads\":" + readsJson + "}", "", diagnosticJson);
 }
 
 std::string handleReadMemoryBlock(const JsonValue& params, Channel& channel) {
@@ -868,6 +1132,147 @@ std::string handleWriteMemory(const JsonValue& params, Channel& channel) {
                     "{\"address\":" + std::to_string(*address) +
                         ",\"bytesWritten\":" + std::to_string(bytes->size()) + "}",
                     "", targetDiagnosticsJson(diag, channel.packetSize));
+}
+
+class CmsisDapRttMemory final : public RttMemory {
+ public:
+  CmsisDapRttMemory(CmsisDapTarget& target, std::chrono::milliseconds timeout)
+      : target_(target), timeout_(timeout) {}
+
+  Result read(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
+              DapTransferDiagnostics& diagnostics) override {
+    return target_.readMemory(address, size, bytes, diagnostics);
+  }
+
+  Result write(uint32_t address, const std::vector<uint8_t>& bytes,
+               DapTransferDiagnostics& diagnostics) override {
+    return target_.writeMemory(address, bytes, diagnostics, timeout_);
+  }
+
+ private:
+  CmsisDapTarget& target_;
+  std::chrono::milliseconds timeout_;
+};
+
+std::optional<uint32_t> controlTimeoutMs(const JsonValue& params);
+
+std::string rttReadDataJson(const RttReadResult& output) {
+  std::string bytesJson = "[";
+  for (size_t i = 0; i < output.bytes.size(); ++i) {
+    if (i > 0) bytesJson += ",";
+    bytesJson += std::to_string(output.bytes[i]);
+  }
+  bytesJson += "]";
+  return "{\"bytes\":" + bytesJson +
+      ",\"controlBlockAddress\":" + std::to_string(output.controlBlockAddress) +
+      ",\"bufferIndex\":" + std::to_string(output.bufferIndex) +
+      ",\"descriptorAddress\":" + std::to_string(output.descriptorAddress) +
+      ",\"bufferAddress\":" + std::to_string(output.bufferAddress) +
+      ",\"bufferSize\":" + std::to_string(output.bufferSize) +
+      ",\"wrOff\":" + std::to_string(output.wrOff) +
+      ",\"rdOff\":" + std::to_string(output.rdOff) +
+      ",\"flags\":" + std::to_string(output.flags) +
+      ",\"mode\":" + std::to_string(output.mode) +
+      ",\"committedRdOff\":" + std::to_string(output.committedRdOff) +
+      ",\"requestedBytes\":" + std::to_string(output.requestedBytes) +
+      ",\"readBytes\":" + std::to_string(output.readBytes) +
+      ",\"committedBytes\":" + std::to_string(output.committedBytes) +
+      ",\"wrapped\":" + std::string(output.wrapped ? "true" : "false") +
+      ",\"overrun\":" + std::string(output.overrun ? "true" : "false") +
+      ",\"writerAdvanced\":" + std::string(output.writerAdvanced ? "true" : "false") + "}";
+}
+
+std::string rttDiagnosticsJson(const DapTransferDiagnostics& diagnostics, uint16_t packetSize,
+                               const RttReadResult* output = nullptr,
+                               const std::string& extra = "") {
+  std::string json = targetDiagnosticsJson(diagnostics, packetSize);
+  json.pop_back();
+  if (output) json += ",\"rtt\":" + rttReadDataJson(*output);
+  if (!extra.empty()) json += "," + extra;
+  json += "}";
+  return json;
+}
+
+std::string handleStartRtt(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) {
+    return resultJson(false, ready.message, channel.state(), 0, "{}", ready.errorCode,
+                      "{\"operation\":\"startRtt\"}");
+  }
+  const auto address = uintField(params, "controlBlockAddress");
+  const auto timeout = controlTimeoutMs(params);
+  if (!address || *address == 0 || *address > 0xFFFFFFFFull || !timeout) {
+    return resultJson(false, "startRtt requires controlBlockAddress and timeoutMs", channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"startRtt\"}");
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CmsisDapRttMemory memory(target, std::chrono::milliseconds(*timeout));
+  DapTransferDiagnostics diagnostics;
+  const Result result = channel.rttReader.start(memory, static_cast<uint32_t>(*address), diagnostics);
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string extra = "\"operation\":\"startRtt\",\"controlBlockAddress\":" +
+      std::to_string(*address);
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedMs, "{}",
+                      result.errorCode, rttDiagnosticsJson(diagnostics, channel.packetSize, nullptr, extra));
+  }
+  return resultJson(true, "RTT started", channel.state(), elapsedMs,
+                    "{\"controlBlockAddress\":" + std::to_string(*address) + "}", "",
+                    rttDiagnosticsJson(diagnostics, channel.packetSize, nullptr, extra));
+}
+
+std::string handleStopRtt(Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const bool wasStarted = channel.rttReader.started();
+  channel.rttReader.stop();
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  return resultJson(true, wasStarted ? "RTT stopped" : "RTT already stopped",
+                    channel.state(), elapsedMs, "{\"started\":false}");
+}
+
+std::string handleReadRtt(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  if (!channel.rttReader.started()) {
+    return resultJson(false, "RTT is not started", channel.state(), 0, "{}",
+                      ErrorCodes::kRttStopped, "{\"operation\":\"readRtt\"}");
+  }
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) {
+    return resultJson(false, ready.message, channel.state(), 0, "{}",
+                      ErrorCodes::kRttOwnerLost, "{\"operation\":\"readRtt\",\"cause\":\"" +
+                          jsonEscape(ready.errorCode) + "\"}");
+  }
+  const auto bufferIndex = uintField(params, "bufferIndex");
+  const auto size = uintField(params, "size");
+  const auto timeout = controlTimeoutMs(params);
+  if (!bufferIndex || *bufferIndex > 0xFFFFFFFFull || !size || *size == 0 ||
+      *size > 65536 || !timeout) {
+    return resultJson(false, "readRtt requires bufferIndex and size in 1..65536", channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"readRtt\"}");
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CmsisDapRttMemory memory(target, std::chrono::milliseconds(*timeout));
+  DapTransferDiagnostics diagnostics;
+  RttReadResult output;
+  const Result result = channel.rttReader.read(memory, static_cast<uint32_t>(*bufferIndex),
+                                               static_cast<uint32_t>(*size), output, diagnostics);
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string extra = "\"operation\":\"readRtt\"";
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedMs, "{}",
+                      result.errorCode, rttDiagnosticsJson(diagnostics, channel.packetSize, &output, extra));
+  }
+  return resultJson(true, output.bytes.empty() ? "RTT empty read" : "RTT read",
+                    channel.state(), elapsedMs, rttReadDataJson(output), "",
+                    rttDiagnosticsJson(diagnostics, channel.packetSize, &output, extra));
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,10 +2295,18 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
     result = handleApWrite(*params, channel);
   } else if (name == "readMemory") {
     result = handleReadMemory(*params, channel);
+  } else if (name == "readMemoryBatch") {
+    result = handleReadMemoryBatch(*params, channel);
   } else if (name == "readMemoryBlock") {
     result = handleReadMemoryBlock(*params, channel);
   } else if (name == "writeMemory") {
     result = handleWriteMemory(*params, channel);
+  } else if (name == "startRtt") {
+    result = handleStartRtt(*params, channel);
+  } else if (name == "stopRtt") {
+    result = handleStopRtt(channel);
+  } else if (name == "readRtt") {
+    result = handleReadRtt(*params, channel);
   } else if (name == "flashAlgorithm") {
     result = handleFlashAlgorithm(*params, channel);
   } else if (name == "getState") {
@@ -2030,6 +2443,117 @@ class FakeHidIo : public HidIo {
   int eventCounter_ = 0;
 };
 
+class FakeWinUsbIo : public WinUsbIo {
+ public:
+  Result enumerate(const DeviceSelector& selector, std::vector<DeviceDescriptor>& out) override {
+    ++enumerateCalls;
+    out.clear();
+    DeviceDescriptor device;
+    device.path = "\\\\?\\usb#vid_1234&pid_5678#WINUSB-1";
+    device.vid = "1234";
+    device.pid = "5678";
+    device.serial = "WINUSB-1";
+    device.transport = "winusb";
+    device.protocolPacketSize = protocolPacketSize;
+    if (!selector.vid.empty() && selector.vid != device.vid) return Result::success();
+    out.push_back(device);
+    return Result::success();
+  }
+  HANDLE createEvent() override { return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x8100)); }
+  HANDLE createFile(const wchar_t*) override { return fileHandle; }
+  BOOL initialize(HANDLE, WINUSB_INTERFACE_HANDLE& handle, DWORD& error) override {
+    error = initializeError;
+    handle = initializeResult ? interfaceHandle : nullptr;
+    return initializeResult;
+  }
+  BOOL queryInterfaceSettings(WINUSB_INTERFACE_HANDLE, USB_INTERFACE_DESCRIPTOR& descriptor,
+                              DWORD& error) override {
+    error = ERROR_SUCCESS;
+    descriptor = USB_INTERFACE_DESCRIPTOR{};
+    descriptor.bInterfaceNumber = 2;
+    descriptor.bNumEndpoints = 2;
+    return TRUE;
+  }
+  BOOL queryPipe(WINUSB_INTERFACE_HANDLE, UCHAR index, WINUSB_PIPE_INFORMATION& pipe,
+                 DWORD& error) override {
+    error = ERROR_SUCCESS;
+    pipe = WINUSB_PIPE_INFORMATION{};
+    pipe.PipeType = UsbdPipeTypeBulk;
+    pipe.PipeId = index == 0 ? 0x81 : 0x02;
+    pipe.MaximumPacketSize = index == 0 ? 64 : 512;
+    return TRUE;
+  }
+  BOOL writePipe(WINUSB_INTERFACE_HANDLE, UCHAR endpoint, PUCHAR buffer, ULONG length,
+                 PULONG transferred, LPOVERLAPPED, DWORD& error) override {
+    ++writeCalls;
+    lastWriteEndpoint = endpoint;
+    lastWrite.assign(buffer, buffer + length);
+    *transferred = writeBytes == UINT32_MAX ? length : writeBytes;
+    error = writeError;
+    return writeResult;
+  }
+  BOOL readPipe(WINUSB_INTERFACE_HANDLE, UCHAR endpoint, PUCHAR buffer, ULONG capacity,
+                PULONG transferred, LPOVERLAPPED, DWORD& error) override {
+    ++readCalls;
+    lastReadEndpoint = endpoint;
+    if (!queuedReads.empty()) {
+      readData = queuedReads.front();
+      queuedReads.pop_front();
+    }
+    const ULONG count = static_cast<ULONG>(std::min<size_t>(readData.size(), capacity));
+    if (count > 0) std::memcpy(buffer, readData.data(), count);
+    *transferred = count;
+    error = readError;
+    return readResult;
+  }
+  BOOL abortPipe(WINUSB_INTERFACE_HANDLE, UCHAR endpoint, DWORD& error) override {
+    ++abortCalls;
+    abortedEndpoint = endpoint;
+    error = abortError;
+    return abortResult;
+  }
+  BOOL getOverlappedResult(HANDLE, LPOVERLAPPED, LPDWORD transferred, BOOL,
+                           DWORD& error) override {
+    ++overlappedCalls;
+    *transferred = overlappedBytes;
+    error = overlappedError;
+    return overlappedResult;
+  }
+  DWORD waitForSingleObject(HANDLE, DWORD) override { return waitResult; }
+  BOOL freeInterface(WINUSB_INTERFACE_HANDLE) override { ++freeCalls; return TRUE; }
+  BOOL closeHandle(HANDLE) override { ++closeCalls; return TRUE; }
+
+  HANDLE fileHandle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x8000));
+  WINUSB_INTERFACE_HANDLE interfaceHandle = reinterpret_cast<WINUSB_INTERFACE_HANDLE>(static_cast<uintptr_t>(0x8001));
+  uint16_t protocolPacketSize = 512;
+  BOOL initializeResult = TRUE;
+  DWORD initializeError = ERROR_SUCCESS;
+  BOOL writeResult = TRUE;
+  DWORD writeError = ERROR_SUCCESS;
+  DWORD writeBytes = UINT32_MAX;
+  BOOL readResult = TRUE;
+  DWORD readError = ERROR_SUCCESS;
+  std::vector<uint8_t> readData;
+  std::deque<std::vector<uint8_t>> queuedReads;
+  BOOL abortResult = TRUE;
+  DWORD abortError = ERROR_SUCCESS;
+  BOOL overlappedResult = FALSE;
+  DWORD overlappedError = ERROR_OPERATION_ABORTED;
+  DWORD overlappedBytes = 0;
+  DWORD waitResult = WAIT_OBJECT_0;
+  int enumerateCalls = 0;
+  int writeCalls = 0;
+  int readCalls = 0;
+  int abortCalls = 0;
+  int overlappedCalls = 0;
+  int freeCalls = 0;
+  int closeCalls = 0;
+  UCHAR lastWriteEndpoint = 0;
+  UCHAR lastReadEndpoint = 0;
+  UCHAR abortedEndpoint = 0;
+  std::vector<uint8_t> lastWrite;
+};
+
 // Scriptable wire transport used by the DAP-03 raw-frame golden tests. It
 // records every command the production protocol layer writes to the wire (for
 // golden REQUEST assertions) and replays one hardcoded response frame per
@@ -2078,12 +2602,14 @@ class ScriptedTransport : public CmsisDapTransport {
   Result drainInput(std::chrono::milliseconds /*timeout*/) override { return Result::success(); }
   size_t payloadCapacity() const override { return 64; }
   bool deviceLost() const override { return false; }
+  TransportIoCounters ioCounters() const override { return counters; }
 
   std::vector<uint8_t> lastRequest;
   std::vector<std::vector<uint8_t>> requests;
   std::vector<uint8_t> scripted;
   std::deque<std::vector<uint8_t>> scriptedResponses;
   int writeCalls = 0;
+  TransportIoCounters counters;
 };
 
 int runSelfTest() {
@@ -2315,6 +2841,103 @@ int runSelfTest() {
     expect(io.setOutputReportCalls_ == 0, "write-settle-unknown-never-resent");
   }
 
+  // --- CMSIS-DAP v2 WinUSB transport through the injected backend. ---
+  {
+    FakeWinUsbIo io;
+    CmsisDapWinUsbTransport transport(&io);
+    DeviceSelector selector;
+    std::vector<DeviceDescriptor> devices;
+    expect(transport.enumerate(selector, devices).ok && devices.size() == 1,
+           "winusb-enumerate");
+    expect(transport.open(devices.front()).ok && transport.bulkInEndpoint() == 0x81 &&
+               transport.bulkOutEndpoint() == 0x02 &&
+               transport.bulkInMaxPacketSize() == 64 &&
+               transport.bulkOutMaxPacketSize() == 512,
+           "winusb-endpoint-discovery");
+    expect(transport.payloadCapacity() == 512, "winusb-protocol-packet-size-not-endpoint-size");
+
+    const uint8_t command[] = {0x05, 0x00, 0x01};
+    const Result write = transport.writePacket(command, sizeof(command), std::chrono::milliseconds(5));
+    expect(write.ok && io.writeCalls == 1 && io.lastWriteEndpoint == 0x02 &&
+               io.lastWrite == std::vector<uint8_t>(command, command + sizeof(command)),
+           "winusb-bulk-write-exact-packet");
+    std::vector<uint8_t> oversized(513, 0);
+    expect(transport.writePacket(oversized.data(), oversized.size(),
+                                 std::chrono::milliseconds(5)).errorCode == ErrorCodes::kPacketTooLarge &&
+               io.writeCalls == 1,
+           "winusb-packet-too-large-not-written");
+
+    io.readData = {0x05, 0x01, 0x01, 0x77};
+    uint8_t response[512] = {};
+    size_t responseLength = 0;
+    const Result read = transport.readPacket(response, sizeof(response), responseLength,
+                                             std::chrono::milliseconds(5));
+    expect(read.ok && responseLength == 4 && response[0] == 0x05 && response[3] == 0x77 &&
+               io.lastReadEndpoint == 0x81,
+           "winusb-short-read-preserved");
+
+    io.readData = {0x05, 0x01, 0x01, 0x77, 0x14, 0xA0, 0x2B};
+    CmsisDapProtocol protocol(&transport);
+    std::vector<DapTransferItem> items(1);
+    items[0].rnw = true;
+    uint8_t completed = 0;
+    const Result transfer = protocol.dapTransfer(0, items, std::chrono::milliseconds(5), &completed);
+    expect(transfer.ok && completed == 1 && items[0].readData == 0x2BA01477u &&
+               io.lastWrite == std::vector<uint8_t>({0x05, 0x00, 0x01, 0x02}),
+           "winusb-shares-official-dap-transfer-protocol");
+  }
+  {
+    FakeWinUsbIo io;
+    CmsisDapWinUsbTransport transport(&io);
+    std::vector<DeviceDescriptor> devices;
+    DeviceSelector selector;
+    transport.enumerate(selector, devices);
+    expect(transport.open(devices.front()).ok, "winusb-timeout-open");
+    io.writeResult = FALSE;
+    io.writeError = ERROR_IO_PENDING;
+    io.waitResult = WAIT_TIMEOUT;
+    io.overlappedResult = TRUE;
+    io.overlappedError = ERROR_SUCCESS;
+    io.overlappedBytes = 2;
+    const uint8_t command[] = {0x02, 0x01};
+    const Result late = transport.writePacket(command, sizeof(command), std::chrono::milliseconds(1));
+    expect(!late.ok && late.errorCode == ErrorCodes::kWriteCompletedLate && io.writeCalls == 1,
+           "winusb-late-write-not-resent");
+
+    io.overlappedResult = FALSE;
+    io.overlappedError = ERROR_CRC;
+    const Result unknown = transport.writePacket(command, sizeof(command), std::chrono::milliseconds(1));
+    expect(!unknown.ok && unknown.errorCode == ErrorCodes::kOutcomeUnknown && io.writeCalls == 2,
+           "winusb-unknown-write-not-resent");
+
+    io.overlappedError = ERROR_DEVICE_REMOVED;
+    const Result removed = transport.writePacket(command, sizeof(command), std::chrono::milliseconds(1));
+    expect(!removed.ok && removed.errorCode == ErrorCodes::kDeviceRemoved &&
+               transport.deviceLost() && !transport.isOpen(),
+           "winusb-device-removal-closes-owner");
+    const int writesAfterRemoval = io.writeCalls;
+    expect(transport.writePacket(command, sizeof(command), std::chrono::milliseconds(1)).errorCode ==
+               ErrorCodes::kDeviceRemoved && io.writeCalls == writesAfterRemoval,
+           "winusb-no-io-after-removal");
+  }
+  {
+    FakeWinUsbIo io;
+    CmsisDapWinUsbTransport transport(&io);
+    std::vector<DeviceDescriptor> devices;
+    DeviceSelector selector;
+    transport.enumerate(selector, devices);
+    expect(transport.open(devices.front()).ok, "winusb-drain-open");
+    io.queuedReads = {{0x00, 0x01}, {0x05, 0x00}, {}};
+    expect(transport.drainInput(std::chrono::milliseconds(1)).ok && io.readCalls == 3,
+           "winusb-stale-input-drain");
+    io.readData.assign(513, 0xAA);
+    uint8_t small[4] = {};
+    size_t length = 0;
+    expect(transport.readPacket(small, sizeof(small), length, std::chrono::milliseconds(1)).errorCode ==
+               ErrorCodes::kMalformedResponse,
+           "winusb-malformed-response-capacity");
+  }
+
   // --- DAP-03: DP/AP protocol and target layer against the in-memory mock
   // SWD target. These cases need no real USB device and no JSON-RPC round
   // trip: they drive CmsisDapProtocol + CmsisDapTarget directly. ---
@@ -2386,6 +3009,137 @@ int runSelfTest() {
     expect(mock.injection().blockReadCount == 1 &&
                mock.lastBlockRequest() == std::vector<uint8_t>({0x06, 0x00, 0x03, 0x00, 0x0F}),
            "dap03-vector-block-requests-chunk-minus-one");
+  }
+
+  {
+    // DAP-07 independent packed-read oracle. Three scattered words must fit
+    // in one 64-byte DAP_Transfer, remain in caller order, and contain no AP
+    // DRW write request (0x0D).
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap07-scattered-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const std::vector<uint32_t> addresses = {0x20000008u, 0x20000000u, 0x20000020u};
+    const Result result = target.readMemoryScattered32(
+        addresses, values, completedReads, diag, std::chrono::milliseconds(200));
+    expect(result.ok && completedReads == 3 && values == std::vector<uint32_t>({
+               mockWordAt(0x20000008u), mockWordAt(0x20000000u), mockWordAt(0x20000020u)}),
+           "dap07-scattered-values-preserve-order");
+    expect(diag.packets == 1 && diag.packedReads == 3 && diag.fallbackReads == 0,
+           "dap07-scattered-one-packet-diagnostics");
+    const std::vector<uint8_t> expectedRequest = {
+        0x05, 0x00, 0x0B,
+        0x08, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x12, 0x00, 0x00, 0xA2,
+        0x05, 0x08, 0x00, 0x00, 0x20, 0x0F, 0x0E,
+        0x05, 0x00, 0x00, 0x00, 0x20, 0x0F, 0x0E,
+        0x05, 0x20, 0x00, 0x00, 0x20, 0x0F, 0x0E,
+    };
+    expect(mock.lastTransferRequest() == expectedRequest,
+           "dap07-scattered-hardcoded-request-frame-no-target-write");
+  }
+
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap07-capacity-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> addresses;
+    for (uint32_t i = 0; i < 8; ++i) addresses.push_back(0x20000000u + i * 0x20u);
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const Result result = target.readMemoryScattered32(
+        addresses, values, completedReads, diag, std::chrono::milliseconds(200));
+    expect(result.ok && completedReads == 8 && values.size() == 8 && diag.packets == 2 &&
+               diag.packedReads == 8 && mock.injection().transferCount == 2,
+           "dap07-scattered-64-byte-capacity-splits-7-plus-1");
+  }
+
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "dap07-unaligned-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const Result result = target.readMemoryScattered32(
+        {0x20000001u}, values, completedReads, diag, std::chrono::milliseconds(200));
+    expect(!result.ok && result.errorCode == ErrorCodes::kDapInvalidRequest &&
+               completedReads == 0 && diag.packets == 0,
+           "dap07-scattered-unaligned-rejected-before-io");
+  }
+
+  {
+    // Literal response frame: five transfers completed (one whole scalar),
+    // then WAIT. Repeating it through the bounded retry budget must report
+    // exactly one completed read and never mark later reads successful.
+    ScriptedTransport scripted;
+    for (uint32_t attempt = 0; attempt <= kMaxTransferRetries; ++attempt) {
+      scripted.scriptedResponses.push_back(
+          {0x05, 0x05, 0x02, 0xAA, 0xAA, 0xAA, 0xAA, 0x44, 0x33, 0x22, 0x11});
+    }
+    CmsisDapProtocol protocol(&scripted);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const Result result = target.readMemoryScattered32(
+        {0x20000000u, 0x20000020u}, values, completedReads, diag,
+        std::chrono::milliseconds(200));
+    expect(!result.ok && result.errorCode == ErrorCodes::kDapAckWait &&
+               completedReads == 1 && values == std::vector<uint32_t>({0x11223344u}) &&
+               diag.waitRetries == kMaxTransferRetries,
+           "dap07-scattered-partial-completion-exact");
+  }
+
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5680", mock), "dap07-fault-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const Result result = target.readMemoryScattered32(
+        {0x20000000u, 0x20000020u}, values, completedReads, diag,
+        std::chrono::milliseconds(200));
+    expect(result.ok && completedReads == 2 && values.size() == 2 && diag.faultClears >= 1,
+           "dap07-scattered-fault-clears-and-recovers");
+  }
+
+  {
+    ScriptedTransport scripted;
+    scripted.scripted = {0x05, 0x05, 0x01, 0xAA};
+    CmsisDapProtocol protocol(&scripted);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const Result result = target.readMemoryScattered32(
+        {0x20000000u}, values, completedReads, diag, std::chrono::milliseconds(200));
+    expect(!result.ok && result.errorCode == ErrorCodes::kMalformedResponse &&
+               completedReads == 0 && values.empty(),
+           "dap07-scattered-short-response-rejected");
+  }
+
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5685", mock), "dap07-removal-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+    std::vector<uint32_t> values;
+    uint32_t completedReads = 0;
+    const Result result = target.readMemoryScattered32(
+        {0x20000000u}, values, completedReads, diag, std::chrono::milliseconds(200));
+    expect(!result.ok && result.errorCode == ErrorCodes::kDeviceRemoved &&
+               completedReads == 0 && values.empty() && mock.deviceLost(),
+           "dap07-scattered-device-removal-is-terminal");
   }
 
   {
@@ -3971,7 +4725,7 @@ int runSelfTest() {
   }
 
   std::cout << "{\"selftest\":\"" << (failures == 0 ? "ok" : "fail")
-            << "\",\"cases\":" << 185 << ",\"failures\":" << failures << "}\n"
+            << "\",\"cases\":" << 200 << ",\"failures\":" << failures << "}\n"
             << std::flush;
   return failures == 0 ? 0 : 1;
 }
@@ -3990,7 +4744,7 @@ int run(int argc, char** argv) {
     }
   }
   if (selfTestRequested) return runSelfTest();
-  if (channel.requestedTransport.empty()) channel.requestedTransport = "hid";
+  if (channel.requestedTransport.empty()) channel.requestedTransport = "auto";
   diag("starting helper version=" + std::string(kHelperVersion) + " protocol=" +
        std::to_string(kProtocolVersion) + " defaultTransport=" + channel.requestedTransport);
 

@@ -134,7 +134,9 @@ async function runMockMatrix() {
     && hello.data.capabilities.includes('swDp')
     && hello.data.capabilities.includes('memAp')
     && hello.data.capabilities.includes('readMemory')
-    && hello.data.capabilities.includes('readMemoryBlock'), JSON.stringify(hello.data.capabilities));
+    && hello.data.capabilities.includes('readMemoryBatch')
+    && hello.data.capabilities.includes('readMemoryBlock')
+    && hello.data.capabilities.includes('rtt'), JSON.stringify(hello.data.capabilities));
 
   const enumAll = await request('enumDevices', { transport: 'mock' });
   check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 24,
@@ -148,9 +150,9 @@ async function runMockMatrix() {
   check('open: device not found', !noDevice.ok && noDevice.errorCode === 'DeviceNotFound',
     JSON.stringify(noDevice));
 
-  const winusb = await request('open', { transport: 'winusb' });
-  check('open: winusb unsupported', !winusb.ok && winusb.errorCode === 'TransportNotSupported',
-    JSON.stringify(winusb));
+  const unsupported = await request('open', { transport: 'not-a-transport' });
+  check('open: unsupported transport', !unsupported.ok && unsupported.errorCode === 'TransportNotSupported',
+    JSON.stringify(unsupported));
 
   // --- normal device: official layout happy path ---
   // Covers: official [cmd][len][data] DAP_Info (no info id echo), NUL-
@@ -280,6 +282,87 @@ async function runDap02AMatrix() {
       await closeDevice('dap02a-normal');
       return;
     }
+    const rttControlBlockAddress = 0x20000100;
+    const rttBufferAddress = 0x20001000;
+    const rttHeader = [
+      0x53, 0x45, 0x47, 0x47, 0x45, 0x52, 0x20, 0x52, 0x54, 0x54,
+      0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const rttDescriptor = [
+      0, 0, 0, 0,
+      0, 0x10, 0, 0x20,
+      8, 0, 0, 0,
+      3, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+    ];
+    const rttData = [0x61, 0x62, 0x63];
+    const rttHeaderWrite = await request('writeMemory', {
+      address: rttControlBlockAddress, bytes: rttHeader,
+    });
+    check('dap08: RTT control block fixture written', rttHeaderWrite.ok, JSON.stringify(rttHeaderWrite));
+    const rttDescriptorWrite = await request('writeMemory', {
+      address: rttControlBlockAddress + 24, bytes: rttDescriptor,
+    });
+    check('dap08: RTT descriptor fixture written', rttDescriptorWrite.ok, JSON.stringify(rttDescriptorWrite));
+    const rttDescriptorVerify = await request('readMemory', {
+      address: rttControlBlockAddress + 24, size: rttDescriptor.length,
+    });
+    check('dap08: RTT descriptor fixture readable', rttDescriptorVerify.ok
+      && rttDescriptorVerify.data.bytes.join(',') === rttDescriptor.join(','),
+    JSON.stringify(rttDescriptorVerify));
+    const rttDataWrite = await request('writeMemory', { address: rttBufferAddress, bytes: rttData });
+    check('dap08: RTT data fixture written', rttDataWrite.ok, JSON.stringify(rttDataWrite));
+    const rttStart = await request('startRtt', {
+      controlBlockAddress: rttControlBlockAddress,
+    });
+    check('dap08: startRtt', rttStart.ok && rttStart.data.controlBlockAddress === rttControlBlockAddress,
+      JSON.stringify(rttStart));
+    const rttDescriptorAfterStart = await request('readMemory', {
+      address: rttControlBlockAddress + 24, size: rttDescriptor.length,
+    });
+    check('dap08: RTT descriptor survives start', rttDescriptorAfterStart.ok
+      && rttDescriptorAfterStart.data.bytes.join(',') === rttDescriptor.join(','),
+    JSON.stringify(rttDescriptorAfterStart));
+    const rttRead = await request('readRtt', { bufferIndex: 0, size: 8 });
+    check('dap08: readRtt commits bytes', rttRead.ok
+      && rttRead.data.bytes.join(',') === '97,98,99'
+      && rttRead.data.committedRdOff === 3
+      && rttRead.data.readBytes === 3,
+    JSON.stringify(rttRead));
+    const rttEmpty = await request('readRtt', { bufferIndex: 0, size: 8 });
+    check('dap08: empty read leaves RdOff unchanged', rttEmpty.ok
+      && rttEmpty.data.bytes.length === 0
+      && rttEmpty.data.committedRdOff === 3,
+    JSON.stringify(rttEmpty));
+    const rttRdOff = await request('readMemory', {
+      address: rttControlBlockAddress + 24 + 16, size: 4,
+    });
+    check('dap08: RdOff committed in target memory', rttRdOff.ok
+      && rttRdOff.data.bytes.join(',') === '3,0,0,0', JSON.stringify(rttRdOff));
+    const invalidFlagsWrite = await request('writeMemory', {
+      address: rttControlBlockAddress + 24 + 20, bytes: [4, 0, 0, 0],
+    });
+    check('dap08: invalid RTT Flags fixture written', invalidFlagsWrite.ok, JSON.stringify(invalidFlagsWrite));
+    const invalidFlagsRead = await request('readRtt', { bufferIndex: 0, size: 8 });
+    check('dap08: invalid RTT Flags rejected without bytes', !invalidFlagsRead.ok
+      && invalidFlagsRead.errorCode === 'RttInvalidBufferFlags'
+      && invalidFlagsRead.diagnostics?.rtt?.flags === 4
+      && invalidFlagsRead.diagnostics?.rtt?.mode === 0
+      && invalidFlagsRead.diagnostics?.rtt?.bytes?.length === 0,
+    JSON.stringify(invalidFlagsRead));
+    const rttRdOffAfterInvalidFlags = await request('readMemory', {
+      address: rttControlBlockAddress + 24 + 16, size: 4,
+    });
+    check('dap08: invalid RTT Flags leave RdOff unchanged', rttRdOffAfterInvalidFlags.ok
+      && rttRdOffAfterInvalidFlags.data.bytes.join(',') === '3,0,0,0',
+    JSON.stringify(rttRdOffAfterInvalidFlags));
+    const validFlagsRestore = await request('writeMemory', {
+      address: rttControlBlockAddress + 24 + 20, bytes: [0, 0, 0, 0],
+    });
+    check('dap08: valid RTT Flags restored', validFlagsRestore.ok, JSON.stringify(validFlagsRestore));
+    const rttStop = await request('stopRtt', {});
+    check('dap08: stopRtt', rttStop.ok, JSON.stringify(rttStop));
     const init = await request('flashAlgorithm', flashAlgorithmParams('init', 0x08000000, 0));
     check('dap02a: algorithm init', init.ok && init.data.returnCode === 0, JSON.stringify(init));
     check('dap02a: initial algorithm upload recorded', init.ok
@@ -429,6 +512,46 @@ async function runDap03Matrix() {
     const memWord = await request('readMemory', { address: 0x20000000, size: 4 });
     check('dap03: readMemory 4 bytes', memWord.ok && memWord.data.size === 4
       && bytesMatchPattern(memWord.data.bytes, 0x20000000), JSON.stringify(memWord));
+    const memoryBatch = await request('readMemoryBatch', {
+      reads: [
+        { address: 0x20000008, size: 4 },
+        { address: 0x20000000, size: 4 },
+      ],
+    });
+    check('dap07: readMemoryBatch is one ordered helper RPC', memoryBatch.ok
+      && memoryBatch.data.reads.length === 2
+      && memoryBatch.data.reads[0].address === 0x20000008
+      && memoryBatch.data.reads[1].address === 0x20000000
+      && bytesMatchPattern(memoryBatch.data.reads[0].bytes, 0x20000008)
+      && bytesMatchPattern(memoryBatch.data.reads[1].bytes, 0x20000000)
+      && memoryBatch.diagnostics.packedReads === 2
+      && memoryBatch.diagnostics.fallbackReads === 0
+      && memoryBatch.diagnostics.completedReads === 2,
+    JSON.stringify(memoryBatch));
+    const mixedBatch = await request('readMemoryBatch', {
+      reads: [
+        { address: 0x20000000, size: 4 },
+        { address: 0x20000004, size: 4 },
+        { address: 0x20000013, size: 1 },
+        { address: 0x20000020, size: 4 },
+        { address: 0x20000040, size: 4 },
+      ],
+    });
+    check('dap07: continuous/block/scattered/fallback strategy is mixed safely', mixedBatch.ok
+      && mixedBatch.data.reads.length === 5
+      && mixedBatch.diagnostics.dapTransferBlockCount > 0
+      && mixedBatch.diagnostics.packedReads === 2
+      && mixedBatch.diagnostics.fallbackReads === 3
+      && mixedBatch.diagnostics.effectiveReadBytes === 17,
+    JSON.stringify(mixedBatch));
+    const emptyBatch = await request('readMemoryBatch', { reads: [] });
+    check('dap07: readMemoryBatch rejects an empty request', !emptyBatch.ok
+      && emptyBatch.errorCode === 'DapInvalidRequest', JSON.stringify(emptyBatch));
+    const overflowBatch = await request('readMemoryBatch', {
+      reads: [{ address: 0xFFFFFFFE, size: 4 }],
+    });
+    check('dap07: readMemoryBatch rejects uint32 range overflow', !overflowBatch.ok
+      && overflowBatch.errorCode === 'DapInvalidRequest', JSON.stringify(overflowBatch));
     const memByte = await request('readMemory', { address: 0x20000003, size: 1 });
     check('dap03: readMemory 1 unaligned byte', memByte.ok && memByte.data.bytes.length === 1
       && memByte.data.bytes[0] === mockByteAt(0x20000003), JSON.stringify(memByte));

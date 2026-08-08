@@ -32,6 +32,43 @@ describe('ExperimentalCppJLinkChannel', () => {
 });
 
 describe('CppJLinkHelperClient scheduling', () => {
+  it('routes RTT lifecycle through control and RTT reads through background', async () => {
+    const controlRequest = vi.spyOn(CppJLinkHelperClient.prototype, 'controlRequest').mockResolvedValue({
+      ok: true,
+      message: 'RTT lifecycle completed',
+      targetState: 'Running',
+      elapsedMs: 0,
+      data: {},
+    } as any);
+    const request = vi.spyOn(CppJLinkHelperClient.prototype, 'request').mockResolvedValue({
+      ok: true,
+      message: 'RTT read',
+      targetState: 'Running',
+      elapsedMs: 0,
+      data: { bytesBase64: '' },
+    } as any);
+    const channel = new ExperimentalCppJLinkChannel({ helperPath: 'unused-helper.exe' });
+    (channel as any).nativeConnected = true;
+    const controller = new AbortController();
+
+    try {
+      await channel.startRtt(0x20000100);
+      await channel.stopRtt();
+      await channel.readRtt(0, 4096, { signal: controller.signal });
+
+      expect(controlRequest).toHaveBeenNthCalledWith(1, 'startRtt', { controlBlockAddress: 0x20000100 });
+      expect(controlRequest).toHaveBeenNthCalledWith(2, 'stopRtt', {});
+      expect(request).toHaveBeenCalledWith('readRtt', { bufferIndex: 0, size: 4096 }, {
+        priority: 'background',
+        coalesceKey: 'rtt-read',
+        signal: controller.signal,
+      });
+    } finally {
+      controlRequest.mockRestore();
+      request.mockRestore();
+    }
+  });
+
   it('rejects an already cancelled request before attempting helper I/O', async () => {
     const helper = new CppJLinkHelperClient('unused-helper.exe');
     const controller = new AbortController();

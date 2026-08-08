@@ -14,6 +14,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../utils/logger';
+import { BoundedMetric } from '../utils/bounded-metric';
 import {
   CppJLinkResult,
   NativeStepExecutor,
@@ -92,6 +93,13 @@ export class OzoneBackend {
   private lastNativeStopInfo: NativeStopInfo | null = null;
   private readonly sessionTarget?: SessionTargetOwner | SessionTargetSelector;
   private readonly sessionBreakpointSlots: (number | null)[] = [];
+  private symbolGeneration = 0;
+  private sessionGeneration = 0;
+  private readonly fastPlanCache = new Map<string, FastDataSamplePlanItem[]>();
+  private readonly planBuildElapsed = new BoundedMetric(2_048);
+  private planCacheHit = 0;
+  private planCacheMiss = 0;
+  private planCacheInvalidation = 0;
 
   constructor(
     private readonly nativeStepExecutor?: NativeStepExecutor,
@@ -232,25 +240,36 @@ export class OzoneBackend {
     return result.ok;
   }
 
-  private async targetStartRtt(controlBlockAddress?: number): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.startRtt(controlBlockAddress);
-    const result = await this.sessionTarget.startRtt(controlBlockAddress);
-    return result.ok;
+  private async targetStartRtt(controlBlockAddress?: number): Promise<CppJLinkResult<any>> {
+    if (!this.sessionTarget) {
+      const ok = this.jlink.startRtt(controlBlockAddress);
+      return ok
+        ? { ok: true, message: 'RTT started', targetState: 'Unknown', elapsedMs: 0, data: {} }
+        : { ok: false, message: 'legacy RTT start failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
+    }
+    return this.sessionTarget.startRtt(controlBlockAddress);
   }
 
-  private async targetStopRtt(): Promise<boolean> {
+  private async targetStopRtt(): Promise<CppJLinkResult<any>> {
     if (!this.sessionTarget) {
       this.jlink.stopRtt();
-      return true;
+      return { ok: true, message: 'RTT stopped', targetState: 'Unknown', elapsedMs: 0, data: {} };
     }
-    const result = await this.sessionTarget.stopRtt();
-    return result.ok;
+    return this.sessionTarget.stopRtt();
   }
 
-  private async targetReadRtt(bufferIndex: number, size: number): Promise<Uint8Array | null> {
-    if (!this.sessionTarget) return this.jlink.readRtt(bufferIndex, size);
-    const result = await this.sessionTarget.readRtt(bufferIndex, size);
-    return result.ok && result.data ? result.data.bytes : null;
+  private async targetReadRtt(
+    bufferIndex: number,
+    size: number,
+    signal?: AbortSignal,
+  ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
+    if (!this.sessionTarget) {
+      const bytes = this.jlink.readRtt(bufferIndex, size);
+      return bytes
+        ? { ok: true, message: 'RTT read', targetState: 'Unknown', elapsedMs: 0, data: { bytes } }
+        : { ok: false, message: 'legacy RTT read failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
+    }
+    return this.sessionTarget.readRtt(bufferIndex, size, { priority: 'background', signal });
   }
 
   configureNativeSteps(enabled = true): void {
@@ -268,7 +287,9 @@ export class OzoneBackend {
       if (this.localTargetAccessBlocked()
         && command.cmd !== 'disconnect'
         && command.cmd !== 'loadSymbols'
-        && command.cmd !== 'prepareFastDataSampling') {
+        && command.cmd !== 'resolveSymbol'
+        && command.cmd !== 'prepareFastDataSampling'
+        && command.cmd !== 'getPerformanceDiagnostics') {
         return { ok: false, error: 'Target access is owned by the active ozone DAP session' };
       }
       switch (command.cmd) {
@@ -390,24 +411,69 @@ case 'readVariableRuntime':
         case 'prepareFastDataSampling':
           return { ok: true, data: this.prepareFastDataSampling(command.expressions) };
         case 'readFastDataSampling':
-          return { ok: true, data: await this.readFastDataSampling(command.specs) };
+          return { ok: true, data: await this.readFastDataSampling(command.specs, command.priority) };
+        case 'getPerformanceDiagnostics':
+          return {
+            ok: true,
+            data: {
+              owner: this.targetRegisterSource(),
+              planner: {
+                planCacheHit: this.planCacheHit,
+                planCacheMiss: this.planCacheMiss,
+                planCacheInvalidation: this.planCacheInvalidation,
+                planBuildElapsed: this.planBuildElapsed.snapshot(),
+                cacheEntries: this.fastPlanCache.size,
+                symbolGeneration: this.symbolGeneration,
+                sessionGeneration: this.sessionGeneration,
+              },
+              ...(this.sessionTarget?.getPerformanceDiagnostics?.() || {
+                helperRpcElapsedMs: null,
+                helperProcessingMs: null,
+                cmsisDap: null,
+              }),
+            },
+          };
         case 'writeMemory':
           return await this.doWriteMemory(command.address, command.data);
         case 'setWatchValue':
           return await this.doSetWatchValue(command.expression, command.value, command.address, command.typeName);
         case 'startRtt':
-          return (await this.targetStartRtt(command.controlBlockAddress))
-            ? { ok: true, data: 'RTT started' }
-            : { ok: false, error: 'RTT start failed' };
+          {
+            const result = await this.targetStartRtt(command.controlBlockAddress);
+            if (!result.ok) return this.sessionOwnerFailure(result, 'RttStartFailed');
+            return {
+              ok: true,
+              data: result.data ?? 'RTT started',
+              message: result.message,
+              targetState: result.targetState,
+              elapsedMs: result.elapsedMs,
+              diagnostics: result.diagnostics,
+            };
+          }
         case 'stopRtt':
-          return (await this.targetStopRtt())
-            ? { ok: true, data: 'RTT stopped' }
-            : { ok: false, error: 'RTT stop failed' };
+          {
+            const result = await this.targetStopRtt();
+            if (!result.ok) return this.sessionOwnerFailure(result, 'RttStopFailed');
+            return {
+              ok: true,
+              data: result.data ?? 'RTT stopped',
+              message: result.message,
+              targetState: result.targetState,
+              elapsedMs: result.elapsedMs,
+              diagnostics: result.diagnostics,
+            };
+          }
         case 'readRtt': {
-          const bytes = await this.targetReadRtt(command.bufferIndex, command.size);
-          return bytes
-            ? { ok: true, data: { bytes: Array.from(bytes) } }
-            : { ok: false, error: 'RTT read failed' };
+          const result = await this.targetReadRtt(command.bufferIndex, command.size, command.signal);
+          if (!result.ok) return this.sessionOwnerFailure(result, 'RttReadFailed');
+          return {
+            ok: true,
+            data: { bytes: Array.from(result.data?.bytes || []) },
+            message: result.message,
+            targetState: result.targetState,
+            elapsedMs: result.elapsedMs,
+            diagnostics: result.diagnostics,
+          };
         }
         case 'loadSymbols':
     if (this.elfPath === command.elfPath && this.symbols.length > 0) {
@@ -456,7 +522,31 @@ case 'readVariableRuntime':
     }
     this.lineEntries.sort((a, b) => a.address - b.address);
     this.dwarfInfo = await parseDwarfTypeInfo(command.elfPath);
+    this.symbolGeneration++;
+    this.invalidateFastPlan('ELF/symbol reload');
     return { ok: true, data: `Loaded ${this.symbols.length} symbols` };
+        case 'resolveSymbol': {
+          if (!this.elfPath || this.symbols.length === 0) {
+            return {
+              ok: false,
+              errorCode: 'SymbolsUnavailable',
+              error: 'SymbolsUnavailable: no ELF symbols are loaded',
+            };
+          }
+          const symbol = this.findSymbolByName(command.name);
+          if (!symbol || !Number.isFinite(symbol.address)) {
+            return {
+              ok: false,
+              errorCode: 'SymbolNotFound',
+              error: `SymbolNotFound: ${command.name}`,
+            };
+          }
+          log.eval(`resolveSymbol name=${command.name} address=0x${symbol.address.toString(16)} source=elf`);
+          return {
+            ok: true,
+            data: { name: symbol.name, address: symbol.address, size: symbol.size, type: symbol.type },
+          };
+        }
         default:
           return { ok: false, error: `Unsupported command: ${(command as any).cmd}` };
       }
@@ -495,9 +585,11 @@ case 'readVariableRuntime':
     }
     if (config.cmsisDapTransport !== undefined
       && config.cmsisDapTransport !== 'auto'
+      && config.cmsisDapTransport !== 'cmsis-dap-v2'
+      && config.cmsisDapTransport !== 'cmsis-dap'
       && config.cmsisDapTransport !== 'hid'
       && config.cmsisDapTransport !== 'winusb') {
-      return invalidConfiguration('cmsisDapTransport', 'auto, hid, or winusb', config.cmsisDapTransport);
+      return invalidConfiguration('cmsisDapTransport', 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb', config.cmsisDapTransport);
     }
     const requestedProbe: DebugProbe = config.probe === undefined ? 'jlink' : config.probe;
     const selectedProbe = this.selectedProbe();
@@ -570,6 +662,8 @@ case 'readVariableRuntime':
     }
 
     this.state = TargetState.Connected;
+    this.sessionGeneration++;
+    this.invalidateFastPlan('session connected');
 
     return { ok: true, data: { state: TargetState.Connected } };
   }
@@ -728,6 +822,8 @@ case 'readVariableRuntime':
   private async doDisconnect(): Promise<OzoneCommandResult> {
     this.clearNativeStopInfo('disconnect');
     if (this.state === TargetState.Disconnected) {
+      this.sessionGeneration++;
+      this.invalidateFastPlan('disconnect while disconnected');
       return { ok: true, data: null };
     }
     if (this.sessionTarget) {
@@ -741,6 +837,9 @@ case 'readVariableRuntime':
       this.jlink.disconnect();
     }
     this.state = TargetState.Disconnected;
+    this.sessionGeneration++;
+    this.symbolGeneration++;
+    this.invalidateFastPlan('disconnect');
     this.symbols = [];
     this.lineMapCache.clear();
     this.addressLocCache.clear();
@@ -2544,6 +2643,8 @@ case 'readVariableRuntime':
       }
       this.lineEntries.sort((a, b) => a.address - b.address);
       this.dwarfInfo = await parseDwarfTypeInfo(elfPath);
+      this.symbolGeneration++;
+      this.invalidateFastPlan('ELF reload after flash');
       if (this.dwarfInfo.typeDefs.size === 0) {
         try {
           const out = await new Promise<string>(r => {
@@ -2584,10 +2685,43 @@ case 'readVariableRuntime':
   }
 
   private prepareFastDataSampling(expressions: string[]): FastDataSamplePlanItem[] {
-    return expressions.map(expression => {
+    const normalized = expressions.map(expression => String(expression).trim());
+    const key = JSON.stringify({
+      version: 'scalar-v1',
+      plannerMode: 'fast-scalar-read-v1',
+      readSizePolicy: 'strict-scalar-only',
+      expressions: normalized,
+      symbolGeneration: this.symbolGeneration,
+      sessionGeneration: this.sessionGeneration,
+    });
+    const cached = this.fastPlanCache.get(key);
+    if (cached) {
+      this.planCacheHit++;
+      return this.cloneFastPlan(cached);
+    }
+    this.planCacheMiss++;
+    const started = Date.now();
+    const plan = normalized.map(expression => {
       const spec = this.resolveFastDataSampleSpec(expression);
       return spec ? { expression, spec } : { expression, error: 'Fast sampling supports scalar globals, scalar array elements, and scalar struct fields only' };
     });
+    this.planBuildElapsed.record(Date.now() - started);
+    this.fastPlanCache.set(key, this.cloneFastPlan(plan));
+    while (this.fastPlanCache.size > 32) this.fastPlanCache.delete(this.fastPlanCache.keys().next().value!);
+    return this.cloneFastPlan(plan);
+  }
+
+  private cloneFastPlan(plan: FastDataSamplePlanItem[]): FastDataSamplePlanItem[] {
+    return plan.map(item => ({
+      expression: item.expression,
+      ...(item.error ? { error: item.error } : {}),
+      ...(item.spec ? { spec: { ...item.spec, format: item.spec.format ? { ...item.spec.format } : undefined } } : {}),
+    }));
+  }
+
+  private invalidateFastPlan(_reason: string) {
+    this.fastPlanCache.clear();
+    this.planCacheInvalidation++;
   }
 
   private resolveFastDataSampleSpec(expression: string): FastDataSampleSpec | null {
@@ -2603,13 +2737,15 @@ case 'readVariableRuntime':
       const elemType = arrayType.typeOffset ? this.resolveDwarfType(arrayType.typeOffset) : null;
       if (!this.isFastScalarType(elemType)) return null;
       const size = this.getScalarReadSize(undefined, elemType);
+      const typeName = arrayType.typeOffset ? this.getDwarfTypeName(arrayType.typeOffset) : elemType?.typeName || elemType?.name || '';
       return {
         expression,
         address: baseSym.address + index * size,
         size,
-        typeName: arrayType.typeOffset ? this.getDwarfTypeName(arrayType.typeOffset) : elemType?.typeName || elemType?.name || '',
+        typeName,
         isFloat: this.isFloatType(elemType),
         signed: this.isSignedIntegerType(elemType),
+        format: this.fastDataSampleFormat(elemType, typeName),
       };
     }
 
@@ -2647,14 +2783,16 @@ case 'readVariableRuntime':
 
         if (!this.isFastScalarType(fieldType)) return null;
         const size = this.getScalarReadSize(undefined, fieldType);
+        const typeName = this.getDwarfTypeName(field.typeOffset) || fieldType?.typeName || fieldType?.name || '';
         return {
           expression,
           address: pointerAddress === undefined ? baseSym.address + fieldOffset : pointerAddress,
           size,
           ...(pointerAddress === undefined ? {} : { pointerAddress, pointeeOffset: fieldOffset }),
-          typeName: this.getDwarfTypeName(field.typeOffset) || fieldType?.typeName || fieldType?.name || '',
+          typeName,
           isFloat: this.isFloatType(fieldType),
           signed: this.isSignedIntegerType(fieldType),
+          format: this.fastDataSampleFormat(fieldType, typeName),
         };
       }
     }
@@ -2666,13 +2804,34 @@ case 'readVariableRuntime':
     if (!resolvedType && sym.size > 8) return null;
     if (!this.isFastScalarType(resolvedType)) return null;
     const size = this.getScalarReadSize(sym.size, resolvedType);
+    const typeName = varTypeOffset ? this.getDwarfTypeName(varTypeOffset) : resolvedType?.typeName || resolvedType?.name || '';
     return {
       expression,
       address: sym.address,
       size,
-      typeName: varTypeOffset ? this.getDwarfTypeName(varTypeOffset) : resolvedType?.typeName || resolvedType?.name || '',
+      typeName,
       isFloat: this.isFloatType(resolvedType),
       signed: this.isSignedIntegerType(resolvedType),
+      format: this.fastDataSampleFormat(resolvedType, typeName),
+    };
+  }
+
+  private fastDataSampleFormat(
+    info: {
+      kind?: string;
+      encoding?: string;
+      name?: string;
+      typeName?: string;
+      enumerators?: Array<{ name: string; value: string }>;
+    } | null,
+    typeName: string,
+  ): FastDataSampleSpec['format'] {
+    return {
+      kind: info?.kind || 'base',
+      encoding: info?.encoding,
+      name: info?.name || typeName,
+      typeName: info?.typeName || typeName,
+      enumerators: info?.enumerators,
     };
   }
 
@@ -2688,7 +2847,54 @@ case 'readVariableRuntime':
     return size > 0 && size <= 8;
   }
 
-  private async readFastDataSampling(specs: FastDataSampleSpec[]): Promise<WatchValue[]> {
+  private mergeFastSampleReads(reads: Array<{ index: number; address: number; size: number }>): Array<{
+    address: number;
+    size: number;
+    members: Array<{ index: number; address: number; size: number }>;
+  }> {
+    const merged: Array<{
+      address: number;
+      size: number;
+      members: Array<{ index: number; address: number; size: number }>;
+    }> = [];
+    for (const read of [...reads].sort((left, right) => left.address - right.address || left.size - right.size)) {
+      const previous = merged[merged.length - 1];
+      if (previous && read.address <= previous.address + previous.size) {
+        previous.size = Math.max(previous.address + previous.size, read.address + read.size) - previous.address;
+        previous.members.push(read);
+      } else {
+        merged.push({ address: read.address, size: read.size, members: [read] });
+      }
+    }
+    return merged;
+  }
+
+  private assignFastSampleBatch(
+    rawByIndex: Array<Uint8Array | null>,
+    merged: Array<{
+      address: number;
+      size: number;
+      members: Array<{ index: number; address: number; size: number }>;
+    }>,
+    reads: Array<{ address: number; bytes: Uint8Array }>,
+  ): void {
+    for (let groupIndex = 0; groupIndex < merged.length; groupIndex++) {
+      const group = merged[groupIndex];
+      const bytes = reads[groupIndex]?.bytes;
+      if (!bytes) continue;
+      for (const member of group.members) {
+        const offset = member.address - group.address;
+        if (offset + member.size <= bytes.length) {
+          rawByIndex[member.index] = bytes.slice(offset, offset + member.size);
+        }
+      }
+    }
+  }
+
+  private async readFastDataSampling(
+    specs: FastDataSampleSpec[],
+    priority: 'watch' | 'timeline' = 'timeline',
+  ): Promise<WatchValue[]> {
     const rawByIndex: Array<Uint8Array | null> = Array(specs.length).fill(null);
     const resolvedAddresses = specs.map(spec => spec.address);
     const initialReads = specs.map(spec => ({
@@ -2697,18 +2903,21 @@ case 'readVariableRuntime':
     }));
 
     if (this.sessionTarget && specs.length > 0) {
+      const merged = this.mergeFastSampleReads(initialReads.map((read, index) => ({ index, ...read })));
       const result = await this.sessionTarget.readMemoryBatch(
-        initialReads,
-        { priority: 'timeline', coalesceKey: 'fast-data-sampling' },
+        merged.map(read => ({ address: read.address, size: read.size })),
+        priority === 'timeline'
+          ? { priority, coalesceKey: 'fast-data-sampling' }
+          : { priority },
       );
       if (result.ok && result.data) {
-        for (let index = 0; index < specs.length; index++) rawByIndex[index] = result.data.reads[index]?.bytes || null;
+        this.assignFastSampleBatch(rawByIndex, merged, result.data.reads);
       }
     }
     for (let index = 0; index < specs.length; index++) {
       if (rawByIndex[index]) continue;
       const initial = initialReads[index];
-      rawByIndex[index] = await this.targetReadMemory(initial.address, initial.size, 'timeline');
+      rawByIndex[index] = await this.targetReadMemory(initial.address, initial.size, priority);
     }
 
     const indirectReads: Array<{ index: number; address: number; size: number }> = [];
@@ -2728,21 +2937,22 @@ case 'readVariableRuntime':
     }
 
     if (this.sessionTarget && indirectReads.length > 0) {
+      const merged = this.mergeFastSampleReads(indirectReads);
       const result = await this.sessionTarget.readMemoryBatch(
-        indirectReads.map(read => ({ address: read.address, size: read.size })),
-        { priority: 'timeline', coalesceKey: 'fast-data-sampling' },
+        merged.map(read => ({ address: read.address, size: read.size })),
+        priority === 'timeline'
+          ? { priority, coalesceKey: 'fast-data-sampling' }
+          : { priority },
       );
       if (result.ok && result.data) {
-        for (let index = 0; index < indirectReads.length; index++) {
-          rawByIndex[indirectReads[index].index] = result.data.reads[index]?.bytes || null;
-        }
+        this.assignFastSampleBatch(rawByIndex, merged, result.data.reads);
       } else {
         for (const read of indirectReads) rawByIndex[read.index] = null;
       }
     }
     for (const read of indirectReads) {
       if (rawByIndex[read.index]) continue;
-      rawByIndex[read.index] = await this.targetReadMemory(read.address, read.size, 'timeline');
+      rawByIndex[read.index] = await this.targetReadMemory(read.address, read.size, priority);
     }
 
     const results: WatchValue[] = [];
@@ -2764,7 +2974,11 @@ case 'readVariableRuntime':
         display = spec.size === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
         hex = `0x${Array.from(raw.slice(0, spec.size)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
       } else {
-        const formatted = this.formatScalarValue(raw, spec.size, { kind: 'base', encoding: spec.signed ? 'signed' : 'unsigned', name: spec.typeName || '' });
+        const formatted = this.formatScalarValue(
+          raw,
+          spec.size,
+          spec.format || { kind: 'base', encoding: spec.signed ? 'signed' : 'unsigned', name: spec.typeName || '' },
+        );
         value = formatted.value;
         display = formatted.display;
         hex = formatted.hex;

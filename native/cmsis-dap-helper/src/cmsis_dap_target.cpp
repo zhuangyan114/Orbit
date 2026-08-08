@@ -396,6 +396,122 @@ Result CmsisDapTarget::readMemory(uint32_t address, uint32_t size, std::vector<u
   return Result::success();
 }
 
+Result CmsisDapTarget::readMemoryScattered32(
+    const std::vector<uint32_t>& addresses, std::vector<uint32_t>& values,
+    uint32_t& completedReads, DapTransferDiagnostics& diag,
+    std::chrono::milliseconds timeout) {
+  values.clear();
+  completedReads = 0;
+  for (const uint32_t address : addresses) {
+    if ((address & 0x03u) != 0 || address > 0xFFFFFFFCu) {
+      return Result::error(
+          ErrorCodes::kDapInvalidRequest,
+          "readMemoryScattered32 requires aligned uint32 ranges, got 0x" +
+              std::to_string(address));
+    }
+  }
+  if (addresses.empty()) return Result::success();
+
+  size_t capacity = packetSize_;
+  const size_t transportCapacity = protocol_->payloadCapacity();
+  if (transportCapacity != 0) capacity = std::min(capacity, transportCapacity);
+  // Request: [cmd,dap,count] + SELECT/CSW writes (10 bytes) +
+  // N * [TAR write (5), AP DRW read (1), DP RDBUFF read (1)].
+  // Response: [cmd,count,status] + N * two 32-bit read values.
+  const size_t requestCapacity = capacity >= 20 ? (capacity - 13) / 7 : 0;
+  const size_t responseCapacity = capacity >= 11 ? (capacity - 3) / 8 : 0;
+  const size_t transferCountCapacity = (255u - 2u) / 3u;
+  const size_t maxReadsPerPacket =
+      std::min({requestCapacity, responseCapacity, transferCountCapacity});
+  if (maxReadsPerPacket == 0) {
+    return Result::error(ErrorCodes::kPacketTooLarge,
+                         "CMSIS-DAP packet capacity is too small for one scattered read");
+  }
+
+  values.reserve(addresses.size());
+  size_t offset = 0;
+  while (offset < addresses.size()) {
+    const size_t count = std::min(maxReadsPerPacket, addresses.size() - offset);
+    ++diag.chunks;
+    uint32_t attempt = 0;
+    for (;;) {
+      std::vector<DapTransferItem> items(2 + count * 3);
+      items[0].ap = false;
+      items[0].rnw = false;
+      items[0].addr = static_cast<uint8_t>((kDpRegSelect >> 2) & 0x03);
+      items[0].value = 0;
+      items[1].ap = true;
+      items[1].rnw = false;
+      items[1].addr = static_cast<uint8_t>((kApRegCsw >> 2) & 0x03);
+      items[1].value = kApCsw32Auto;
+      for (size_t index = 0; index < count; ++index) {
+        const size_t base = 2 + index * 3;
+        items[base].ap = true;
+        items[base].rnw = false;
+        items[base].addr = static_cast<uint8_t>((kApRegTar >> 2) & 0x03);
+        items[base].value = addresses[offset + index];
+        items[base + 1].ap = true;
+        items[base + 1].rnw = true;
+        items[base + 1].addr = static_cast<uint8_t>((kApRegDrw >> 2) & 0x03);
+        items[base + 2].ap = false;
+        items[base + 2].rnw = true;
+        items[base + 2].addr = static_cast<uint8_t>((kDpRegRdbuff >> 2) & 0x03);
+      }
+
+      uint8_t completedTransfers = 0;
+      ++diag.packets;
+      const Result transfer = protocol_->dapTransfer(0, items, timeout, &completedTransfers);
+      size_t packetCompletedReads = 0;
+      while (packetCompletedReads < count &&
+             completedTransfers >= 2 + (packetCompletedReads + 1) * 3 &&
+             items[2 + packetCompletedReads * 3 + 2].readDataValid) {
+        ++packetCompletedReads;
+      }
+      if (transfer.ok) {
+        if (packetCompletedReads != count) {
+          return Result::error(ErrorCodes::kInternalError,
+                               "packed scattered read returned incomplete RDBUFF data");
+        }
+        for (size_t index = 0; index < count; ++index) {
+          values.push_back(items[2 + index * 3 + 2].readData);
+        }
+        completedReads += static_cast<uint32_t>(count);
+        diag.packedReads += static_cast<uint32_t>(count);
+        break;
+      }
+
+      const bool retryable = transfer.errorCode == ErrorCodes::kDapAckWait ||
+                             transfer.errorCode == ErrorCodes::kDapAckFault;
+      if (retryable && attempt < kMaxTransferRetries) {
+        if (transfer.errorCode == ErrorCodes::kDapAckFault) {
+          ++diag.faultClears;
+          const Result clearResult = clearStickyErrors(diag, timeout);
+          if (!clearResult.ok) return clearResult;
+        }
+        ++attempt;
+        ++diag.waitRetries;
+        continue;
+      }
+
+      for (size_t index = 0; index < packetCompletedReads; ++index) {
+        values.push_back(items[2 + index * 3 + 2].readData);
+      }
+      completedReads += static_cast<uint32_t>(packetCompletedReads);
+      diag.packedReads += static_cast<uint32_t>(packetCompletedReads);
+      if (retryable) {
+        return Result::error(
+            transfer.errorCode,
+            "packed scattered read failed after " + std::to_string(attempt + 1) +
+                " attempts; completedReads=" + std::to_string(completedReads) +
+                "/" + std::to_string(addresses.size()) + ": " + transfer.message);
+      }
+      return transfer;
+    }
+    offset += count;
+  }
+  return Result::success();
+}
+
 Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint32_t>& words,
                                         DapTransferDiagnostics& diag,
                                         std::chrono::milliseconds timeout) {

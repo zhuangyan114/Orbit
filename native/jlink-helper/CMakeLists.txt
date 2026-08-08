@@ -6,9 +6,13 @@ if(NOT WIN32)
   message(FATAL_ERROR "orbit-jlink-helper is Windows-only")
 endif()
 
-add_executable(orbit-jlink-helper src/main.cpp)
+add_executable(orbit-jlink-helper
+  src/main.cpp
+  ../cmsis-dap-helper/src/segger_rtt.cpp
+)
 target_compile_features(orbit-jlink-helper PRIVATE cxx_std_17)
 target_compile_definitions(orbit-jlink-helper PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(orbit-jlink-helper PRIVATE ../cmsis-dap-helper/src)
 
 add_library(ozone-jlink-mock SHARED test/mock-jlink.cpp test/mock-jlink.def)
 target_compile_features(ozone-jlink-mock PRIVATE cxx_std_17)

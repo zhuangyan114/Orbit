@@ -11,6 +11,50 @@
 
 ## 修改记录
 
+### Bug: Reset 后 RTT 控制块暂未就绪导致日志永久停用
+
+- **日期**: 2026-08-08
+- **问题描述**: CMSIS-DAP 会话执行 Reset/Restart 后，固件尚未运行到 RTT 初始化阶段时，首次 `startRtt` 会返回 `RttInvalidControlBlock`。原实现将该结果视为会话级永久不可用并停止轮询，后续 Continue 即使已重新初始化控制块，RTT 日志也不会恢复。
+- **根因分析**: Restart 恢复路径与普通 launch 共用 RTT 致命错误处理，没有区分“启动配置/布局确实非法”和“Reset 后控制块短暂无效”。因此一次符合固件生命周期的瞬态错误错误地清除了 RTT 可用状态和用户启用意图。
+- **修改方案**: 仅在 Restart 创建的 polling generation 中将 `RttInvalidControlBlock` 视为瞬态状态，保持 RTT 启用意图，并继续按 `orbit.rttPollIntervalMs` 串行、完成后定时重试；普通 launch 的非法布局仍禁用 RTT，owner 丢失仍终止会话，不创建第二 owner，也不回退到 J-Link。
+- **涉及文件**: `src/debug/dap-session.ts` - `startRttLogPolling()`、`handleRestartRequest()`；`src/debug/dap-session-rtt.test.ts` - Reset 后控制块延迟恢复回归测试；`docs/dap08-rtt-acceptance-report.md` - DAPLink 4 MHz 真机验收数据
+- **验证结果**: 全量 Vitest 31 文件/284 项、类型检查、扩展构建、native 构建、CMSIS-DAP/J-Link mock、CMSIS-DAP selftest 200/200、RTT C++ oracle 和 `git diff --check` 均通过。DAPLink 4 MHz 真机持续 60.136 秒，RTT 读取 624,960 B、reader overrun 0、字节守恒残差 0；Reset 时控制块尚未就绪，Continue 后 427 ms 获得首个有效 RTT，Watch 成功率 100%，Timeline 167 个事件/657 点，唯一 owner 为 `cmsis-dap`，Flash operation 0，断开后无残留 helper/owner。
+
+### Bug: CMSIS-DAP RTT 控制块地址需要手工维护
+
+- **日期**: 2026-08-08
+- **问题描述**: CMSIS-DAP RTT 日志依赖固定的 `rttControlBlockAddress`，固件重新链接后地址变化会导致 Orbit RTT Log 无法启动或没有日志。
+- **根因分析**: DAP 启动流程只接受显式地址，未利用已加载 ELF 中的 `_SEGGER_RTT` 符号；CMSIS-DAP 路径也不应通过扫描目标 RAM 猜测控制块。
+- **修改方案**: 保留显式地址优先；未配置时由 Commander 从当前 ELF 符号缓存解析 `_SEGGER_RTT`，校验为有效 32 位地址后传给 `startRtt`；符号缺失或非法时返回 `RttControlBlockUnavailable`，不启动轮询。
+- **涉及文件**: `src/debug/dap-session.ts`、`src/ozone-backend/commander.ts`、`src/ozone-backend/types.ts`、`src/debug/dap-session-rtt.test.ts`、`src/ozone-backend/commander-session-owner.test.ts`
+- **验证结果**: 用户确认真实使用功能正常；全量 Vitest 31 文件/268 项通过，类型检查、扩展构建、native 构建及 CMSIS-DAP/J-Link mock 验证通过。
+
+### Bug: DAP-07 target-read 轮询导致 Watch/Timeline 交接空闲和高延迟
+
+- **日期**: 2026-08-07
+- **问题描述**: Watch 与 Timeline 共用单一 target owner 时，Watch 请求排队后会阻止新的 Timeline 读取，但当前 Timeline 释放 target-read gate 后，Watch 仍可能等待下一次 20 ms 轮询；此时 owner 已空闲，而 Watch 和 Timeline 都无法推进。实测基线中，CMSIS-DAP 6 Watch 的端到端 P50/P95 为 42/51 ms，J-Link OB 为 31/37 ms，明显高于各自约 14--19 ms 和 3--6 ms 的实际 gate 持有时间。
+- **根因分析**:
+  1. `beginTargetReadWhenAvailable()` 和 `beginTargetControl()` 使用 20 ms `setTimeout` 轮询可用状态，`endTargetRead()` 只清除占用标志，不会主动唤醒 waiter，形成最长接近一个轮询周期的 owner idle/handoff gap。
+  2. Watch 排队期间会正确阻止低优先级 Timeline，但轮询模型无法在 gate 释放时立即把所有权交给已排队 Watch；简单提高 Timeline 优先级或降低 Watch 频率会破坏既有语义。
+  3. control、timeout、取消、session generation 和 termination 共用同一读取边界，改为通知机制时还必须避免丢失唤醒、同时双重获取、取消残留及 listener/timer 泄漏。
+- **修改方案**:
+  1. 用事件驱动的优先级 waiter queue 替换 target-read 和 control drain 的 20 ms 轮询，保持 `control/foreground > watch > timeline > background`；释放时同步选择并只授予一个 waiter，同优先级保持 FIFO。
+  2. waiter 绑定 timeout、可选 `AbortSignal`、`readCancelEpoch` generation 和 session termination；timeout/release、abort/release 使用幂等 settlement，取消、断线和 dispose 主动移除 waiter、timer 与 listener。
+  3. control 开始时先设置排他状态并失效旧 generation waiter，再等待当前读取通过事件通知退出；完整 control 临界区内禁止 Watch、Timeline 和 background 进入，`endControl()` 主动恢复调度。
+  4. 增加有界聚合指标，记录 queue wait、target gate hold 和 owner idle/handoff gap，并按优先级输出一次受控采样摘要，不在高频路径逐样本写日志。
+  5. 保留单 target owner、Watch/Timeline 独立读取语义和既有标量批读；未引入跨 consumer 缓存、read broker、流式 sampler、WinUSB、OpenOCD、GDB server、JLink.exe 或第二 owner。
+- **涉及文件**:
+  - `src/debug/dap-session.ts:288,312,354,363,407,455,474,493,526,533,554` - control/read gate、waiter 调度、取消/清理和聚合指标
+  - `src/debug/dap-session-target-read-gate.test.ts:19` - 事件驱动交接、优先级、control 排他、timeout、AbortSignal、generation/termination、无双重获取和无残留资源回归
+  - `src/debug/dap-session-scopes.test.ts` - stopped-state scope 使用真实 `endControl()` 通知路径
+  - `scripts/cmsis-dap/verify-dap07-timeline-hw.js:140,184` - 硬件 evidence 持久化 target-read gate 指标
+  - `docs/dap07-timeline-performance-report.md:90,156` - 实现、四组真机矩阵和验收结论
+- **验证结果**:
+  - **自动化**: 新增 gate 测试 11/11 通过；全量 Vitest 30 个文件、252/252 项通过；`npm run typecheck`、`npm run build`、`npm run build:native`、J-Link mock、CMSIS-DAP mock 和 `git diff --check` 均通过。
+  - **CMSIS-DAP v1 HID 真机**: 3 Watch 的 Timeline flush/实际采样由 42.67/66.48 提升至 56.16/87.58 Hz，Watch P50/P95/max 降至 17/23/31 ms；6 Watch 由 41.17/61.99 提升至 52.27/80.95 Hz，Watch 降至 23/28/34 ms。Watch 成功率均为 100%，Pause 为 30/34 ms。
+  - **J-Link OB native 真机**: 3 Watch 的 Timeline flush/实际采样由 50.41/272.98 提升至 58.43/368.67 Hz，Watch P50/P95/max 降至 5/6/8 ms；6 Watch 由 50.23/269.40 提升至 60.13/357.40 Hz，Watch 降至 6/7/8 ms。Watch 成功率均为 100%，Pause 为 10/11 ms。
+  - **交接与安全性**: 四组 60 秒矩阵的 handoff gap P95 均不超过 0.003 ms；每个 session 只有一个 helper/owner，Flash 操作数均为 0，disconnect 成功且退出后无残留 owner 进程。
+
 ### Bug: CMSIS-DAP 烧写成功后偶发 VerifyFailed，重复烧写又能成功
 
 - **日期**: 2026-08-06

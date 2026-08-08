@@ -187,6 +187,27 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
               packetSize: 64,
             },
           };
+        case 'readMemoryBatch': {
+          const reads = (params as { reads: Array<{ address: number; size: number }> }).reads;
+          return {
+            ok: true,
+            message: 'memory batch read',
+            targetState: 'Unknown' as const,
+            elapsedMs: 0,
+            data: {
+              reads: reads.map((read, index) => ({
+                address: read.address,
+                size: read.size,
+                bytes: Array.from({ length: read.size }, (_, byteIndex) => index * 16 + byteIndex + 1),
+              })),
+            },
+            diagnostics: {
+              completedReads: reads.length,
+              packedReads: reads.length,
+              fallbackReads: 0,
+            },
+          };
+        }
         case 'writeMemory':
           return {
             ok: true,
@@ -197,6 +218,39 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
               address: (params as { address: number }).address,
               bytesWritten: (params as { bytes: number[] }).bytes.length,
             },
+          };
+        case 'startRtt':
+          return {
+            ok: true,
+            message: 'RTT started',
+            targetState: 'Running' as const,
+            elapsedMs: 2,
+            data: { controlBlockAddress: params.controlBlockAddress },
+            diagnostics: { ownerKind: 'cmsis-dap', bufferIndex: 0 },
+          };
+        case 'readRtt':
+          return {
+            ok: true,
+            message: 'RTT read',
+            targetState: 'Running' as const,
+            elapsedMs: 3,
+            data: {
+              bytes: [65, 66],
+              descriptorAddress: 0x20000118,
+              flags: 2,
+              mode: 2,
+              readBytes: 2,
+              committedRdOff: 2,
+            },
+            diagnostics: { ownerKind: 'cmsis-dap', readBytes: 2 },
+          };
+        case 'stopRtt':
+          return {
+            ok: true,
+            message: 'RTT stopped',
+            targetState: 'Running' as const,
+            elapsedMs: 1,
+            data: { started: false },
           };
         case 'disconnect':
         case 'close':
@@ -245,6 +299,102 @@ function owner(
 }
 
 describe('SessionTargetSelector owner lifecycle', () => {
+  it('routes CMSIS-DAP RTT through the helper owner with structured results', async () => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const connected = await channel.connect({
+      device: 'STM32F407VET6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+    expect(connected.ok).toBe(true);
+
+    const started = await channel.startRtt(0x20000100);
+    const read = await channel.readRtt(0, 128);
+    const stopped = await channel.stopRtt();
+
+    expect(started).toMatchObject({
+      ok: true,
+      data: { controlBlockAddress: 0x20000100 },
+      diagnostics: { ownerKind: 'cmsis-dap' },
+    });
+    expect(read).toMatchObject({
+      ok: true,
+      data: {
+        descriptorAddress: 0x20000118,
+        flags: 2,
+        mode: 2,
+        readBytes: 2,
+        committedRdOff: 2,
+      },
+      diagnostics: { readBytes: 2 },
+    });
+    expect(read.ok && read.data?.bytes).toBeInstanceOf(Uint8Array);
+    expect(stopped.ok).toBe(true);
+    expect(helper.controlRequest).toHaveBeenCalledWith('startRtt', expect.objectContaining({
+      controlBlockAddress: 0x20000100,
+    }));
+    expect(helper.request).toHaveBeenCalledWith('readRtt', expect.anything(), expect.objectContaining({
+      priority: 'background',
+    }));
+  });
+
+  it('preserves an RTT Flags error without replacing the CMSIS-DAP owner or creating J-Link fallback', async () => {
+    const base = fakeCmsisDapHelper();
+    const request = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'readRtt') {
+        return {
+          ok: false,
+          message: 'RTT Up Buffer Flags contain reserved bits',
+          errorCode: 'RttInvalidBufferFlags',
+          targetState: 'Running' as const,
+          elapsedMs: 2,
+          diagnostics: {
+            rtt: {
+              bufferIndex: 0,
+              descriptorAddress: 0x20000118,
+              bufferAddress: 0x20001000,
+              bufferSize: 8,
+              wrOff: 3,
+              rdOff: 0,
+              flags: 4,
+              mode: 0,
+              bytes: [],
+            },
+          },
+        };
+      }
+      return (base.request as any)(method, params);
+    });
+    const helper = fakeCmsisDapHelper({ request: request as any });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    await selector.connect({
+      probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    await expect(selector.readRtt(0, 8)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'RttInvalidBufferFlags',
+      diagnostics: {
+        rtt: {
+          flags: 4,
+          mode: 0,
+          bufferIndex: 0,
+          descriptorAddress: 0x20000118,
+          bytes: [],
+        },
+      },
+    });
+    expect(selector.ownerKind).toBe('cmsis-dap');
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+    await selector.dispose(false);
+  });
+
   it('never constructs or connects legacy when the native owner succeeds', async () => {
     const native = owner('jlink-native', vi.fn(async () => ({
       ok: true,
@@ -641,7 +791,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(createLegacy).not.toHaveBeenCalled();
   });
 
-  it('rejects CMSIS-DAP winusb transport with UnsupportedCapability without spawning the helper', async () => {
+  it('routes CMSIS-DAP WinUSB through the same single helper owner', async () => {
     const helper = fakeCmsisDapHelper();
     const cmsisDap = new CmsisDapTargetChannel({ helperClient: helper });
     const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => cmsisDap);
@@ -655,9 +805,10 @@ describe('SessionTargetSelector owner lifecycle', () => {
       speedKHz: 4000,
     });
 
-    expect(result).toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-    expect(helper.start).not.toHaveBeenCalled();
-    expect(selector.ownerKind).toBe('none');
+    expect(result).toMatchObject({ ok: true });
+    expect(helper.start).toHaveBeenCalledWith('winusb');
+    expect(helper.request).toHaveBeenCalledWith('enumDevices', expect.objectContaining({ transport: 'winusb' }));
+    expect(selector.ownerKind).toBe('cmsis-dap');
   });
 
   it('cleans the CMSIS-DAP owner to none when the helper start fails', async () => {
@@ -1062,7 +1213,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(read.message).toContain('helper exited');
   });
 
-  it('aggregates CMSIS-DAP batch reads and fails the batch on the first error', async () => {
+  it('uses one CMSIS-DAP helper RPC for an ordered memory batch', async () => {
     const helper = fakeCmsisDapHelper();
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
     await channel.connect({
@@ -1080,21 +1231,49 @@ describe('SessionTargetSelector owner lifecycle', () => {
     ]);
     expect(batch.ok).toBe(true);
     expect(batch.data!.reads).toHaveLength(2);
-    expect(batch.data!.reads[1]).toEqual({ address: 0x20000004, bytes: Uint8Array.from([1, 2, 3, 4]) });
+    expect(batch.data!.reads).toEqual([
+      { address: 0x20000000, bytes: Uint8Array.from([1, 2, 3, 4]) },
+      { address: 0x20000004, bytes: Uint8Array.from([17, 18, 19, 20]) },
+    ]);
+    const batchCalls = (helper.request as ReturnType<typeof vi.fn>).mock.calls
+      .filter(call => call[0] === 'readMemoryBatch');
+    expect(batchCalls).toHaveLength(1);
+    expect(batchCalls[0][1]).toEqual({
+      reads: [
+        { address: 0x20000000, size: 4 },
+        { address: 0x20000004, size: 4 },
+      ],
+    });
+    expect(batchCalls[0][2]).toMatchObject({ priority: 'watch' });
+    expect((helper.request as ReturnType<typeof vi.fn>).mock.calls
+      .filter(call => call[0] === 'readMemory')).toHaveLength(0);
+  });
+
+  it('preserves structured CMSIS-DAP batch failures without consuming partial data', async () => {
+    const baseRequest = fakeCmsisDapHelper().request as ReturnType<typeof vi.fn>;
 
     const failingHelper = fakeCmsisDapHelper({
       request: vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
-        if (method === 'readMemory') {
+        if (method === 'readMemoryBatch') {
           return {
             ok: false,
-            message: 'read failed',
+            message: 'batch read failed at index 1',
             targetState: 'Error' as const,
             elapsedMs: 0,
             errorCode: 'DapAckWait',
+            data: {
+              reads: [{ address: 0x20000000, size: 4, bytes: [1, 2, 3, 4] }],
+            },
+            diagnostics: {
+              failedIndex: 1,
+              failedAddress: 0x20000004,
+              completedReads: 1,
+              packedReads: 0,
+              fallbackReads: 2,
+            },
           };
         }
-        const base = fakeCmsisDapHelper().request as ReturnType<typeof vi.fn>;
-        return base(method, params);
+        return baseRequest(method, params);
       }),
     });
     const failingChannel = new CmsisDapTargetChannel({ helperClient: failingHelper });
@@ -1112,6 +1291,47 @@ describe('SessionTargetSelector owner lifecycle', () => {
     ]);
     expect(failed.ok).toBe(false);
     expect(failed.errorCode).toBe('DapAckWait');
+    expect(failed.data).toBeUndefined();
+    expect(failed.diagnostics).toMatchObject({
+      failedIndex: 1,
+      failedAddress: 0x20000004,
+      completedReads: 1,
+    });
+  });
+
+  it('rejects malformed or reordered CMSIS-DAP batch success responses', async () => {
+    const baseRequest = fakeCmsisDapHelper().request as ReturnType<typeof vi.fn>;
+    const helper = fakeCmsisDapHelper({
+      request: vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+        if (method === 'readMemoryBatch') {
+          return {
+            ok: true,
+            message: 'malformed batch success',
+            targetState: 'Unknown' as const,
+            elapsedMs: 0,
+            data: {
+              reads: [{ address: 0x20000004, size: 4, bytes: [1, 2, 3, 4] }],
+            },
+          };
+        }
+        return baseRequest(method, params);
+      }),
+    });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    await channel.connect({
+      probe: 'cmsis-dap',
+      cmsisDapTransport: 'hid',
+      flashBeforeDebug: false,
+      device: 'STM32F407VET6',
+      interface: 'SWD',
+      speedKHz: 4000,
+    });
+
+    const result = await channel.readMemoryBatch([
+      { address: 0x20000000, size: 4 },
+      { address: 0x20000004, size: 4 },
+    ]);
+    expect(result).toMatchObject({ ok: false, errorCode: 'MalformedResponse' });
   });
 
   it('returns InvalidState for CMSIS-DAP reads after disconnect', async () => {

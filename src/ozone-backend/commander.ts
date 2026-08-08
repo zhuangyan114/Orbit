@@ -191,7 +191,9 @@ export class OzoneBackend {
     if (signal?.aborted) {
       return { ok: false, errorCode: 'TargetReadCancelled', message: 'target read cancelled', targetState: 'Unknown', elapsedMs: 0 };
     }
-    if (this.sessionTarget) return this.sessionTarget.readMemory(address, size, { priority, signal });
+    if (this.sessionTarget) {
+      return this.sessionTarget.readMemory(address, size, signal ? { priority, signal } : { priority });
+    }
     const started = Date.now();
     const bytes = this.jlink.readMemory(address, size);
     if (bytes) {

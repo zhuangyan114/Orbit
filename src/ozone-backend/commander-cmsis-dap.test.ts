@@ -452,7 +452,7 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       },
     });
     expect(result.ok === false && result.error).toContain('DapAckFault');
-    expect(owner.readMemory).toHaveBeenCalledWith(0xFFFFFFFF, 4, { priority: 'watch' });
+    expect(owner.readMemory).toHaveBeenCalledWith(0xFFFFFFFF, 4, { priority: 'background' });
   });
 
   it('writes only an explicitly resolved STM32F407 SRAM Watch address', async () => {

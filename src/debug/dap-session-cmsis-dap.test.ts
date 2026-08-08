@@ -676,6 +676,66 @@ describe('DapSession CMSIS-DAP control routing', () => {
     }
   });
 
+  it('preserves standard DAP expansion for non-RTOS compound evaluate results', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => {
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        if (command.cmd === 'evaluateExpression') {
+          return {
+            ok: true,
+            data: {
+              expression: 'config',
+              evaluateName: 'config',
+              value: 0x20004000,
+              display: 'Config_t',
+              hex: '',
+              typeName: 'Config_t',
+              hasChildren: true,
+              children: [{
+                expression: 'enabled',
+                evaluateName: 'config.enabled',
+                value: 1,
+                display: '1',
+                hex: '0x00000001',
+                typeName: 'uint32_t',
+              }],
+            },
+          };
+        }
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleEvaluate({
+      ...request(48, 'evaluate'),
+      arguments: { expression: 'config', context: 'hover', frameId: 1 },
+    });
+    const reference = messages.find(message => message.request_seq === 48)?.body?.variablesReference;
+    expect(reference).toBeGreaterThan(0);
+
+    await (session as any).handleVariables({
+      ...request(49, 'variables'),
+      arguments: { variablesReference: reference },
+    });
+
+    expect(messages.find(message => message.request_seq === 49)).toMatchObject({
+      success: true,
+      body: {
+        variables: [expect.objectContaining({
+          name: 'enabled',
+          evaluateName: 'config.enabled',
+          value: '1',
+          variablesReference: 0,
+        })],
+      },
+    });
+  });
+
   it('preserves the RTOS Views evaluate, variables, and byte readMemory contract', async () => {
     const backend = {
       execute: vi.fn(async (command: { cmd: string; expression?: string; address?: number; size?: number }) => {
@@ -878,12 +938,13 @@ describe('DapSession CMSIS-DAP control routing', () => {
   it('runs queued Local reads before a background RTOS variable expansion', async () => {
     const executionOrder: string[] = [];
     const backend = {
-      execute: vi.fn(async (command: { cmd: string }) => {
+      execute: vi.fn(async (command: { cmd: string; priority?: string }) => {
         if (command.cmd === 'getLocals') {
           executionOrder.push('locals');
           return { ok: true, data: [{ name: 'localValue', value: '7', type: 'int' }] };
         }
         if (command.cmd === 'evaluateExpression') {
+          expect(command.priority).toBe('background');
           executionOrder.push('rtos');
           return {
             ok: true,
@@ -1121,11 +1182,101 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(evaluateSignal?.aborted).toBe(true);
     expect((session as any).variableHandles.size).toBe(0);
     expect(messages.find(message => message.request_seq === 65)).toMatchObject({
-      success: true,
-      body: { variables: [] },
+      success: false,
+      body: {
+        variables: [],
+        errorCode: 'RtosReadCancelled',
+        targetState: 'Running',
+        elapsedMs: expect.any(Number),
+        diagnostics: expect.objectContaining({
+          readEpoch: expect.any(Number),
+          stopGeneration: expect.any(Number),
+        }),
+      },
     });
     expect(messages.find(message => message.request_seq === 65)).not.toMatchObject({
       body: { variables: [expect.objectContaining({ value: 'stale child' })] },
+    });
+  });
+
+  it('does not publish cached RTOS children after the target connection is lost', async () => {
+    const backend = {
+      execute: vi.fn(),
+      dispose: vi.fn(async () => {}),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).variableHandles.set(1001, {
+      children: [{
+        expression: 'staleTask',
+        evaluateName: 'staleTask',
+        value: 0x20005000,
+        display: 'staleTask',
+        hex: '',
+      }],
+      rtosExpansion: {
+        rootExpression: 'pxReadyTasksLists',
+        expandedExpressions: ['pxReadyTasksLists'],
+        targetEvaluateName: 'pxReadyTasksLists',
+      },
+      stopGeneration: 0,
+    });
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).terminateForConnectionLoss('DeviceRemoved');
+    await (session as any).handleVariables({
+      ...request(68, 'variables'),
+      arguments: { variablesReference: 1001 },
+    });
+
+    expect((session as any).variableHandles.size).toBe(0);
+    expect(messages.find(message => message.request_seq === 68)).not.toMatchObject({
+      body: { variables: [expect.objectContaining({ name: 'staleTask' })] },
+    });
+  });
+
+  it('returns structured RTOS cancellation when a stop generation invalidates a lazy handle', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).stopGeneration = 2;
+    (session as any).variableHandles.set(1002, {
+      rtosExpansion: {
+        rootExpression: 'pxReadyTasksLists',
+        expandedExpressions: [],
+        targetEvaluateName: 'pxReadyTasksLists',
+      },
+      stopGeneration: 1,
+    });
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleVariables({
+      ...request(69, 'variables'),
+      arguments: { variablesReference: 1002 },
+    });
+
+    expect(backend.execute).not.toHaveBeenCalled();
+    expect(messages.find(message => message.request_seq === 69)).toMatchObject({
+      success: false,
+      body: {
+        variables: [],
+        errorCode: 'RtosReadCancelled',
+        targetState: 'Halted',
+        elapsedMs: expect.any(Number),
+        diagnostics: {
+          readEpoch: expect.any(Number),
+          stopGeneration: 2,
+          handleStopGeneration: 1,
+        },
+      },
     });
   });
 

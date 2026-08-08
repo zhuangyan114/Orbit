@@ -579,10 +579,15 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       expression: 'root',
       force: true,
       signal: controller.signal,
-    });
+      priority: 'background',
+    } as any);
 
     expect(result).toMatchObject({ ok: false, errorCode: 'EvaluateCancelled' });
     expect(owner.readMemory).toHaveBeenCalledTimes(1);
+    expect(owner.readMemory).toHaveBeenCalledWith(0x20000000, 4, {
+      priority: 'background',
+      signal: controller.signal,
+    });
   });
 
   it('reads call-stack PC and LR through the CMSIS-DAP owner and labels the source', async () => {

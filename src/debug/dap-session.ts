@@ -2097,7 +2097,23 @@ export class DapSession extends EventEmitter {
         return;
       }
       this.activeMemoryReadAbortController = controller;
-      const result = await this.backend.execute({ cmd: 'readMemory', address, size: count, signal: controller.signal });
+      let result: OzoneCommandResult;
+      try {
+        result = await this.backend.execute({ cmd: 'readMemory', address, size: count, signal: controller.signal });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const cancelled = controller.signal.aborted || readEpoch !== this.readCancelEpoch;
+        const errorCode = cancelled ? 'TargetReadCancelled' : 'MemoryReadFailed';
+        this.sendResponse(msg, {
+          address: this.formatMemoryReference(address),
+          unreadableBytes: count,
+          errorCode,
+          targetState: this.targetRunning ? 'Running' : 'Halted',
+          elapsedMs: 0,
+          diagnostics: { operation: 'readMemory', phase: 'backend', error: message },
+        }, false, `${errorCode}: ${message}`);
+        return;
+      }
       const stale = controller.signal.aborted || readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating();
       if (stale) {
         this.sendResponse(msg, {

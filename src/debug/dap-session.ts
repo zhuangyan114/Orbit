@@ -679,6 +679,7 @@ export class DapSession extends EventEmitter {
     startedAtMs: number,
     result?: OzoneCommandResult,
   ) {
+    const dapMessage = this.isRetryableRtosReadError(errorCode) ? 'Busy' : `${errorCode}: ${message}`;
     this.sendResponse(msg, {
       result: message,
       variablesReference: 0,
@@ -686,7 +687,14 @@ export class DapSession extends EventEmitter {
       targetState: result?.targetState || (this.targetRunning ? 'Running' : 'Halted'),
       elapsedMs: result?.elapsedMs ?? Math.max(0, this.nowMs() - startedAtMs),
       diagnostics: result?.diagnostics || { targetReadGate: this.snapshotTargetReadGateMetrics() },
-    }, false, `${errorCode}: ${message}`);
+    }, false, dapMessage);
+  }
+
+  private isRetryableRtosReadError(errorCode: string): boolean {
+    return errorCode === 'TargetReadUnavailable'
+      || errorCode === 'TargetReadCancelled'
+      || errorCode === 'RtosReadCancelled'
+      || errorCode === 'TargetRunning';
   }
 
   private sendRtosVariablesFailure(
@@ -697,6 +705,7 @@ export class DapSession extends EventEmitter {
     handle: DapVariableHandle,
     result?: OzoneCommandResult,
   ) {
+    const dapMessage = this.isRetryableRtosReadError(errorCode) ? 'Busy' : `${errorCode}: ${message}`;
     const targetState = result?.targetState
       || (!this.targetConnectionEstablished || this.isSessionTerminating()
         ? 'Disconnected'
@@ -713,7 +722,7 @@ export class DapSession extends EventEmitter {
         stopGeneration: this.stopGeneration,
         handleStopGeneration: handle.stopGeneration,
       },
-    }, false, `${errorCode}: ${message}`);
+    }, false, dapMessage);
   }
 
   private markStoppedForUi() {

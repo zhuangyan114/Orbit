@@ -1035,6 +1035,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
       expect(backend.execute).not.toHaveBeenCalled();
       expect(messages.find(message => message.request_seq === 67)).toMatchObject({
         success: false,
+        message: 'Busy',
         body: {
           variablesReference: 0,
           errorCode: 'TargetReadUnavailable',
@@ -1224,6 +1225,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect((session as any).variableHandles.size).toBe(0);
     expect(messages.find(message => message.request_seq === 65)).toMatchObject({
       success: false,
+      message: 'Busy',
       body: {
         variables: [],
         errorCode: 'RtosReadCancelled',
@@ -1307,6 +1309,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(backend.execute).not.toHaveBeenCalled();
     expect(messages.find(message => message.request_seq === 69)).toMatchObject({
       success: false,
+      message: 'Busy',
       body: {
         variables: [],
         errorCode: 'RtosReadCancelled',

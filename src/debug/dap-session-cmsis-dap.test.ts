@@ -676,6 +676,108 @@ describe('DapSession CMSIS-DAP control routing', () => {
     }
   });
 
+  it('preserves the RTOS Views evaluate, variables, and byte readMemory contract', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; expression?: string; address?: number; size?: number }) => {
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        if (command.cmd === 'evaluateExpression') {
+          expect(command.expression).toBe('pxReadyTasksLists');
+          return {
+            ok: true,
+            data: {
+              expression: 'pxReadyTasksLists',
+              value: 0x20001000,
+              display: 'List_t[5]',
+              hex: '',
+              address: 0x20001000,
+              typeName: 'List_t[5]',
+              children: [{
+                expression: '[0]',
+                evaluateName: 'pxReadyTasksLists[0]',
+                value: 1,
+                display: 'List_t',
+                hex: '',
+                address: 0x20001000,
+                typeName: 'List_t',
+                children: [{
+                  expression: 'uxNumberOfItems',
+                  evaluateName: 'pxReadyTasksLists[0].uxNumberOfItems',
+                  value: 1,
+                  display: '1',
+                  hex: '0x00000001',
+                  address: 0x20001000,
+                  typeName: 'UBaseType_t',
+                }],
+              }],
+            },
+          };
+        }
+        if (command.cmd === 'readMemory') {
+          expect(command).toMatchObject({ address: 0x20002000, size: 4 });
+          return {
+            ok: true,
+            data: { address: 0x20002000, data: [0xa5, 0xa5, 0x00, 0x01], ascii: '....' },
+          };
+        }
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleEvaluate({
+      ...request(50, 'evaluate'),
+      arguments: { expression: 'pxReadyTasksLists', context: 'hover', frameId: 1 },
+    });
+    const evaluateResponse = messages.find(message => message.request_seq === 50);
+    const listReference = evaluateResponse?.body?.variablesReference;
+    expect(evaluateResponse).toMatchObject({
+      success: true,
+      body: {
+        result: 'List_t[5]',
+        type: 'List_t[5]',
+        variablesReference: expect.any(Number),
+        memoryReference: '0x20001000',
+      },
+    });
+    expect(listReference).toBeGreaterThan(0);
+
+    await (session as any).handleVariables({
+      ...request(51, 'variables'),
+      arguments: { variablesReference: listReference },
+    });
+    const variablesResponse = messages.find(message => message.request_seq === 51);
+    expect(variablesResponse).toMatchObject({
+      success: true,
+      body: {
+        variables: [expect.objectContaining({
+          name: '[0]',
+          evaluateName: 'pxReadyTasksLists[0]',
+          variablesReference: expect.any(Number),
+          memoryReference: '0x20001000',
+        })],
+      },
+    });
+
+    await (session as any).handleReadMemory({
+      ...request(52, 'readMemory'),
+      arguments: { memoryReference: '0x20002000', count: 4 },
+    });
+    expect(messages.find(message => message.request_seq === 52)).toMatchObject({
+      success: true,
+      body: {
+        address: '0x20002000',
+        data: Buffer.from([0xa5, 0xa5, 0x00, 0x01]).toString('base64'),
+        unreadableBytes: 0,
+      },
+    });
+  });
+
   it('cancels stale RTOS evaluate before Continue so the next breakpoint stackTrace can refresh', async () => {
     let evaluateSignal: AbortSignal | undefined;
     let releaseEvaluate: (() => void) | undefined;

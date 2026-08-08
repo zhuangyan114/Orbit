@@ -649,6 +649,7 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       varToType: new Map([['uxCurrentNumberOfTasks', 'u32-type']]),
       typeDefs: new Map([['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }]]),
     };
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
 
     const result = await backend.execute({
       cmd: 'evaluateExpression',
@@ -658,9 +659,12 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       priority: 'background',
       signal: controller.signal,
     });
+    const scheduledTimeouts = setTimeoutSpy.mock.calls.length;
+    setTimeoutSpy.mockRestore();
 
     expect(result).toMatchObject({ ok: true, data: expect.objectContaining({ value: 3 }) });
     expect(owner.getState).not.toHaveBeenCalled();
+    expect(scheduledTimeouts).toBe(0);
     expect(owner.readMemory).toHaveBeenCalledWith(0x20000000, 4, {
       priority: 'background',
       signal: controller.signal,

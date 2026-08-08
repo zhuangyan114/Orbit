@@ -3159,13 +3159,13 @@ case 'readVariableRuntime':
       log.step(`sym=${sym.name} addr=0x${sym.address.toString(16)} size=${sym.size} type=${sym.type} isHalted=${isHalted} force=${force}`);
     }
 
-    if (!force && !(await this.targetIsHalted())) {
+    if (!force && watchContext?.priority !== 'background' && !(await this.targetIsHalted())) {
       this.throwIfEvaluationCancelled(watchContext);
       log.eval(`doEvaluateExpression: CPU is running, returning running`);
       return { ok: false, error: 'process is running' };
     }
 
-    if (!force) {
+    if (!force && watchContext?.priority !== 'background') {
       await new Promise<void>(r => setTimeout(r, 100));
       this.throwIfEvaluationCancelled(watchContext);
     }

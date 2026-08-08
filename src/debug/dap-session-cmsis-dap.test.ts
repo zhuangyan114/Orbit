@@ -778,6 +778,44 @@ describe('DapSession CMSIS-DAP control routing', () => {
     });
   });
 
+  it('detects FreeRTOS through rtosInfo symbol probing and preserves diagnostics', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; expression?: string; signal?: AbortSignal }) => {
+        if (command.cmd === 'evaluateExpression') {
+          expect(command.expression).toBe('uxCurrentNumberOfTasks');
+          expect(command.signal).toBeInstanceOf(AbortSignal);
+          return {
+            ok: true,
+            data: { expression: command.expression, value: 3, display: '3', hex: '0x3', typeName: 'UBaseType_t' },
+            targetState: 'Halted',
+            elapsedMs: 4,
+            diagnostics: { ownerKind: 'cmsis-dap', symbolProbe: true },
+          };
+        }
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleRequest(request(49, 'rtosInfo'));
+
+    expect(messages.find(message => message.request_seq === 49)).toMatchObject({
+      success: true,
+      body: {
+        rtos: 'FreeRTOS',
+        detected: true,
+        targetState: 'Halted',
+        elapsedMs: 4,
+        diagnostics: { ownerKind: 'cmsis-dap', symbolProbe: true },
+      },
+    });
+  });
+
   it('does not publish a variablesReference tree created before Continue', async () => {
     const backend = {
       execute: vi.fn(async (command: { cmd: string }) => {

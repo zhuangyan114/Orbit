@@ -1444,16 +1444,85 @@ export class DapSession extends EventEmitter {
         case 'getTargetState':
           return this.handleGetTargetState(msg);
         case 'rtosInfo':
-          return this.sendResponse(msg, {
-            rtos: this._rtos,
-            device: this._device,
-            detected: false,
-          });
+          return this.handleRtosInfo(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
       }
     } catch (err: any) {
       this.sendResponse(msg, undefined, false, err.message);
+    }
+  }
+
+  private async handleRtosInfo(msg: DebugProtocolMessage) {
+    const configuredRtos = this._rtos.trim();
+    const readEpoch = this.readCancelEpoch;
+    const controller = new AbortController();
+    const base = {
+      rtos: configuredRtos,
+      device: this._device,
+      detected: false,
+    };
+    if (!(await this.beginTargetReadWhenAvailable('background', 700, controller.signal))) {
+      this.sendResponse(msg, {
+        ...base,
+        errorCode: 'TargetReadUnavailable',
+        targetState: this.targetRunning ? 'Running' : 'Unknown',
+        elapsedMs: 0,
+        diagnostics: { operation: 'rtosInfo', phase: 'targetReadGate' },
+      });
+      return;
+    }
+    try {
+      if (readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating()) {
+        this.sendResponse(msg, {
+          ...base,
+          errorCode: 'TargetReadCancelled',
+          targetState: this.targetRunning ? 'Running' : 'Halted',
+          elapsedMs: 0,
+          diagnostics: { operation: 'rtosInfo', phase: 'cancelled' },
+        });
+        return;
+      }
+      const result = await this.backend.execute({
+        cmd: 'evaluateExpression',
+        expression: 'uxCurrentNumberOfTasks',
+        force: true,
+        signal: controller.signal,
+      });
+      const stale = controller.signal.aborted || readEpoch !== this.readCancelEpoch
+        || this.controlInProgress || this.isSessionTerminating();
+      if (stale) {
+        this.sendResponse(msg, {
+          ...base,
+          errorCode: 'TargetReadCancelled',
+          targetState: this.targetRunning ? 'Running' : 'Halted',
+          elapsedMs: result.elapsedMs ?? 0,
+          diagnostics: { ...result.diagnostics, operation: 'rtosInfo', phase: 'cancelled' },
+        });
+        return;
+      }
+      if (!result.ok) {
+        this.sendResponse(msg, {
+          ...base,
+          errorCode: result.errorCode || 'RtosNotDetected',
+          targetState: result.targetState,
+          elapsedMs: result.elapsedMs,
+          diagnostics: { ...result.diagnostics, operation: 'rtosInfo', phase: 'symbolProbe' },
+          error: result.error,
+        });
+        return;
+      }
+      this._rtos = configuredRtos || 'FreeRTOS';
+      this.sendResponse(msg, {
+        ...base,
+        rtos: this._rtos,
+        detected: true,
+        targetState: result.targetState,
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, operation: 'rtosInfo', phase: 'symbolProbe' },
+      });
+    } finally {
+      this.endTargetRead();
     }
   }
 

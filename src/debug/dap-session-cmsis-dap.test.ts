@@ -1088,6 +1088,47 @@ describe('DapSession CMSIS-DAP control routing', () => {
     });
   });
 
+  it('uses the stopped-session state for RTOS evaluate without scheduling getTargetState control work', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; priority?: string }) => {
+        if (command.cmd === 'evaluateExpression') {
+          expect(command.priority).toBe('background');
+          return {
+            ok: true,
+            data: {
+              expression: 'uxCurrentNumberOfTasks',
+              value: 3,
+              display: '3',
+              hex: '0x00000003',
+              typeName: 'UBaseType_t',
+            },
+          };
+        }
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any)._rtos = 'FreeRTOS';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    (session as any).targetRunning = false;
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleEvaluate({
+      ...request(70, 'evaluate'),
+      arguments: { expression: 'uxCurrentNumberOfTasks', context: 'hover', frameId: 1 },
+    });
+
+    expect(backend.execute).toHaveBeenCalledTimes(1);
+    expect(backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({ cmd: 'getTargetState' }));
+    expect(messages.find(message => message.request_seq === 70)).toMatchObject({
+      success: true,
+      body: { result: '3', variablesReference: 0 },
+    });
+  });
+
   it('does not publish a variablesReference tree created before Continue', async () => {
     const backend = {
       execute: vi.fn(async (command: { cmd: string }) => {

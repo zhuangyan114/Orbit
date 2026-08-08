@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { OzoneBackend } from './commander';
 import { SessionTargetOwner } from './session-target-channel';
+import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
 
 function cmsisOwner(overrides: Partial<SessionTargetOwner> = {}): SessionTargetOwner {
@@ -584,6 +585,81 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
 
     expect(result).toMatchObject({ ok: false, errorCode: 'EvaluateCancelled' });
     expect(owner.readMemory).toHaveBeenCalledTimes(1);
+    expect(owner.readMemory).toHaveBeenCalledWith(0x20000000, 4, {
+      priority: 'background',
+      signal: controller.signal,
+    });
+  });
+
+  it('normalizes a queued owner cancellation into a structured evaluate result', async () => {
+    const controller = new AbortController();
+    let markReadQueued: (() => void) | undefined;
+    const readQueued = new Promise<void>(resolve => { markReadQueued = resolve; });
+    const owner = cmsisOwner({
+      readMemory: vi.fn(async (_address: number, _size: number, options?: { signal?: AbortSignal }) => {
+        markReadQueued?.();
+        return await new Promise((_, reject) => {
+          options?.signal?.addEventListener('abort', () => {
+            reject(new NativeSchedulerCancelledError('RTOS background read was cancelled'));
+          }, { once: true });
+        });
+      }),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).symbols = [{ name: 'uxCurrentNumberOfTasks', address: 0x20000000, size: 4, type: 'D' }];
+    (backend as any).dwarfInfo = {
+      varToType: new Map([['uxCurrentNumberOfTasks', 'u32-type']]),
+      typeDefs: new Map([['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }]]),
+    };
+
+    const evaluate = backend.execute({
+      cmd: 'evaluateExpression',
+      expression: 'uxCurrentNumberOfTasks',
+      force: true,
+      priority: 'background',
+      signal: controller.signal,
+    });
+    const assertion = expect(evaluate).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'EvaluateCancelled',
+      targetState: 'halted',
+    });
+    await readQueued;
+    controller.abort('continue started');
+
+    await assertion;
+  });
+
+  it('does not schedule a control-priority getState while evaluating an RTOS symbol in background', async () => {
+    const controller = new AbortController();
+    const owner = cmsisOwner({
+      readMemory: vi.fn(async () => ({
+        ok: true,
+        message: 'memory read',
+        targetState: 'Halted' as const,
+        elapsedMs: 1,
+        data: { bytes: Uint8Array.from([3, 0, 0, 0]) },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    (backend as any).state = 'halted';
+    (backend as any).symbols = [{ name: 'uxCurrentNumberOfTasks', address: 0x20000000, size: 4, type: 'D' }];
+    (backend as any).dwarfInfo = {
+      varToType: new Map([['uxCurrentNumberOfTasks', 'u32-type']]),
+      typeDefs: new Map([['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }]]),
+    };
+
+    const result = await backend.execute({
+      cmd: 'evaluateExpression',
+      expression: 'uxCurrentNumberOfTasks',
+      force: true,
+      expandedExpressions: [],
+      priority: 'background',
+      signal: controller.signal,
+    });
+
+    expect(result).toMatchObject({ ok: true, data: expect.objectContaining({ value: 3 }) });
+    expect(owner.getState).not.toHaveBeenCalled();
     expect(owner.readMemory).toHaveBeenCalledWith(0x20000000, 4, {
       priority: 'background',
       signal: controller.signal,

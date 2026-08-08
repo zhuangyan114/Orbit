@@ -1,0 +1,93 @@
+{
+  "dap": "DAP-09",
+  "timestamp": "2026-08-08T17:46:40+08:00",
+  "branch": "codex/dap09-rtos-view",
+  "head": "7505d7da4ac40382bdb308e1365f7d204af39e72",
+  "hardware": {
+    "authorized": false,
+    "mcu": "STM32F407VET6",
+    "probe": "CMSIS-DAP_LU",
+    "probeId": "C251:F001/LU_2022_8888",
+    "transport": "wired CMSIS-DAP HID",
+    "project": "D:\\STM32\\project\\vet6_led",
+    "rtos": "FreeRTOS 10.3.1, CMSIS-RTOS v1 wrapper",
+    "targetMutatingOperations": [],
+    "flashOperations": 0,
+    "acceptance": "pending-explicit-authorization"
+  },
+  "observedFailure": {
+    "source": "C:\\Users\\22690\\AppData\\Roaming\\Code\\logs\\20260808T094627\\window4\\renderer.log",
+    "rtosDetected": true,
+    "messages": [
+      "Failed to get variable reference for pxReadyTasksLists",
+      "Failed to get variable reference for xDelayedTaskList2",
+      "Failed to get variable reference for xSuspendedTaskList",
+      "Unable to collect full RTOS information"
+    ],
+    "secondarySymptom": "Local and Registers did not load while rtos was enabled"
+  },
+  "rootCause": {
+    "zeroReference": "RTOS evaluate gate timeout returned success with variablesReference 0",
+    "gateMonopoly": "initial RTOS evaluate eagerly expanded recursive FreeRTOS list and pointer children",
+    "invalidMemoryConsequence": "an inconsistent expanded TCB produced a stack-peak read at peripheral address 0x40022800"
+  },
+  "verification": {
+    "typecheck": "passed",
+    "unitTests": { "status": "passed", "tests": 292, "files": 31 },
+    "focusedTests": { "status": "passed", "tests": 97, "files": 5 },
+    "redGreen": {
+      "initial": { "status": "failed-as-expected", "failed": 2, "passed": 42 },
+      "fixedFourFileSet": { "status": "passed", "tests": 78, "files": 4 }
+    },
+    "build": "passed",
+    "buildNative": "passed",
+    "cmsisDapMock": "passed",
+    "cppChannelMock": "passed",
+    "cmsisDapAlgorithm": "passed",
+    "helperSelftest": { "status": "passed", "cases": 200, "failures": 0 },
+    "gitDiffCheck": "passed",
+    "distStatus": "clean"
+  },
+  "rtosContract": {
+    "initializeSupportsRTOS": true,
+    "rtosInfoSymbolProbe": "uxCurrentNumberOfTasks",
+    "initialExpandedExpressions": [],
+    "expansionMode": "one DAP level per variables request",
+    "compoundVariablesReference": "non-zero within stop generation",
+    "byteOrientedReadMemory": true,
+    "staleReadCancellation": true,
+    "structuredErrors": ["errorCode", "targetState", "elapsedMs", "diagnostics"],
+    "priority": "foreground Local/Registers > RTOS background"
+  },
+  "owner": {
+    "probeCmsisDapUniqueOwner": true,
+    "ownerEvidenceLayer": "code-and-mock",
+    "jlinkFallback": false,
+    "legacyFallback": false,
+    "secondHelper": false
+  },
+  "externalLaunchConfig": {
+    "path": "D:\\STM32\\project\\vet6_led\\.vscode\\launch.json",
+    "selectedName": "Ozone: DAPLink Debug STM32F407VET6",
+    "selectedCount": 1,
+    "duplicateRtosConfiguration": false,
+    "rtos": "FreeRTOS",
+    "cmsisDapTransport": "hid",
+    "cmsisDapVid": "C251",
+    "cmsisDapPid": "F001",
+    "cmsisDapSerial": "LU_2022_8888",
+    "flashBeforeDebug": true,
+    "flashBeforeDebugNote": "preserved existing value; configuration was not launched"
+  },
+  "commits": [
+    { "hash": "d187e06", "message": "test: characterize RTOS View DAP contract", "pushed": true },
+    { "hash": "ea41517", "message": "fix: preserve RTOS stopped-state requests", "pushed": true },
+    { "hash": "3b2e2dc", "message": "fix: detect FreeRTOS through DAP rtosInfo", "pushed": true },
+    { "hash": "352d353", "message": "test: preserve RTOS background read scheduling contract", "pushed": true },
+    { "hash": "46bc4ff", "message": "fix: preserve structured memory cancellation errors", "pushed": true },
+    { "hash": "0da9b31", "message": "docs: add DAP-09 acceptance evidence", "pushed": true },
+    { "hash": "6ca8756", "message": "docs: record final DAP-09 commit", "pushed": true },
+    { "hash": "7f645d9", "message": "test: characterize RTOS lazy variable expansion", "pushed": true },
+    { "hash": "7505d7d", "message": "fix: lazily expand RTOS DAP variables", "pushed": true }
+  ]
+}

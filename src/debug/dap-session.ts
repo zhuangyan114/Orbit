@@ -150,6 +150,7 @@ export class DapSession extends EventEmitter {
   };
   private activeStoppedReadAbortController: AbortController | null = null;
   private activeEvaluateAbortController: AbortController | null = null;
+  private activeRtosInfoAbortController: AbortController | null = null;
   private activeRtosVariablesAbortController: AbortController | null = null;
   private activeMemoryReadAbortController: AbortController | null = null;
 
@@ -372,6 +373,11 @@ export class DapSession extends EventEmitter {
     if (evaluateController && !evaluateController.signal.aborted) {
       log.dap(`cancel evaluate target read reason=control readEpoch=${this.readCancelEpoch}`);
       evaluateController.abort(reason);
+    }
+    const rtosInfoController = this.activeRtosInfoAbortController;
+    if (rtosInfoController && !rtosInfoController.signal.aborted) {
+      log.dap(`cancel RTOS info target read reason=control readEpoch=${this.readCancelEpoch}`);
+      rtosInfoController.abort(reason);
     }
     const rtosVariablesController = this.activeRtosVariablesAbortController;
     if (rtosVariablesController && !rtosVariablesController.signal.aborted) {
@@ -1553,22 +1559,32 @@ export class DapSession extends EventEmitter {
     const configuredRtos = this._rtos.trim();
     const readEpoch = this.readCancelEpoch;
     const controller = new AbortController();
+    const previousController = this.activeRtosInfoAbortController;
+    if (previousController && !previousController.signal.aborted) {
+      previousController.abort('superseded by a newer rtosInfo request');
+    }
+    this.activeRtosInfoAbortController = controller;
+    let gateAcquired = false;
     const base = {
       rtos: configuredRtos,
       device: this._device,
       detected: false,
     };
-    if (!(await this.beginTargetReadWhenAvailable('background', 700, controller.signal))) {
-      this.sendResponse(msg, {
-        ...base,
-        errorCode: 'TargetReadUnavailable',
-        targetState: this.targetRunning ? 'Running' : 'Unknown',
-        elapsedMs: 0,
-        diagnostics: { operation: 'rtosInfo', phase: 'targetReadGate' },
-      });
-      return;
-    }
     try {
+      gateAcquired = await this.beginTargetReadWhenAvailable('background', 700, controller.signal);
+      if (!gateAcquired) {
+        const cancelled = controller.signal.aborted || readEpoch !== this.readCancelEpoch
+          || this.controlInProgress || this.isSessionTerminating();
+        const errorCode = cancelled ? 'TargetReadCancelled' : 'TargetReadUnavailable';
+        this.sendResponse(msg, {
+          ...base,
+          errorCode,
+          targetState: this.targetRunning ? 'Running' : 'Unknown',
+          elapsedMs: 0,
+          diagnostics: { operation: 'rtosInfo', phase: cancelled ? 'cancelled' : 'targetReadGate' },
+        }, !cancelled, cancelled ? 'Busy' : undefined);
+        return;
+      }
       if (readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating()) {
         this.sendResponse(msg, {
           ...base,
@@ -1576,7 +1592,7 @@ export class DapSession extends EventEmitter {
           targetState: this.targetRunning ? 'Running' : 'Halted',
           elapsedMs: 0,
           diagnostics: { operation: 'rtosInfo', phase: 'cancelled' },
-        });
+        }, false, 'Busy');
         return;
       }
       const result = await this.backend.execute({
@@ -1595,18 +1611,20 @@ export class DapSession extends EventEmitter {
           targetState: this.targetRunning ? 'Running' : 'Halted',
           elapsedMs: result.elapsedMs ?? 0,
           diagnostics: { ...result.diagnostics, operation: 'rtosInfo', phase: 'cancelled' },
-        });
+        }, false, 'Busy');
         return;
       }
       if (!result.ok) {
+        const errorCode = result.errorCode || 'RtosNotDetected';
+        const cancelled = errorCode === 'TargetReadCancelled' || errorCode === 'RtosReadCancelled';
         this.sendResponse(msg, {
           ...base,
-          errorCode: result.errorCode || 'RtosNotDetected',
+          errorCode,
           targetState: result.targetState,
           elapsedMs: result.elapsedMs,
           diagnostics: { ...result.diagnostics, operation: 'rtosInfo', phase: 'symbolProbe' },
           error: result.error,
-        });
+        }, !cancelled, cancelled ? 'Busy' : undefined);
         return;
       }
       this._rtos = configuredRtos || 'FreeRTOS';
@@ -1619,7 +1637,10 @@ export class DapSession extends EventEmitter {
         diagnostics: { ...result.diagnostics, operation: 'rtosInfo', phase: 'symbolProbe' },
       });
     } finally {
-      this.endTargetRead();
+      if (this.activeRtosInfoAbortController === controller) {
+        this.activeRtosInfoAbortController = null;
+      }
+      if (gateAcquired) this.endTargetRead();
     }
   }
 
@@ -3204,6 +3225,7 @@ export class DapSession extends EventEmitter {
       this.targetConnectionEstablished = false;
       this.controlInProgress = true;
       this.advanceReadCancelEpoch();
+      this.resetVariableHandles();
       this.cancelTargetReadGateWaiters();
       this.cancelActiveTargetReads('DAP session disposed');
       this.stopDataSampling();

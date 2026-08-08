@@ -7,6 +7,46 @@ function request(seq: number, command: string): DebugProtocolMessage {
   return { type: 'request', seq, command, arguments: {} };
 }
 
+async function flushMicrotasks() {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+function connectedRtosSession(backend: OzoneBackend) {
+  const session = new DapSession(backend);
+  (session as any)._probe = 'cmsis-dap';
+  (session as any)._rtos = 'FreeRTOS';
+  (session as any).targetConnectionEstablished = true;
+  (session as any).phase = 'connected';
+  (session as any).rttLogEnabled = false;
+  (session as any).rttAvailable = false;
+  return session;
+}
+
+function expectRtosCancelled(messages: DebugProtocolMessage[], requestSeq: number) {
+  const response = messages.find(message => message.request_seq === requestSeq);
+  expect(response).toMatchObject({
+    success: false,
+    message: 'Busy',
+    body: {
+      detected: false,
+      errorCode: expect.stringMatching(/TargetReadCancelled|RtosReadCancelled/),
+      elapsedMs: expect.any(Number),
+      diagnostics: expect.objectContaining({ operation: 'rtosInfo' }),
+    },
+  });
+  expect(response?.body?.detected).not.toBe(true);
+}
+
+function expectRtosReadStateClean(session: DapSession) {
+  expect((session as any).activeRtosInfoAbortController).toBeNull();
+  expect((session as any).targetReadWaiters).toHaveLength(0);
+  expect((session as any).targetReadWaiterTimerCount).toBe(0);
+  expect((session as any).targetReadDrainWaiterTimerCount).toBe(0);
+  expect((session as any).targetReadInProgress).toBe(false);
+  expect((session as any).variableHandles.size).toBe(0);
+}
+
 function setBreakpointsRequest(seq: number, sourcePath: string, lines: number[]): DebugProtocolMessage {
   return {
     ...request(seq, 'setBreakpoints'),
@@ -1087,6 +1127,154 @@ describe('DapSession CMSIS-DAP control routing', () => {
         diagnostics: { ownerKind: 'cmsis-dap', symbolProbe: true },
       },
     });
+  });
+
+  it('preserves ordinary rtosInfo detection failures as compatibility responses', async () => {
+    const backend = {
+      execute: vi.fn(async () => ({
+        ok: false,
+        errorCode: 'RtosNotDetected',
+        error: 'uxCurrentNumberOfTasks is unavailable',
+        targetState: 'Halted',
+        elapsedMs: 3,
+        diagnostics: { symbolProbe: false },
+      })),
+    } as unknown as OzoneBackend;
+    const session = connectedRtosSession(backend);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleRequest(request(69, 'rtosInfo'));
+
+    expect(messages.find(message => message.request_seq === 69)).toMatchObject({
+      success: true,
+      body: {
+        detected: false,
+        errorCode: 'RtosNotDetected',
+        targetState: 'Halted',
+        elapsedMs: 3,
+        diagnostics: { symbolProbe: false, operation: 'rtosInfo', phase: 'symbolProbe' },
+      },
+    });
+    expectRtosReadStateClean(session);
+  });
+
+  it('aborts an in-flight rtosInfo when Continue takes control priority', async () => {
+    let evaluateSignal: AbortSignal | undefined;
+    let evaluateStarted!: () => void;
+    const started = new Promise<void>(resolve => { evaluateStarted = resolve; });
+    const execute = vi.fn(async (command: { cmd: string; signal?: AbortSignal }) => {
+      if (command.cmd === 'evaluateExpression') {
+        evaluateSignal = command.signal;
+        evaluateStarted();
+        await new Promise<void>(resolve => command.signal?.addEventListener('abort', () => resolve(), { once: true }));
+        return { ok: false, errorCode: 'TargetReadCancelled', error: 'cancelled by Continue', targetState: 'Running', elapsedMs: 2 };
+      }
+      if (command.cmd === 'run') return { ok: true, data: { state: 'Running' } };
+      if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
+      return { ok: true, data: {} };
+    });
+    const backend = {
+      execute,
+      dispose: vi.fn(async () => {}),
+    } as unknown as OzoneBackend;
+    const session = connectedRtosSession(backend);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    const rtosInfo = (session as any).handleRequest(request(70, 'rtosInfo'));
+    await started;
+    expect((session as any).activeRtosInfoAbortController).toBeInstanceOf(AbortController);
+    const continueRequest = (session as any).handleContinue(request(71, 'continue'));
+    await flushMicrotasks();
+
+    expect(evaluateSignal?.aborted).toBe(true);
+    await Promise.all([rtosInfo, continueRequest]);
+    expectRtosCancelled(messages, 70);
+    expectRtosReadStateClean(session);
+    expect(execute.mock.calls.filter(([command]) => command.cmd === 'evaluateExpression')).toHaveLength(1);
+  });
+
+  it('cancels a queued rtosInfo during Continue without granting the gate', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'run'
+        ? { ok: true, data: { state: 'Running' } }
+        : command.cmd === 'getTargetState'
+          ? { ok: true, data: 'running' }
+          : { ok: true, data: {} }),
+    } as unknown as OzoneBackend;
+    const session = connectedRtosSession(backend);
+    (session as any).targetReadInProgress = true;
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    const rtosInfo = (session as any).handleRequest(request(72, 'rtosInfo'));
+    await flushMicrotasks();
+    expect((session as any).targetReadWaiters).toHaveLength(1);
+    const continueRequest = (session as any).handleContinue(request(73, 'continue'));
+    await flushMicrotasks();
+    expect((session as any).targetReadWaiters).toHaveLength(0);
+    (session as any).endTargetRead();
+    await continueRequest;
+    await rtosInfo;
+
+    expectRtosCancelled(messages, 72);
+    expect((session as any).backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({ cmd: 'evaluateExpression' }));
+    expect((session as any).backend.execute).toHaveBeenCalledWith(expect.objectContaining({ cmd: 'run' }));
+    expect(messages.find(message => message.request_seq === 73)).toMatchObject({ success: true });
+    expect((session as any).targetReadWaiters).toHaveLength(0);
+    expect((session as any).targetReadWaiterTimerCount).toBe(0);
+    expectRtosReadStateClean(session);
+  });
+
+  it.each([
+    ['Reset', async (session: DapSession) => {
+      (session as any)._runToEntryPoint = false;
+      (session as any)._flashEnabled = false;
+      await (session as any).handleRestart(request(75, 'restart'));
+    }],
+    ['Disconnect', async (session: DapSession) => {
+      await (session as any).handleDisconnect(request(76, 'disconnect'));
+    }],
+    ['session replacement', async (session: DapSession) => {
+      await session.dispose();
+    }],
+    ['owner loss', async (session: DapSession) => {
+      await (session as any).terminateForConnectionLoss('NativeOwnerLost');
+    }],
+  ])('cancels rtosInfo during %s and releases all state', async (_label, control) => {
+    let evaluateSignal: AbortSignal | undefined;
+    let evaluateStarted!: () => void;
+    const started = new Promise<void>(resolve => { evaluateStarted = resolve; });
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; signal?: AbortSignal }) => {
+        if (command.cmd === 'evaluateExpression') {
+          evaluateSignal = command.signal;
+          evaluateStarted();
+          await new Promise<void>(resolve => command.signal?.addEventListener('abort', () => resolve(), { once: true }));
+          return { ok: false, errorCode: 'TargetReadCancelled', error: 'cancelled by control', targetState: 'Disconnected', elapsedMs: 1 };
+        }
+        if (command.cmd === 'disconnect') return { ok: true, data: {} };
+        if (command.cmd === 'reset' || command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        return { ok: true, data: {} };
+      }),
+      dispose: vi.fn(async () => {}),
+      configureNativeSteps: vi.fn(),
+    } as unknown as OzoneBackend;
+    const session = connectedRtosSession(backend);
+    (session as any).variableHandles.set(9001, { value: { expression: 'stale', value: 1 } });
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    const rtosInfo = (session as any).handleRequest(request(74, 'rtosInfo'));
+    await started;
+    await control(session);
+    expect(evaluateSignal?.aborted).toBe(true);
+    await rtosInfo;
+
+    expectRtosCancelled(messages, 74);
+    expectRtosReadStateClean(session);
   });
 
   it('uses the stopped-session state for RTOS evaluate without scheduling getTargetState control work', async () => {

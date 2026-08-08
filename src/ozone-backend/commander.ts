@@ -3300,6 +3300,7 @@ case 'readVariableRuntime':
                 : undefined;
               children.push({
                 expression: `[${i}]`,
+                evaluateName: elementExpression,
                 value: structChildren?.[0]?.value ?? 0,
                 display: structChildren
                   ? `${elemType.name || 'struct'} { ${structChildren.map(c => `${c.expression}=${c.display}`).join(', ')} }`

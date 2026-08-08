@@ -604,6 +604,67 @@ describe('OzoneBackend realtime variables', () => {
     }));
   });
 
+  it('provides full evaluate names for top-level RTOS array elements', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    const listAddress = 0x200000A8;
+    internal.symbols = [{ name: 'pxReadyTasksLists', address: listAddress, size: 40 }];
+    internal.dwarfInfo = {
+      varToType: new Map([['pxReadyTasksLists', 'ready-lists-type']]),
+      typeDefs: new Map([
+        ['ready-lists-type', {
+          name: 'List_t[2]', byteSize: 40, kind: 'array', typeOffset: 'list-type', arrayCount: 2,
+        }],
+        ['list-type', {
+          name: 'xLIST', byteSize: 20, kind: 'struct',
+          fields: [{ name: 'uxNumberOfItems', typeOffset: 'u32-type', byteOffset: 0 }],
+        }],
+        ['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address, size) => {
+      if (address !== listAddress || size !== 40) return null;
+      const bytes = new Uint8Array(40);
+      bytes[0] = 1;
+      return bytes;
+    };
+
+    const rootResult = await backend.execute({
+      cmd: 'evaluateExpression',
+      expression: 'pxReadyTasksLists',
+      force: true,
+      expandedExpressions: ['pxReadyTasksLists'],
+    });
+
+    expect(rootResult.ok).toBe(true);
+    if (!rootResult.ok) throw new Error(rootResult.error);
+    const root = rootResult.data as any;
+    expect(root.children?.[0]).toEqual(expect.objectContaining({
+      expression: '[0]',
+      evaluateName: 'pxReadyTasksLists[0]',
+      hasChildren: true,
+      children: undefined,
+    }));
+
+    const expandedResult = await backend.execute({
+      cmd: 'evaluateExpression',
+      expression: 'pxReadyTasksLists',
+      force: true,
+      expandedExpressions: ['pxReadyTasksLists', 'pxReadyTasksLists[0]'],
+    });
+
+    expect(expandedResult.ok).toBe(true);
+    if (!expandedResult.ok) throw new Error(expandedResult.error);
+    const expandedRoot = expandedResult.data as any;
+    expect(expandedRoot.children?.[0]).toEqual(expect.objectContaining({
+      evaluateName: 'pxReadyTasksLists[0]',
+      children: [expect.objectContaining({
+        evaluateName: 'pxReadyTasksLists[0].uxNumberOfItems',
+        value: 1,
+      })],
+    }));
+  });
+
   it('expands unions nested in struct arrays and through a struct pointer', async () => {
     const backend = new OzoneBackend();
     const internal = backend as unknown as BackendInternals;

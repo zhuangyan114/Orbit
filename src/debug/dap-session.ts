@@ -2861,7 +2861,9 @@ export class DapSession extends EventEmitter {
         }
         return;
       }
-      const targetHalted = force ? await this.isTargetHalted() : true;
+      const targetHalted = force
+        ? (isRTOS ? !this.targetRunning : await this.isTargetHalted())
+        : true;
       if (controller.signal.aborted || readEpoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) {
         log.dap(`evaluate discarded before dispatch expression=${expr} readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
         if (isRTOS) {

@@ -3152,7 +3152,9 @@ case 'readVariableRuntime':
     }
 
     if (isRTOS || expression.startsWith('ux') || expression.startsWith('px') || expression.startsWith('x')) {
-      const isHalted = await this.targetIsHalted();
+      const isHalted = watchContext?.priority === 'background'
+        ? this.state === TargetState.Halted
+        : await this.targetIsHalted();
       this.throwIfEvaluationCancelled(watchContext);
       log.step(`sym=${sym.name} addr=0x${sym.address.toString(16)} size=${sym.size} type=${sym.type} isHalted=${isHalted} force=${force}`);
     }
@@ -3944,9 +3946,14 @@ case 'readVariableRuntime':
     context?: WatchEvaluationContext,
   ): Promise<Uint8Array | null> {
     this.throwIfEvaluationCancelled(context);
-    const raw = await this.targetReadMemory(address, size, context?.priority, context?.signal);
-    this.throwIfEvaluationCancelled(context);
-    return raw;
+    try {
+      const raw = await this.targetReadMemory(address, size, context?.priority, context?.signal);
+      this.throwIfEvaluationCancelled(context);
+      return raw;
+    } catch (error) {
+      this.throwIfEvaluationCancelled(context);
+      throw error;
+    }
   }
 
   private pointerTargetHasChildren(typeOffset: string): boolean {

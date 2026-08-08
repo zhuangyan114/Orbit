@@ -598,7 +598,7 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     const owner = cmsisOwner({
       readMemory: vi.fn(async (_address: number, _size: number, options?: { signal?: AbortSignal }) => {
         markReadQueued?.();
-        return await new Promise((_, reject) => {
+        return await new Promise<never>((_, reject) => {
           options?.signal?.addEventListener('abort', () => {
             reject(new NativeSchedulerCancelledError('RTOS background read was cancelled'));
           }, { once: true });
@@ -606,6 +606,7 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       }),
     });
     const backend = new OzoneBackend(undefined, owner);
+    (backend as any).state = 'halted';
     (backend as any).symbols = [{ name: 'uxCurrentNumberOfTasks', address: 0x20000000, size: 4, type: 'D' }];
     (backend as any).dwarfInfo = {
       varToType: new Map([['uxCurrentNumberOfTasks', 'u32-type']]),

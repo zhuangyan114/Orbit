@@ -390,18 +390,18 @@ function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
               //
               // Optional compatibility path only; normal debug flow should not
               // wait for RTOS Views detection.
-              setTimeout(() => {
-                vscode.commands.executeCommand('rtos-views.rtos.focus').then(() => {
+            setTimeout(() => {
+              vscode.commands.executeCommand('rtos-views.rtos.focus').then(() => {
                   // Wait for resolveWebviewView to render the panel
-                  setTimeout(() => {
-                    vscode.commands.executeCommand('mcu-debug.rtos-views.refresh').then(undefined, (e2: any) => {
-                      diagChannel.appendLine(`RTOS Views refresh failed: ${e2?.message || e2}`);
-                    });
-                  }, 500);
+                setTimeout(() => {
+                  vscode.commands.executeCommand('mcu-debug.rtos-views.refresh').then(undefined, (e2: any) => {
+                    diagChannel.appendLine(`RTOS Views refresh failed: ${e2?.message || e2}`);
+                  });
+                }, 500);
               }, () => {
-                  diagChannel.appendLine('RTOS Views panel not found (not installed?)');
-                });
-              }, 1000);
+                diagChannel.appendLine('RTOS Views panel not found (not installed?)');
+              });
+            }, 1000);
           }),
           wantCurrentStatus: true,
           notifyAllEvents: false,

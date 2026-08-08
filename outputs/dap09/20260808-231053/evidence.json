@@ -1,0 +1,93 @@
+{
+  "dap": "DAP-09",
+  "timestamp": "2026-08-08T23:10:53+08:00",
+  "branch": "codex/dap09-rtos-view",
+  "codeHead": "3266c40701f955409d492af05fd64c69b4555313",
+  "status": "automation-pass-hardware-authorization-pending",
+  "target": {
+    "mcu": "STM32F407VET6",
+    "project": "D:\\STM32\\project\\vet6_led",
+    "rtos": "FreeRTOS 10.3.1, CMSIS-RTOS v1 wrapper",
+    "probe": "CMSIS-DAP_LU C251:F001 LU_2022_8888",
+    "transport": "wired CMSIS-DAP HID"
+  },
+  "tdd": {
+    "red": { "failed": 5, "passed": 50 },
+    "greenFocused": { "file": "src/debug/dap-session-cmsis-dap.test.ts", "passed": 57 },
+    "covered": [
+      "active rtosInfo controller registration",
+      "in-flight Continue cancellation",
+      "queued Continue cancellation with successful control completion",
+      "Reset cancellation",
+      "Disconnect cancellation",
+      "session replacement cancellation",
+      "owner-loss cancellation",
+      "controller, waiter, timer, gate, and variable-handle cleanup",
+      "ordinary RTOS detection-failure compatibility"
+    ]
+  },
+  "codeReview": {
+    "activeRtosInfoController": true,
+    "controllerRegisteredBeforeGateWait": true,
+    "controlCancellationPaths": ["Continue", "Reset", "Disconnect", "session replacement", "owner loss"],
+    "controllerIdentityCleanup": true,
+    "gateOwnershipCleanup": true,
+    "staleDetectedDataPublished": false,
+    "structuredCancellationFields": ["errorCode", "targetState", "elapsedMs", "diagnostics"],
+    "variableHandlesResetOnDispose": true,
+    "ordinaryFailureCompatibilityPreserved": true,
+    "independentSubagentReview": "not completed: service-side HTTP 429"
+  },
+  "automation": {
+    "typecheck": "passed",
+    "unitTests": { "status": "passed", "files": 32, "tests": 310 },
+    "build": "passed",
+    "buildNative": "passed",
+    "cmsisDapMock": "passed",
+    "cppChannelMock": "passed",
+    "cmsisDapAlgorithm": { "status": "passed", "bytes": 1576 },
+    "helperSelftest": { "status": "passed", "cases": 200, "failures": 0 },
+    "gitDiffCheck": "passed",
+    "distStatus": "clean"
+  },
+  "ownerAndRouting": {
+    "cmsisDapOwnerCount": 1,
+    "ownerEvidence": "code and mock",
+    "jlinkFallback": false,
+    "legacyFallback": false,
+    "openocd": false,
+    "gdbServer": false,
+    "jlinkExe": false,
+    "secondOwnerCreated": false,
+    "evaluateVariablesReadMemoryPreserved": true,
+    "watchTimelineRttPreserved": true,
+    "jlinkPathPreserved": true
+  },
+  "hardware": {
+    "authorizedForThisRun": false,
+    "executedForCodeHead": false,
+    "agentTargetMutatingOperations": [],
+    "flashOperationCount": 0,
+    "dapTrace": null,
+    "helperPid": null,
+    "ownerKind": null,
+    "jlinkInvolved": null,
+    "secondOwnerCreated": null,
+    "controlLatencyMs": { "p50": null, "p95": null },
+    "stableRefreshSeconds": null,
+    "dynamicTaskCreateDelete": null,
+    "previousUserObservedEvidence": "outputs/dap09/20260808-214005/evidence.json",
+    "acceptance": "pending explicit authorization and independent rerun"
+  },
+  "deferred": [
+    "three-task and dynamic create/delete hardware validation",
+    "invalidated TCB non-reuse proof",
+    "Reset/Continue/Disconnect stale-data and helper cleanup",
+    "Watch/Timeline/RTT/RTOS concurrency and control-latency P50/P95",
+    "60-second stable refresh",
+    "FreeRTOS version, ABI, optimization, and FreeRTOSConfig capture",
+    "synchronized DAP trace and owner metadata",
+    "DAP-10 MemoryView"
+  ],
+  "commitsPushed": ["79c39c0", "3266c40"]
+}

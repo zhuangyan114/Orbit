@@ -1,0 +1,151 @@
+{
+  "dap": "DAP-09",
+  "timestamp": "2026-08-08T18:37:02+08:00",
+  "branch": "codex/dap09-rtos-view",
+  "verifiedCodeHead": "a7b22be38d456c192fedb583c8a2b9201a506985",
+  "hardware": {
+    "authorized": false,
+    "mcu": "STM32F407VET6",
+    "probe": "CMSIS-DAP_LU",
+    "probeId": "C251:F001/LU_2022_8888",
+    "transport": "wired CMSIS-DAP HID",
+    "project": "D:\\STM32\\project\\vet6_led",
+    "rtos": "FreeRTOS 10.3.1, CMSIS-RTOS v1 wrapper",
+    "targetMutatingOperations": [],
+    "flashOperations": 0,
+    "acceptance": "pending-explicit-authorization"
+  },
+  "observedExternalFailure": {
+    "rtosDetected": true,
+    "messages": [
+      "Failed to get variable reference for pxReadyTasksLists",
+      "Unable to collect full RTOS information"
+    ],
+    "secondarySymptom": "Local and Registers did not load while rtos was enabled"
+  },
+  "review": {
+    "independentFindings": 7,
+    "resolved": [
+      "standard non-RTOS compound variables expansion",
+      "background priority and AbortSignal propagation to the physical owner scheduler",
+      "connection-loss invalidation of cached RTOS children",
+      "structured cancellation for stale lazy RTOS expansion",
+      "queued owner cancellation normalization",
+      "RTOS background state probes at the DAP and Commander layers",
+      "contextless RTOS background getState and fixed-delay work"
+    ],
+    "finalIndependentReview": "no-findings-code-review; hardware-not-run"
+  },
+  "verification": {
+    "tddReviewRed": {
+      "status": "failed-as-expected",
+      "failed": 6,
+      "passed": 61,
+      "files": 2
+    },
+    "reviewFocusedGreen": {
+      "status": "passed",
+      "tests": 71,
+      "files": 2
+    },
+    "schedulingReviewRed": {
+      "status": "failed-as-expected",
+      "failed": 3,
+      "passed": 67,
+      "files": 2
+    },
+    "contextlessEvaluateRed": {
+      "status": "failed-as-expected",
+      "failed": 1,
+      "passed": 20,
+      "files": 1,
+      "delayRegressionRecheck": "failed with one scheduled 100ms timeout before restoring the fix"
+    },
+    "requiredCrossModuleTests": {
+      "status": "passed",
+      "tests": 122,
+      "files": 6
+    },
+    "typecheck": "passed",
+    "unitTests": {
+      "status": "passed",
+      "tests": 299,
+      "files": 31
+    },
+    "build": "passed",
+    "buildNative": "passed",
+    "cmsisDapMock": "passed",
+    "cppChannelMock": "passed",
+    "cmsisDapAlgorithm": {
+      "status": "passed",
+      "bytes": 1576
+    },
+    "helperSelftest": {
+      "status": "passed",
+      "cases": 200,
+      "failures": 0
+    },
+    "gitDiffCheck": "passed-before-documentation-staging",
+    "distStatus": "clean-after-final-build"
+  },
+  "rtosContract": {
+    "initializeSupportsRTOS": true,
+    "rtosInfoSymbolProbe": "uxCurrentNumberOfTasks",
+    "initialExpandedExpressions": [],
+    "expansionMode": "one DAP level per variables request",
+    "compoundVariablesReference": "non-zero within stop generation",
+    "standardCompoundVariablesPreserved": true,
+    "byteOrientedReadMemory": true,
+    "staleReadCancellation": true,
+    "structuredErrors": [
+      "errorCode",
+      "targetState",
+      "elapsedMs",
+      "diagnostics"
+    ],
+    "dapGatePriority": "background",
+    "nativeOwnerPriority": "background",
+    "ownerAbortSignalPropagation": true,
+    "queuedOwnerCancellationNormalized": true,
+    "backgroundTargetStateProbe": false,
+    "contextlessBackgroundFixedDelayMs": 0
+  },
+  "owner": {
+    "probeCmsisDapUniqueOwner": true,
+    "ownerEvidenceLayer": "code-and-mock",
+    "jlinkFallback": false,
+    "legacyFallback": false,
+    "secondHelper": false
+  },
+  "externalLaunchConfig": {
+    "path": "D:\\STM32\\project\\vet6_led\\.vscode\\launch.json",
+    "selectedName": "Ozone: DAPLink Debug STM32F407VET6",
+    "selectedCount": 1,
+    "rtos": "FreeRTOS",
+    "cmsisDapTransport": "hid",
+    "cmsisDapVid": "C251",
+    "cmsisDapPid": "F001",
+    "cmsisDapSerial": "LU_2022_8888",
+    "flashBeforeDebug": true,
+    "flashBeforeDebugNote": "preserved; configuration was not launched"
+  },
+  "commits": [
+    { "hash": "d187e06", "message": "test: characterize RTOS View DAP contract", "pushed": true },
+    { "hash": "ea41517", "message": "fix: preserve RTOS stopped-state requests", "pushed": true },
+    { "hash": "3b2e2dc", "message": "fix: detect FreeRTOS through DAP rtosInfo", "pushed": true },
+    { "hash": "352d353", "message": "test: preserve RTOS background read scheduling contract", "pushed": true },
+    { "hash": "46bc4ff", "message": "fix: preserve structured memory cancellation errors", "pushed": true },
+    { "hash": "0da9b31", "message": "docs: add DAP-09 acceptance evidence", "pushed": true },
+    { "hash": "6ca8756", "message": "docs: record final DAP-09 commit", "pushed": true },
+    { "hash": "7f645d9", "message": "test: characterize RTOS lazy variable expansion", "pushed": true },
+    { "hash": "7505d7d", "message": "fix: lazily expand RTOS DAP variables", "pushed": true },
+    { "hash": "5f13806", "message": "docs: update DAP-09 RTOS regression evidence", "pushed": true },
+    { "hash": "0304f0c", "message": "test: cover RTOS review regressions", "pushed": true },
+    { "hash": "7ef8fe9", "message": "fix: preserve RTOS scheduling and variable contracts", "pushed": true },
+    { "hash": "0cd96aa", "message": "test: cover RTOS background scheduling regressions", "pushed": true },
+    { "hash": "2397829", "message": "fix: keep RTOS refreshes off the control queue", "pushed": true },
+    { "hash": "0172357", "message": "test: cover contextless RTOS background evaluate", "pushed": true },
+    { "hash": "f8b963e", "message": "fix: avoid foreground work in RTOS background evaluate", "pushed": true },
+    { "hash": "a7b22be", "message": "test: assert contextless RTOS refresh has no delay", "pushed": true }
+  ]
+}

@@ -1,10 +1,10 @@
 # DAP-09 CMSIS-DAP RTOS View Acceptance Report
 
-Date: 2026-08-09 14:15 CST
+Date: 2026-08-09 15:40 CST
 Branch: `codex/dap09-rtos-view`
 Verified implementation head: `1852d7e91db5079d2b2a3723f1c59946e8dd43a6`
 Remote implementation head: `origin/codex/dap09-rtos-view` at `1852d7e91db5079d2b2a3723f1c59946e8dd43a6`
-Evidence set: `outputs/dap09/20260809-140832/`
+Evidence set: `outputs/dap09/20260809-140832/` (historical/unit) and `outputs/dap09/hardware/2026-08-09-07-44-19/` (current hardware)
 
 The verified implementation head is the code and test commit exercised by the commands in this report. The documentation commit that contains this report is recorded separately by Git because a commit cannot contain its own SHA.
 
@@ -14,7 +14,7 @@ The verified implementation head is the code and test commit exercised by the co
 
 Code review, unit/Mock tests, TypeScript/native builds, helper mocks, the Flash algorithm check, and the formal CMSIS-DAP helper selftest pass. The runtime-counter defect has a focused regression fix, and a 20-generation reused-TCB Mock test covers stale handle invalidation.
 
-Hardware acceptance remains incomplete. No target-mutating hardware authorization was available for this continuation, so no firmware fixture was changed or flashed and no Reset, Halt, Run, Step, breakpoint, or RAM-write operation was issued. The remaining hardware gaps are a post-fix synchronized runtime-counter cross-check, real task creation/deletion, concurrent control latency, and transition/helper cleanup.
+The authorized static-firmware hardware workload now passes: one CMSIS-DAP HID owner, no Flash or target-memory writes, a synchronized RTOS snapshot, 60.989 seconds of Watch/Timeline/RTT/RTOS concurrency, control latency, and disconnect cleanup. DAP-09 remains partial because the firmware has no authorized dynamic create/delete fixture and hardware session replacement was not manufactured.
 
 ## Root Cause and Fix
 
@@ -77,7 +77,18 @@ The stopped trace proves whole-TCB CMSIS-DAP reads, but it does not retain separ
 
 Percentage basis is now explicit: `taskRawUint32 / totalRawUint32 * 100`, only when both values come from the same halted snapshot, total is non-zero, and no runtime timer overflow has occurred. Orbit must not invent a counter epoch after overflow.
 
-Post-fix unit evidence passes in `src/ozone-backend/commander-realtime-variables.test.ts` (23/23 within that file). Post-fix same-snapshot RTOS View, DAP evaluate/variables, direct `readMemory` bytes, and independent decode remain **not run on hardware**.
+Post-fix unit evidence passes in `src/ozone-backend/commander-realtime-variables.test.ts` (23/23 within that file). The current hardware snapshot passes the same-snapshot contract: `rtosInfo.detected=true`, `evaluate(pxReadyTasksLists)` returned `variablesReference=1000`, `variables` returned 7 list entries, and all four task runtime counters matched direct 4-byte `readMemory` values and independent little-endian `uint32_t` decoding.
+
+Current hardware runtime-counter cross-check (`outputs/dap09/hardware/2026-08-09-07-44-19/evidence.json`):
+
+| Task | Field address | Evaluate | Direct bytes | Independent `uint32_t` | Cross-check |
+| --- | --- | ---: | --- | ---: | --- |
+| `defaultTask` | `0x20000798` | 0 | `00 00 00 00` | 0 | pass |
+| `myTask02` | `0x20000A10` | 99949563 | `FB 1B F5 05` | 99949563 | pass |
+| `rttBench` | `0x20000E88` | 3103722348 | `6C 0B FF B8` | 3103722348 | pass |
+| `IDLE` | `0x20003EB0` | 713360962 | `42 06 85 2A` | 713360962 | pass |
+
+The same snapshot recorded four task names, priorities, stack base/top/end, stack usage, `uxTCBNumber`, and states: `defaultTask=Blocked`, `myTask02=Blocked`, `rttBench=Running`, `IDLE=Ready`.
 
 ## Dynamic Task Lifecycle
 
@@ -100,21 +111,29 @@ Historical read-only hardware baselines remain useful but are not control benchm
 | `outputs/dap09/20260809-130446/evidence.json` | 60 s | 39 | 0 | not measured |
 | `outputs/dap09/20260809-133000/evidence.json` | 60 s | 40 | 0 | not measured |
 
-Required hardware workload with RTOS View, at least eight Watch expressions, fast Timeline sampling, and continuous RTT was **not run**. Consequently Pause/Continue, Halt/Step, Reset, and Disconnect success rates and P50/P95/max are all unavailable (`null`). No claim is made about the 1200 ms gate threshold at the hardware layer.
+Current hardware workload (`outputs/dap09/hardware/2026-08-09-07-44-19/evidence.json`) ran 61.031 seconds with eight Watch expressions, three Timeline expressions, RTT buffer 1 polling, and 60 RTOS refresh requests. Watch data success was 91/91; Timeline produced 54 events and 183 points for `uwTick`, `xTickCount`, and `aww`; RTT produced 124 reads (110 non-empty, 443520 bytes, zero overrun). RTOS refresh success was 88.3% (the remaining 7 requests were stale/cancelled around control transitions), with zero gate-unavailable and zero unrelated errors.
+
+| Control | Attempts | Success | P50 | P95 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Continue/Pause | 9 | 9/9 | 257 ms | 599 ms | 599 ms |
+| Instruction Step | 3 | 3/3 | 635 ms | 641 ms | 641 ms |
+| Reset/Halt (`restart` to `osKernelStart`) | 2 | 2/2 | 552 ms | 641 ms | 641 ms |
+
+Watch latency was P50 508 ms, P95 1595 ms, max 1613 ms. The trace recorded 7 stale-result cancellations and no target-read-gate-unavailable responses.
 
 ## State and Cleanup Matrix
 
 | Transition | Mock | Hardware | Verified behavior at Mock layer |
 | --- | --- | --- | --- |
-| Continue | pass | not run | advances read epoch, aborts RTOS work, clears stale handles/results |
-| Reset | pass | not run | cancels RTOS work and releases controller/gate/timers |
-| Disconnect | pass | not run | cancels reads and disposes the selected owner |
+| Continue | pass | pass (9/9) | advances read epoch, aborts RTOS work, clears stale handles/results |
+| Reset | pass | pass (2/2) | cancels RTOS work and releases controller/gate/timers |
+| Disconnect | pass | pass | cancels reads and disposes the selected owner |
 | Session replacement | pass | not run | invalidates the old session generation and handles |
 | Owner loss | pass | not run by design | terminates without J-Link fallback or stale publication |
 
 Mock assertions cover the RTOS `AbortController`, gate waiters, waiter timers, drain timer, target-read flag, variable handles, and stale-result fences. `session-target-channel.test.ts` also covers symmetric CMSIS-DAP `DAP_Disconnect -> close -> helper exit` ordering.
 
-The post-automation process snapshot found zero Orbit helper processes. This proves the local test/build commands left no helper, but it is not a synchronized hardware Disconnect or replacement trace.
+The synchronized hardware disconnect returned success and the post-disconnect process snapshot contained zero Orbit owner processes. Session replacement was not run; the Mock generation fence remains the evidence for that transition.
 
 ## Owner and No-Fallback Evidence
 
@@ -124,6 +143,7 @@ Historical hardware evidence recorded one CMSIS-DAP HID owner:
 | --- | ---: | --- | --- | --- |
 | `outputs/dap09/20260809-130446/owner-process.json` | 6224 | `cmsis-dap` | false | false |
 | `outputs/dap09/20260809-133000/owner-process.json` | 30564 | `cmsis-dap` | false | false |
+| `outputs/dap09/hardware/2026-08-09-07-44-19/evidence.json` | 33632 | `cmsis-dap` | false | false |
 
 No OpenOCD, GDB server, `JLink.exe`, legacy fallback, extension-host backend fallback, or second CMSIS-DAP helper was observed. Mock selection and loss tests independently enforce the same contract.
 
@@ -147,6 +167,8 @@ All commands below were run after commit `1852d7e` and exited 0:
 | `npm run test:cpp-channel:mock` | pass |
 | `npm run test:cmsis-dap:algorithm` | pass; 1576 bytes |
 | `out/native/win32-x64/orbit-cmsis-dap-helper.exe --selftest` | 200 cases, 0 failures |
+| `npx vitest run src/dap09-evidence-validation.test.ts` | 3/3 pass |
+| `node --check scripts/cmsis-dap/verify-dap09-rtos-hw.js` | pass |
 | `git diff --check` | pass |
 | `git status --short -- dist` | clean |
 
@@ -164,21 +186,20 @@ The two earlier VS Code launch sessions each recorded 13 CMSIS-DAP Flash operati
 | `20260809-133000` | 1 | 3 | 4 | 4 | 1 | 13 |
 | Total known | 2 | 6 | 8 | 8 | 2 | 26 |
 
-The agent issued no Reset/Halt/Run/Step/RAM-write command during those read-only recordings. A Flash-free measurement session is still desirable for cleaner evidence, but Flash count is not treated as an independent primary rejection criterion; the missing runtime, lifecycle, concurrency, and cleanup measurements are the substantive blockers.
+The current authorized run issued only Reset/Halt/Run/Continue/Pause/Step and target reads. It issued zero Flash, erase, program, verify, breakpoint, option-byte, or target-memory-write operations. The helper log records VID `C251`, PID `F001`, serial `LU_2022_8888`, HID reports 65/65, report ID 0, protocol packet size 64, and DPIDR/target-control traffic.
 
 ## Remaining Acceptance Gaps
 
-1. Capture one post-fix halted snapshot for at least three tasks containing RTOS View values, DAP evaluate/variables values, direct DAP `readMemory` bytes, and independent declared-type decode.
-2. Build and Flash an authorized dynamic task fixture, then record 20 real create/delete/refresh cycles and stale TCB cleanup.
-3. Run at least 60 seconds with RTOS View, eight or more Watch expressions, fast Timeline, and RTT active; record control success rate and P50/P95/max latency.
-4. Record hardware Continue, Reset, Disconnect, and session replacement cleanup with no stale publication and no residual helper. Owner loss remains acceptable as Mock when unsafe to manufacture.
-5. Preserve a complete synchronized DAP request/response trace for the hardware measurements.
+1. Build and Flash an explicitly authorized dynamic task fixture, then record 20 real create/delete/refresh cycles and stale TCB cleanup.
+2. Manufacture a hardware session replacement case, or retain the Mock-only evidence with an explicit risk decision.
 
-Until these items are independently captured, DAP-09 remains **PARTIAL, NOT ACCEPTED**. DAP-10 is out of scope and has not been started.
+Until the dynamic lifecycle and session-replacement decisions are independently closed, DAP-09 remains **PARTIAL, NOT ACCEPTED**. The static-firmware hardware workload and synchronized runtime-counter cross-check are now accepted evidence. DAP-10 is out of scope and has not been started.
 
 ## Commits and Push Status
 
 - `6e9d8a3` `fix: preserve raw FreeRTOS runtime counters`
 - `1852d7e` `test: cover reused RTOS task lifecycles`
+
+The DAP-09 hardware harness and validator are added in this documentation/acceptance commit: `scripts/cmsis-dap/verify-dap09-rtos-hw.js`, `scripts/cmsis-dap/dap09-evidence-validation.js`, and `src/dap09-evidence-validation.test.ts`.
 
 Both implementation commits are pushed to `origin/codex/dap09-rtos-view`. The evidence set is intentionally under ignored `outputs/`; the report is the tracked acceptance index for those files.

@@ -23,14 +23,15 @@ The fixture exposes these stable symbols for DAP reads:
 - `g_dap09_lifecycle_delete_count`
 - `g_dap09_lifecycle_live`
 - `g_dap09_lifecycle_worker_counter`
+- `g_dap09_lifecycle_worker_tcb`
 
 The controller stops mutating after round 20 and remains alive until the debug session ends.
 
 ## Hardware Evidence
 
-The lifecycle harness records probe VID/PID/serial, HID report details, DPIDR, owner selection, helper PID, launch configuration, every round's sampled phase and counters, dynamic task name/TCB number when present, and direct-memory cross-checks. It rejects missing rounds, counter regressions, stale task publication after deletion, additional owners, Flash activity outside the authorized launch, and residual helper processes.
+The lifecycle harness records probe VID/PID/serial, HID report details, DPIDR, owner selection, helper PID, launch configuration, every round's sampled phase and counters, and the dynamic task name/TCB number when present. At each created/deleted halt it evaluates all seven fixture scalars, reads the same contiguous 28-byte block through DAP `readMemory`, independently decodes each little-endian field, and records the base64 block, field addresses, bytes, values, and mismatch list. The fixture Flash run uses the default `flashBeforeDebug:true`; the formal measurement run uses `--no-flash`, which maps to `flashBeforeDebug:false` and performs a DAP `restart` before sampling so the 20-round fixture starts from reset without another Flash. It rejects missing rounds, missing or reused TCB numbers, intra/inter-round counter regressions, incomplete or mismatched scalar evidence, stale task publication after deletion, additional owners, an incomplete/failed 13-stage Flash sequence, Flash activity outside the authorized launch, and residual helper processes.
 
-The replacement harness launches a first DAP adapter process, starts concurrent Watch/RTOS requests, terminates that session, waits for the helper process to exit, then launches a second process against the same CMSIS-DAP serial. It records first/second owner identities and cleanup results separately; it does not claim that process replacement alone proves same-process VS Code session identity fencing.
+The replacement harness launches a first DAP adapter process, starts concurrent Watch/RTOS requests, captures the actual pending request sequence numbers and commands, terminates that session, correlates `TargetReadCancelled` to a captured sequence number, waits for adapter/helper exit, then launches a second process against the same CMSIS-DAP serial. It records both adapter exit codes, whether a forced kill was needed, first/second owner identities, and cleanup results separately; it does not claim that process replacement alone proves same-process VS Code session identity fencing.
 
 ## Acceptance Criteria
 

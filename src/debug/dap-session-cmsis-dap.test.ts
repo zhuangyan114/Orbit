@@ -1496,6 +1496,11 @@ describe('DapSession CMSIS-DAP control routing', () => {
 
       const taskName = `dynamic-${generation}`;
       const runtimeCounter = generation * 100;
+      const taskState = generation % 2 === 0 ? 'Blocked' : 'Ready';
+      const priority = generation % 7;
+      const stackBase = 0x20006000 + generation * 0x100;
+      const stackTop = stackBase + 0x40 + generation;
+      const stackEnd = stackBase + 0x100;
       const currentReference = (session as any).allocateVariableHandle({
         expression: taskName,
         evaluateName: `((TCB_t*)0x${tcbAddress.toString(16)}).task`,
@@ -1519,6 +1524,27 @@ describe('DapSession CMSIS-DAP control routing', () => {
             hex: `0x${runtimeCounter.toString(16).toUpperCase().padStart(8, '0')}`,
             address: tcbAddress + 88, typeName: 'uint32_t',
           },
+          {
+            expression: 'eTaskState', value: generation % 2, display: taskState, hex: '',
+            address: tcbAddress, typeName: 'eTaskState',
+          },
+          {
+            expression: 'uxPriority', value: priority, display: `${priority}`,
+            hex: `0x${priority.toString(16).toUpperCase().padStart(8, '0')}`,
+            address: tcbAddress + 44, typeName: 'UBaseType_t',
+          },
+          {
+            expression: 'pxStack', value: stackBase, display: `0x${stackBase.toString(16).toUpperCase()}`,
+            hex: `0x${stackBase.toString(16).toUpperCase()}`, address: tcbAddress + 48, typeName: 'StackType_t *',
+          },
+          {
+            expression: 'pxTopOfStack', value: stackTop, display: `0x${stackTop.toString(16).toUpperCase()}`,
+            hex: `0x${stackTop.toString(16).toUpperCase()}`, address: tcbAddress, typeName: 'StackType_t *',
+          },
+          {
+            expression: 'pxEndOfStack', value: stackEnd, display: `0x${stackEnd.toString(16).toUpperCase()}`,
+            hex: `0x${stackEnd.toString(16).toUpperCase()}`, address: tcbAddress + 96, typeName: 'StackType_t *',
+          },
         ],
       });
       const currentRequestSeq = 3000 + generation;
@@ -1531,6 +1557,11 @@ describe('DapSession CMSIS-DAP control routing', () => {
         expect.objectContaining({ name: 'pcTaskName', value: `"${taskName}"` }),
         expect.objectContaining({ name: 'uxTCBNumber', value: `${generation}` }),
         expect.objectContaining({ name: 'ulRunTimeCounter', value: `${runtimeCounter}` }),
+        expect.objectContaining({ name: 'eTaskState', value: taskState }),
+        expect.objectContaining({ name: 'uxPriority', value: `${priority}` }),
+        expect.objectContaining({ name: 'pxStack', value: `0x${stackBase.toString(16).toUpperCase()}` }),
+        expect.objectContaining({ name: 'pxTopOfStack', value: `0x${stackTop.toString(16).toUpperCase()}` }),
+        expect.objectContaining({ name: 'pxEndOfStack', value: `0x${stackEnd.toString(16).toUpperCase()}` }),
       ]);
       expect(currentReference).not.toBe(previousReference);
       previousReference = currentReference;

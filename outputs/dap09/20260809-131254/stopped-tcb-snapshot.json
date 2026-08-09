@@ -1,0 +1,70 @@
+﻿{
+    "timestamp":  "2026-08-09T13:13:42.4400984+08:00",
+    "targetState":  "halted",
+    "uxCurrentNumberOfTasks":  4,
+    "pxCurrentTCB":  "0x20000E30 (536874544)",
+    "xTickCount":  1385912,
+    "ulTotalRunTime":  905252485,
+    "tasks":  [
+                  {
+                      "stableKey":  "0x20000740",
+                      "name":  "defaultTask",
+                      "namePrefix":  "16 elems [\u0027d\u0027 (100, 0x64), \u0027e\u0027 (101, 0x65), \u0027f\u0027 (102, 0x66), ...]",
+                      "uxPriority":  3,
+                      "uxBasePriority":  536873304,
+                      "pxStack":  "0x20000338",
+                      "pxEndOfStack":  "0x20000730",
+                      "pxTopOfStack":  "0x20000664",
+                      "stackCapacityBytes":  1016,
+                      "stackUsedBytes":  204,
+                      "stackUsedPercent":  20.1,
+                      "ulRunTimeCounter":  4294967296,
+                      "uxTCBNumber":  1
+                  },
+                  {
+                      "stableKey":  "0x200009B8",
+                      "name":  "myTask02",
+                      "namePrefix":  "16 elems [\u0027m\u0027 (109, 0x6D), \u0027y\u0027 (121, 0x79), \u0027T\u0027 (84, 0x54), ...]",
+                      "uxPriority":  0,
+                      "uxBasePriority":  0,
+                      "pxStack":  "0x200007B0",
+                      "pxEndOfStack":  "0x200009A8",
+                      "pxTopOfStack":  "0x2000086C",
+                      "stackCapacityBytes":  504,
+                      "stackUsedBytes":  316,
+                      "stackUsedPercent":  62.7,
+                      "ulRunTimeCounter":  8998516513,
+                      "uxTCBNumber":  2
+                  },
+                  {
+                      "stableKey":  "0x20000E30",
+                      "name":  "rttBench",
+                      "namePrefix":  "16 elems [\u0027r\u0027 (114, 0x72), \u0027t\u0027 (116, 0x74), \u0027t\u0027 (116, 0x74), ...]",
+                      "uxPriority":  0,
+                      "uxBasePriority":  0,
+                      "pxStack":  "0x20000A28",
+                      "pxEndOfStack":  "0x20000E20",
+                      "pxTopOfStack":  "0x20000DBC",
+                      "stackCapacityBytes":  1016,
+                      "stackUsedBytes":  100,
+                      "stackUsedPercent":  9.8,
+                      "ulRunTimeCounter":  22294789995,
+                      "uxTCBNumber":  3
+                  },
+                  {
+                      "stableKey":  "0x20003E58",
+                      "name":  "IDLE",
+                      "namePrefix":  "16 elems [\u0027I\u0027 (73, 0x49), \u0027D\u0027 (68, 0x44), \u0027L\u0027 (76, 0x4C), ...]",
+                      "uxPriority":  0,
+                      "uxBasePriority":  0,
+                      "pxStack":  "0x20003EBC",
+                      "pxEndOfStack":  "0x200040B8",
+                      "pxTopOfStack":  "0x20004064",
+                      "stackCapacityBytes":  508,
+                      "stackUsedBytes":  84,
+                      "stackUsedPercent":  16.5,
+                      "ulRunTimeCounter":  12495680298,
+                      "uxTCBNumber":  4
+                  }
+              ]
+}

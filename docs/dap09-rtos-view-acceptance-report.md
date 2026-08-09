@@ -1,8 +1,8 @@
 # DAP-09 CMSIS-DAP RTOS View Acceptance Report
 
-Date: 2026-08-09 13:05 CST
+Date: 2026-08-09 13:20 CST
 Branch: `codex/dap09-rtos-view`
-Verified code head: `905c6560fb259a6e1a517db2173f7f466d31cc30`
+Verified code head: `b1be0c668f3bd5c707fcd00a6cf45f4e8324f2d5`
 Target profile: STM32F407VET6, CMSIS-DAP_LU (`C251:F001`, `LU_2022_8888`), wired CMSIS-DAP HID, FreeRTOS 10.3.1 with CMSIS-RTOS v1 wrapper.
 Firmware workspace: `D:\STM32\project\vet6_led`
 
@@ -10,7 +10,7 @@ Firmware workspace: `D:\STM32\project\vet6_led`
 
 Code review, unit/Mock verification, and builds: **PASS**.
 
-Hardware acceptance for code head `905c656`: **PARTIAL, NOT ACCEPTED**. The authorized read-only rerun proved a stable running-state FreeRTOS baseline and a single CMSIS-DAP owner. It did not produce a stopped-state TCB snapshot, dynamic create/delete fixture, synchronized raw DAP trace, concurrency latency, or a zero-Flash run. The run evidence is under `outputs/dap09/20260809-130446/`.
+Hardware acceptance for code head `b1be0c6`: **PARTIAL, NOT ACCEPTED**. The authorized read-only rerun proved a stable running-state FreeRTOS baseline, a stopped-state TCB snapshot, and a single CMSIS-DAP owner. It did not produce a dynamic create/delete fixture, synchronized raw DAP trace, concurrency latency, or a zero-Flash run. The running evidence is under `outputs/dap09/20260809-130446/`; the stopped snapshot is under `outputs/dap09/20260809-131254/`.
 
 ## Code Review
 
@@ -49,6 +49,17 @@ Hardware acceptance for code head `905c656`: **PARTIAL, NOT ACCEPTED**. The auth
 
 The authorized rerun used the already-open session and performed read-only expression reads plus a 60-second background recording. No reset, halt, run, step, RAM write, or external firmware edit was issued by the agent during the recording. However, the session's launch log contains 13 CMSIS-DAP Flash operations (`init`, 3 `eraseSector`, 4 `programPage`, 4 `verify`, `uninit`) at 04:45:19-04:45:24. Because that launch was not a separately captured zero-Flash run, the DAP-09 Flash=0 gate is **not met**.
 
+Stopped-state snapshot (`outputs/dap09/20260809-131254/`) was captured after the user paused the already-open session. The API reported `targetState=halted`; the snapshot contains four tasks and uses each TCB address as its stable key:
+
+| Task | Stable TCB key | Priority | Stack used |
+| --- | --- | ---: | ---: |
+| `defaultTask` | `0x20000740` | 3 | 204 / 1016 bytes (20.1%) |
+| `myTask02` | `0x200009B8` | 0 | 316 / 504 bytes (62.7%) |
+| `rttBench` | `0x20000E30` | 0 | 100 / 1016 bytes (9.8%) |
+| `IDLE` | `0x20003E58` | 0 | 84 / 508 bytes (16.5%) |
+
+The snapshot also records `uxTCBNumber` values 1-4, which can support invalidated-TCB detection when a dynamic create/delete fixture is available. Dynamic task creation/deletion was not exercised, so stale-key non-reuse remains unverified. The captured `ulRunTimeCounter` values showed a mismatch between decoded numeric values and their low 32-bit hexadecimal representation; runtime counters are retained as raw evidence but are not claimed as final accurate values. Raw captures are preserved in `stopped-tcb-raw.json` and `stopped-dap-trace.log`.
+
 Read-only hardware evidence (`outputs/dap09/20260809-130446/evidence.json`):
 
 - `targetState`: running; `uxCurrentNumberOfTasks`: 4 throughout 39 frames over 60.0 seconds; zero read errors.
@@ -82,8 +93,7 @@ Those captures show `defaultTask`, `myTask02`, `rttBench`, and `IDLE`, with name
 
 ## Unimplemented / Deferred
 
-- Stopped-state TCB snapshot against code head `905c656` with a synchronized DAP trace.
-- At least three tasks plus dynamic task create/delete, with proof that invalidated TCB data is not reused.
+- Dynamic task create/delete with proof that invalidated TCB data is not reused (the stopped-state four-task snapshot is recorded, but no lifecycle fixture was available).
 - Reset, Continue, and Disconnect proof that stale tasks do not publish and no helper remains.
 - Concurrent Watch, Timeline, RTT, and RTOS View refresh with control-latency P50/P95.
 - 60-second stopped-state/concurrent refresh with control latency; the running-state 60-second baseline is recorded.

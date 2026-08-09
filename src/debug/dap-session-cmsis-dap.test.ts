@@ -1470,6 +1470,77 @@ describe('DapSession CMSIS-DAP control routing', () => {
     });
   });
 
+  it('invalidates stale RTOS references across 20 reused-TCB lifecycle generations', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const session = connectedRtosSession(backend);
+    const messages: DebugProtocolMessage[] = [];
+    const tcbAddress = 0x20005000;
+    session.on('send', message => messages.push(message));
+
+    let previousReference = 0;
+    for (let generation = 1; generation <= 20; generation++) {
+      if (previousReference > 0) {
+        (session as any).beginControl();
+        (session as any).endControl();
+        (session as any).sendEvent('stopped', { reason: 'breakpoint', threadId: 1 });
+        const staleRequestSeq = 2000 + generation;
+        await (session as any).handleVariables({
+          ...request(staleRequestSeq, 'variables'),
+          arguments: { variablesReference: previousReference },
+        });
+        expect(messages.find(message => message.request_seq === staleRequestSeq)).toMatchObject({
+          success: true,
+          body: { variables: [] },
+        });
+      }
+
+      const taskName = `dynamic-${generation}`;
+      const runtimeCounter = generation * 100;
+      const currentReference = (session as any).allocateVariableHandle({
+        expression: taskName,
+        evaluateName: `((TCB_t*)0x${tcbAddress.toString(16)}).task`,
+        value: tcbAddress,
+        display: taskName,
+        hex: `0x${tcbAddress.toString(16).toUpperCase()}`,
+        address: tcbAddress,
+        typeName: 'TCB_t',
+        children: [
+          {
+            expression: 'pcTaskName', value: tcbAddress, display: `"${taskName}"`, hex: '',
+            address: tcbAddress + 52, typeName: 'char[16]',
+          },
+          {
+            expression: 'uxTCBNumber', value: generation, display: `${generation}`,
+            hex: `0x${generation.toString(16).toUpperCase().padStart(8, '0')}`,
+            address: tcbAddress + 84, typeName: 'UBaseType_t',
+          },
+          {
+            expression: 'ulRunTimeCounter', value: runtimeCounter, display: `${runtimeCounter}`,
+            hex: `0x${runtimeCounter.toString(16).toUpperCase().padStart(8, '0')}`,
+            address: tcbAddress + 88, typeName: 'uint32_t',
+          },
+        ],
+      });
+      const currentRequestSeq = 3000 + generation;
+      await (session as any).handleVariables({
+        ...request(currentRequestSeq, 'variables'),
+        arguments: { variablesReference: currentReference },
+      });
+      const currentVariables = messages.find(message => message.request_seq === currentRequestSeq)?.body?.variables;
+      expect(currentVariables).toEqual([
+        expect.objectContaining({ name: 'pcTaskName', value: `"${taskName}"` }),
+        expect.objectContaining({ name: 'uxTCBNumber', value: `${generation}` }),
+        expect.objectContaining({ name: 'ulRunTimeCounter', value: `${runtimeCounter}` }),
+      ]);
+      expect(currentReference).not.toBe(previousReference);
+      previousReference = currentReference;
+    }
+
+    expect((session as any).stopGeneration).toBe(19);
+    expect((session as any).variableHandles.size).toBe(1);
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
+
   it('returns structured RTOS cancellation when a stop generation invalidates a lazy handle', async () => {
     const backend = { execute: vi.fn() } as unknown as OzoneBackend;
     const session = new DapSession(backend);

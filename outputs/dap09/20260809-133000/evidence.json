@@ -36,9 +36,16 @@
     "gdbServerInvolved": false,
     "secondOwnerCreated": false,
     "synchronizedDapTrace": false,
-    "flashOperationCount": "not independently captured for this rerun",
+    "flashOperationCount": 13,
+    "flashOperations": {
+      "init": 1,
+      "eraseSector": 3,
+      "programPage": 4,
+      "verify": 4,
+      "uninit": 1
+    },
     "dynamicTaskCreateDelete": "not exercised",
     "controlLatencyMs": { "p50": null, "p95": null }
   },
-  "acceptance": "hardware-partial; stable running-state rerun recorded, control lifecycle and flash-zero gates remain pending"
+  "acceptance": "hardware-partial; stable running-state rerun recorded, control lifecycle remains pending, flash-zero gate failed"
 }

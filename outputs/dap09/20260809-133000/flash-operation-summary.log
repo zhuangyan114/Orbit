@@ -1,0 +1,7 @@
+05:21:04.487 flash init count=1
+05:21:04.882-05:21:05.663 flash eraseSector count=3
+05:21:06.850-05:21:09.231 flash programPage count=4
+05:21:07.041-05:21:09.413 flash verify count=4
+05:21:09.595 flash uninit count=1
+total flash operations=13
+source=outputs/Log/dll.log lines 13-25

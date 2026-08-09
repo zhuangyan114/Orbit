@@ -475,6 +475,8 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 ### DAP-09：RTOS View
 
+**状态**: 2026-08-09 已通过用户独立验收；实现、Mock、真实 CMSIS-DAP lifecycle/session replacement 和剩余风险边界见 `docs/dap09-rtos-view-acceptance-report.md`。DAP-10 尚未启动。
+
 **技术方向**:
 
 - 第一版只支持明确版本范围内的 FreeRTOS、Cortex-M、ELF/DWARF 可用目标；其他 RTOS 标记为未支持，不通过猜测结构体布局兼容；

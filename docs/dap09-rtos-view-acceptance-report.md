@@ -17,9 +17,9 @@ The verified code head is the implementation, harness, and test commit exercised
 
 ## Acceptance Status
 
-**WAITING FOR USER INDEPENDENT ACCEPTANCE (等待用户独立验收)**
+**ACCEPTED BY USER (用户独立验收通过)**
 
-All DAP-09 automated and authorized hardware acceptance items in the project plan have evidence. This report does not mark the project plan complete, does not update `docs/bug-fix-log.md`, and does not start DAP-10.
+All DAP-09 automated and authorized hardware acceptance items in the project plan have evidence. The user confirmed independent acceptance on 2026-08-09; the project plan and `docs/bug-fix-log.md` now record that decision. DAP-10 has not been started.
 
 | DAP-09 criterion | Result | Evidence |
 | --- | --- | --- |
@@ -265,7 +265,7 @@ The earlier successful no-Flash `2026-08-09-11-08-06` and replacement `2026-08-0
 
 There are no remaining automated or authorized-hardware blockers for DAP-09. The only remaining action is the user's independent acceptance decision. The hardware session-replacement evidence has the explicit process/owner scope described above; same extension-host session identity behavior remains Mock-covered rather than overstated as hardware-proven.
 
-DAP-09 is therefore **waiting for user independent acceptance**, not self-declared complete. The project plan and `docs/bug-fix-log.md` remain unchanged. DAP-10 has not been started.
+DAP-09 was **accepted by the user on 2026-08-09** after independent review. This acceptance authorizes integration into the repository's primary branch. DAP-10 has not been started.
 
 ## Commits and Push Status
 
@@ -276,4 +276,4 @@ DAP-09 is therefore **waiting for user independent acceptance**, not self-declar
 - `b68143c` `test: close DAP-09 lifecycle hardware acceptance` (final verified implementation/harness commit)
 - report publication commit: recorded by Git after this file is committed
 
-Push status: pending report-only commit and push to `origin/codex/dap09-rtos-view`.
+Publication status: verified code and the pre-acceptance report are published through `e6e98d2`; the acceptance confirmation is recorded by the subsequent integration commit.

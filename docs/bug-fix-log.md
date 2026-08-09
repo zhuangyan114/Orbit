@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### Bug: DAP-09 RTOS View 发布伪造运行计数并缺少动态任务生命周期证据
+
+- **日期**: 2026-08-09
+- **问题描述**: FreeRTOS RTOS View 会把正常降低的 32 位运行计数误判为溢出，发布超过 `UINT32_MAX` 的合成值；同时缺少真实任务连续 create/delete、TCB 地址复用、并发刷新和 session replacement 的完整硬件验收证据。
+- **根因分析**: Orbit 对 `TCB_t.ulRunTimeCounter` 和总运行计数维护了跨读取的 wrap epoch 与缓存合成，而 FreeRTOS 10.3.1 的这些字段只是无溢出保护的原始 `uint32_t`。原有静态任务证据也无法证明同一 TCB 地址被新任务复用时旧 handle、字段和异步读取不会泄漏到新 generation。
+- **修改方案**: 按 DWARF 声明直接解码原始 32 位计数，移除 wrap/总量合成；保持标准 DAP `rtosInfo`、`evaluate`、`variables` 和 `readMemory` 合同；增加 20-generation reused-TCB Mock 回归、20 轮真实动态任务 fixture、每个 created/deleted snapshot 的七标量 28-byte raw/evaluate 对照，以及可审计的 adapter/helper session replacement 验证。
+- **涉及文件**: `src/ozone-backend/commander.ts` - FreeRTOS 运行计数解码；`src/debug/dap-session.ts` - RTOS 读取取消与 generation 清理；`src/debug/dap-session-cmsis-dap.test.ts` - 20-generation reused-TCB 回归；`scripts/cmsis-dap/verify-dap09-lifecycle-hw.js`、`verify-dap09-session-replacement-hw.js`、`dap09-lifecycle-evidence-validation.js` - 硬件验收与离线 validator；`docs/dap09-rtos-view-acceptance-report.md` - 完整验收报告
+- **验证结果**: 用户于 2026-08-09 明确确认验收通过。全量 Vitest 34 文件/335 项、focused 7 文件/134 项、类型检查、扩展/native 构建、CMSIS-DAP/J-Link Mock、1576-byte Flash Algorithm、CMSIS-DAP selftest 200/200 均通过。真实 CMSIS-DAP lifecycle 为 20/20 轮、40/40 个 28-byte raw/evaluate snapshot 一致、零 Flash、单 owner 且断开后无残留；replacement 的 pending `rtosInfo` 同 seq 返回 `TargetReadCancelled`，两个 adapter 均 exit code 0、未 forced kill、helper PID 不同且清理为 0。
+
 ### Bug: Reset 后 RTT 控制块暂未就绪导致日志永久停用
 
 - **日期**: 2026-08-08

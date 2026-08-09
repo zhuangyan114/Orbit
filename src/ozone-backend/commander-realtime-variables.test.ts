@@ -233,6 +233,74 @@ describe('OzoneBackend realtime variables', () => {
     });
   });
 
+  it('reports a TCB runtime counter from its declared uint32_t bytes without synthetic wrap extension', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    const tcbAddress = 0x20000740;
+    const runtimeCounterOffset = 88;
+    let runtimeCounter = 0xF0000000;
+    internal.symbols = [];
+    internal.dwarfInfo = {
+      varToType: new Map(),
+      typeDefs: new Map([
+        ['tcb-type', {
+          name: 'TCB_t', byteSize: 100, kind: 'struct', fields: [
+            { name: 'ulRunTimeCounter', typeOffset: 'u32-type', byteOffset: runtimeCounterOffset },
+          ],
+        }],
+        ['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address, size) => {
+      if (address !== tcbAddress || size !== 100) return null;
+      const bytes = new Uint8Array(size);
+      new DataView(bytes.buffer).setUint32(runtimeCounterOffset, runtimeCounter, true);
+      return bytes;
+    };
+
+    const expression = `((TCB_t*)0x${tcbAddress.toString(16)}).ulRunTimeCounter`;
+    const beforeWrap = await backend.execute({ cmd: 'evaluateExpression', expression, force: true });
+    runtimeCounter = 0x30DF7F6B;
+    const afterWrap = await backend.execute({ cmd: 'evaluateExpression', expression, force: true });
+
+    expect(beforeWrap).toMatchObject({
+      ok: true,
+      data: { value: 0xF0000000, display: '0xF0000000 (4026531840)', hex: '0xF0000000' },
+    });
+    expect(afterWrap).toMatchObject({
+      ok: true,
+      data: { value: 0x30DF7F6B, display: '0x30DF7F6B (819953515)', hex: '0x30DF7F6B' },
+    });
+  });
+
+  it('reports the FreeRTOS runtime total from its declared uint32_t bytes', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as unknown as BackendInternals;
+    let runtimeTotal = 0xF1234567;
+    internal.symbols = [{ name: 'ulTotalRunTime', address: 0x20000100, size: 4 }];
+    internal.dwarfInfo = {
+      varToType: new Map([['ulTotalRunTime', 'u32-type']]),
+      typeDefs: new Map([
+        ['u32-type', { name: 'uint32_t', byteSize: 4, kind: 'base', encoding: 'unsigned' }],
+      ]),
+    };
+    internal.targetReadMemory = async (address, size) => {
+      if (address !== 0x20000100 || size !== 4) return null;
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, runtimeTotal, true);
+      return bytes;
+    };
+
+    await backend.execute({ cmd: 'evaluateExpression', expression: 'ulTotalRunTime', force: true });
+    runtimeTotal = 0x067F0AC6;
+    const result = await backend.execute({ cmd: 'evaluateExpression', expression: 'ulTotalRunTime', force: true });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: { value: 0x067F0AC6, display: '0x067F0AC6 (108989126)', hex: '0x067F0AC6' },
+    });
+  });
+
   it('formats bool and char with numeric and semantic text', () => {
     const bool = formatScalar(new OzoneBackend(), [1], 1, { kind: 'base', name: '_Bool', encoding: 'boolean' });
     const char = formatScalar(new OzoneBackend(), [0x41], 1, { kind: 'base', name: 'char', encoding: 'signed char' });

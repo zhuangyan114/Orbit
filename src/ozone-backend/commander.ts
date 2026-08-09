@@ -86,8 +86,6 @@ export class OzoneBackend {
   private stepOverClearedBps: { index: number; addr: number }[] = [];
   private _lastTempBpAddr = -1;
   private dwarfInfo: DwarfInfo = { varToType: new Map(), typeDefs: new Map() };
-  private runtimeCounterWraps = new Map<string, { lastRaw: number; base: number }>();
-  private runtimeTaskCounters = new Map<string, number>();
   private stepProfileSeq = 0;
   private activeStepProfile: { id: number; kind: 'stepOver' | 'stepInto' | 'stepOut'; start: number } | null = null;
   private nativeStepsEnabled = { stepInto: false, stepOver: false, stepOut: false };
@@ -854,8 +852,6 @@ case 'readVariableRuntime':
     this.addressLocCache.clear();
     this.lineEntries = [];
     this.sourceStatementRanges.clear();
-    this.runtimeCounterWraps.clear();
-    this.runtimeTaskCounters.clear();
     return { ok: true, data: null };
   }
 
@@ -3390,11 +3386,6 @@ case 'readVariableRuntime':
       if (tn) typeName = tn;
     }
 
-    if (this.shouldUnwrapRuntimeCounter(expression) && typeof value === 'number') {
-      const counter = this.formatRuntimeCounterValue(expression, value, sym.address, typeName || 'uint32_t');
-      value = counter.value;
-      display = counter.display;
-    }
     if (isRTOS || expression.startsWith('ux')) {
       log.eval(`read result value=${value} display="${display}"`);
     }
@@ -3407,9 +3398,7 @@ case 'readVariableRuntime':
       ? await this.evaluatePointerChildren(pointerValue, resolvedType!.typeOffset!, expression, 1, watchContext)
       : undefined;
 
-    const hexValue = this.shouldUnwrapRuntimeCounter(expression) && typeof value === 'number'
-      ? `0x${(this.readUnsignedLittleEndian(raw, readSize) >>> 0).toString(16).toUpperCase().padStart(readSize * 2, '0')}`
-      : isFloat
+    const hexValue = isFloat
       ? `0x${Array.from(raw.slice(0, readSize)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`
       : this.formatScalarValue(raw, readSize, resolvedType).hex;
 
@@ -3440,67 +3429,6 @@ case 'readVariableRuntime':
       address: isAddress ? normalized : undefined,
       typeName,
     };
-  }
-
-  private shouldUnwrapRuntimeCounter(expression: string): boolean {
-    return expression === 'ulTotalRunTime' || expression.endsWith('.ulRunTimeCounter') || expression.endsWith('->ulRunTimeCounter');
-  }
-
-  private unwrapRuntimeCounter(key: string, rawValue: number): number {
-    const raw = rawValue >>> 0;
-    const previous = this.runtimeCounterWraps.get(key);
-    if (!previous) {
-      this.runtimeCounterWraps.set(key, { lastRaw: raw, base: 0 });
-      return raw;
-    }
-
-    let base = previous.base;
-    if (raw < previous.lastRaw) {
-      base += 0x1_0000_0000;
-    }
-    this.runtimeCounterWraps.set(key, { lastRaw: raw, base });
-    return base + raw;
-  }
-
-  private formatRuntimeCounterValue(expression: string, rawValue: number, address?: number, typeName = 'uint32_t'): WatchValue {
-    const raw = rawValue >>> 0;
-    const key = this.runtimeCounterKey(expression, address);
-    let value = this.unwrapRuntimeCounter(key, raw);
-    if (expression === 'ulTotalRunTime') {
-      const taskTotal = this.latestTaskRuntimeTotal();
-      if (taskTotal > value) value = taskTotal;
-    } else if (this.isTaskRuntimeCounterExpression(expression)) {
-      this.runtimeTaskCounters.set(key, value);
-    }
-    const hex = `0x${raw.toString(16).toUpperCase().padStart(8, '0')}`;
-    return {
-      expression,
-      evaluateName: expression,
-      value,
-      display: value > raw ? `${value}` : `${hex} (${value})`,
-      hex,
-      address,
-      typeName,
-    };
-  }
-
-  private isTaskRuntimeCounterExpression(expression: string): boolean {
-    return expression.endsWith('.ulRunTimeCounter') || expression.endsWith('->ulRunTimeCounter');
-  }
-
-  private runtimeCounterKey(expression: string, address?: number): string {
-    if (this.isTaskRuntimeCounterExpression(expression) && address !== undefined) {
-      return `tcb-runtime@0x${address.toString(16).toUpperCase()}`;
-    }
-    return expression;
-  }
-
-  private latestTaskRuntimeTotal(): number {
-    let total = 0;
-    for (const value of this.runtimeTaskCounters.values()) {
-      if (Number.isFinite(value) && value > 0) total += value;
-    }
-    return total;
   }
 
   private formatAddress(value: number): string {
@@ -4187,13 +4115,6 @@ case 'readVariableRuntime':
     }
     if (this.isFunctionPointerType(resolved) && typeof value === 'number') {
       display = this.formatFunctionPointer(value);
-    }
-
-    if (field.name === 'ulRunTimeCounter' && typeof value === 'number') {
-      const counter = this.formatRuntimeCounterValue(evaluateName, value, addr, resolvedTypeName || 'uint32_t');
-      value = counter.value;
-      display = counter.display;
-      hex = counter.hex;
     }
 
     const pointerHasChildren = resolvedKind === 'pointer'

@@ -103,7 +103,7 @@ FreeRTOS 兼容性验收补充：
 
 ### 6. Configure RTT and P-RTLog
 
-- RTT 默认 `rttLogEnabled: true`，up-buffer 默认 `0`，默认 poll interval `50 ms`，每轮默认读取 `4096 bytes`，输出默认到 `terminal`。
+- RTT 默认 `rttLogEnabled: true`，up-buffer 默认 `0`，默认 poll interval `500 ms`，每轮默认读取 `64 bytes`，输出默认到 `terminal`。
 - `rttLogTarget` 只能使用 `terminal`、`debugConsole` 或 `both`。
 - `pRtLogEnabled` 默认 `false`；仅在当前 firmware 使用 tokenized P-RTLog 或用户明确要求时打开。
 - P-RTLog 解码使用当前 ELF/AXF 的 `.pw_tokenizer.entries`；`pRtLogRoot` 是当前源码读取的配置/诊断值，不要描述成 token 搜索目录，除非源码已改变并重新核对。

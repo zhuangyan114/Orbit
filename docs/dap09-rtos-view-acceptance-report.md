@@ -1,8 +1,8 @@
 # DAP-09 CMSIS-DAP RTOS View Acceptance Report
 
-Date: 2026-08-08 23:10 CST
+Date: 2026-08-09 13:05 CST
 Branch: `codex/dap09-rtos-view`
-Verified code head: `3266c40701f955409d492af05fd64c69b4555313`
+Verified code head: `905c6560fb259a6e1a517db2173f7f466d31cc30`
 Target profile: STM32F407VET6, CMSIS-DAP_LU (`C251:F001`, `LU_2022_8888`), wired CMSIS-DAP HID, FreeRTOS 10.3.1 with CMSIS-RTOS v1 wrapper.
 Firmware workspace: `D:\STM32\project\vet6_led`
 
@@ -10,7 +10,7 @@ Firmware workspace: `D:\STM32\project\vet6_led`
 
 Code review, unit/Mock verification, and builds: **PASS**.
 
-Hardware acceptance for code head `3266c40`: **PENDING EXPLICIT AUTHORIZATION**. Earlier user-provided screenshots show that both DAPLink and J-Link could populate RTOS Views, but those screenshots predate the lifecycle fix and are not an independent hardware rerun. DAP-09 must not be declared independently accepted until the hardware gates below are executed with authorization.
+Hardware acceptance for code head `905c656`: **PARTIAL, NOT ACCEPTED**. The authorized read-only rerun proved a stable running-state FreeRTOS baseline and a single CMSIS-DAP owner. It did not produce a stopped-state TCB snapshot, dynamic create/delete fixture, synchronized raw DAP trace, concurrency latency, or a zero-Flash run. The run evidence is under `outputs/dap09/20260809-130446/`.
 
 ## Code Review
 
@@ -47,7 +47,15 @@ Hardware acceptance for code head `3266c40`: **PENDING EXPLICIT AUTHORIZATION**.
 
 ## Hardware Status
 
-No target-mutating operation was executed during this rework. The agent did not reset, halt, run, step, write RAM, write Flash, modify the external firmware, or start a hardware debug session. Agent-side Flash operation count is 0.
+The authorized rerun used the already-open session and performed read-only expression reads plus a 60-second background recording. No reset, halt, run, step, RAM write, or external firmware edit was issued by the agent during the recording. However, the session's launch log contains 13 CMSIS-DAP Flash operations (`init`, 3 `eraseSector`, 4 `programPage`, 4 `verify`, `uninit`) at 04:45:19-04:45:24. Because that launch was not a separately captured zero-Flash run, the DAP-09 Flash=0 gate is **not met**.
+
+Read-only hardware evidence (`outputs/dap09/20260809-130446/evidence.json`):
+
+- `targetState`: running; `uxCurrentNumberOfTasks`: 4 throughout 39 frames over 60.0 seconds; zero read errors.
+- Stable task handles: `defaultTaskHandle=0x20000740`, `myTask02Handle=0x200009B8`, `rttBenchTaskHandle=0x20000E30`, `xIdleTaskHandle=0x20003E58`.
+- `pxCurrentTCB` changed among three values while running, as expected from scheduler switches; this is not a consistent TCB snapshot.
+- `ownerKind=cmsis-dap`, helper PID `6224`, no J-Link process or legacy/OpenOCD/GDB log match, and no second owner observed.
+- Firmware evidence: FreeRTOS 10.3.1/CMSIS-RTOS v1, GCC 10.3, `-O0 -g3`, Cortex-M4F hard-float ABI; key `FreeRTOSConfig` values are recorded in `firmware-config.txt`.
 
 The earlier screenshots under `outputs/dap09/20260808-214005/screenshots/` remain useful only as user-observed baseline evidence:
 
@@ -70,17 +78,18 @@ Those captures show `defaultTask`, `myTask02`, `rttBench`, and `IDLE`, with name
 - `rtosInfo` owns the DAP read gate while its background owner operation runs, but Continue/Reset/Disconnect/termination abort it and allow control to drain the gate.
 - The queued test proves Continue completes successfully and no `evaluateExpression` is issued by the cancelled RTOS request after the target starts running.
 - Local and Registers retain foreground stopped-state priority while RTOS refresh is pending.
-- Hardware P50/P95 control latency, Watch + Timeline + RTT + RTOS concurrency, and 60-second stability were not measured. The earlier 1669 ms and 189 ms screenshot refresh times are observations, not a controlled benchmark.
+- The 60-second running-state refresh baseline passed with 39 frames and zero read errors. Hardware P50/P95 control latency, Watch + Timeline + RTT + RTOS concurrency, and stopped-state TCB consistency were not measured. The earlier 1669 ms and 189 ms screenshot refresh times are observations, not a controlled benchmark.
 
 ## Unimplemented / Deferred
 
-- Independent authorized hardware rerun against code head `3266c40` with a synchronized DAP trace.
+- Stopped-state TCB snapshot against code head `905c656` with a synchronized DAP trace.
 - At least three tasks plus dynamic task create/delete, with proof that invalidated TCB data is not reused.
 - Reset, Continue, and Disconnect proof that stale tasks do not publish and no helper remains.
 - Concurrent Watch, Timeline, RTT, and RTOS View refresh with control-latency P50/P95.
-- Continuous 60-second refresh.
-- FreeRTOS version, ABI, compiler optimization, and key `FreeRTOSConfig` capture from the tested image.
-- Helper PID, `ownerKind`, `jlinkInvolved`, `secondOwnerCreated`, and Flash operation count in the same hardware evidence set.
+- 60-second stopped-state/concurrent refresh with control latency; the running-state 60-second baseline is recorded.
+- Independent confirmation that the captured image's FreeRTOS version, ABI, optimization, and `FreeRTOSConfig` match the source workspace; source/build evidence is recorded for this run.
+- Flash-zero launch evidence; this run recorded 13 Flash operations and therefore cannot satisfy the zero-Flash gate.
+- Helper PID, `ownerKind`, `jlinkInvolved`, and `secondOwnerCreated` are present in the new evidence set; a raw synchronized DAP trace remains pending.
 - DAP-10 MemoryView remains out of scope.
 
 ## Commits and Pushes

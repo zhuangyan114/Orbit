@@ -1,0 +1,17 @@
+﻿FreeRTOSConfig evidence: D:\STM32\project\vet6_led\Core\Inc\FreeRTOSConfig.h
+compiler: arm-none-eabi-gcc 10.3-2021.10
+optimization: -O0
+debug: -g3
+ABI: Cortex-M4F hard-float (mcpu=cortex-m4, mfpu=fpv4-sp-d16, mfloat-abi=hard)
+configUSE_PREEMPTION=1
+configSUPPORT_STATIC_ALLOCATION=1
+configSUPPORT_DYNAMIC_ALLOCATION=1
+configTICK_RATE_HZ=1000
+configMAX_PRIORITIES=7
+configMINIMAL_STACK_SIZE=128
+configTOTAL_HEAP_SIZE=15360
+configQUEUE_REGISTRY_SIZE=8
+configUSE_TRACE_FACILITY=1
+configGENERATE_RUN_TIME_STATS=1
+configRECORD_STACK_HIGH_ADDRESS=1
+configUSE_MUTEXES=1

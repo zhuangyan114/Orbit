@@ -60,6 +60,8 @@ Stopped-state snapshot (`outputs/dap09/20260809-131254/`) was captured after the
 
 The snapshot also records `uxTCBNumber` values 1-4, which can support invalidated-TCB detection when a dynamic create/delete fixture is available. Dynamic task creation/deletion was not exercised, so stale-key non-reuse remains unverified. The captured `ulRunTimeCounter` values showed a mismatch between decoded numeric values and their low 32-bit hexadecimal representation; runtime counters are retained as raw evidence but are not claimed as final accurate values. Raw captures are preserved in `stopped-tcb-raw.json` and `stopped-dap-trace.log`.
 
+The restarted debug session produced a second read-only running-state recording in `outputs/dap09/20260809-133000/evidence.json`: 60 seconds, 500 ms interval, 40 frames, and 0 read errors. `uxCurrentNumberOfTasks` stayed at 4; all four task handles stayed unchanged; `pxCurrentTCB` switched between `0x20000E30` and `0x20003E58`. The active owner was one CMSIS-DAP HID helper (PID 30564); no J-Link, OpenOCD, GDB server, or second helper process was found. This is stability and owner evidence only; it does not prove Reset/Continue/Disconnect cleanup or control latency.
+
 Read-only hardware evidence (`outputs/dap09/20260809-130446/evidence.json`):
 
 - `targetState`: running; `uxCurrentNumberOfTasks`: 4 throughout 39 frames over 60.0 seconds; zero read errors.
@@ -89,7 +91,7 @@ Those captures show `defaultTask`, `myTask02`, `rttBench`, and `IDLE`, with name
 - `rtosInfo` owns the DAP read gate while its background owner operation runs, but Continue/Reset/Disconnect/termination abort it and allow control to drain the gate.
 - The queued test proves Continue completes successfully and no `evaluateExpression` is issued by the cancelled RTOS request after the target starts running.
 - Local and Registers retain foreground stopped-state priority while RTOS refresh is pending.
-- The 60-second running-state refresh baseline passed with 39 frames and zero read errors. Hardware P50/P95 control latency, Watch + Timeline + RTT + RTOS concurrency, and stopped-state TCB consistency were not measured. The earlier 1669 ms and 189 ms screenshot refresh times are observations, not a controlled benchmark.
+- The 60-second running-state refresh baseline passed twice: the original run had 39 frames and zero read errors, and the restarted-session rerun had 40 frames and zero read errors. Hardware P50/P95 control latency, Watch + Timeline + RTT + RTOS concurrency, and stopped-state TCB consistency across transitions were not measured. The earlier 1669 ms and 189 ms screenshot refresh times are observations, not a controlled benchmark.
 
 ## Unimplemented / Deferred
 

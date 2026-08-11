@@ -14,10 +14,10 @@ describe('RuntimeRouter active DAP ownership', () => {
     vscodeState.activeDebugSession = undefined;
   });
 
-  it('does not fall back to the extension backend when active DAP requests fail', async () => {
+  it('does not fall back to the extension backend when an active Orbit DAP request fails', async () => {
     const backend = { execute: vi.fn() } as unknown as OzoneBackend;
     vscodeState.activeDebugSession = {
-      type: 'ozone',
+      type: 'orbit',
       customRequest: vi.fn(async () => { throw new Error('DAP unavailable'); }),
     };
     const router = new RuntimeRouter(backend);
@@ -32,7 +32,7 @@ describe('RuntimeRouter active DAP ownership', () => {
     expect(backend.execute).not.toHaveBeenCalled();
   });
 
-  it('uses the extension backend only when there is no active ozone session', async () => {
+  it('uses the extension backend only when there is no active Orbit session', async () => {
     const backend = {
       execute: vi.fn(async (command: { cmd: string }) => {
         if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };

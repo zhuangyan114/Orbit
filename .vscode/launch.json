@@ -32,7 +32,7 @@
       }
     },
     {
-      "type": "ozone",
+      "type": "orbit",
       "request": "launch",
       "name": "Orbit: Debug STM32",
       "program": "${workspaceFolder}/build/Debug/frame.elf",

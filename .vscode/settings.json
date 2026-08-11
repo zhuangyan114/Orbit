@@ -1,8 +1,10 @@
 {
     "memory-view.trackDebuggers": [
+        "orbit",
         "ozone"
     ],
     "mcu-debug.rtos-views.trackDebuggers": [
+        "orbit",
         "ozone"
     ],
     "cmake.sourceDirectory": "${workspaceFolder}/native/jlink-helper"

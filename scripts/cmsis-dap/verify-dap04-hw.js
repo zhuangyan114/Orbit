@@ -270,7 +270,7 @@ async function runSession(index) {
   const client = new DapClient(session);
   try {
     const initialize = await client.request('initialize', {
-      clientID: 'orbit-dap04-hw', adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true,
+      clientID: 'orbit-dap04-hw', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true,
     });
     addCheck(session, 'initialize', responseOk(initialize), { elapsedMs: initialize.elapsedMs, body: initialize.message.body });
 

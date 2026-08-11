@@ -2,7 +2,7 @@
 
 ## 1. 状态与目标
 
-本文档是 DAP-06 Watch 扩展类型工作的实施与验收依据。当前状态为“待实施”，本文档本身不代表功能已经通过。
+本文档是 DAP-06 Watch 扩展类型工作的原始实施与验收依据。该阶段后来已实施并通过，最终状态与证据见 [DAP-06 Watch AI 验收交接报告](dap06-watch-ai-acceptance-handoff.md)；本文保留当时的范围和门槛，不再以“待实施”作为当前状态。
 
 本轮在现有 CMSIS-DAP Watch 路由、单一 physical owner、`NativeScheduler` 和 DAP 变量树合同上增加以下能力：
 

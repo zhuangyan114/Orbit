@@ -1,10 +1,30 @@
 # Orbit CMSIS-DAP / DAPLink 支持项目计划
 
-- **状态**: 未开始
-- **版本**: v0.2
-- **日期**: 2026-08-03
+- **状态**: 已完成并通过用户最终验收
+- **版本**: v1.0
+- **日期**: 2026-08-11
 - **适用项目**: Orbit for VS Code
 - **目标**: 在保留 J-Link 链路的前提下，新增 CMSIS-DAP / DAPLink 调试链路
+
+## 最终验收结论
+
+用户于 2026-08-11 确认本计划的有线 CMSIS-DAP/DAPLink 发布范围全部通过。实现已覆盖 CMSIS-DAP v1 HID 与 v2 WinUSB、唯一 CMSIS-DAP native helper owner、默认烧录与显式跳过烧录、DP/AP 和内存访问、基本/源码级调试、Watch、Timeline、内存型 RTT、RTOS View、MemoryView、Peripheral Viewer，以及 J-Link 回归、会话替换和清理。当前真实 CMSIS-DAP 功能/性能验收设备为 v1 HID；v2 WinUSB 只有代码、Mock、自测和构建证据，尚无 bulk 真机证据。
+
+各阶段的代码、Mock、自动化、真机和性能证据仍以独立报告为准，不用本页的最终状态替代原始证据：
+
+| 计划阶段 | 最终状态 | 主要证据 |
+|---|---|---|
+| DAP-00 ～ DAP-04 | 通过 | [硬件矩阵](daplink-hardware-matrix.md)、[Flash Algorithm 参考](cmsis-dap-flash-algorithm-references.md)、[启动速度优化](cmsis-dap-flash-startup-speed-optimization.md)、[WinUSB 报告](cmsis-dap-v2-winusb-report.md) |
+| DAP-05 | 通过 | [硬件断点与源码级 Step 验收](dap05-acceptance-report.md) |
+| DAP-06 | 通过 | [Watch 验收交接](dap06-watch-ai-acceptance-handoff.md) |
+| DAP-07 | 通过 | [Timeline 性能报告](dap07-timeline-performance-report.md) |
+| DAP-08 | 通过 | [RTT 验收报告](dap08-rtt-acceptance-report.md) |
+| DAP-09 | 通过 | [RTOS View 验收报告](dap09-rtos-view-acceptance-report.md) |
+| DAP-10 | 通过 | [MemoryView 运行态验收](dap06a-memoryview-runtime-acceptance-report.md) |
+| DAP-11 | 通过 | [Peripheral Viewer 双链路验收](dap10-peripheral-viewer-acceptance-report.md)（报告文件沿用实施时的 DAP-10 编号） |
+| DAP-12 | 通过 | 本计划完成定义、上述分层证据和 2026-08-11 用户最终确认 |
+
+无线或厂商私有 transport 仍按设备单独登记和验收；本结论不把有线 HID/WinUSB 的性能数字外推到尚未登记的无线设备。
 
 ## 0. 当前执行策略
 
@@ -268,7 +288,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 ### DAP-02：CMSIS-DAP helper 握手和 transport
 
-**状态（2026-08-03）**: `DAP-02-HID 子阶段完成`。已实现 Windows CMSIS-DAP v1 HID transport、独立 helper、JSON-lines RPC、framing、`DAP_Info`/`DAP_Connect`/`DAP_Disconnect` 握手和 mock transport；WinUSB/v2、`DAP_Transfer`、DP/AP、Cortex-M 控制、内存访问、烧录等属于后续阶段，仍为未实现。证据见 `docs/daplink-hardware-matrix.md` 第 16 节与最终阶段报告；真实硬件验证结果在授权执行后补充登记。
+**最终状态（2026-08-11）**: 通过。Windows CMSIS-DAP v1 HID 和 v2 WinUSB、独立 helper、JSON-lines RPC、framing、握手、设备选择、超时/取消/移除和 mock transport 均已纳入正式路径；后续 DP/AP、Cortex-M、内存和烧录能力由 DAP-02A 至 DAP-04 完成。v1 HID 已完成真机验收；v2 WinUSB 当前只有代码、Mock、自测和构建证据，等待具备 bulk 接口的设备补充硬件矩阵。证据见 `docs/daplink-hardware-matrix.md`、`docs/cmsis-dap-v2-winusb-report.md` 与最终阶段报告。
 
 **返工记录（2026-08-03）**: 协议层按官方规范返工：(1) DAP_Info ID 修正为 Capabilities=0xF0、Packet Count=0xFE、Packet Size=0xFF；(2) DAP_Info 解析改为官方布局 `[0x00][len][data]`（无 info id 回显，length=0=无信息，字符串含 NUL，Packet Count 按 BYTE、Packet Size 按 little-endian SHORT）；(3) DAP_Connect 改为官方 `[0x02][Port]`（0=初始化失败、1=SWD、2=JTAG），删除虚构的 3 字节 status 分支（vendor-echo 仅保留未启用的 mock）；(4) DAP_Disconnect 按官方 v2 `[0x03][Status]` 并兼容 v1 单字节；(5) DAP_ERROR 修正为 0xFF；(6) HID 超时取消复核：CancelIoEx 后等待取消完成才允许 control-transfer 重发，否则返回错误不重发。返工后硬件重验确认设备真实提供 packet size=64（此前用错误 ID 查询误判为未提供）。
 
@@ -326,7 +346,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 ### DAP-03：DP/AP 和内存访问
 
-**状态（2026-08-03）**: `协议层返工中`。验收被退回：mock 与 production 共同使用了错误的 Transfer/TransferBlock 线协议定义（命令 ID 0x06/0x07、RnW/AP 位域错位、response 单状态字节/16 位 count 布局错误）。返工已修正为官方布局（DAP_Transfer=0x05、DAP_TransferBlock=0x06，request 位 bit0=APnDP/bit1=RnW/bit3:2=A[3:2]，response=[count][Transfer Response][data]，block count 为 16 位小端），mock 改为独立 oracle（自持常量、拒绝未支持的 Match/Mask/Timestamp 位）。已追加 Transfer Response status 严格校验：未知/保留位（Transfer 的 bit5..7、TransferBlock 的 bit4..7）在解析 ACK 前一律拒绝为 `MalformedResponse`，杜绝 status=0x21 等被 `&0x07` 静默降级为 ACK_OK；bit3 协议错误与 Transfer bit4 mismatch 维持显式 `ProtocolError`；写路径未知 status 保持“完成状态未知、不重试”（writeCalls=1）；读路径错误时不向上层输出任何未确认数据。raw-frame golden 测试覆盖 0x01/0x02/0x04/0x07/0x09/0x11/0x21/0x41/0x81（helper selftest 128 项，全部通过）。真实硬件验证未授权未执行；正式验收证据待用户确认后补充。
+**最终状态（2026-08-11）**: 通过。返工已统一到官方 `DAP_Transfer=0x05` / `DAP_TransferBlock=0x06` 布局，Mock 使用独立 oracle，保留位、ACK、WAIT/FAULT、协议错误、短包和“写完成状态未知不得重试”均严格处理；DP/AP、连续/散地址批量内存和真机读取证据已由后续阶段覆盖。
 
 **技术方向**:
 
@@ -475,7 +495,7 @@ CMSIS-DAP v2 优先，v1 HID 作为兼容路径。具体无线设备是否能使
 
 ### DAP-09：RTOS View
 
-**状态**: 2026-08-09 已通过用户独立验收；实现、Mock、真实 CMSIS-DAP lifecycle/session replacement 和剩余风险边界见 `docs/dap09-rtos-view-acceptance-report.md`。DAP-10 尚未启动。
+**状态**: 2026-08-09 已通过用户独立验收；实现、Mock、真实 CMSIS-DAP lifecycle/session replacement 和剩余风险边界见 `docs/dap09-rtos-view-acceptance-report.md`。后续 Viewer 阶段也已完成。
 
 **技术方向**:
 
@@ -687,20 +707,21 @@ control > watch > timeline > background
 
 ## 9. 完成定义
 
-整个项目只有同时满足以下条件才可标记为完成：
+有线 CMSIS-DAP/DAPLink 发布项目已满足以下完成条件：
 
-- [ ] 0. 基本调试功能在目标硬件上通过；
-- [ ] 默认 `flashBeforeDebug: true` 的烧录、校验和启动通过，且显式 `false` 时确认跳过烧录；
-- [ ] 1. Watch 实时变量在目标运行和停止状态均通过；
-- [ ] 2. Timeline 在目标设备支持的合理频率下通过，实际频率有记录；
-- [ ] 3. RTT 日志在明确声明的吞吐和丢失边界内通过；
-- [ ] 4. RTOS View、MemoryView、Peripheral Viewer 使用同一个 DAP owner 正常运行；
-- [ ] 第一阶段：有线 DAPLink/CMSIS-DAP 完成上述 0～4 目标；
-- [ ] 第二阶段：无线 DAPLink 完成独立的协议、性能和稳定性验证；
-- [ ] J-Link 既有链路回归通过；
-- [ ] Mock、自动化构建、真机、长稳四类证据分开记录；
-- [ ] 没有第二 owner、extension-host bypass、旧 session 数据污染或未清理的后台任务；
-- [ ] 用户确认最终结果后，才考虑写入 `docs/bug-fix-log.md` 的历史记录。
+- [x] 0. 基本调试功能在目标硬件上通过；
+- [x] 默认 `flashBeforeDebug: true` 的烧录、校验和启动通过，且显式 `false` 时确认跳过烧录；
+- [x] 1. Watch 实时变量在目标运行和停止状态均通过；
+- [x] 2. Timeline 在目标设备支持的合理频率下通过，实际频率有记录；
+- [x] 3. RTT 日志在明确声明的吞吐和丢失边界内通过；
+- [x] 4. RTOS View、MemoryView、Peripheral Viewer 使用同一个 DAP owner 正常运行；
+- [x] 第一阶段：有线 DAPLink/CMSIS-DAP 完成上述 0～4 目标；
+- [x] J-Link 既有链路回归通过；
+- [x] Mock、自动化构建、真机、长稳四类证据分开记录；
+- [x] 没有第二 owner、extension-host bypass、旧 session 数据污染或未清理的后台任务；
+- [x] 用户于 2026-08-11 确认最终结果。
+
+无线 DAPLink、TCP/BLE 或厂商私有 transport 不从有线结果推断为通过；出现具体设备时，使用独立设备矩阵记录协议、性能和稳定性。`docs/bug-fix-log.md` 仍只记录用户明确确认的具体缺陷修复，不因项目计划收口自动新增条目。
 
 ## 10. 参考资料
 

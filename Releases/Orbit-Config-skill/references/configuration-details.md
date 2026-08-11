@@ -1,6 +1,6 @@
 # Orbit Configuration Details
 
-本文是 `Orbit-Config-skill` 的配置参考。配置项名称、枚举值、默认值和范围来自当前仓库的 `package.json`、debug configuration provider、DAP session、Plugin API 和 Native/Legacy channel 源码；不要把示例中的芯片、路径或 RTOS 值复制到另一个 firmware workspace。
+本文是 `Orbit-Config-skill` 的配置参考。配置项名称、枚举值、默认值和范围来自当前仓库的 `package.json`、debug configuration provider、DAP session、Plugin API，以及 J-Link/CMSIS-DAP owner 源码；不要把示例中的芯片、路径或 RTOS 值复制到另一个 firmware workspace。
 
 ## Workspace settings
 
@@ -12,7 +12,7 @@
 | `orbit.jlinkDllPath` | path | `""` | 指定 `JLink_x64.dll`；空值时自动搜索。|
 | `orbit.defaultDevice` | string | `STM32F407VG` | `device` 的共享默认值；必须改成当前真实 MCU。|
 | `orbit.defaultInterface` | `SWD` / `JTAG` | `SWD` | 默认 debug interface。|
-| `orbit.defaultSpeed` | number, kHz | `4000` | 默认 J-Link interface speed。|
+| `orbit.defaultSpeed` | number, kHz | `4000` | 默认 target interface speed。|
 | `orbit.defaultProgram` | path | `""` | 默认 ELF/AXF；空值时扫描 `build/Debug`、`build/Release`、`build`。|
 | `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的 SVD 默认路径。|
 | `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称；例如实际使用 FreeRTOS 时写 `FreeRTOS`。|
@@ -21,7 +21,7 @@
 | `orbit.rttBufferIndex` | number | `0`, `0..15` | RTT up-buffer index。|
 | `orbit.rttPollIntervalMs` | number, ms | `50`, `10..5000` | RTT poll interval。|
 | `orbit.rttReadSize` | number, bytes/poll | `4096`, `64..65536` | 每轮 RTT 最大读取字节数。|
-| `orbit.rttControlBlockAddress` | string | `""` | RTT control block address；空值交给 J-Link 自动检测。|
+| `orbit.rttControlBlockAddress` | string | `""` | RTT control block address；J-Link 可自动检测，CMSIS-DAP 可从 ELF 符号定位或使用显式地址。|
 | `orbit.rttStripAnsi` | boolean | `true` | 仅去除写入 Debug Console 的 ANSI 控制序列。|
 | `orbit.rttLogTarget` | `terminal` / `debugConsole` / `both` | `terminal` | RTT 输出位置。|
 | `orbit.pRtLogEnabled` | boolean | `false` | 是否把 RTT bytes 解码为 P-RTLog tokenized frames。|
@@ -32,48 +32,111 @@
 | `orbit.timelineSampleIntervalMs` | number, ms | `0.2`, `0.1..10000` | Timeline target sampling 目标间隔。|
 | `orbit.timelineSendIntervalMs` | number, ms | `16`, `1..10000` | Timeline 向 Webview 发送更新的间隔。|
 
-另有源码会读取但 `package.json` 当前未注册的 workspace setting：`orbit.flashBeforeDebug`，默认 `true`。它控制有 `program` 时是否先调用 `JLink.exe` flash；launch 层的 `flashBeforeDebug: false` 可以跳过 flash。
+`orbit.flashBeforeDebug` 默认 `true`。launch 层可覆盖它：J-Link 使用 Commander 烧录，CMSIS-DAP 使用当前 helper owner 的 Flash Algorithm；`false` 跳过所有 Flash 操作。
 
 External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目标 workspace 中加入：
 
 ```json
 {
-  "memory-view.trackDebuggers": ["ozone"],
-  "mcu-debug.rtos-views.trackDebuggers": ["ozone"],
-  "mcu-debug.debug-tracker-vscode.trackDebuggers": ["ozone"]
+  "memory-view.trackDebuggers": ["orbit", "ozone"],
+  "mcu-debug.rtos-views.trackDebuggers": ["orbit", "ozone"],
+  "mcu-debug.debug-tracker-vscode.trackDebuggers": ["orbit", "ozone"]
 }
 ```
 
-合并时保留数组已有元素，并确保 `"ozone"` 不重复。
+合并时保留数组已有元素，并确保 `"orbit"` 与兼容别名 `"ozone"` 不重复。
 
 ## Launch configuration
 
-最小结构：
+每次调用 Orbit-Config-skill 都生成或更新四项标准配置。下面是结构示例；`program`、`device`、`deviceName`、SVD、RTOS 和速度必须替换为当前工程已核实的值：
 
-```json
+```jsonc
 {
   "version": "0.2.0",
   "configurations": [
     {
-      "type": "ozone",
+      "name": "Orbit: J-Link (Flash)",
+      "type": "orbit",
       "request": "launch",
-      "name": "Orbit: Debug STM32"
+      "probe": "jlink",
+      "program": "${workspaceFolder}/build/Debug/firmware.elf",
+      "device": "STM32F407VE",
+      "deviceName": "STM32F407VET6",
+      "interface": "SWD",
+      "speedKHz": 4000,
+      "flashBeforeDebug": true
+    },
+    {
+      "name": "Orbit: J-Link (No Flash)",
+      "type": "orbit",
+      "request": "launch",
+      "probe": "jlink",
+      "program": "${workspaceFolder}/build/Debug/firmware.elf",
+      "device": "STM32F407VE",
+      "deviceName": "STM32F407VET6",
+      "interface": "SWD",
+      "speedKHz": 4000,
+      "flashBeforeDebug": false
+    },
+    {
+      "name": "Orbit: DAPLink (Flash)",
+      "type": "orbit",
+      "request": "launch",
+      "probe": "cmsis-dap",
+      "cmsisDapTransport": "auto",
+      "program": "${workspaceFolder}/build/Debug/firmware.elf",
+      "device": "STM32F407VE",
+      "deviceName": "STM32F407VET6",
+      "interface": "SWD",
+      "speedKHz": 4000,
+      "flashBeforeDebug": true
+    },
+    {
+      "name": "Orbit: DAPLink (No Flash)",
+      "type": "orbit",
+      "request": "launch",
+      "probe": "cmsis-dap",
+      "cmsisDapTransport": "auto",
+      "program": "${workspaceFolder}/build/Debug/firmware.elf",
+      "device": "STM32F407VE",
+      "deviceName": "STM32F407VET6",
+      "interface": "SWD",
+      "speedKHz": 4000,
+      "flashBeforeDebug": false
     }
   ]
 }
 ```
 
+默认 DAPLink 配置不包含以下选择器：
+
+```json
+"cmsisDapVid": "C251",
+"cmsisDapPid": "F001",
+"cmsisDapSerial": "LU_2022_8888"
+```
+
+上面的值是特定验收设备示例，不是通用默认值。只有用户明确要求绑定该设备时，才把所需选择器同时加入 `Orbit: DAPLink (Flash)` 和 `Orbit: DAPLink (No Flash)`；仅检测到设备或只连接一只 probe 不构成绑定要求。
+
 当前 `package.json` debug schema 注册的 launch properties 如下。`default` 是 schema/config provider 的默认值，不代表当前板卡一定应使用该值。
 
 | Property | Type / unit | Default / range | 说明 |
 | --- | --- | --- | --- |
-| `device` | string | `STM32F407VG` | J-Link device name。|
+| `device` | string | `STM32F407VG` | 目标 device；J-Link 用于 DLL 选型，CMSIS-DAP 用于芯片/Flash Algorithm 校验。|
 | `deviceName` | string | `STM32F407VG` | 外部 MCU Views 兼容别名；provider 默认跟随 `device`。|
+| `probe` | `jlink` / `cmsis-dap` | `jlink` | 每个 session 的物理 target owner 类型。|
+| `cmsisDapTransport` | enum | `auto` | `auto`、`cmsis-dap-v2`/`winusb`、`cmsis-dap`/`hid`。|
+| `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。|
+| `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。|
+| `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。|
+| `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、许可和目标适配已确认的 Flash Algorithm。|
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF；provider 可能自动从 build 目录选择。|
 | `svdFile` | path | `""` | SVD 兼容字段。|
 | `svdPath` | path | `""` | SVD 兼容字段；provider 默认跟随 `svdFile`。|
-| `interface` | `SWD` / `JTAG` | `SWD` | J-Link interface。|
-| `speedKHz` | number, kHz | `4000` | J-Link interface speed。|
+| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口；当前 CMSIS-DAP 路径使用 SWD。|
+| `speedKHz` | number, kHz | `4000` | target interface speed。|
+| `flashBeforeDebug` | boolean | `true` | 使用当前 owner 烧录/校验；`false` 明确跳过。|
+| `runToEntryPoint` | string / `false` | `main` | CMSIS-DAP Launch/Restart 后停靠符号；`false` 禁用。|
 | `rtos` | string | `""` | 传给 RTOS Views 的 RTOS 名称。|
 | `rttLogEnabled` | boolean | `true` | 是否轮询 RTT。|
 | `rttBufferIndex` | number | `0` | RTT up-buffer index；运行时限制为 `0..15`。|
@@ -90,7 +153,7 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | `nativeDebugEngineStepOver` | boolean | `true` | Native step over 开关。|
 | `nativeDebugEngineStepOut` | boolean | `true` | Native step out 开关。|
 
-源码还支持 launch-only/未在 schema 注册但被读取的字段：`elfPath` 是 `program` 的别名；`flashBeforeDebug` 默认 `true`。`interface`、`device`、`speedKHz`、`rtos` 和所有 RTT/P-RTLog/Native 字段最终由 DAP session 使用。
+源码还支持 `elfPath` 作为 `program` 的兼容别名。`probe`、`interface`、`device`、`speedKHz`、`flashBeforeDebug`、`rtos` 和所有 RTT/P-RTLog/owner 字段最终由 DAP session 使用。
 
 项目实际值确认顺序建议：`.ioc` 的 `Mcu.Name`、startup file、linker script、CMake compile definitions、SVD 文件名、同板已知可用配置。`device`、`deviceName`、SVD 和 active ELF 必须属于同一目标。
 
@@ -122,17 +185,25 @@ set(CMAKE_SIZE "${ARM_TOOLCHAIN_BIN_DIR}/arm-none-eabi-size.exe")
 
 注意：当前 Legacy `JLinkDLL.connect()` 固定选择 SWD，虽然配置 schema 接受 `JTAG`；需要 JTAG 时优先使用 Native，并把这个结论作为 source limitation 报告。
 
+## CMSIS-DAP / DAPLink
+
+`probe: "cmsis-dap"` 启动 `out/native/win32-x64/orbit-cmsis-dap-helper.exe`，不加载 J-Link DLL。`cmsisDapTransport: "auto"` 优先 WinUSB v2 并兼容 HID v1。标准配置保持未绑定；用户明确要求选择特定设备时，才使用 serial、VID/PID 或 interface path。
+
+CMSIS-DAP owner 负责协议 framing、SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm 和内存型 RTT。它不回退到 J-Link/Legacy，也不允许 Watch、Timeline、RTT 或 Viewer 创建第二个 target owner。
+
+默认 `flashBeforeDebug: true` 要求目标型号和 Flash Algorithm 匹配，并由同一 owner 完成 erase/program/verify；`false` 不得发出 Flash 操作。使用自定义 `cmsisDapFlashAlgorithmPath` 时，必须确认来源、许可、目标范围、RAM 布局和 ABI。
+
 ## Native / Legacy owner
 
 Native helper 路径为 source checkout 的 `out/native/win32-x64/orbit-jlink-helper.exe`。Native 与 Legacy 不能在同一 DAP session 同时持有 target。`auto` 的 fallback 发生在 Native startup/initialization 失败或已 dispose 的 Native owner loss 之后；不会 hot-switch，Native owner 丢失通常要求结束并重新启动 session。
 
-Native scheduler 的优先级是 `control > watch > timeline`。step、continue、halt、reset、breakpoint 和 write 属于 control work；不要通过第二个 DLL owner 绕过调度。
+Native scheduler 的优先级是 `control > watch > timeline > background`。step、continue、halt、reset、breakpoint、Flash 和 write 属于 control work；RTT/RTOS refresh 属于 background。不要通过第二个 owner 绕过调度。
 
 ## RTOS Views
 
 Orbit 通过 DAP capability 和外部 extension tracker 对接 RTOS Views；Orbit 本身不解析 RTOS kernel。需要三层同时正确：
 
-1. tracker arrays 含 `"ozone"`，且对应的 MCU Debug extensions 已安装；
+1. tracker arrays 含 `"orbit"`（兼容时同时保留 `"ozone"`），且对应的 MCU Debug extensions 已安装；
 2. launch 的 MCU、active ELF、SVD、`rtos` 一致；
 3. firmware 有外部 RTOS View 所需的 symbols、trace 和 runtime-stat hooks。
 
@@ -144,7 +215,7 @@ FreeRTOS 10.x 使用 CMSIS-RTOS v1 wrapper 时，launch 示例为：
 
 ```json
 {
-  "type": "ozone",
+  "type": "orbit",
   "request": "launch",
   "name": "Orbit: FreeRTOS STM32F407",
   "program": "${workspaceFolder}/build/Debug/firmware.elf",
@@ -165,7 +236,7 @@ FreeRTOS 10.x 使用 CMSIS-RTOS v1 wrapper 时，launch 示例为：
 
 ## RTT and P-RTLog
 
-RTT 必须由 firmware 初始化 SEGGER RTT control block，当前 J-Link DLL 还要导出 RTT control/read 函数。`rttStripAnsi` 仅影响 Debug Console；terminal 输出保留 ANSI。RTT `ESC[2J` 会触发 Debug Console 清屏行为。
+RTT 必须由 firmware 初始化 SEGGER RTT control block。J-Link DLL 还要导出 RTT control/read 函数；CMSIS-DAP 通过当前 owner 读取目标内存，需可解析 `_SEGGER_RTT` 或提供 `rttControlBlockAddress`。`rttStripAnsi` 仅影响 Debug Console；terminal 输出保留 ANSI。RTT `ESC[2J` 会触发 Debug Console 清屏行为。
 
 P-RTLog frame 格式是：
 
@@ -185,7 +256,7 @@ MCP server：`Releases/mcp/orbit-mcp-server.js`，stdio 进程；它读取 `ORBI
 
 Plugin API 使用 `127.0.0.1`、随机端口、`/health` GET 和带 Bearer token 的 `/rpc` POST；endpoint 文件在 extension global storage 中生成。当前 MCP tools：`ozone_status`、`ozone_read_many`、`ozone_write_many`、`ozone_record`、`ozone_experiment_run`。
 
-如果活动 `ozone` DAP session 存在，runtime reads/writes/status 通过该 DAP session 路由；DAP 请求失败应返回错误，不回退到另一个 Extension Host target owner。
+如果活动 `orbit` DAP session（或旧 `ozone` 别名）存在，runtime reads/writes/status 通过该 DAP session 路由；DAP 请求失败应返回错误，不回退到另一个 Extension Host target owner。
 
 ## Validation commands
 
@@ -199,6 +270,7 @@ Get-Command arm-none-eabi-objdump
 Get-Command node
 Test-Path "C:\Program Files\SEGGER\JLink\JLink_x64.dll"
 Test-Path ".\out\native\win32-x64\orbit-jlink-helper.exe"
+Test-Path ".\out\native\win32-x64\orbit-cmsis-dap-helper.exe"
 cmake --preset debug
 cmake --build --preset debug
 ```
@@ -214,4 +286,4 @@ JSONC 必须使用 JSONC-aware parser 或 VS Code 检查，不要删除注释来
 
 ## Final report template
 
-最终报告使用以下英文字段名，内容可用中文：`Files changed`、`Launch`、`Device`、`Interface`、`Speed`、`SVD`、`RTOS`、`J-Link DLL`、`Native/Legacy owner`、`RTT/P-RTLog`、`MCP endpoint`、`Commands run`、`Manual confirmation required`。
+最终报告使用以下英文字段名，内容可用中文：`Files changed`、`Launch`、`Probe`、`Transport`、`Device`、`Interface`、`Speed`、`SVD`、`RTOS`、`Owner`、`J-Link DLL/Helper`、`RTT/P-RTLog`、`MCP endpoint`、`Commands run`、`Manual confirmation required`。

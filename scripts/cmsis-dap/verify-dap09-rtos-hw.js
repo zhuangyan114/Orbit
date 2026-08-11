@@ -497,7 +497,7 @@ async function main() {
   let disconnected = false;
   try {
     const initialize = await client.request('initialize', {
-      clientID: 'orbit-dap09-acceptance', adapterID: 'ozone', pathFormat: 'path',
+      clientID: 'orbit-dap09-acceptance', adapterID: 'orbit', pathFormat: 'path',
       linesStartAt1: true, columnsStartAt1: true,
     });
     if (!responseOk(initialize)) throw new Error(`initialize failed: ${JSON.stringify(initialize.message)}`);

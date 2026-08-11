@@ -201,7 +201,7 @@ async function runScenario(name, flashBeforeDebug, verifyRestart, restartWhileRu
   let launched = false;
   try {
     const initialize = await client.request('initialize', {
-      clientID: 'orbit-dap06-hw', adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true,
+      clientID: 'orbit-dap06-hw', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true,
     });
     check(`${name}: initialize`, initialize.message.success === true);
 

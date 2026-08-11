@@ -1,8 +1,8 @@
 {
   "name": "orbit-for-vscode",
   "displayName": "Orbit",
-  "description": "Modern STM32 debugging frontend powered by SEGGER J-Link with AI integration",
-  "version": "1.0.0",
+  "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
+  "version": "1.1.0",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -22,6 +22,8 @@
     "arm",
     "cortex-m",
     "j-link",
+    "cmsis-dap",
+    "daplink",
     "orbit",
     "segger",
     "embedded",
@@ -32,6 +34,7 @@
     "onStartupFinished",
     "onView:ozoneTimeline",
     "onView:ozoneWatch",
+    "onDebugResolve:orbit",
     "onDebugResolve:ozone"
   ],
   "main": "./dist/extension.js",
@@ -129,8 +132,8 @@
     ],
     "debuggers": [
       {
-        "type": "ozone",
-        "label": "Orbit (J-Link)",
+        "type": "orbit",
+        "label": "Orbit (J-Link / CMSIS-DAP)",
         "runtime": "node",
         "program": "./dist/debugadapter.js",
         "configurationAttributes": {
@@ -214,7 +217,7 @@
               },
               "flashBeforeDebug": {
                 "type": "boolean",
-                "description": "Flash the current ELF before debugging; CMSIS-DAP flashing is unavailable until DAP-02A",
+                "description": "Flash and verify the current ELF through the selected J-Link or CMSIS-DAP owner before debugging",
                 "default": true
               },
               "runToEntryPoint": {
@@ -317,6 +320,12 @@
             }
           }
         }
+      },
+      {
+        "type": "ozone",
+        "label": "Orbit (legacy ozone compatibility)",
+        "runtime": "node",
+        "program": "./dist/debugadapter.js"
       }
     ],
     "configuration": {

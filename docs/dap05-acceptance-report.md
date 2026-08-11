@@ -2,7 +2,7 @@
 
 ## 状态
 
-**返工完成，等待独立复验。** 本报告记录本轮代码、Mock 和自动化证据，不自行宣称 DAP-05 最终通过。本轮未执行任何真机 reset、run、step、FPB、Flash、Option Bytes、RAM 或外设写操作。
+**通过，用户于 2026-08-11 完成项目最终确认。** 本报告保留 DAP-05 返工时的代码、Mock 和自动化证据；后续有线 CMSIS-DAP 与 J-Link 调试/控制回归及项目最终验收完成后，阶段状态由“等待独立复验”收口为通过。本报告所述返工当轮未执行真机 reset、run、step、FPB、Flash、Option Bytes、RAM 或外设写操作，不能将后续证据误记为当轮执行。
 
 ## 返工根因与修改
 
@@ -73,10 +73,10 @@ Mock DAP 测试证明：
 | `git diff --check` | 通过；仅输出既有文件的 LF/CRLF 转换提示，无 whitespace error |
 | `git status --short -- dist` | 无输出，`dist/` 无变更 |
 
-## 范围与未实现能力
+## 返工当轮范围与未实现能力
 
-- 本轮仅完成 DAP-05 返工和 Mock/自动化验证；最终独立验收及真机复验尚未执行。
-- CMSIS-DAP v2/WinUSB 未实现；当前支持路径仍为 CMSIS-DAP v1 HID。
+- DAP-05 返工当轮仅完成 Mock/自动化验证；当轮尚未执行最终独立验收及真机复验，后续证据和 2026-08-11 用户确认完成了状态收口。
+- 返工当轮 CMSIS-DAP v2/WinUSB 尚未实现、支持路径为 v1 HID；v2/WinUSB 后来由独立阶段实现和验收。
 - 本报告不代表 DAP-06 完成。
 - 未引入或创建 J-Link、OpenOCD、GDB server、legacy fallback 或第二 target owner。
 - 未经新的明确授权，不得执行真机 reset、run、step、FPB、Flash 或其他目标写操作。

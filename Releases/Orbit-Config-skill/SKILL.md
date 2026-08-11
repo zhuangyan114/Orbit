@@ -1,6 +1,6 @@
 ---
 name: Orbit-Config-skill
-description: Configure and verify an STM32 firmware workspace for Orbit for VS Code. Use when Codex must inspect or edit CMake and ARM toolchain settings, .vscode/launch.json, J-Link DLL or JLink.exe settings, Native/Legacy debug ownership, MCU Debug RTOS Views integration, RTT, P-RTLog, or the local MCP setup. Do not use for generic embedded debugging, firmware algorithm changes, or changes to Orbit debug implementation.
+description: Configure and verify an STM32 firmware workspace for Orbit for VS Code. Use when Codex must inspect or edit CMake and ARM toolchain settings, .vscode/launch.json, J-Link or CMSIS-DAP/DAPLink probe settings, target ownership, MCU Debug Views integration, RTT, P-RTLog, or the local MCP setup. Do not use for generic embedded debugging, firmware algorithm changes, or changes to Orbit debug implementation.
 ---
 
 # Orbit Workspace Configuration
@@ -10,7 +10,7 @@ description: Configure and verify an STM32 firmware workspace for Orbit for VS C
 Use this skill when the user asks to configure or validate an STM32 firmware workspace for Orbit — The Debugger for What's Next, including:
 
 - `.vscode/launch.json`, `.vscode/settings.json`, CMake, ARM GCC, ELF/AXF, or SVD setup;
-- J-Link `JLink_x64.dll`, `JLink.exe`, Native helper, Legacy `koffi`, or the `nativeDebugEngine*` options;
+- J-Link `JLink_x64.dll`/`JLink.exe`, CMSIS-DAP/DAPLink HID/WinUSB, either native helper, Legacy `koffi`, or owner-selection options;
 - Watch, Timeline, RTT, P-RTLog, RTOS Views, Memory View, or Peripheral Viewer integration;
 - the local Orbit Plugin API or MCP server setup;
 - a source-grounded audit of an existing Orbit debug configuration.
@@ -26,9 +26,31 @@ Do not use this skill for:
 
 ## Goal
 
-让当前 STM32 firmware workspace 能够以一个可复现的 Orbit debug launch 工作；如果已有配置，合并缺失项并保留用户选择，不用模板值覆盖实际工程值。
+让当前 STM32 firmware workspace 获得四个可复现的 Orbit debug launch，分别覆盖 J-Link/CMSIS-DAP 与烧录/不烧录组合；如果已有配置，合并真实工程值，不用模板芯片、ELF、SVD 或 RTOS 覆盖项目事实。
 
-具体 JSON、CMake、RTOS、RTT、P-RTLog 和 MCP 示例必须先阅读 `references/configuration-details.md`。完整配置项、默认值、范围和功能说明以仓库内 `docs/user-guide.md` 与当前 `package.json` 为准。
+具体 JSON、CMake、RTOS、RTT、P-RTLog 和 MCP 示例必须先阅读 `references/configuration-details.md`。完整配置项、默认值、范围和功能说明以仓库内 `Releases/docs/user-guide.md` 与当前 `package.json` 为准。
+
+## Required launch output
+
+每次调用本 skill 配置工程时，都要确保 `.vscode/launch.json` 的 `configurations` 中存在以下四项：
+
+| Name | `probe` | `flashBeforeDebug` |
+| --- | --- | --- |
+| `Orbit: J-Link (Flash)` | `jlink` | `true` |
+| `Orbit: J-Link (No Flash)` | `jlink` | `false` |
+| `Orbit: DAPLink (Flash)` | `cmsis-dap` | `true` |
+| `Orbit: DAPLink (No Flash)` | `cmsis-dap` | `false` |
+
+四项复用同一组已核实的 `program`、`device`、`deviceName`、`interface`、`speedKHz`、SVD、RTOS、RTT 和 P-RTLog 工程值。保留非 Orbit 配置和用户额外命名的配置；按上述名称更新已有标准项，不重复追加同名项。
+
+DAPLink 两项默认只写：
+
+```json
+"probe": "cmsis-dap",
+"cmsisDapTransport": "auto"
+```
+
+只有用户明确要求绑定某一只 probe 时，才在两项 DAPLink 配置中加入 `cmsisDapVid`、`cmsisDapPid`、`cmsisDapSerial` 或 `cmsisDapPath`。PnP/HID 枚举发现的 VID/PID/Serial 只是诊断信息，不能自动写入 launch，也不能因为当前只连接一只设备就固定它。
 
 ## One-pass workflow
 
@@ -59,16 +81,16 @@ Do not use this skill for:
 
 ### 4. Configure `launch.json`
 
-确保至少有一项：
+确保生成或更新四项标准配置，而不是只生成当前接入 probe 的一项。最小输出形状为：
 
-```json
-{
-  "type": "ozone",
-  "request": "launch"
-}
+```text
+Orbit: J-Link (Flash)    -> probe=jlink,     flashBeforeDebug=true
+Orbit: J-Link (No Flash)  -> probe=jlink,     flashBeforeDebug=false
+Orbit: DAPLink (Flash)   -> probe=cmsis-dap, flashBeforeDebug=true
+Orbit: DAPLink (No Flash) -> probe=cmsis-dap, flashBeforeDebug=false
 ```
 
-按实际工程配置 `program`、`device`、`deviceName`、`interface`、`speedKHz`、`svdFile` / `svdPath`、`rtos`、RTT 字段、P-RTLog 字段和 Native/Legacy 字段。`program` 为空时，源码会检查 `build/Debug`、`build/Release`、`build` 中的第一个 `.elf` 或 `.axf`；不要假设这个自动选择一定是用户想要的 ELF。
+先核实一次 `program`、`device`、`deviceName`、`interface`、`speedKHz`、`svdFile` / `svdPath`、`rtos`、RTT 和 P-RTLog 字段，再复制到四项标准配置。每对配置只在 `flashBeforeDebug` 上不同；两类 probe 只在 owner/transport 专属字段上不同。`program` 为空时，源码会检查 `build/Debug`、`build/Release`、`build` 中的第一个 `.elf` 或 `.axf`；不要假设这个自动选择一定是用户想要的 ELF。
 
 项目级值优先写在 launch；`orbit.*` 是共享默认值。`deviceName`、`svdFile`、`svdPath` 是兼容外部 MCU Debug Views 的字段，保留别名时仍要指向同一实际目标。
 
@@ -80,6 +102,16 @@ Native owner 规则：
 - `nativeDebugEngineEnabled: false` 且 mode 为 `auto`：使用 Legacy；
 - 一个 DAP session 只有一个 target owner。不能让 Native helper 和 Legacy DLL 同时控制同一个目标，也不能用 Legacy 模拟 Native source-level step。
 
+CMSIS-DAP owner 规则：
+
+- `probe: "cmsis-dap"` 只能创建唯一的 `orbit-cmsis-dap-helper.exe` owner；不得回退 J-Link、Legacy 或第二个 helper；
+- 两项 DAPLink 标准配置默认使用 `cmsisDapTransport: "auto"`，优先 v2 WinUSB 并兼容 v1 HID；
+- 默认省略 `cmsisDapSerial`、`cmsisDapVid`、`cmsisDapPid` 和 `cmsisDapPath`。只有用户明确要求固定具体 probe 时才加入，并在烧录/不烧录两项中保持相同选择器；
+- 不从 Windows 枚举、当前连接设备、验收 fixture 或示例值推断绑定。尤其不得默认写入 `C251`、`F001`、`LU_2022_8888`；
+- 当前 CMSIS-DAP 调试接口为 SWD。不要把 J-Link 的 `nativeDebugEngineMode` 当成 CMSIS-DAP transport 开关；
+- `flashBeforeDebug: true` 使用当前 CMSIS-DAP owner 和匹配目标的 Flash Algorithm；`false` 不得触发 erase/program/verify 或 Flash-only reset；
+- owner loss 结束当前 session。Watch、Timeline、RTT 和 Viewer 失败不得创建 J-Link 或 extension-host bypass。
+
 ### 5. Configure external MCU Debug Views
 
 只有在用户要用这些外部视图、且对应扩展已安装时，才补齐这些 workspace arrays：
@@ -88,7 +120,7 @@ Native owner 规则：
 - `mcu-debug.rtos-views.trackDebuggers`；
 - `mcu-debug.debug-tracker-vscode.trackDebuggers`。
 
-数组中加入字符串 `"ozone"`，去重并保留已有 debugger 类型。执行 `Orbit: Enable MCU Debug Views Integration` 后按提示 Reload Window。Orbit 提供 DAP memory、`memoryReference`、RTOS capability 和 SVD metadata，但不把外部视图的 UI 或 kernel/SVD parser 复制进本 skill。
+数组中加入字符串 `"orbit"`，并为旧配置保留 `"ozone"`；去重并保留其他 debugger 类型。执行 `Orbit: Enable MCU Debug Views Integration` 后按提示 Reload Window。Orbit 提供 DAP memory、`memoryReference`、RTOS capability 和 SVD metadata，但不把外部视图的 UI 或 kernel/SVD parser 复制进本 skill。
 
 `rtos` / `orbit.defaultRtos` 只有在 firmware 实际使用对应 RTOS 时才填写，例如 `FreeRTOS`。RTOS Views 还依赖正确的 ELF/SVD/MCU 和 firmware-side FreeRTOS symbols、trace/runtime-stat hooks；缺失时要明确报告，而不是把启动成功当作 RTOS Views 已验证。
 
@@ -104,6 +136,7 @@ FreeRTOS 兼容性验收补充：
 ### 6. Configure RTT and P-RTLog
 
 - RTT 默认 `rttLogEnabled: true`，up-buffer 默认 `0`，默认 poll interval `500 ms`，每轮默认读取 `64 bytes`，输出默认到 `terminal`。
+- J-Link RTT 使用 DLL API；CMSIS-DAP RTT 使用目标内存 control block/ring buffer，必要时配置 `rttControlBlockAddress`。两者都必须复用当前 owner。
 - `rttLogTarget` 只能使用 `terminal`、`debugConsole` 或 `both`。
 - `pRtLogEnabled` 默认 `false`；仅在当前 firmware 使用 tokenized P-RTLog 或用户明确要求时打开。
 - P-RTLog 解码使用当前 ELF/AXF 的 `.pw_tokenizer.entries`；`pRtLogRoot` 是当前源码读取的配置/诊断值，不要描述成 token 搜索目录，除非源码已改变并重新核对。
@@ -124,8 +157,8 @@ Orbit 的 MCP client/server 关系必须保持清楚：
 按当前工程实际情况执行非破坏检查：
 
 - JSON/JSONC 语法检查；
-- `cmake`、选定 generator、`arm-none-eabi-gcc`、`arm-none-eabi-objdump`、`node` 和 J-Link 可执行文件/DLL 的 discoverability；
-- extension checkout 需要 Native 时确认 `out/native/win32-x64/orbit-jlink-helper.exe` 存在，必要时报告需要 `npm run build:native`；
+- `cmake`、选定 generator、`arm-none-eabi-gcc`、`arm-none-eabi-objdump` 和 `node`；按所选 probe 验证 J-Link DLL/可执行文件或 CMSIS-DAP Windows 枚举/驱动；
+- extension checkout 需要 Native 时确认相应的 `out/native/win32-x64/orbit-jlink-helper.exe` 或 `orbit-cmsis-dap-helper.exe` 存在，必要时报告需要 `npm run build:native`；
 - firmware project 支持时执行 non-destructive CMake configure/build；
 - MCP 仅可验证 Node module/dependency 是否能加载；endpoint 和目标读写必须在 VS Code 激活 Orbit 且有活动目标时验证。
 
@@ -136,8 +169,8 @@ Orbit 的 MCP client/server 关系必须保持清楚：
 报告必须包含：
 
 - 修改的文件和保留的用户配置；
-- 实际选择的 launch name、ELF/AXF、device、interface、speed、SVD、RTOS；
-- J-Link DLL/JLink.exe、Native/Legacy owner 和 fallback 状态；
+- 四个标准 launch name，以及它们共享的 ELF/AXF、device、interface、speed、SVD、RTOS；
+- probe、transport、serial/VID/PID（若使用）、J-Link DLL/JLink.exe 或 CMSIS-DAP helper、最终 owner 和 fallback 状态；
 - RTT/P-RTLog 状态以及 `.pw_tokenizer.entries` 是否被 source/build 检查发现；
 - MCP server、endpoint 和验证范围；
 - 已执行命令及结果；
@@ -145,7 +178,8 @@ Orbit 的 MCP client/server 关系必须保持清楚：
 
 ## Editing rules
 
-- 修改 JSON 数组时去重加入 `"ozone"`，保留其他 debugger 类型、注释和用户值。
+- 修改 JSON 数组时去重加入 `"orbit"` 和兼容别名 `"ozone"`，保留其他 debugger 类型、注释和用户值。
+- 更新四个标准 launch 时按 name 去重；默认 DAPLink 项不得包含 probe selector。只有当前请求明确要求绑定时，才把相同 selector 写入两项 DAPLink 配置。
 - 使用 `${workspaceFolder}` 表示提交到 firmware workspace 的路径；不要硬编码本机扩展仓库路径，除非没有可解析的已安装扩展路径且用户明确同意。
 - `.vscode/*.json` 可能是 JSONC；不要为验证而删除注释。
 - 不要启用 P-RTLog 来处理普通文本 RTT。

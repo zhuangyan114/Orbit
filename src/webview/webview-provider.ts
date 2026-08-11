@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { TargetState, RegisterValue, WatchValue } from '../ozone-backend/types';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import { isOrbitDebugSessionType } from '../utils/debug-session-type';
 
 export class DebugWebviewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -113,7 +114,7 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
 
   private async readMemory(address: number, size: number) {
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       try {
         const result = await session.customRequest('readMemory', {
           memoryReference: `0x${(address >>> 0).toString(16).toUpperCase()}`,
@@ -150,7 +151,7 @@ export class DebugWebviewProvider implements vscode.WebviewViewProvider {
 
   async evaluateWatches(expressions: string[]) {
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       try {
         const result = await session.customRequest('watchEvaluate', { expressions });
         if (result && result.results) {

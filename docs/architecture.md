@@ -1,169 +1,107 @@
-# Orbit for VS Code — 项目架构图
+# Orbit for VS Code - 项目架构图
 
-> 本图描述 Orbit(ozone 调试类型)扩展的完整架构,包括 3 个进程边界、目标访问双通道、Webview、插件 API 与 MCP。
-> 图中灰色虚线节点为**未接线(遗留/未被 `extension.ts` 实例化)**组件。
-> 维护时应与 `AGENTS.md` 中的架构约束(单目标拥有者、调度优先级、DAP 路由契约)保持一致。
+> 本图描述当前 `orbit` DAP 调试路径；`ozone` 仅作为旧配置兼容别名。维护时应与 `AGENTS.md` 的单 owner、调度优先级和活动会话路由约束保持一致。
 
 ```mermaid
 flowchart TD
-    classDef ext   fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
-    classDef host  fill:#f0f9ff,stroke:#0284c7,color:#0c4a6e
-    classDef dap   fill:#f0fdf4,stroke:#16a34a,color:#14532d
-    classDef nat   fill:#fefce8,stroke:#ca8a04,color:#713f12
-    classDef legacy fill:#fdf2f8,stroke:#db2777,color:#831843
-    classDef unwired fill:#f3f4f6,stroke:#9ca3af,color:#4b5563,stroke-dasharray:6 4
-    classDef blocked fill:#fef2f2,stroke:#ef4444,color:#7f1d1d
+    VSCode["VS Code 调试 UI\nWatch / Timeline / 外部 Viewer"]
+    MCP["MCP client"]
 
-    %% ==================== 外部 ====================
-    VSCodeUI["VS Code 调试 UI<br/>DebugAdapter · 断点/步进/变量视图"]:::ext
-    MCP["MCP Server<br/>Releases/mcp/ozone-mcp-server.js<br/>(stdio · HTTP /rpc 客户端)"]:::ext
-    JLinkHW["J-Link 硬件<br/>USB / SWD"]:::ext
-    JLinkExe["JLink.exe<br/>(烧录子进程)"]:::ext
-    ArmTools["arm-none-eabi-nm / objdump / addr2line<br/>(外部 GNU 工具链)"]:::ext
-    WFrontend["Watch 前端 (React iframe)<br/>src/webview/watch/app.tsx"]:::ext
-    TFrontend["Timeline 前端 (React iframe)<br/>src/webview/timeline/app.tsx"]:::ext
-
-    %% ============ ① 扩展宿主进程 ============
-    subgraph HOST["① VS Code 扩展宿主进程 (extension host)"]
-        direction TB
-        ExtEntry["extension.ts — 激活入口<br/>activate() · 命令注册 · 调试会话事件"]:::host
-        HostBackend["OzoneBackend (扩展宿主实例)<br/>src/ozone-backend/commander.ts"]:::blocked
-        WatchTree["Watch TreeView<br/>WatchProvider (变化高亮)"]:::host
-        WatchWV["Watch Webview<br/>WatchWebviewProvider · 加载 dist/watch.js"]:::host
-        TimelineWV["Timeline Webview<br/>TimelineWebviewProvider · 加载 dist/timeline.js"]:::host
-        DSM["DataSamplingManager<br/>remote(经 DAP) / local(宿主直连) 双模式"]:::host
-        PluginApi["PluginApiServer<br/>127.0.0.1 随机端口 · Bearer 认证<br/>写出 plugin-api-endpoint.json"]:::host
-        Router["RuntimeRouter<br/>活跃 ozone 会话时强制走 customRequest"]:::host
-        WaveRec["WaveRecorder"]:::host
-        ExpSvc["ExperimentService"]:::host
-        RttTerm["RTT 输出终端 (伪终端)<br/>消费 ozoneRttOutput 事件"]:::host
-
-        subgraph UNWIRED["遗留组件 (未接线 — 未实例化)"]
-            U1["SessionManager<br/>src/session/session-manager.ts"]:::unwired
-            U2["DebugWebviewProvider / 旧版 app.tsx<br/>src/webview/"]:::unwired
-            U3["breakpoints/ BreakpointManager"]:::unwired
-            U4["ai/ AIProviderManager"]:::unwired
-            U5["debug-manager.ts<br/>Ozone.exe --jdebug 启动器"]:::unwired
-        end
+    subgraph Host["VS Code Extension Host"]
+        Ext["extension.ts\n命令、Webview、会话生命周期"]
+        Router["RuntimeRouter\n活动 Orbit session 身份检查"]
+        Api["Plugin API\n127.0.0.1 + Bearer token"]
+        Watch["Watch provider / webview"]
+        Timeline["DataSamplingManager / Timeline"]
     end
 
-    %% ============ ② DAP 适配器进程 ============
-    subgraph DAP["② DAP 适配器进程 (dist/debugadapter.js)"]
-        direction TB
-        DapEntry["debugadapter.ts — DAP 入口<br/>Content-Length 帧解析 · 生命周期"]:::dap
-        DapSession["DapSession<br/>src/debug/dap-session.ts<br/>断点/步进/RTT 轮询/数据采样/连接监视"]:::dap
-        DapBackend["OzoneBackend (DAP 实例)<br/>src/ozone-backend/commander.ts<br/>唯一目标所有者"]:::dap
-        Selector["SessionTargetSelector<br/>src/ozone-backend/session-target-channel.ts<br/>native / legacy 二选一"]:::dap
-        NativeCh["ExperimentalCppJLinkChannel<br/>src/ozone-backend/cpp-jlink-channel.ts"]:::nat
-        Scheduler["NativeScheduler<br/>control &gt; watch &gt; timeline &gt; background"]:::nat
-        LegacyCh["LegacyJLinkTargetChannel"]:::legacy
-        JLinkDLL["JLinkDLL (koffi)<br/>src/ozone-backend/jlink-dll.ts"]:::legacy
-        Symbols["jlink-symbols.ts<br/>ELF 符号 / DWARF / 行号映射"]:::dap
-        Flasher["flasher.ts"]:::dap
-        PRtLog["p-rtlog-decoder.ts<br/>P-RTLog 令牌解码"]:::dap
+    subgraph Adapter["DAP Adapter Process"]
+        Entry["debugadapter.ts\nDAP Content-Length stdio"]
+        Session["DapSession\n控制、变量、内存、RTT、采样"]
+        Backend["OzoneBackend\nOzoneCommand dispatch"]
+        Selector["SessionTargetSelector\n一个 session 只发布一个 owner"]
+        Symbols["jlink-symbols.ts\nELF / DWARF / 行号"]
     end
 
-    %% ============ ③ Native Helper 子进程 ============
-    subgraph HELPER["③ Native Helper 子进程 (orbit-jlink-helper.exe)"]
-        direction TB
-        HelperMain["main.cpp — JLinkChannel<br/>JSON-lines RPC 主循环<br/>hello 握手 · 能力协商 (协议 v2)"]:::nat
-        HelperDLL["LoadLibraryW(JLink_x64.dll)<br/>GetProcAddress 函数指针解析"]:::nat
-        HelperStep["指令级步进<br/>stepInto / Over / Out (Thumb 解码)"]:::nat
-        HelperBP["6 槽位硬件断点"]:::nat
-        HelperRTT["RTT 终端读写"]:::nat
+    subgraph Owners["候选 Target Owner（互斥）"]
+        JNative["jlink-native\nExperimentalCppJLinkChannel"]
+        JLegacy["jlink-legacy\nLegacyJLinkTargetChannel + koffi"]
+        Cmsis["cmsis-dap\nCmsisDapTargetChannel"]
     end
 
-    %% ==================== 连接 ====================
-    %% DAP 协议链路
-    VSCodeUI -- "DAP 协议<br/>(Content-Length stdio)" --> DapEntry
-    DapEntry --> DapSession
-    DapSession -- "OzoneCommand.execute()" --> DapBackend
-    DapBackend --> Selector
-    DapBackend -- "loadSymbols (connect 后预加载)" --> Symbols
-    DapBackend --> Flasher
-    DapSession --> PRtLog
+    subgraph Helpers["Native Child Process"]
+        JHelper["orbit-jlink-helper.exe\nJSON-lines + JLink_x64.dll"]
+        CHelper["orbit-cmsis-dap-helper.exe\nJSON-lines + HID/WinUSB"]
+    end
 
-    %% 目标通道双模式
-    Selector -- "kind = native" --> NativeCh
-    Selector -- "kind = legacy" --> LegacyCh
-    NativeCh --> Scheduler
-    Scheduler -- "JSON-lines RPC (串行)" --> HelperMain
-    HelperMain --> HelperStep
-    HelperMain --> HelperBP
-    HelperMain --> HelperRTT
-    HelperMain --> HelperDLL
-    HelperDLL -- "调用 J-Link API" --> JLinkHW
-    LegacyCh --> JLinkDLL
-    JLinkDLL -- "koffi 同进程加载 JLink_x64.dll" --> JLinkHW
+    JLink["J-Link probe\nSWD / JTAG"]
+    DapProbe["CMSIS-DAP / DAPLink probe\nWinUSB v2 or HID v1 / SWD"]
+    Target["STM32 / ARM Cortex-M\nFirmware + ELF/DWARF"]
+    ExternalViews["Memory View / Peripheral Viewer / RTOS Views"]
 
-    %% 外部工具
-    ArmTools --> Symbols
-    Flasher -- "spawn" --> JLinkExe
-    JLinkExe -- "烧录" --> JLinkHW
+    VSCode --> Entry
+    VSCode --> Ext
+    MCP --> Api --> Router
+    Ext --> Watch
+    Ext --> Timeline
+    Watch -->|"customRequest"| Session
+    Timeline -->|"customRequest / events"| Session
+    Router -->|"active session only"| Session
+    Entry --> Session --> Backend --> Selector
+    Backend --> Symbols
+    Session -->|"standard DAP memory / variables"| ExternalViews
 
-    %% 宿主内部
-    ExtEntry --> HostBackend
-    ExtEntry --> WatchTree
-    ExtEntry --> WatchWV
-    ExtEntry --> TimelineWV
-    ExtEntry --> PluginApi
-    ExtEntry --> RttTerm
-    PluginApi --> Router
-    Router --> WaveRec
-    Router --> ExpSvc
-
-    %% Webview 通信 (postMessage)
-    WatchWV -- "postMessage<br/>evaluateWatches / watchResults" --> WFrontend
-    TimelineWV -- "postMessage<br/>samples / addExpression" --> TFrontend
-
-    %% 跨进程:宿主 ⇄ DAP (经 DAP stdio 通道)
-    WatchWV -- "customRequest 'dataSample' / setWatches" --> DapSession
-    WatchTree -- "customRequest 'dataSample'" --> DapSession
-    DSM -- "customRequest 'dataSamplingStart'" --> DapSession
-    DapSession -- "事件 ozoneDataSamples (0.2ms 采样)" --> DSM
-    DapSession -- "事件 ozoneRttOutput / ozoneClearDebugConsole" --> RttTerm
-    Router -- "活跃会话: customRequest<br/>getTargetState / dataSample / setWatchValue" --> DapSession
-
-    %% 宿主后端的阻塞与回退
-    Router -. "无 DAP 会话时回退" .-> HostBackend
-    HostBackend -. "ozone 会话激活时被 localTargetAccessBlocked 阻塞" .-> JLinkHW
-
-    %% 插件 API
-    MCP -- "HTTP POST /rpc (Bearer)<br/>端点发现: plugin-api-endpoint.json" --> PluginApi
+    Selector -->|"probe=jlink, native"| JNative --> JHelper --> JLink
+    Selector -->|"probe=jlink, legacy"| JLegacy --> JLink
+    Selector -->|"probe=cmsis-dap"| Cmsis --> CHelper --> DapProbe
+    JLink --> Target
+    DapProbe --> Target
 ```
 
-## 分层说明
+## 进程与职责
 
-### 进程模型(3 个进程)
-
-| 进程 | 入口 | 职责 |
+| 边界 | 入口 | 职责 |
 |---|---|---|
-| 扩展宿主 | `src/extension.ts` → `dist/extension.js` | UI(Watch/Timeline webview)、插件 API HTTP 服务器、宿主侧 `OzoneBackend` |
-| DAP 适配器 | `src/debugadapter.ts` → `dist/debugadapter.js` | 通过 stdio `Content-Length` 帧与 VS Code 通信;持有**唯一目标所有者** |
-| Native Helper | `native/jlink-helper/src/main.cpp` → `orbit-jlink-helper.exe` | 独立子进程,内部加载 `JLink_x64.dll`(DLL 不进入 Node 进程) |
+| Extension Host | `src/extension.ts` | Watch/Timeline UI、Plugin API、活动 session identity/generation、DAP custom request 路由 |
+| DAP Adapter | `src/debugadapter.ts`、`src/debug/dap-session.ts` | DAP 协议、目标控制、变量/内存、RTT、采样、停止/终止事件；不导入 `vscode` |
+| J-Link helper | `native/jlink-helper/src/main.cpp` | 在独立进程加载 `JLink_x64.dll`，提供 J-Link 控制、内存、断点、源码步进和 RTT |
+| CMSIS-DAP helper | `native/cmsis-dap-helper/src/main.cpp` | 枚举 HID/WinUSB、CMSIS-DAP framing、SWD/DP/AP、Cortex-M 控制、内存、FPB、Flash Algorithm 和内存型 RTT |
 
-- `OzoneBackend` 在扩展宿主与 DAP 中各实例化一份,行为差异由构造参数决定(`sessionTarget` / `localTargetAccessBlocked`)。
-- **DAP 会话激活期间 DAP 拥有目标访问权**:扩展宿主后端被 `localTargetAccessBlocked` 回调拒绝;`SessionManager` 在会话激活时不得连接宿主后端。`ozone.debug` 命令先 `disconnect` 释放宿主连接,再启动 DAP。
+一次调试会话实际只启动所选 owner 所需的 helper。J-Link Legacy 是例外：它在 DAP Adapter 进程内由 `koffi` 加载 DLL。
 
-### 目标通道双模式(每会话单一物理 J-Link 拥有者)
+## Owner 选择
 
-- **native**(默认优先):`ExperimentalCppJLinkChannel` 派生 helper 子进程,JSON-lines RPC(`hello` 握手 + 能力协商,协议 v2),所有调用经 `NativeScheduler` 按 `control > watch > timeline > background` 严格串行化;control 请求暂停 timeline/background。
-- **legacy**:`LegacyJLinkTargetChannel` 通过 koffi 将 `JLink_x64.dll` 加载进适配器进程。仅在 native 启动失败时(或 `auto` 模式)回退;**已连接的 native owner 永不热切换**;`NativeOwnerLost` 时清空 owner 并要求重启会话,失败回退不留任何 owner。
-- 安全规则:6 槽位索引硬件断点、无 `ExecCommand("SetBP ...")`、`disconnect` 不得以 close/open 做 owner 切换。
+- `probe: "jlink"` 使用 `jlink-native` 或 `jlink-legacy`。`auto` 只允许在 native 启动/初始化失败且进程完全退出后创建 legacy；已连接 owner 丢失时不热切换。
+- `probe: "cmsis-dap"` 只创建 `cmsis-dap` owner。`cmsisDapTransport: "auto"` 优先 WinUSB v2，再选择兼容的 HID v1；不会回退到 J-Link、Legacy 或第二个 helper。
+- Flash、DAP、Watch、Timeline、RTT、RTOS View、Memory View 和 Peripheral Viewer 都复用当前 owner。
+- owner loss、session termination 或 replacement 会取消排队工作、阻止旧 generation 发布，并在退出前释放 helper。
 
-### 四条主要数据流
+## 访问调度
 
-1. **Watch 求值/轮询**:Webview → `WatchWebviewProvider` → `session.customRequest('dataSample')` → `DapSession.handleDataSample` → `OzoneBackend.execute(evaluateExpression)` → 目标通道;宿主 `startWatchPolling` 按 `orbit.watchPollIntervalMs` 定时走同一路径并同步推给 TreeView 与 Webview。
-2. **Timeline 采样**:`DataSamplingManager` 双模式 —— remote(DAP 侧 0.2ms 高频采样,16ms 经 `ozoneDataSamples` 事件推送,采样期间暂停 RTT 轮询)/ local(无 DAP 会话时宿主 `setTimeout` 循环 `evaluateExpression`)。
-3. **RTT Log**:`DapSession.startRttLogPolling`(`rttPollIntervalMs`)→ `readRtt` → 经 `ozoneRttOutput` / `ozoneClearDebugConsole` 事件写入 RTT 伪终端;支持 p-RTLog 令牌解码与 ANSI 剥离。
-4. **插件 API**:MCP(stdio)→ `POST /rpc`(Bearer)→ `PluginApiServer.dispatch` → `RuntimeRouter` → 活跃会话存在时一律 `session.customRequest`(跨进程),否则回退宿主后端。`WaveRecorder` 按 interval 采帧,`ExperimentService` 编排 read/write/wait/record。
+Native owner 访问按以下优先级串行化：
 
-### 遗留(未接线)组件
+```text
+control > watch > timeline > background
+```
 
-`SessionManager`、`DebugWebviewProvider` / 旧版 `src/webview/app.tsx`、`breakpoints/`、`ai/`、`debug-manager.ts`(Ozone.exe 启动器)未被 `extension.ts` 实例化,图中以灰色虚线标出,当前激活路径为:宿主后端 + Watch/Timeline webview + PluginApiServer + DAP 进程。
+- `control`: run、halt、reset、step、断点、变量/内存/外设写入和 Flash；
+- `watch`: Watch、evaluate、变量树及必要的高优先级读取；
+- `timeline`: 可取消的数据采样；
+- `background`: RTT、RTOS refresh 和诊断性读取。
 
-### 相关文档
+控制请求的完整临界区暂停低优先级读取；Watch 在小分片之间释放 target-read gate。任何优化都不能通过禁用 Watch/Timeline/Viewer 或建立第二条目标连接实现。
 
-- `docs/plugin-api-plan-zh.md` — 插件 API 设计
-- `docs/debug-engine-refactor/` — 调试引擎重构说明
-- `AGENTS.md` — 架构约束与开发流程(本图应与其保持同步)
+## 四条主要数据流
+
+1. **Watch / evaluate**: Webview 或 VS Code DAP request -> `DapSession` -> `OzoneBackend` -> 当前 owner。运行态 realtime path 不额外查询 target state。
+2. **Timeline**: `DataSamplingManager` -> 活动 session `dataSample` -> scheduler timeline work -> `ozoneDataSamples`；结果发布前检查 session identity 和 generation。
+3. **RTT**: J-Link owner 使用 DLL RTT API；CMSIS-DAP owner通过目标内存读取 SEGGER RTT control block 和 ring buffer。两者都属于当前 owner，轮询为 background work。
+4. **Viewer / MCP**: Viewer 使用标准 DAP `variables`、`memoryReference`、`readMemory`、`writeMemory` 和 SVD metadata；MCP 通过 loopback Plugin API 到 `RuntimeRouter`，活动 session 存在时不得回退 Extension Host backend。
+
+## 相关文档
+
+- [CMSIS-DAP / DAPLink 支持项目计划](cmsis-dap-daplink-support-project-plan.md)
+- [DAP/owner 验证矩阵](debug-engine-refactor/validation-matrix.md)
+- [Native scheduler 设计](debug-engine-refactor/native-scheduler-design.md)
+- [实时变量保护](debug-engine-refactor/realtime-variable-protection.md)
+- [`AGENTS.md`](../AGENTS.md)

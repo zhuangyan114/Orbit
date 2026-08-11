@@ -8,12 +8,13 @@ import {
   WriteSpec,
   normalizeWatchValue,
 } from './types';
+import { isOrbitDebugSessionType } from '../utils/debug-session-type';
 
 export class RuntimeRouter {
   constructor(private backend: OzoneBackend) {}
 
   async getTargetState(): Promise<string> {
-    const session = this.activeOzoneSession();
+    const session = this.activeOrbitSession();
     if (session) {
       try {
         const response: any = await session.customRequest('getTargetState', {});
@@ -34,7 +35,7 @@ export class RuntimeRouter {
     if (normalized.length === 0) return [];
 
     const expressions = normalized.map(signal => signal.expression);
-    const session = this.activeOzoneSession();
+    const session = this.activeOrbitSession();
     if (session) {
       try {
         const response: any = await session.customRequest('dataSample', { expressions });
@@ -101,7 +102,7 @@ export class RuntimeRouter {
 
     const results: RuntimeWriteResult[] = [];
     for (const write of normalized) {
-      const session = this.activeOzoneSession();
+      const session = this.activeOrbitSession();
       if (session) {
         try {
           const response: any = await session.customRequest('setWatchValue', {
@@ -138,9 +139,9 @@ export class RuntimeRouter {
     return results;
   }
 
-  private activeOzoneSession(): vscode.DebugSession | undefined {
+  private activeOrbitSession(): vscode.DebugSession | undefined {
     const session = vscode.debug.activeDebugSession;
-    return session?.type === 'ozone' ? session : undefined;
+    return isOrbitDebugSessionType(session?.type) ? session : undefined;
   }
 
   private normalizeSignal(signal: SignalSpec): SignalSpec {

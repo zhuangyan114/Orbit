@@ -33,10 +33,10 @@ describe('WatchWebviewProvider session fence', () => {
   it('does not publish a dataSample result from a replaced DAP session', async () => {
     const pending = deferred<any>();
     const firstSession = {
-      type: 'ozone',
+      type: 'orbit',
       customRequest: vi.fn(() => pending.promise),
     };
-    const secondSession = { type: 'ozone', customRequest: vi.fn() };
+    const secondSession = { type: 'orbit', customRequest: vi.fn() };
     let currentSession: any = firstSession;
     vscodeState.activeDebugSession = firstSession;
     const { provider, postMessage } = createProvider(session => currentSession === session);
@@ -55,7 +55,7 @@ describe('WatchWebviewProvider session fence', () => {
   it('does not publish a setWatchValue result from a terminated DAP session', async () => {
     const pending = deferred<any>();
     const session = {
-      type: 'ozone',
+      type: 'orbit',
       customRequest: vi.fn(() => pending.promise),
     };
     let currentSession: any = session;

@@ -1,4 +1,4 @@
 interface:
   display_name: "Orbit Workspace Config"
-  short_description: "Configure Orbit STM32 workspaces."
-  default_prompt: "Use $Orbit-Config-skill to configure or audit this STM32 workspace for Orbit debugging, Native/Legacy J-Link ownership, RTOS Views, RTT, and MCP."
+  short_description: "Configure four Orbit J-Link/DAPLink launches."
+  default_prompt: "Use $Orbit-Config-skill to configure or audit this STM32 workspace. Always generate the four standard J-Link/DAPLink flash and no-flash launches, and leave DAPLink unbound unless I explicitly request a probe selector."

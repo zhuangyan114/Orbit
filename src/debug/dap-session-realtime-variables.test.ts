@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DapSession, DebugProtocolMessage } from './dap-session';
+import { parseConstantExpression } from '../utils/constant-expression';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -12,6 +13,45 @@ function request(seq: number, command: string, args: Record<string, unknown> = {
 }
 
 describe('DapSession realtime variable arbitration', () => {
+  it.each([
+    ['4 * 1024 * 1024', 4194304],
+    ['0x20000000 + 0x100', 0x20000100],
+    ['(1024 * 4)', 4096],
+  ])('parses safe constant expression %s as %s', (expression, expected) => {
+    expect(parseConstantExpression(expression)).toBe(expected);
+  });
+
+  it.each([
+    'myVariable', '&myVariable', '*(0x20000000)', 'foo()', 'obj.field', 'array[0]',
+    '1 / 0', '1.5', '1 + unknown', '0x100000000', '0xFFFFFFFF + 1',
+    '-1', '-0x1', '-(1)', '1 + -2', '0 - 1',
+  ])('rejects non-constant or unsafe expression %s', expression => {
+    expect(parseConstantExpression(expression)).toBeUndefined();
+  });
+
+  it('returns a running MemoryView constant without target access or state changes', async () => {
+    const backend = {
+      execute: vi.fn(async () => { throw new Error('backend must not be called'); }),
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    (session as any).setTargetRunning(true);
+    const sent: DebugProtocolMessage[] = [];
+    session.on('send', message => sent.push(message));
+
+    await (session as any).handleEvaluate({
+      ...request(901, 'evaluate'),
+      arguments: { expression: '4 * 1024 * 1024', context: 'hover' },
+    });
+
+    expect(backend.execute).not.toHaveBeenCalled();
+    expect((session as any).targetRunning).toBe(true);
+    expect(sent.find(message => message.request_seq === 901)).toMatchObject({
+      success: true,
+      body: { result: '4194304', variablesReference: 0 },
+    });
+  });
+
   it('strips Han characters before Watch target reads', async () => {
     const evaluated: string[] = [];
     const backend = {
@@ -432,6 +472,32 @@ describe('DapSession realtime variable arbitration', () => {
     expect(points).toHaveLength(2);
     expect(points[0]).toMatchObject({ value: 42, startsNewSegment: true });
     expect(points[1]).not.toHaveProperty('startsNewSegment');
+  });
+
+  it('starts a new Timeline segment after a sampling gap', async () => {
+    const backend = {
+      async execute(command: any) {
+        if (command.cmd !== 'readFastDataSampling') throw new Error(`Unexpected command: ${command.cmd}`);
+        return { ok: true, data: [{ expression: 'counter', value: 42, display: '42', hex: '0x2A' }] };
+      },
+      dispose() {},
+    };
+    const session = new DapSession(backend as any);
+    vi.spyOn(session as any, 'timelineNowMs')
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1040);
+    (session as any).dataSamplingIntervalMs = 1;
+    (session as any).dataSamplingSendIntervalMs = 10;
+    (session as any).dataSamplingSpecs = [{ expression: 'counter', address: 0x20000000, size: 4, format: 'u32' }];
+    (session as any).dataSamplingPending.set('counter', []);
+    (session as any).setTargetRunning(true);
+
+    await (session as any).captureFastDataSample();
+    await (session as any).captureFastDataSample();
+
+    const points = (session as any).dataSamplingPending.get('counter');
+    expect(points[0]).toMatchObject({ timestamp: 1000, startsNewSegment: true });
+    expect(points[1]).toMatchObject({ timestamp: 1040, startsNewSegment: true });
   });
 
   it('does not advance the Timeline sampling clock while the target is halted', async () => {

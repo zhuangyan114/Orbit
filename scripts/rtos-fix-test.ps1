@@ -10,19 +10,19 @@ if (Test-Path $settingsPath) {
     $settings = Get-Content $settingsPath | ConvertFrom-Json
     
     # 检查 mcu-debug.rtos-views.trackDebuggers
-    if ($settings.'mcu-debug.rtos-views.trackDebuggers' -contains 'ozone') {
-        Write-Host "   ✓ mcu-debug.rtos-views.trackDebuggers 包含 'ozone'" -ForegroundColor Green
+    if (($settings.'mcu-debug.rtos-views.trackDebuggers' -contains 'orbit') -or ($settings.'mcu-debug.rtos-views.trackDebuggers' -contains 'ozone')) {
+        Write-Host "   ✓ mcu-debug.rtos-views.trackDebuggers 包含 'orbit' 或 'ozone'" -ForegroundColor Green
     } else {
-        Write-Host "   ✗ mcu-debug.rtos-views.trackDebuggers 不包含 'ozone'" -ForegroundColor Red
-        Write-Host "   请添加 'ozone' 到配置中" -ForegroundColor Yellow
+        Write-Host "   ✗ mcu-debug.rtos-views.trackDebuggers 不包含 'orbit' 或 'ozone'" -ForegroundColor Red
+        Write-Host "   请添加 'orbit'（或兼容别名 'ozone'）到配置中" -ForegroundColor Yellow
     }
     
     # 检查 mcu-debug.debug-tracker-vscode.trackDebuggers
-    if ($settings.'mcu-debug.debug-tracker-vscode.trackDebuggers' -contains 'ozone') {
-        Write-Host "   ✓ mcu-debug.debug-tracker-vscode.trackDebuggers 包含 'ozone'" -ForegroundColor Green
+    if (($settings.'mcu-debug.debug-tracker-vscode.trackDebuggers' -contains 'orbit') -or ($settings.'mcu-debug.debug-tracker-vscode.trackDebuggers' -contains 'ozone')) {
+        Write-Host "   ✓ mcu-debug.debug-tracker-vscode.trackDebuggers 包含 'orbit' 或 'ozone'" -ForegroundColor Green
     } else {
-        Write-Host "   ✗ mcu-debug.debug-tracker-vscode.trackDebuggers 不包含 'ozone'" -ForegroundColor Red
-        Write-Host "   请添加 'ozone' 到配置中" -ForegroundColor Yellow
+        Write-Host "   ✗ mcu-debug.debug-tracker-vscode.trackDebuggers 不包含 'orbit' 或 'ozone'" -ForegroundColor Red
+        Write-Host "   请添加 'orbit'（或兼容别名 'ozone'）到配置中" -ForegroundColor Yellow
     }
 } else {
     Write-Host "   配置文件不存在" -ForegroundColor Red

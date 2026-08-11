@@ -3,6 +3,7 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { DebugSessionConfig, TargetState } from '../ozone-backend/types';
 import { SessionInfo, RecentSession } from './types';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import { isOrbitDebugSessionType } from '../utils/debug-session-type';
 
 export class SessionManager {
   private current: SessionInfo | null = null;
@@ -19,7 +20,7 @@ export class SessionManager {
   }
 
   async start(config?: DebugSessionConfig): Promise<void> {
-    if (vscode.debug.activeDebugSession?.type === 'ozone') {
+    if (isOrbitDebugSessionType(vscode.debug.activeDebugSession?.type)) {
       vscode.window.showErrorMessage('Orbit: target access is owned by the active debug session');
       return;
     }

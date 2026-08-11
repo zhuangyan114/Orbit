@@ -7,7 +7,7 @@
 ## 目录
 
 - [1. 安装和系统要求](#1-安装和系统要求)
-- [2. J-Link DLL 与烧录工具](#2-j-link-dll-与烧录工具)
+- [2. 调试探针与烧录](#2-调试探针与烧录)
 - [3. launch.json](#3-launchjson)
 - [4. Watch](#4-watch)
 - [5. Timeline](#5-timeline)
@@ -16,7 +16,7 @@
 - [8. RTOS Views](#8-rtos-views)
 - [9. Memory View](#9-memory-view)
 - [10. Peripheral Viewer](#10-peripheral-viewer)
-- [11. Native / Legacy 调试通道](#11-native--legacy-调试通道)
+- [11. Target owner 与调试通道](#11-target-owner-与调试通道)
 - [12. MCP 与 Plugin API](#12-mcp-与-plugin-api)
 - [13. 常见问题](#13-常见问题)
 - [14. 已知限制](#14-已知限制)
@@ -30,7 +30,7 @@
 1. 下载对应版本的 `.vsix`。
 2. 在 VS Code 中打开命令面板，执行 `Extensions: Install from VSIX...`。
 3. 选择 VSIX，安装完成后重新加载窗口。
-4. 打开包含 ELF/AXF 固件的工作区，再使用 `type: "ozone"` 的调试配置。
+4. 打开包含 ELF/AXF 固件的工作区，再使用 `type: "orbit"` 的调试配置；旧配置中的 `type: "ozone"` 仍可用。
 
 当前仓库的发布计划还会把 MCP server 和 SKILL 作为 Releases 资产提供；它们不是 VSIX 内的 DAP 协议替代品，详见 [MCP 与 Plugin API](#12-mcp-与-plugin-api)。
 
@@ -40,8 +40,8 @@
 | --- | --- |
 | 操作系统 | Native helper 的 CMake 配置明确要求 Windows；Native 发布目标为 `win32-x64`。当前产品应按 Windows 环境准备。 |
 | VS Code | `package.json` 声明 `engines.vscode: ^1.90.0`，即 VS Code 1.90.0 以上且仍在 1.x 主版本范围内。 |
-| 目标 | 产品定位为 STM32 / ARM Cortex-M；目标设备名必须能被 J-Link DLL 识别。 |
-| 调试器 | 需要已安装、已连接的 SEGGER J-Link probe，并准备相应 J-Link 软件包和 `JLink_x64.dll`。 |
+| 目标 | 产品定位为 STM32 / ARM Cortex-M；J-Link 需要 DLL 可识别的 device，CMSIS-DAP 烧录需要匹配目标的 Flash Algorithm。 |
+| 调试器 | 支持 SEGGER J-Link，以及标准 CMSIS-DAP/DAPLink v2 WinUSB 或 v1 HID probe。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
 | 固件文件 | `program` 使用 ELF/AXF。符号、源码行和 DWARF 类型质量取决于文件是否包含相应调试信息。 |
 | 外部视图 | RTOS Views、Memory View、Peripheral Viewer 和 debug tracker 由外部扩展提供，Orbit 不在 `extensionDependencies` 中自动安装它们。 |
 | 源码构建 | 仅在从源码构建 Native helper 时需要 CMake 3.20+，以及 Visual Studio C++ 工具或 x64 MinGW-w64。 |
@@ -70,11 +70,11 @@ npm run typecheck
 
 `npm run build:native` 会寻找 CMake 3.20+，优先使用 Visual Studio 生成器，否则要求 x64 MinGW-w64；产物目标目录是 `out/native/win32-x64/`。发布版用户通常直接安装 Releases 中的 VSIX，不需要在目标机上安装 CMake。
 
-## 2. J-Link DLL 与烧录工具
+## 2. 调试探针与烧录
 
 ### 2.1 DLL 的作用
 
-F5/Run and Debug 的 `ozone` DAP 路径直接使用 J-Link DLL 访问目标。它不需要通过 OpenOCD、GDB server 或 Ozone GUI 来承接常规 DAP 控制。
+F5/Run and Debug 的 `orbit` DAP 路径按 `probe` 选择 J-Link 或 CMSIS-DAP；旧的 `ozone` DAP 类型仍路由到同一实现。两种路径都不需要 OpenOCD、GDB server 或 Ozone GUI 承接常规 DAP 控制。
 
 扩展设置 `orbit.jlinkDllPath` 为空时，源码按以下顺序尝试定位 `JLink_x64.dll`：
 
@@ -99,11 +99,17 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 没有 `program`，或显式设置 `flashBeforeDebug: false` 时，不会因为 DAP 连接本身而调用 `JLink.exe`。J-Link DLL 仍然是调试连接的必需品。
 
+### 2.3 CMSIS-DAP / DAPLink
+
+`probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。
+
+CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。`flashBeforeDebug: false` 完全跳过烧录，仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
+
 ## 3. `launch.json`
 
 ### 3.1 最小配置
 
-下面的配置使用源码中公开的 `ozone` debugger schema：
+下面的配置使用 J-Link 默认 owner：
 
 ```jsonc
 {
@@ -111,8 +117,9 @@ C:\Program Files\SEGGER\JLink\JLink.exe
   "configurations": [
     {
       "name": "Orbit: Debug STM32",
-      "type": "ozone",
+      "type": "orbit",
       "request": "launch",
+      "probe": "jlink",
       "program": "${workspaceFolder}/build/Debug/frame.elf",
       "device": "STM32F407IG",
       "interface": "SWD",
@@ -123,25 +130,49 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 }
 ```
 
+有线 CMSIS-DAP/DAPLink 的最小差异配置为：
+
+```jsonc
+{
+  "type": "orbit",
+  "request": "launch",
+  "probe": "cmsis-dap",
+  "cmsisDapTransport": "auto",
+  "program": "${workspaceFolder}/build/Debug/frame.elf",
+  "device": "STM32F407VG",
+  "interface": "SWD",
+  "speedKHz": 4000,
+  "flashBeforeDebug": true
+}
+```
+
 ### 3.2 默认值和 launch 属性
 
 以下是 `package.json` 的 launch schema 以及 DAP 源码实际读取的值：
 
 | 属性 | 类型 / 单位 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `device` | string | `STM32F407VG` | J-Link 目标设备名。 |
+| `device` | string | `STM32F407VG` | 目标设备名；J-Link 用于 DLL 选型，CMSIS-DAP 用于 Flash Algorithm/芯片校验。 |
 | `deviceName` | string | `STM32F407VG` | `device` 的外部 MCU Debug Views 兼容别名；未填写时由 `device` 补齐。 |
+| `probe` | `jlink` / `cmsis-dap` | `jlink` | 当前 session 的唯一物理 owner 类型。 |
+| `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1。 |
+| `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。 |
+| `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。 |
+| `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。 |
+| `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、来源和许可已确认的 Flash Algorithm binary/manifest。 |
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF 路径；用于可选烧录、符号和 DWARF。 |
 | `svdFile` | path | `""` | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径。 |
  | `svdPath` | path | `""` | `svdFile` 的兼容别名；未填写时跟随 `svdFile` 或 `orbit.defaultSvdFile`。 |
-| `interface` | `SWD` / `JTAG` | `SWD` | J-Link 接口。Native 连接会按该值选择接口；Legacy 当前源码固定选择 SWD，见限制。 |
-| `speedKHz` | number，kHz | `4000` | J-Link 接口速度。 |
+| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
+| `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
+| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验；`false` 明确跳过所有 Flash 操作。 |
+| `runToEntryPoint` | string / `false` | `main` | CMSIS-DAP 启动或 Restart 后停靠的符号；`false` 禁用 run-to-entry。 |
 | `rtos` | string | `""` | 传给 DAP capability/外部 RTOS Views 的 RTOS 名称，例如 `FreeRTOS`。 |
 | `rttLogEnabled` | boolean | `true` | 启动后读取 SEGGER RTT。 |
 | `rttBufferIndex` | number，up-buffer index | `0`，限制为 `0..15` | RTT 上行缓冲区索引。 |
 | `rttPollIntervalMs` | number，ms | `50`，限制为 `10..5000` | RTT 轮询周期。 |
 | `rttReadSize` | number，bytes/poll | `4096`，限制为 `64..65536` | 每次 RTT 读取的最大字节数。 |
-| `rttControlBlockAddress` | number 或 string，地址 | `""` | RTT control block 地址；空值交给 J-Link 自动检测，正数可写成十进制或 `0x` 形式。 |
+| `rttControlBlockAddress` | number 或 string，地址 | `""` | RTT control block 地址；J-Link 可自动检测，CMSIS-DAP 可从 ELF 符号定位或使用显式地址；正数可写成十进制或 `0x`。 |
 | `rttStripAnsi` | boolean | `true` | 写入 Debug Console 前去除 ANSI 控制序列；RTT terminal 始终保留 ANSI。 |
 | `rttLogTarget` | `terminal` / `debugConsole` / `both` | `terminal` | RTT 文本显示位置。 |
 | `pRtLogEnabled` | boolean | `false` | 将 RTT 字节按 P-RTLog tokenized 帧解码，而不是按普通文本处理。 |
@@ -159,17 +190,17 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 每个目录中按文件系统返回顺序取第一个 `.elf` 或 `.axf`。找不到时使用 `${workspaceFolder}/build/Debug/frame.elf` 作为未解析的默认路径。
 
-DAP 源码还接受下列兼容输入，但它们没有全部出现在 `package.json` 的 launch schema 中：
+DAP 源码还接受下列兼容输入：
 
 | 输入 | 默认值 | 当前行为 |
 | --- | --- | --- |
 | `elfPath` | `""` | `program` 为空时作为 ELF 路径别名。 |
 | `defaultRtos` | `""` | `rtos` 为空时作为 RTOS 名称别名。 |
-| `flashBeforeDebug` | `true` | 有 ELF 时默认先调用 JLink.exe 烧录；设为 `false` 可跳过烧录。它是源码读取的 launch 字段，不是当前 package schema 中的独立配置项。 |
+| `flashBeforeDebug` | `true` | 使用当前 owner 烧录；J-Link 调用 Commander，CMSIS-DAP 运行 Flash Algorithm。设为 `false` 时不执行擦除、编程或校验。 |
 
-### 3.4 `ozone.*` 工作区设置
+### 3.4 `orbit.*` 工作区设置
 
-这些设置可以在 VS Code Settings JSON 中使用；设置前缀仍是源码中的 `ozone`，与 Orbit 的产品品牌名称无关。
+这些设置可以在 VS Code Settings JSON 中使用；正式前缀为 `orbit.*`，旧版 `ozone.*` 会在激活时迁移。
 
 | 设置 | 类型 / 范围 | 默认值 | 作用 |
 | --- | --- | --- | --- |
@@ -210,14 +241,14 @@ DAP 源码还接受下列兼容输入，但它们没有全部出现在 `package.
 - 展开结构体、数组、指针等返回的子节点。
 - 读取 `display`、类型、地址和错误状态；目标运行时可显示 `Running...` 或使用短期缓存。
 - 叶子数值可编辑。输入支持十进制、科学计数法和完整的十六进制 `0x...` 数字；复合节点不能直接写入。
-- 写入通过活动 `ozone` DAP session 的 `setWatchValue` 完成；写入后会清理对应运行时缓存并重新读取。
+- 写入通过活动 Orbit DAP session 的 `setWatchValue` 完成；写入后会清理对应运行时缓存并重新读取。
 - 叶子表达式可以发送到 Timeline；值变化会短暂高亮，源码中的高亮窗口是 500 ms。
 
 ### 4.2 状态保存和路由
 
 Watch 表达式保存为 workspace state 的 `ozoneWatchExpressions`，展开节点保存为 `ozoneWatchExpandedExpressions`。切换视图或重新创建 Webview 后，表达式和展开状态会恢复。
 
-如果存在活动的 `ozone` DAP session，Watch 读取和写入都通过该 session 路由；不会为同一目标再打开一个 Extension Host owner。没有活动 DAP session 时，扩展侧 Watch provider 才会使用其后端路径。
+如果存在活动的 `orbit` DAP session（或旧 `ozone` 别名），Watch 读取和写入都通过该 session 路由；不会为同一目标再打开一个 Extension Host owner。没有活动 DAP session 时，扩展侧 Watch provider 才会使用其后端路径。
 
 ### 4.3 刷新和并发
 
@@ -243,7 +274,7 @@ Timeline 状态保存为 `ozoneTimelineState`，包括自动跟随、时间每�
 ### 5.3 采样语义
 
 - 目标停止时不生成新的 Timeline 采样点；恢复运行后从新的实时读取继续，不回填停止期间的时间槽。
-- 活动 DAP session 使用 Native/Legacy 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
+- 活动 DAP session 使用 J-Link Native/Legacy 或 CMSIS-DAP 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
 - 不是每个表达式都能进入快速采样计划。无法解析为当前快速采样格式的表达式会被计划拒绝，不应把它当作“曲线为零”。
 - `orbit.timelineSampleIntervalMs` 是目标采样目标，不是硬件保证的实际采样频率。
 - `orbit.timelineSendIntervalMs` 只控制发送到 Webview 的节奏，不等于目标采样间隔。
@@ -252,7 +283,7 @@ Timeline 状态保存为 `ozoneTimelineState`，包括自动跟随、时间每�
 
 ### 6.1 启动和输出
 
-`rttLogEnabled` 默认为 `true`。DAP launch 在目标连接并初次 halt 后开始 RTT 轮询，断开或会话结束时停止。读取使用当前 session 选定的 Native 或 Legacy owner。
+`rttLogEnabled` 默认为 `true`。DAP launch 在目标连接并初次 halt 后开始 RTT 轮询，断开或会话结束时停止。读取始终使用当前 session 选定的 owner：J-Link 调用 DLL RTT API，CMSIS-DAP 通过目标内存读取 RTT control block 和 ring buffer。
 
 输出目标由 `rttLogTarget` 选择：
 
@@ -269,11 +300,11 @@ Debug Console 输出默认移除 ANSI 控制序列；RTT terminal 始终保留 A
 | `rttBufferIndex` | `0` | `0..15`，RTT up-buffer index |
 | `rttPollIntervalMs` | `50` | `10..5000 ms` |
 | `rttReadSize` | `4096` | `64..65536 bytes` / poll |
-| `rttControlBlockAddress` | 空 | 正的 32-bit 地址；空值由 J-Link 自动检测 |
+| `rttControlBlockAddress` | 空 | 正的 32-bit 地址；J-Link 可自动检测，CMSIS-DAP 可从 ELF 符号定位或使用显式地址 |
 | `rttStripAnsi` | `true` | 只影响 Debug Console |
 | `rttLogTarget` | `terminal` | `terminal`、`debugConsole` 或 `both` |
 
-RTT 需要目标固件已经初始化 SEGGER RTT control block，并且当前 J-Link DLL 导出 RTT control/read 函数。RTT 不会替目标固件自动插入 RTT 初始化代码。
+RTT 需要目标固件已经初始化 SEGGER RTT control block。J-Link 还要求 DLL 导出 RTT control/read 函数；CMSIS-DAP 要求 control block 地址/符号和目标内存可读写。RTT 不会替目标固件自动插入初始化代码。
 
 ## 7. P-RTLog
 
@@ -293,7 +324,7 @@ P-RTLog 是 RTT 之上的 tokenized 二进制帧格式。启用 `pRtLogEnabled: 
 
 ```jsonc
 {
-  "type": "ozone",
+  "type": "orbit",
   "request": "launch",
   "program": "${workspaceFolder}/build/Debug/frame.elf",
   "rttLogEnabled": true,
@@ -308,13 +339,13 @@ P-RTLog 是 RTT 之上的 tokenized 二进制帧格式。启用 `pRtLogEnabled: 
 
 ### 8.1 外部扩展和自动登记
 
-RTOS Views 由外部扩展提供。Orbit 激活时会尝试把 `ozone` 加入以下设置数组：
+RTOS Views 由外部扩展提供。Orbit 激活时会尝试把主类型 `orbit` 和兼容别名 `ozone` 加入以下设置数组：
 
 ```jsonc
 {
-  "memory-view.trackDebuggers": ["ozone"],
-  "mcu-debug.rtos-views.trackDebuggers": ["ozone"],
-  "mcu-debug.debug-tracker-vscode.trackDebuggers": ["ozone"]
+  "memory-view.trackDebuggers": ["orbit", "ozone"],
+  "mcu-debug.rtos-views.trackDebuggers": ["orbit", "ozone"],
+  "mcu-debug.debug-tracker-vscode.trackDebuggers": ["orbit", "ozone"]
 }
 ```
 
@@ -339,7 +370,7 @@ RTOS Views 由外部扩展提供。Orbit 激活时会尝试把 `ozone` 加入以
 RTOS Views 能看到的字段取决于：
 
 - 外部 RTOS Views 与 debug tracker 已安装并启用；
-- `trackDebuggers` 包含 `ozone`；
+- `trackDebuggers` 包含 `orbit`（为旧配置兼容也可同时保留 `ozone`）；
 - ELF/DWARF 中保留了外部视图需要的类型和符号；
 - 目标处于外部视图可读取的状态；
 - 固件使用的 RTOS 版本和配置被外部视图支持。
@@ -357,11 +388,11 @@ Memory View 是外部扩展通过 DAP memory 请求访问 Orbit 的目标内存�
 
 变量节点有有效地址时会提供 `memoryReference`，供外部 Memory View 跳转。读写请求仍由当前 DAP session 的唯一 target owner 执行；目标忙或读取失败时返回 DAP 错误，不会偷偷创建第二个连接。
 
-若 Memory View 没有列出 `ozone`，执行集成命令，或在工作区设置中加入：
+若 Memory View 没有列出 Orbit，执行集成命令，或在工作区设置中加入：
 
 ```json
 {
-  "memory-view.trackDebuggers": ["ozone"]
+  "memory-view.trackDebuggers": ["orbit", "ozone"]
 }
 ```
 
@@ -389,19 +420,22 @@ Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供
 
 当前源码保留 `svdFile` / `svdPath` / `deviceName` 供外部 MCU Debug Views 使用，但 Orbit 自身不解析 SVD，也不内置 Peripheral Viewer。寄存器名称、bit 字段、读写权限和显示质量取决于 SVD 文件及外部 Viewer。外部 Viewer 不显示时先检查扩展安装、`trackDebuggers`、SVD 路径和目标 device name。
 
-## 11. Native / Legacy 调试通道
+## 11. Target owner 与调试通道
 
-### 11.1 两条通道
+### 11.1 三类 owner
 
 | 通道 | 实现 | 特点 |
 | --- | --- | --- |
 | Native | 独立的 `orbit-jlink-helper.exe`，通过 JSON-lines 与 DAP 侧通信；helper 内加载 J-Link DLL | 拥有 Native source-level step into/over/out、批量内存读取和 NativeScheduler；目标为 Windows x64。 |
 | Legacy | Node 进程中的 `koffi` 直接加载 `JLink_x64.dll` | 保留现有调试和 DAP 兼容路径；Native source-level step API 在该 owner 上不可用。 |
+| CMSIS-DAP | 独立的 `orbit-cmsis-dap-helper.exe`，使用 WinUSB v2 或 HID v1 | 提供 SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm、Watch/Timeline 和内存型 RTT；不加载 J-Link DLL。 |
 
 ### 11.2 owner 选择
 
 当前每个 DAP session 由 `SessionTargetSelector` 选择且只持有一个物理 owner：
 
+- `probe: "cmsis-dap"`：只建立 CMSIS-DAP owner；失败或 owner loss 都不回退 J-Link；
+- `probe: "jlink"`：再由以下 Native/Legacy 设置选择 J-Link owner；
 - `nativeDebugEngineMode: "legacy"`：只建立 Legacy owner；
 - `nativeDebugEngineMode: "native"`：只尝试 Native，Native 初始化失败即失败，不回退；
 - `nativeDebugEngineMode: "auto"` 且 `nativeDebugEngineEnabled: true`：先尝试 Native，只有 Native 启动/初始化失败且尚未建立目标连接时才创建 Legacy owner；
@@ -412,13 +446,13 @@ Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供
 
 ### 11.3 访问调度
 
-NativeScheduler 的优先级为：
+Native owner 的 scheduler 优先级为：
 
 ```text
-control  >  watch  >  timeline
+control  >  watch  >  timeline  >  background
 ```
 
-继续、暂停、复位、断点、单步和变量/内存写入属于 control；Watch 和 Timeline 目标读属于低优先级读取。调试会话运行时，活动 DAP 请求沿已选 owner 路由，Extension Host 不会再作为第二个物理 owner 接管目标。
+继续、暂停、复位、断点、单步、Flash 和变量/内存写入属于 control；RTT 和 RTOS refresh 属于 background。调试会话运行时，活动 DAP 请求沿已选 owner 路由，Extension Host 不会再作为第二个物理 owner 接管目标。
 
 ## 12. MCP 与 Plugin API
 
@@ -445,7 +479,7 @@ Extension Host 激活时启动一个随机端口的本机 HTTP server：
 | `ozone.record.start` / `stop` / `get` / `clear` | 录制、停止、读取和清理波形。 |
 | `ozone.experiment.run` | 执行 read / write / wait / record 步骤，可配置 baseline 和 min/max safety。 |
 
-若活动 `ozone` DAP session 存在，RuntimeRouter 将读写和目标状态请求发送到该 DAP session；DAP 请求失败会作为该操作的错误返回，不会回退到 Extension Host 的另一条目标连接。
+若活动 `orbit` DAP session（或旧 `ozone` 别名）存在，RuntimeRouter 将读写和目标状态请求发送到该 DAP session；DAP 请求失败会作为该操作的错误返回，不会回退到 Extension Host 的另一条目标连接。
 
 ### 12.2 MCP server
 
@@ -492,7 +526,7 @@ MCP 可以写入目标变量，因此应先用只读状态/读取确认表达式
 
 ### Q2：调试连接正常，但自动烧录失败。
 
-调试连接使用 DLL，自动烧录使用 `JLink.exe`。确认 `orbit.jlinkPath` 指向真实的 Commander 可执行文件；如果固件已经烧录，可在 launch 中设置 `flashBeforeDebug: false` 跳过烧录。`program` 仍用于符号加载。
+J-Link 调试连接使用 DLL，自动烧录使用 `JLink.exe`；确认 `orbit.jlinkPath` 指向真实 Commander。CMSIS-DAP 烧录使用当前 helper 和匹配目标的 Flash Algorithm；检查算法来源、RAM 布局、芯片 ID 和 verify 错误。固件已存在时可设置 `flashBeforeDebug: false`，`program` 仍用于符号加载。
 
 ### Q3：没有找到 ELF/AXF。
 
@@ -504,7 +538,7 @@ Watch 和 Timeline 都依赖当前 DAP session 的目标状态。Timeline 在目
 
 ### Q5：RTT 没有输出。
 
-确认 `rttLogEnabled` 为 `true`、固件已初始化 RTT、up-buffer index 正确、J-Link DLL 提供 RTT 导出。必要时设置 `rttControlBlockAddress`。如果使用 `debugConsole`，注意 `rttLogTarget` 默认不是 `debugConsole`，而是 `terminal`。
+确认 `rttLogEnabled` 为 `true`、固件已初始化 RTT 且 up-buffer index 正确。J-Link 要确认 DLL RTT 导出；CMSIS-DAP 要确认 `_SEGGER_RTT` 符号或显式 `rttControlBlockAddress`。如果使用 `debugConsole`，注意默认输出位置是 `terminal`。
 
 ### Q6：P-RTLog 输出 unknown token 或 token database not found。
 
@@ -512,7 +546,7 @@ Watch 和 Timeline 都依赖当前 DAP session 的目标状态。Timeline 在目
 
 ### Q7：RTOS Views、Memory View 或 Peripheral Viewer 没有跟踪到 Orbit。
 
-确认外部扩展已安装，并检查对应的 `trackDebuggers` 数组是否包含 `ozone`。可以执行 MCU Debug Views 集成命令后 Reload Window。Peripheral Viewer 还需要有效 `svdFile` / `svdPath`；RTOS Views 还需要外部扩展能解析当前 ELF、RTOS 和目标状态。
+确认外部扩展已安装，并检查对应的 `trackDebuggers` 数组是否包含 `orbit`；兼容配置可同时保留 `ozone`。可以执行 MCU Debug Views 集成命令后 Reload Window。Peripheral Viewer 还需要有效 `svdFile` / `svdPath`；RTOS Views 还需要外部扩展能解析当前 ELF、RTOS 和目标状态。
 
 ### Q8：`nativeDebugEngineMode: "auto"` 为什么变成 Legacy？
 
@@ -528,16 +562,17 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 
 ### Q11：MCP 读取/写入失败，但 VS Code 中调试已启动。
 
-确认活动 session 的类型是 `ozone`，目标状态为 `running` 或 `halted`，并使用 ELF/DWARF 中实际存在的表达式。活动 DAP session 存在时 MCP 不会绕过它建立第二条目标连接。
+确认活动 session 的类型是 `orbit`（旧配置也可能是 `ozone`），目标状态为 `running` 或 `halted`，并使用 ELF/DWARF 中实际存在的表达式。活动 DAP session 存在时 MCP 不会绕过它建立第二条目标连接。
 
 ## 14. 已知限制
 
 ### 当前实现限制
 
 - Native helper 和当前 J-Link DLL 集成是 Windows 目标；仓库没有把 Linux/macOS 作为当前 Native 运行目标。
+- CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。当前仓库真机验收覆盖 v1 HID，v2 WinUSB 只有代码/Mock/构建证据，具体 probe 固件兼容性仍以设备枚举和握手为准。
 - `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。
 - `interface` schema 接受 `SWD` 和 `JTAG`，但 Legacy DLL 连接实现当前固定选择 SWD；JTAG 应使用 Native 并单独确认硬件。
-- 每个 session 的硬件断点槽位固定为 6 个；槽位耗尽时新断点无法建立。
+- J-Link 路径使用 6 个槽位索引；CMSIS-DAP 会读取 Cortex-M FPB 容量。任何路径槽位耗尽时新硬件断点都必须返回明确错误。
 - Native source-level step into/over/out 只属于 Native owner；Legacy 不能把普通单步宣传为 Native source-level stepping。
 - Timeline 的 `0.2 ms` 是目标间隔，不是硬件实时采样保证；目标读取延迟、表达式数量、控制操作和 Watch 会降低实际频率。
 - Timeline 只保留约 10 分钟历史，且停止期间不回填数据。

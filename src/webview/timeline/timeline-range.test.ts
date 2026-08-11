@@ -4,6 +4,8 @@ import {
   clampTimelineViewportEnd,
   getTimelineHistoryBounds,
   intersectTimelineRange,
+  parseTimelineRangeLoadRequest,
+  quantizeTimelineResolution,
   sliceTimelineRange,
   TimelineRangeController,
 } from './timeline-range';
@@ -11,8 +13,8 @@ import {
 const point = (timestamp: number) => ({ timestamp, value: timestamp, display: String(timestamp) });
 
 describe('calculateBufferedRange', () => {
-  it('prefetches half a visible width on both sides', () => {
-    expect(calculateBufferedRange(100, 200, { start: 0, end: 300 })).toEqual({ start: 50, end: 250 });
+  it('prefetches two visible widths on both sides', () => {
+    expect(calculateBufferedRange(300, 400, { start: 0, end: 800 })).toEqual({ start: 100, end: 600 });
   });
 
   it('clamps the prefetch range to both history boundaries', () => {
@@ -82,13 +84,96 @@ describe('getTimelineHistoryBounds', () => {
   });
 });
 
-describe('TimelineRangeController', () => {
-  it('requests the visible range with a half-screen margin on both sides', () => {
-    const controller = new TimelineRangeController();
-    controller.setHistoryBounds({ start: 0, end: 300 });
+describe('quantizeTimelineResolution', () => {
+  it('quantizes milliseconds per pixel to stable power-of-two levels', () => {
+    expect(quantizeTimelineResolution(800, 100)).toBe(8);
+    expect(quantizeTimelineResolution(840, 100)).toBe(8);
+    expect(quantizeTimelineResolution(1600, 100)).toBe(16);
+  });
 
-    expect(controller.requestViewport(100, 200)).toEqual([
-      { requestId: 1, start: 50, end: 250 },
+  it('rejects invalid viewport dimensions', () => {
+    expect(quantizeTimelineResolution(0, 100)).toBeNull();
+    expect(quantizeTimelineResolution(800, 0)).toBeNull();
+  });
+});
+
+describe('parseTimelineRangeLoadRequest', () => {
+  it('accepts a bounded resolution-aware range request', () => {
+    expect(parseTimelineRangeLoadRequest({
+      requestId: 7,
+      generation: 3,
+      start: 100,
+      end: 500,
+      resolutionKey: 0.5,
+      targetBuckets: 800,
+    })).toEqual({
+      requestId: 7,
+      generation: 3,
+      start: 100,
+      end: 500,
+      resolutionKey: 0.5,
+      targetBuckets: 800,
+    });
+  });
+
+  it('rejects invalid identities, ranges, resolutions, and bucket counts', () => {
+    const valid = {
+      requestId: 7,
+      generation: 3,
+      start: 100,
+      end: 500,
+      resolutionKey: 0.5,
+      targetBuckets: 800,
+    };
+
+    expect(parseTimelineRangeLoadRequest({ ...valid, requestId: 1.5 })).toBeNull();
+    expect(parseTimelineRangeLoadRequest({ ...valid, generation: -1 })).toBeNull();
+    expect(parseTimelineRangeLoadRequest({ ...valid, end: 50 })).toBeNull();
+    expect(parseTimelineRangeLoadRequest({ ...valid, resolutionKey: 0 })).toBeNull();
+    expect(parseTimelineRangeLoadRequest({ ...valid, targetBuckets: 0 })).toBeNull();
+    expect(parseTimelineRangeLoadRequest({ ...valid, targetBuckets: 100_001 })).toBeNull();
+  });
+});
+
+describe('TimelineRangeController', () => {
+  it('invalidates loaded and pending coverage when display resolution changes', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    expect(controller.setResolution(1)).toBe(true);
+    const [oldRequest] = controller.requestViewport(300, 400);
+    const oldGeneration = controller.generation;
+
+    expect(controller.setResolution(1)).toBe(false);
+    expect(controller.setResolution(4)).toBe(true);
+    expect(controller.generation).toBe(oldGeneration + 1);
+    expect(controller.completeRequest(
+      oldRequest.requestId,
+      oldRequest,
+      oldGeneration,
+      1,
+    )).toBe(false);
+    expect(controller.requestViewport(300, 400)).toEqual([
+      { requestId: oldRequest.requestId + 1, start: 100, end: 600 },
+    ]);
+  });
+
+  it('rejects a response whose generation or resolution does not match its request', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 500 });
+    controller.setResolution(2);
+    const [request] = controller.requestViewport(200, 300);
+
+    expect(controller.completeRequest(request.requestId, request, controller.generation - 1, 2)).toBe(false);
+    expect(controller.completeRequest(request.requestId, request, controller.generation, 4)).toBe(false);
+    expect(controller.completeRequest(request.requestId, request, controller.generation, 2)).toBe(true);
+  });
+
+  it('requests the visible range with a two-screen margin on both sides', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 800 });
+
+    expect(controller.requestViewport(300, 400)).toEqual([
+      { requestId: 1, start: 100, end: 600 },
     ]);
   });
 
@@ -97,13 +182,13 @@ describe('TimelineRangeController', () => {
     controller.setHistoryBounds({ start: 0, end: 300 });
 
     expect(controller.requestViewport(0, 100)).toEqual([
-      { requestId: 1, start: 0, end: 150 },
+      { requestId: 1, start: 0, end: 300 },
     ]);
 
     const latest = new TimelineRangeController();
     latest.setHistoryBounds({ start: 0, end: 300 });
     expect(latest.requestViewport(200, 300)).toEqual([
-      { requestId: 1, start: 150, end: 300 },
+      { requestId: 1, start: 0, end: 300 },
     ]);
   });
 
@@ -117,15 +202,35 @@ describe('TimelineRangeController', () => {
     expect(controller.requestViewport(100, 200)).toEqual([]);
   });
 
-  it('requests only missing ranges on both sides after zooming out', () => {
+  it('does not refresh while at least a half-screen margin remains', () => {
     const controller = new TimelineRangeController();
-    controller.setHistoryBounds({ start: 0, end: 300 });
-    const [request] = controller.requestViewport(100, 200);
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    const [request] = controller.requestViewport(300, 400);
     controller.completeRequest(request.requestId, { start: request.start, end: request.end });
 
-    expect(controller.requestViewport(75, 225)).toEqual([
-      { requestId: 2, start: 0, end: 50 },
-      { requestId: 3, start: 250, end: 300 },
+    expect(controller.requestViewport(450, 550)).toEqual([]);
+  });
+
+  it('requests only missing ranges when zooming beyond loaded coverage on both sides', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    const [request] = controller.requestViewport(300, 400);
+    controller.completeRequest(request.requestId, { start: request.start, end: request.end });
+
+    expect(controller.requestViewport(150, 550)).toEqual([
+      { requestId: 2, start: 0, end: 100 },
+      { requestId: 3, start: 600, end: 1000 },
+    ]);
+  });
+
+  it('restores two screens of buffered margin after less than half a screen remains', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 1000 });
+    const [request] = controller.requestViewport(300, 400);
+    controller.completeRequest(request.requestId, { start: request.start, end: request.end });
+
+    expect(controller.requestViewport(460, 560)).toEqual([
+      { requestId: 2, start: 600, end: 760 },
     ]);
   });
 
@@ -185,7 +290,7 @@ describe('TimelineRangeController', () => {
     controller.cancelPendingRequests();
 
     expect(controller.requestViewport(100, 200)).toEqual([
-      { requestId: lostRequest.requestId + 1, start: 50, end: 250 },
+      { requestId: lostRequest.requestId + 1, start: 0, end: 300 },
     ]);
   });
 });

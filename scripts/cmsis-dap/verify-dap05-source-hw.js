@@ -253,7 +253,7 @@ async function main() {
   let launched = false;
   try {
     const initialize = await client.request('initialize', {
-      clientID: 'orbit-dap05-hw', adapterID: 'ozone', pathFormat: 'path',
+      clientID: 'orbit-dap05-hw', adapterID: 'orbit', pathFormat: 'path',
       linesStartAt1: true, columnsStartAt1: true,
     });
     check('initialize preserves DAP memory/source-step surface', responseOk(initialize)

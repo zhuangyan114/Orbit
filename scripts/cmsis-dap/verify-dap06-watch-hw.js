@@ -666,7 +666,7 @@ async function main() {
   let disconnected = false;
   try {
     const initialize = await client.request('initialize', {
-      clientID: 'orbit-dap06-watch-hw', adapterID: 'ozone', pathFormat: 'path',
+      clientID: 'orbit-dap06-watch-hw', adapterID: 'orbit', pathFormat: 'path',
       linesStartAt1: true, columnsStartAt1: true,
     });
     check('initialize', responseOk(initialize), { response: initialize.message });

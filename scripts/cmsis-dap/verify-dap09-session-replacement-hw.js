@@ -93,7 +93,7 @@ class SessionClient {
 async function runSession(label, clearLogsOnStart, terminateWithPending) {
   const session = { label, errors: [] }; const client = new SessionClient(session); let disconnected = false;
   try {
-    const init = await client.request('initialize', { clientID: `orbit-dap09-replacement-${label}`, adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true }); if (!ok(init)) throw new Error('initialize failed');
+    const init = await client.request('initialize', { clientID: `orbit-dap09-replacement-${label}`, adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true }); if (!ok(init)) throw new Error('initialize failed');
     const launch = await client.request('launch', { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe: 'cmsis-dap', cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid, cmsisDapSerial: serial, flashBeforeDebug: false, runToEntryPoint: 'osKernelStart', rtos: 'FreeRTOS', nativeDebugEngineEnabled: true, nativeDebugEngineMode: 'auto', loggingEnabled: true, clearLogsOnStart, rttLogEnabled: false }); if (!ok(launch)) throw new Error(`launch failed: ${JSON.stringify(launch.message)}`);
     const stopped = client.waitEvent('stopped', session.trace.length - 1); const configuration = await client.request('configurationDone'); if (!ok(configuration)) throw new Error('configurationDone failed'); await stopped;
     const after = session.trace.length - 1; const continued = client.waitEvent('continued', after); const cont = await client.request('continue', { threadId: 1 }); if (!ok(cont)) throw new Error('continue failed'); await continued;

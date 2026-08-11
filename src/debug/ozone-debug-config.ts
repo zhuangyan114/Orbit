@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import { ORBIT_DAP_TYPE } from '../utils/debug-session-type';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 export class OzoneDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
@@ -13,7 +14,7 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     const cfg = getOrbitConfiguration();
 
     if (!config.request) {
-      config.type = 'ozone';
+      config.type = config.type || ORBIT_DAP_TYPE;
       config.request = 'launch';
       config.name = 'Orbit Debug';
     }

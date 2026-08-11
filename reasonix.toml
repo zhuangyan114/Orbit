@@ -1,2 +1,2 @@
 [permissions]
-allow = ["Bash=cd \"/c/Users/22690/Desktop/AI/Ozone for VScode\" && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Project cmsis-dap 2>&1 | tail -12", "Bash=cd \"/c/Users/22690/Desktop/AI/Ozone for VScode\" && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Project cmsis-dap 2>&1 | grep -A5 -B2 \"error\" | head -50"]
+allow = ["Bash=cd \"/c/Users/22690/Desktop/AI/Orbit\" && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Project cmsis-dap 2>&1 | tail -12", "Bash=cd \"/c/Users/22690/Desktop/AI/Orbit\" && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Project cmsis-dap 2>&1 | grep -A5 -B2 \"error\" | head -50"]

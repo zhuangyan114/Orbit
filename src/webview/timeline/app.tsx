@@ -8,6 +8,7 @@ import {
 import { buildTimelineTraceCommands, firstPointAtOrAfter } from './timeline-trace-path';
 import {
   clampTimelineViewportEnd,
+  quantizeTimelineResolution,
   TimelineRangeController,
   type TimelineHistoryBounds,
 } from './timeline-range';
@@ -118,8 +119,28 @@ export function TimelineApp() {
     if (!initedRef.current) return;
     const tEnd = tEndRef.current;
     const tStart = tEnd - timePerDivRef.current * H_DIV;
-    for (const request of rangeControllerRef.current!.requestViewport(tStart, tEnd)) {
-      vscode.postMessage({ command: 'loadRange', ...request });
+    const canvasWidth = canvasRef.current?.getBoundingClientRect().width ?? 0;
+    const plotWidth = canvasWidth - 24;
+    if (plotWidth <= 0) return;
+    const resolutionKey = quantizeTimelineResolution(tEnd - tStart, plotWidth);
+    if (resolutionKey === null) return;
+    const controller = rangeControllerRef.current!;
+    if (controller.setResolution(resolutionKey)) {
+      for (const expression of allDataRef.current.keys()) allDataRef.current.set(expression, []);
+      setRenderTick(tick => tick + 1);
+    }
+    for (const request of controller.requestViewport(tStart, tEnd)) {
+      const targetBuckets = Math.min(
+        100_000,
+        Math.max(1, Math.ceil((request.end - request.start) / resolutionKey)),
+      );
+      vscode.postMessage({
+        command: 'loadRange',
+        ...request,
+        generation: controller.generation,
+        resolutionKey,
+        targetBuckets,
+      });
     }
   };
 
@@ -206,7 +227,12 @@ export function TimelineApp() {
         }
         case 'rangeSamples': {
           if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
-          if (!rangeControllerRef.current!.completeRequest(msg.requestId, msg.range ?? null)) break;
+          if (!rangeControllerRef.current!.completeRequest(
+            msg.requestId,
+            msg.range ?? null,
+            msg.generation,
+            msg.resolutionKey,
+          )) break;
           sampleBatcherRef.current?.enqueue(msg.snapshots || []);
           requestVisibleRange();
           break;
@@ -427,7 +453,10 @@ export function TimelineApp() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ro = new ResizeObserver(() => setRenderTick(t => t + 1));
+    const ro = new ResizeObserver(() => {
+      setRenderTick(t => t + 1);
+      scheduleVisibleRangeRequest();
+    });
     ro.observe(canvas.parentElement!);
     return () => ro.disconnect();
   }, []);

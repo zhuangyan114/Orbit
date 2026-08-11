@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make Timeline reopen quickly by loading only the visible interval plus a 0.5-screen margin on both sides while preserving real-time sampling and ten-minute history access.
+**Goal:** Make Timeline reopen quickly by loading only the visible interval plus a 2-screen margin on both sides, refilled at a 0.5-screen threshold, while preserving real-time sampling and ten-minute history access.
 
 **Architecture:** Add pure range, slicing, and merge helpers shared by host and webview code. The host retains all data and answers explicit range requests; the retained webview caches requested intervals, receives live samples while visible, and resynchronizes from host bounds after being hidden.
 
@@ -12,7 +12,7 @@
 
 - Preserve the full ten-minute extension-side history and Halted logical-clock behavior.
 - Preserve DAP routing, target ownership, sampling cadence, scheduler priorities, and live `samples` messages.
-- Prefetch exactly 0.5 visible widths on both sides, clamped to current history bounds.
+- Prefetch exactly 2 visible widths on both sides, refill when less than 0.5 width remains, and clamp both ranges to current history bounds.
 - Do not manually edit `dist/`, touch unrelated dirty files, update the bug-fix log before user confirmation, stage, or commit.
 
 ---
@@ -26,7 +26,7 @@
 - Modify: `src/webview/timeline/timeline-sample-buffer.test.ts`
 
 **Interfaces:**
-- Produces: `calculateBufferedRange(viewStart, viewEnd, historyBounds)` with a `0.5` margin per side and clamped output.
+- Produces: `calculateBufferedRange(viewStart, viewEnd, historyBounds)` with a `2.0` margin per side and clamped output.
 - Produces: `sliceTimelineRange(points, start, end)` using binary search and including one predecessor.
 - Produces: overlap-safe `appendTimelineSamples` that preserves sorted timestamp order and removes duplicate timestamps.
 
@@ -69,7 +69,7 @@
 
 **Interfaces:**
 - Consumes: `init.historyBounds`, `historyBounds`, `rangeSamples`, and unchanged live `samples`.
-- Produces: debounced `loadRange` requests based on `[tEnd - timePerDiv * 8, tEnd]` plus 0.5-screen margins.
+- Produces: debounced `loadRange` requests based on `[tEnd - timePerDiv * 8, tEnd]` plus 2-screen margins, refilled at a 0.5-screen threshold.
 
 - [ ] Add failing controller tests for initial request, both-side margin, rapid-view coalescing, stale response handling, and a latest-bound refresh after hidden time.
 - [ ] Run the focused tests and confirm the controller API is missing.

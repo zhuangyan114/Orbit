@@ -3,11 +3,13 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '../ozone-backend/types';
 import { trimTimelineHistory } from '../utils/timeline-history';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import { isOrbitDebugSessionType } from '../utils/debug-session-type';
 import {
   getTimelineHistoryBounds,
   sliceTimelineRange,
   type TimelineHistoryBounds,
 } from '../webview/timeline/timeline-range';
+import { decimateTimelineRange } from '../webview/timeline/timeline-decimation';
 
 const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
@@ -19,6 +21,7 @@ export class DataSamplingManager {
   private entries: DataSamplingEntry[] = [];
   private dataMap = new Map<string, DataPoint[]>();
   private pendingMap = new Map<string, DataPoint[]>();
+  private lastSampleTimestampMap = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   private sendTimer: NodeJS.Timeout | null = null;
   private colorIndex = 0;
@@ -49,7 +52,7 @@ export class DataSamplingManager {
     }));
     this.disposables.push(vscode.debug.onDidChangeActiveDebugSession(() => void this.syncSamplingMode()));
     this.disposables.push(vscode.debug.onDidTerminateDebugSession(session => {
-      if (session.type !== 'ozone') return;
+      if (!isOrbitDebugSessionType(session.type)) return;
       if (this.remoteSession === session) {
         this.remoteSession = null;
         this.remoteSampling = false;
@@ -84,6 +87,7 @@ export class DataSamplingManager {
     this.entries.push({ expression, enabled: true, color });
     this.dataMap.set(expression, []);
     this.pendingMap.set(expression, []);
+    this.lastSampleTimestampMap.delete(expression);
     void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
@@ -92,6 +96,7 @@ export class DataSamplingManager {
     this.entries = this.entries.filter(e => e.expression !== expression);
     this.dataMap.delete(expression);
     this.pendingMap.delete(expression);
+    this.lastSampleTimestampMap.delete(expression);
     void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
@@ -100,6 +105,7 @@ export class DataSamplingManager {
     this.entries = [];
     this.dataMap.clear();
     this.pendingMap.clear();
+    this.lastSampleTimestampMap.clear();
     this.colorIndex = 0;
     for (const spec of expressions) {
       if (!spec) continue;
@@ -142,10 +148,15 @@ export class DataSamplingManager {
     return sliceTimelineRange(this.dataMap.get(expression) || [], start, end);
   }
 
+  getDataRangeForDisplay(expression: string, start: number, end: number, targetBuckets: number): DataPoint[] {
+    return decimateTimelineRange(this.dataMap.get(expression) || [], start, end, targetBuckets);
+  }
+
   clearData() {
     for (const [expr] of this.dataMap) {
       this.dataMap.set(expr, []);
       this.pendingMap.set(expr, []);
+      this.lastSampleTimestampMap.delete(expr);
     }
   }
 
@@ -160,7 +171,7 @@ export class DataSamplingManager {
     }
 
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       this.stopLocalSampling();
       await this.startRemoteSampling(session, generation);
       return;
@@ -192,7 +203,7 @@ export class DataSamplingManager {
       this.remoteSession = null;
       this.remoteSampling = false;
       const activeSession = vscode.debug.activeDebugSession;
-      if ((!activeSession || activeSession.type !== 'ozone') && !this.timer) this.startSampling();
+      if ((!activeSession || !isOrbitDebugSessionType(activeSession.type)) && !this.timer) this.startSampling();
     }
   }
 
@@ -208,6 +219,7 @@ export class DataSamplingManager {
     this._stopped = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this.sendTimer) { clearInterval(this.sendTimer); this.sendTimer = null; }
+    this.lastSampleTimestampMap.clear();
   }
 
   private startSampling() {
@@ -249,7 +261,7 @@ export class DataSamplingManager {
 
   private async isHalted(): Promise<boolean> {
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       try {
         const r: any = await session.customRequest('getTargetState', {});
         if (r && r.state === 'halted') return true;
@@ -273,7 +285,16 @@ export class DataSamplingManager {
       if (!wv || wv.error) continue;
       if (typeof wv.value !== 'number' || !Number.isFinite(wv.value)) continue;
       const entry = this.entries[i];
-      const pt: DataPoint = { timestamp: now, value: wv.value, display: wv.display };
+      const lastTimestamp = this.lastSampleTimestampMap.get(entry.expression);
+      const gapThresholdMs = Math.max(this.sampleIntervalMs * 3, this.sendIntervalMs * 2);
+      const startsNewSegment = lastTimestamp === undefined || now - lastTimestamp > gapThresholdMs;
+      const pt: DataPoint = {
+        timestamp: now,
+        value: wv.value,
+        display: wv.display,
+        ...(startsNewSegment ? { startsNewSegment: true } : {}),
+      };
+      this.lastSampleTimestampMap.set(entry.expression, now);
       const pts = this.dataMap.get(entry.expression);
       if (pts) {
         pts.push(pt);
@@ -286,7 +307,7 @@ export class DataSamplingManager {
 
   private async readValues(exprs: string[]): Promise<(WatchValue | null)[]> {
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       try {
         const r: any = await session.customRequest('dataSample', { expressions: exprs });
         if (r && r.results) return r.results;
@@ -349,5 +370,6 @@ export class DataSamplingManager {
     this.entries = [];
     this.dataMap.clear();
     this.pendingMap.clear();
+    this.lastSampleTimestampMap.clear();
   }
 }

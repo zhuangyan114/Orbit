@@ -19,7 +19,7 @@ The verified code head is the implementation, harness, and test commit exercised
 
 **ACCEPTED BY USER (用户独立验收通过)**
 
-All DAP-09 automated and authorized hardware acceptance items in the project plan have evidence. The user confirmed independent acceptance on 2026-08-09; the project plan and `docs/bug-fix-log.md` now record that decision. DAP-10 has not been started.
+All DAP-09 automated and authorized hardware acceptance items in the project plan have evidence. The user confirmed independent acceptance on 2026-08-09; the project plan and `docs/bug-fix-log.md` record that decision. Subsequent MemoryView and Peripheral Viewer stages were completed and received final user confirmation on 2026-08-11.
 
 | DAP-09 criterion | Result | Evidence |
 | --- | --- | --- |

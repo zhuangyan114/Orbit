@@ -10,6 +10,7 @@ import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
 import { normalizeDapLaunchConfig } from './dap-launch-config';
+import { parseConstantExpression } from '../utils/constant-expression';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -172,6 +173,7 @@ export class DapSession extends EventEmitter {
   private dataSamplingSpecs: FastDataSampleSpec[] = [];
   private dataSamplingPending = new Map<string, DataPoint[]>();
   private dataSamplingLastDisplay = new Map<string, string>();
+  private dataSamplingLastTimestamp = new Map<string, number>();
   private dataSamplingSeenExpressions = new Set<string>();
   private dataSamplingIntervalMs = 0.2;
   private dataSamplingSendIntervalMs = 16;
@@ -2834,6 +2836,17 @@ export class DapSession extends EventEmitter {
       return;
     }
 
+    // MemoryView evaluates its default address/size expressions while the
+    // target is running. Pure integer expressions are independent of target
+    // state, so answer them before acquiring the target-read gate.
+    if (this.targetRunning) {
+      const constantValue = parseConstantExpression(expr);
+      if (constantValue !== undefined) {
+        this.sendResponse(msg, { result: String(constantValue), variablesReference: 0 });
+        return;
+      }
+    }
+
     const force = context === 'watch' || context === 'hover';
     const waitForConsistentEvaluate = context === 'hover' || isRTOS;
     const readEpoch = this.readCancelEpoch;
@@ -3104,12 +3117,18 @@ export class DapSession extends EventEmitter {
       if (!this.targetRunning || !result.ok) return true;
       const values = result.data as WatchValue[];
       const timestamp = this.timelineNowMs();
+      const gapThresholdMs = Math.max(
+        this.dataSamplingIntervalMs * 3,
+        this.dataSamplingSendIntervalMs * 2,
+      );
       for (const value of values) {
         if (!value || value.error) continue;
         if (typeof value.value !== 'number' || !Number.isFinite(value.value)) continue;
         const pending = this.dataSamplingPending.get(value.expression);
         if (!pending) continue;
-        const startsNewSegment = !this.dataSamplingSeenExpressions.has(value.expression);
+        const lastTimestamp = this.dataSamplingLastTimestamp.get(value.expression);
+        const startsNewSegment = !this.dataSamplingSeenExpressions.has(value.expression)
+          || (lastTimestamp !== undefined && timestamp - lastTimestamp > gapThresholdMs);
         pending.push({
           timestamp,
           value: value.value,
@@ -3117,6 +3136,7 @@ export class DapSession extends EventEmitter {
           ...(startsNewSegment ? { startsNewSegment: true } : {}),
         });
         this.dataSamplingSeenExpressions.add(value.expression);
+        this.dataSamplingLastTimestamp.set(value.expression, timestamp);
         this.dataSamplingLastDisplay.set(value.expression, value.display);
       }
       return true;
@@ -3160,6 +3180,8 @@ export class DapSession extends EventEmitter {
     this.dataSamplingSpecs = [];
     this.dataSamplingPending.clear();
     this.dataSamplingLastDisplay.clear();
+    this.dataSamplingLastTimestamp.clear();
+    this.dataSamplingSeenExpressions.clear();
   }
 
   private nowMs(): number {

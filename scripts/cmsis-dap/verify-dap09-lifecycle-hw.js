@@ -203,7 +203,7 @@ async function control(client, command, event) {
 async function main() {
   const client = new DapClient(); let disconnected = false;
   try {
-    const init = await client.request('initialize', { clientID: 'orbit-dap09-lifecycle', adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true });
+    const init = await client.request('initialize', { clientID: 'orbit-dap09-lifecycle', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true });
     if (!ok(init)) throw new Error('initialize failed');
     const launch = await client.request('launch', { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe: 'cmsis-dap', cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid, cmsisDapSerial: serial, flashBeforeDebug, runToEntryPoint: 'osKernelStart', rtos: 'FreeRTOS', nativeDebugEngineEnabled: true, nativeDebugEngineMode: 'auto', loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false }, 30000);
     if (!ok(launch)) throw new Error(`launch failed: ${JSON.stringify(launch.message)}`);

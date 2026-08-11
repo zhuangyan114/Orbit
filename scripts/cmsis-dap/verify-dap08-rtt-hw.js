@@ -400,7 +400,7 @@ async function main() {
   let soakEndedAt = 0;
   try {
     const init = await client.request('initialize', {
-      clientID: 'orbit-dap08-acceptance', adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true,
+      clientID: 'orbit-dap08-acceptance', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true,
     });
     if (!responseOk(init)) throw new Error(`initialize failed: ${JSON.stringify(init.message)}`);
     const launch = await client.request('launch', {

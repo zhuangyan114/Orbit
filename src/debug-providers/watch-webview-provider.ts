@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { WatchValue } from '../ozone-backend/types';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
+import { isOrbitDebugSessionType } from '../utils/debug-session-type';
 
 const WATCH_EXPANDED_STATE_KEY = 'ozoneWatchExpandedExpressions';
 
@@ -122,7 +123,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   private async evaluateWatches(expressions: string[]) {
     let results: WatchValue[] | null = null;
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       if (!this.canUseDapSession(session)) {
         results = expressions.map(expression => ({
           expression,
@@ -192,7 +193,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     let result: any;
     // Route through active DAP session when debugging, same as readWatchValues
     const session = vscode.debug.activeDebugSession;
-    if (session && session.type === 'ozone') {
+    if (session && isOrbitDebugSessionType(session.type)) {
       if (!this.canUseDapSession(session)) {
         result = { ok: false, error: 'Debug session is not available' };
       } else {

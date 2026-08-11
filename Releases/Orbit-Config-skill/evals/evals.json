@@ -1,0 +1,37 @@
+{
+  "skill_name": "Orbit-Config",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "请为 STM32F407VET6 工程配置 Orbit。ELF 是 ${workspaceFolder}/build/Debug/app.elf，SVD 是 ${workspaceFolder}/STM32F407VETx.svd，SWD 4000 kHz，FreeRTOS。",
+      "expected_output": "生成四个标准 launch：J-Link/DAPLink 各有烧录和不烧录配置，四项共享已核实的工程字段，默认 DAPLink 不含设备选择器。",
+      "files": [],
+      "assertions": [
+        "恰好包含四个标准 Orbit launch name",
+        "每种 probe 都同时包含 flashBeforeDebug true 和 false",
+        "两项 DAPLink 使用 cmsisDapTransport=auto 且不含 VID/PID/Serial/Path"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我配置 Orbit。当前检测到 CMSIS-DAP VID=C251、PID=F001、Serial=LU_2022_8888，但我没有要求固定某一只探针。",
+      "expected_output": "仍生成四个标准 launch；检测信息不写入两项 DAPLink 配置。",
+      "files": [],
+      "assertions": [
+        "生成四个标准 Orbit launch",
+        "两项 DAPLink 均省略 cmsisDapVid、cmsisDapPid、cmsisDapSerial 和 cmsisDapPath"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "配置 Orbit，并把 DAPLink 配置明确绑定到 VID C251、PID F001、Serial LU_2022_8888。",
+      "expected_output": "生成四个标准 launch；仅两项 DAPLink 配置包含用户明确指定的相同选择器。",
+      "files": [],
+      "assertions": [
+        "生成四个标准 Orbit launch",
+        "两项 DAPLink 都包含 C251/F001/LU_2022_8888",
+        "两项 J-Link 不包含 CMSIS-DAP 选择器"
+      ]
+    }
+  ]
+}

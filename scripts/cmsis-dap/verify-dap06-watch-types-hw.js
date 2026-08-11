@@ -157,7 +157,7 @@ function summarize(window) {
 async function main() {
   const client = new DapClient(); let disconnected = false; let thrown = null;
   try {
-    const initialize = await client.request('initialize', { clientID: 'orbit-dap06-watch-types-hw', adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true }); check('initialize', responseOk(initialize), { response: initialize.message });
+    const initialize = await client.request('initialize', { clientID: 'orbit-dap06-watch-types-hw', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true }); check('initialize', responseOk(initialize), { response: initialize.message });
     const launchIndex = evidence.trace.length - 1;
     const launchConfig = { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe, flashBeforeDebug, nativeDebugEngineEnabled: true, nativeDebugEngineMode: isJLink ? 'native' : 'auto', loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false };
     if (!isJLink) Object.assign(launchConfig, { cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid, cmsisDapSerial: serial });

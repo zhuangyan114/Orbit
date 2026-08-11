@@ -9,7 +9,54 @@ export interface TimelineRangeRequest extends TimelineRange {
   requestId: number;
 }
 
-const PREFETCH_RATIO = 0.5;
+export interface TimelineRangeLoadRequest extends TimelineRangeRequest {
+  generation: number;
+  resolutionKey: number;
+  targetBuckets: number;
+}
+
+interface PendingTimelineRange {
+  range: TimelineRange;
+  generation: number;
+  resolutionKey: number | null;
+}
+
+const PREFETCH_RATIO = 2;
+const REFRESH_THRESHOLD_RATIO = 0.5;
+const MAX_TARGET_BUCKETS = 100_000;
+
+export function parseTimelineRangeLoadRequest(value: unknown): TimelineRangeLoadRequest | null {
+  if (!value || typeof value !== 'object') return null;
+  const request = value as Partial<TimelineRangeLoadRequest>;
+  if (!Number.isSafeInteger(request.requestId)
+    || !Number.isSafeInteger(request.generation)
+    || (request.generation as number) < 0
+    || typeof request.start !== 'number'
+    || !Number.isFinite(request.start)
+    || typeof request.end !== 'number'
+    || !Number.isFinite(request.end)
+    || request.end < request.start
+    || typeof request.resolutionKey !== 'number'
+    || !Number.isFinite(request.resolutionKey)
+    || request.resolutionKey <= 0
+    || !Number.isSafeInteger(request.targetBuckets)
+    || (request.targetBuckets as number) < 1
+    || (request.targetBuckets as number) > MAX_TARGET_BUCKETS) {
+    return null;
+  }
+  return request as TimelineRangeLoadRequest;
+}
+
+export function quantizeTimelineResolution(viewportWidthMs: number, plotWidthPx: number): number | null {
+  if (!Number.isFinite(viewportWidthMs)
+    || !Number.isFinite(plotWidthPx)
+    || viewportWidthMs <= 0
+    || plotWidthPx <= 0) {
+    return null;
+  }
+  const millisecondsPerPixel = viewportWidthMs / plotWidthPx;
+  return 2 ** Math.round(Math.log2(millisecondsPerPixel));
+}
 
 export function clampTimelineViewportEnd(
   requestedEnd: number,
@@ -37,10 +84,11 @@ export function intersectTimelineRange(
   return start <= end ? { start, end } : null;
 }
 
-export function calculateBufferedRange(
+function calculateRangeWithMargin(
   viewStart: number,
   viewEnd: number,
   historyBounds: TimelineHistoryBounds | null,
+  marginRatio: number,
 ): TimelineRange | null {
   if (!historyBounds
     || !Number.isFinite(viewStart)
@@ -51,11 +99,20 @@ export function calculateBufferedRange(
     || historyBounds.end < historyBounds.start) {
     return null;
   }
+  if (viewEnd < historyBounds.start || viewStart > historyBounds.end) return null;
 
   const width = viewEnd - viewStart;
-  const start = Math.max(historyBounds.start, viewStart - width * PREFETCH_RATIO);
-  const end = Math.min(historyBounds.end, viewEnd + width * PREFETCH_RATIO);
+  const start = Math.max(historyBounds.start, viewStart - width * marginRatio);
+  const end = Math.min(historyBounds.end, viewEnd + width * marginRatio);
   return start <= end ? { start, end } : null;
+}
+
+export function calculateBufferedRange(
+  viewStart: number,
+  viewEnd: number,
+  historyBounds: TimelineHistoryBounds | null,
+): TimelineRange | null {
+  return calculateRangeWithMargin(viewStart, viewEnd, historyBounds, PREFETCH_RATIO);
 }
 
 function firstPointAtOrAfter<T extends { timestamp: number }>(points: readonly T[], timestamp: number): number {
@@ -135,8 +192,28 @@ function uncoveredRanges(target: TimelineRange, coverage: TimelineRange[]): Time
 export class TimelineRangeController {
   private historyBounds: TimelineHistoryBounds | null = null;
   private loaded: TimelineRange[] = [];
-  private pending = new Map<number, TimelineRange>();
+  private pending = new Map<number, PendingTimelineRange>();
   private nextRequestId = 1;
+  private activeResolutionKey: number | null = null;
+  private activeGeneration = 0;
+
+  get generation(): number {
+    return this.activeGeneration;
+  }
+
+  get resolutionKey(): number | null {
+    return this.activeResolutionKey;
+  }
+
+  setResolution(resolutionKey: number): boolean {
+    if (!Number.isFinite(resolutionKey) || resolutionKey <= 0 || resolutionKey === this.activeResolutionKey) {
+      return false;
+    }
+    this.activeResolutionKey = resolutionKey;
+    this.activeGeneration++;
+    this.clearCoverage();
+    return true;
+  }
 
   setHistoryBounds(bounds: TimelineHistoryBounds | null) {
     this.historyBounds = bounds;
@@ -147,9 +224,9 @@ export class TimelineRangeController {
     this.loaded = this.loaded
       .map(range => intersectTimelineRange(range, bounds))
       .filter((range): range is TimelineRange => range !== null);
-    for (const [requestId, range] of this.pending) {
-      const clipped = intersectTimelineRange(range, bounds);
-      if (clipped) this.pending.set(requestId, clipped);
+    for (const [requestId, pending] of this.pending) {
+      const clipped = intersectTimelineRange(pending.range, bounds);
+      if (clipped) this.pending.set(requestId, { ...pending, range: clipped });
       else this.pending.delete(requestId);
     }
   }
@@ -157,16 +234,38 @@ export class TimelineRangeController {
   requestViewport(viewStart: number, viewEnd: number): TimelineRangeRequest[] {
     const target = calculateBufferedRange(viewStart, viewEnd, this.historyBounds);
     if (!target) return [];
-    const coverage = [...this.loaded, ...this.pending.values()];
+    const coverage = [...this.loaded, ...[...this.pending.values()].map(pending => pending.range)];
+    const refreshRange = calculateRangeWithMargin(
+      viewStart,
+      viewEnd,
+      this.historyBounds,
+      REFRESH_THRESHOLD_RATIO,
+    );
+    if (refreshRange && uncoveredRanges(refreshRange, coverage).length === 0) return [];
     return uncoveredRanges(target, coverage).map(range => {
       const request = { requestId: this.nextRequestId++, ...range };
-      this.pending.set(request.requestId, range);
+      this.pending.set(request.requestId, {
+        range,
+        generation: this.activeGeneration,
+        resolutionKey: this.activeResolutionKey,
+      });
       return request;
     });
   }
 
-  completeRequest(requestId: number, actualRange: TimelineRange | null): boolean {
-    if (!this.pending.delete(requestId)) return false;
+  completeRequest(
+    requestId: number,
+    actualRange: TimelineRange | null,
+    generation?: number,
+    resolutionKey?: number | null,
+  ): boolean {
+    const pending = this.pending.get(requestId);
+    if (!pending) return false;
+    if ((generation ?? pending.generation) !== pending.generation
+      || (resolutionKey ?? pending.resolutionKey) !== pending.resolutionKey) {
+      return false;
+    }
+    this.pending.delete(requestId);
     if (actualRange) this.markLoadedRange(actualRange);
     return true;
   }

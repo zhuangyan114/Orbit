@@ -9,6 +9,7 @@ import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
+import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
 import { createRtosViewsRefreshHandler } from './debug/rtos-views-tracker';
 import * as fs from 'fs';
 
@@ -72,11 +73,11 @@ function writeRttLogTerminal(text: string) {
 }
 
 function isUsableWatchSession(session: vscode.DebugSession | undefined): session is vscode.DebugSession {
-  return !!session && session.type === 'ozone' && activeWatchSession === session;
+  return !!session && isOrbitDebugSessionType(session.type) && activeWatchSession === session;
 }
 
 function setActiveWatchSession(session: vscode.DebugSession | undefined) {
-  const next = session?.type === 'ozone' ? session : null;
+  const next = session && isOrbitDebugSessionType(session.type) ? session : null;
   if (activeWatchSession === next) return;
   activeWatchSession = next;
   if (next) startWatchPolling();
@@ -107,11 +108,10 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }));
 
-    const b = new OzoneBackend(undefined, undefined, () => vscode.debug.activeDebugSession?.type === 'ozone');
+    const b = new OzoneBackend(undefined, undefined, () => isOrbitDebugSessionType(vscode.debug.activeDebugSession?.type));
     backend = b;
-    activeWatchSession = vscode.debug.activeDebugSession?.type === 'ozone'
-      ? vscode.debug.activeDebugSession
-      : null;
+    const initialSession = vscode.debug.activeDebugSession;
+    activeWatchSession = initialSession && isOrbitDebugSessionType(initialSession.type) ? initialSession : null;
 
     const wp = new WatchProvider();
     watchProvider = wp;
@@ -151,11 +151,13 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(pluginApiServer);
       console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);
 
-    // Ensure ozone is tracked by mcu-debug views on activation
+    // Track both the canonical Orbit DAP type and the legacy ozone alias.
     for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
-      appendWorkspaceArraySetting(section, 'trackDebuggers', 'ozone').catch((err) => {
-        console.error(`[Orbit] Failed to register with ${section}.trackDebuggers:`, err);
-      });
+      for (const debuggerType of [ORBIT_DAP_TYPE, 'ozone'] as const) {
+        appendWorkspaceArraySetting(section, 'trackDebuggers', debuggerType).catch((err) => {
+          console.error(`[Orbit] Failed to register ${debuggerType} with ${section}.trackDebuggers:`, err);
+        });
+      }
     }
 
     if (getOrbitConfiguration().get<boolean>('rtosViewsAutoRefresh', false)) {
@@ -179,18 +181,19 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
         webviewOptions: { retainContextWhenHidden: true },
       }),
+      vscode.debug.registerDebugConfigurationProvider('orbit', new OzoneDebugConfigurationProvider()),
       vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
-        if (event.session.type === 'ozone' && event.event === 'ozoneClearDebugConsole') {
+        if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneClearDebugConsole') {
           vscode.commands.executeCommand('workbench.debug.action.clearRepl');
-        } else if (event.session.type === 'ozone' && event.event === 'ozoneRttStarted') {
+        } else if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneRttStarted') {
           showRttLogTerminal();
-        } else if (event.session.type === 'ozone' && event.event === 'ozoneRttOutput') {
+        } else if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneRttOutput') {
           writeRttLogTerminal(String(event.body?.text || ''));
         }
       }),
       vscode.debug.onDidStartDebugSession((session) => {
-        if (session.type === 'ozone') setActiveWatchSession(session);
+        if (isOrbitDebugSessionType(session.type)) setActiveWatchSession(session);
       }),
       vscode.debug.onDidChangeActiveDebugSession((session) => {
         setActiveWatchSession(session);
@@ -275,7 +278,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // process selects its sole session owner.
         await backend.execute({ cmd: 'disconnect' });
         await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
-          type: 'ozone',
+          type: ORBIT_DAP_TYPE,
           request: 'launch',
           name: 'Orbit Debug',
           program: elfPath,
@@ -296,7 +299,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 async function readWatchValues(exprs: string[], expandedExpressions: string[] = []): Promise<any[]> {
   const session = vscode.debug.activeDebugSession;
-  if (session && session.type === 'ozone') {
+  if (session && isOrbitDebugSessionType(session.type)) {
     if (!isUsableWatchSession(session)) {
       return exprs.map(expression => ({
         expression,
@@ -384,7 +387,7 @@ function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
       const result = trackerApi.subscribe({
         version: 1,
         body: {
-          debuggers: ["ozone"],
+          debuggers: [ORBIT_DAP_TYPE, 'ozone'],
           handler: createRtosViewsRefreshHandler(() => {
               // Trigger RTOS Views detection: the 'refresh' command calls
               // RTOSTracker.update() → updateRTOSInfo() → rtosSession.refresh()
@@ -433,14 +436,12 @@ async function appendWorkspaceArraySetting(section: string, key: string, value: 
 
 async function enableMcuDebugViewsIntegration() {
   const changed: string[] = [];
-  if (await appendWorkspaceArraySetting('memory-view', 'trackDebuggers', 'ozone')) {
-    changed.push('memory-view.trackDebuggers');
-  }
-  if (await appendWorkspaceArraySetting('mcu-debug.rtos-views', 'trackDebuggers', 'ozone')) {
-    changed.push('mcu-debug.rtos-views.trackDebuggers');
-  }
-  if (await appendWorkspaceArraySetting('mcu-debug.debug-tracker-vscode', 'trackDebuggers', 'ozone')) {
-    changed.push('mcu-debug.debug-tracker-vscode.trackDebuggers');
+  for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
+    for (const debuggerType of [ORBIT_DAP_TYPE, 'ozone'] as const) {
+      if (await appendWorkspaceArraySetting(section, 'trackDebuggers', debuggerType)) {
+        changed.push(`${section}.trackDebuggers`);
+      }
+    }
   }
 
   if (changed.length > 0) {

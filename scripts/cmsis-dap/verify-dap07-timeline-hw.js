@@ -123,7 +123,7 @@ class DapClient {
 async function main() {
   const client = new DapClient(); let disconnected = false; let samplingStartedAt = 0; let watchLoop = null;
   try {
-    const init = await client.request('initialize', { clientID: 'orbit-dap07-baseline', adapterID: 'ozone', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true });
+    const init = await client.request('initialize', { clientID: 'orbit-dap07-baseline', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true });
     if (!ok(init)) throw new Error(`initialize failed: ${JSON.stringify(init.message)}`);
     const launchArgs = {
       program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe,

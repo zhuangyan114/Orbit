@@ -258,34 +258,9 @@ Mock、单元测试和构建结果只证明代码与协议层；第 6、7 节的
 - 测试包含连接、halt、continue、pause、RTT `RdOff` 提交和 disconnect。
 - 测试结束后未发现 `orbit-cmsis-dap-helper`、`orbit-jlink-helper`、OpenOCD、GDB 或 `JLink.exe` 残留进程。
 
-## 12. 证据路径
+## 12. 证据归档
 
-### DAPLink 本轮 4 MHz
-
-- RTT-off 基线：`outputs/dap07/watch-3/2026-08-08-04-19-59/evidence.json`
-- RTT-on `64 B / 500 ms`：`outputs/dap07/watch-3/2026-08-08-04-20-33/evidence.json`
-- RTT 实际读取日志：`outputs/dap07/watch-3/2026-08-08-04-20-33/dap.log`
-- owner/transport 日志：`outputs/dap07/watch-3/2026-08-08-04-20-33/dll.log`
-
-### J-Link RTT-off 与修复前失败
-
-- 1 MHz RTT-off：`outputs/dap07/jlink/watch-6/2026-08-08-03-07-46/evidence.json`
-- 4 MHz RTT-off：`outputs/dap07/jlink/watch-6/2026-08-08-03-09-57/evidence.json`
-- 4 MHz、64 B / 500 ms、显式地址失败数据：`outputs/dap07/jlink/watch-6/2026-08-08-03-11-49/evidence.json`
-- 4 MHz、64 B / 500 ms、自动发现失败数据：`outputs/dap07/jlink/watch-6/2026-08-08-03-13-19/evidence.json`
-- 1 MHz、4096 B / 50 ms 阻塞归档：`outputs/dap07/jlink/watch-6/2026-08-08-03-08-default-rtt-timeout/`
-- 4 MHz、4096 B / 50 ms 阻塞归档：`outputs/dap07/jlink/watch-6/2026-08-08-03-11-4mhz-default-rtt-timeout/`
-
-### J-Link 修复后
-
-- 4 MHz、3 Watch、5 秒 RTT-off 基线：`outputs/dap07/jlink/watch-3/2026-08-08-03-34-58/evidence.json`
-- 4 MHz、3 Watch、5 秒 RTT-on：`outputs/dap07/jlink/watch-3/2026-08-08-03-44-07/evidence.json`
-- 4 MHz、3 Watch、15 秒 RTT-on soak：`outputs/dap07/jlink/watch-3/2026-08-08-03-42-50/evidence.json`
-
-### 相关历史报告
-
-- `docs/dap07-timeline-performance-report.md`
-- `docs/dap08-rtt-acceptance-report.md`
+本节对应的原始硬件 evidence、运行日志和阶段验收报告已在 1.1.0 发布清理中移出仓库。本文保留最终对比结果、测试条件、安全边界和已知限制；后续复验应使用仓库中的硬件验证脚本生成新的独立证据。
 
 ## 13. 适用范围与剩余限制
 

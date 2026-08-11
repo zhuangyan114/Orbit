@@ -100,7 +100,6 @@ control > watch > timeline > background
 
 ## 相关文档
 
-- [CMSIS-DAP / DAPLink 支持项目计划](cmsis-dap-daplink-support-project-plan.md)
 - [DAP/owner 验证矩阵](debug-engine-refactor/validation-matrix.md)
 - [Native scheduler 设计](debug-engine-refactor/native-scheduler-design.md)
 - [实时变量保护](debug-engine-refactor/realtime-variable-protection.md)

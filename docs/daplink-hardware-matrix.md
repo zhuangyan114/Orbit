@@ -1,6 +1,6 @@
 # DAP-00 有线 DAPLink/CMSIS-DAP + STM32F407VET6 硬件矩阵
 
-> **收口说明（2026-08-11）**：本文件保留 DAP-00 当时的条件通过、未知项和阻塞现场，不再代表项目当前状态。后续阶段已经完成 helper、DP/AP、Flash Algorithm、调试控制和上层功能，用户最终确认见 [CMSIS-DAP / DAPLink 支持项目计划](cmsis-dap-daplink-support-project-plan.md)及各阶段验收报告。
+> **收口说明（2026-08-11）**：本文件保留 DAP-00 当时的条件通过、未知项和阻塞现场，不再代表项目当前状态。后续阶段已经完成 helper、DP/AP、Flash Algorithm、调试控制和上层功能；当前能力与限制以 [README](../README.md) 和 [用户指南](../Releases/docs/user-guide.md) 为准。
 
 - 登记阶段：DAP-00「设备和硬件基线登记」
 - 初始资料采集时间：2026-08-03 13:32:59 +08:00
@@ -293,7 +293,6 @@ J-Link 资料只作为后续对照，不得把 J-Link 连接/烧录结果移植�
 ### Orbit 工作区
 
 - `C:\Users\22690\Desktop\AI\Ozone for VScode\AGENTS.md`
-- `C:\Users\22690\Desktop\AI\Ozone for VScode\docs\cmsis-dap-daplink-support-project-plan.md`
 - `C:\Users\22690\Desktop\AI\Ozone for VScode\src\ozone-backend\session-target-channel.ts`
 - `C:\Users\22690\Desktop\AI\Ozone for VScode\src\debugadapter.ts`
 - `C:\Users\22690\Desktop\AI\Ozone for VScode\src\debug\dap-session.ts`

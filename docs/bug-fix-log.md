@@ -17,7 +17,7 @@
 - **问题描述**: FreeRTOS RTOS View 会把正常降低的 32 位运行计数误判为溢出，发布超过 `UINT32_MAX` 的合成值；同时缺少真实任务连续 create/delete、TCB 地址复用、并发刷新和 session replacement 的完整硬件验收证据。
 - **根因分析**: Orbit 对 `TCB_t.ulRunTimeCounter` 和总运行计数维护了跨读取的 wrap epoch 与缓存合成，而 FreeRTOS 10.3.1 的这些字段只是无溢出保护的原始 `uint32_t`。原有静态任务证据也无法证明同一 TCB 地址被新任务复用时旧 handle、字段和异步读取不会泄漏到新 generation。
 - **修改方案**: 按 DWARF 声明直接解码原始 32 位计数，移除 wrap/总量合成；保持标准 DAP `rtosInfo`、`evaluate`、`variables` 和 `readMemory` 合同；增加 20-generation reused-TCB Mock 回归、20 轮真实动态任务 fixture、每个 created/deleted snapshot 的七标量 28-byte raw/evaluate 对照，以及可审计的 adapter/helper session replacement 验证。
-- **涉及文件**: `src/ozone-backend/commander.ts` - FreeRTOS 运行计数解码；`src/debug/dap-session.ts` - RTOS 读取取消与 generation 清理；`src/debug/dap-session-cmsis-dap.test.ts` - 20-generation reused-TCB 回归；`scripts/cmsis-dap/verify-dap09-lifecycle-hw.js`、`verify-dap09-session-replacement-hw.js`、`dap09-lifecycle-evidence-validation.js` - 硬件验收与离线 validator；`docs/dap09-rtos-view-acceptance-report.md` - 完整验收报告
+- **涉及文件**: `src/ozone-backend/commander.ts` - FreeRTOS 运行计数解码；`src/debug/dap-session.ts` - RTOS 读取取消与 generation 清理；`src/debug/dap-session-cmsis-dap.test.ts` - 20-generation reused-TCB 回归；`scripts/cmsis-dap/verify-dap09-lifecycle-hw.js`、`verify-dap09-session-replacement-hw.js`、`dap09-lifecycle-evidence-validation.js` - 硬件验收与离线 validator
 - **验证结果**: 用户于 2026-08-09 明确确认验收通过。全量 Vitest 34 文件/335 项、focused 7 文件/134 项、类型检查、扩展/native 构建、CMSIS-DAP/J-Link Mock、1576-byte Flash Algorithm、CMSIS-DAP selftest 200/200 均通过。真实 CMSIS-DAP lifecycle 为 20/20 轮、40/40 个 28-byte raw/evaluate snapshot 一致、零 Flash、单 owner 且断开后无残留；replacement 的 pending `rtosInfo` 同 seq 返回 `TargetReadCancelled`，两个 adapter 均 exit code 0、未 forced kill、helper PID 不同且清理为 0。
 
 ### Bug: Reset 后 RTT 控制块暂未就绪导致日志永久停用
@@ -26,7 +26,7 @@
 - **问题描述**: CMSIS-DAP 会话执行 Reset/Restart 后，固件尚未运行到 RTT 初始化阶段时，首次 `startRtt` 会返回 `RttInvalidControlBlock`。原实现将该结果视为会话级永久不可用并停止轮询，后续 Continue 即使已重新初始化控制块，RTT 日志也不会恢复。
 - **根因分析**: Restart 恢复路径与普通 launch 共用 RTT 致命错误处理，没有区分“启动配置/布局确实非法”和“Reset 后控制块短暂无效”。因此一次符合固件生命周期的瞬态错误错误地清除了 RTT 可用状态和用户启用意图。
 - **修改方案**: 仅在 Restart 创建的 polling generation 中将 `RttInvalidControlBlock` 视为瞬态状态，保持 RTT 启用意图，并继续按 `orbit.rttPollIntervalMs` 串行、完成后定时重试；普通 launch 的非法布局仍禁用 RTT，owner 丢失仍终止会话，不创建第二 owner，也不回退到 J-Link。
-- **涉及文件**: `src/debug/dap-session.ts` - `startRttLogPolling()`、`handleRestartRequest()`；`src/debug/dap-session-rtt.test.ts` - Reset 后控制块延迟恢复回归测试；`docs/dap08-rtt-acceptance-report.md` - DAPLink 4 MHz 真机验收数据
+- **涉及文件**: `src/debug/dap-session.ts` - `startRttLogPolling()`、`handleRestartRequest()`；`src/debug/dap-session-rtt.test.ts` - Reset 后控制块延迟恢复回归测试
 - **验证结果**: 全量 Vitest 31 文件/284 项、类型检查、扩展构建、native 构建、CMSIS-DAP/J-Link mock、CMSIS-DAP selftest 200/200、RTT C++ oracle 和 `git diff --check` 均通过。DAPLink 4 MHz 真机持续 60.136 秒，RTT 读取 624,960 B、reader overrun 0、字节守恒残差 0；Reset 时控制块尚未就绪，Continue 后 427 ms 获得首个有效 RTT，Watch 成功率 100%，Timeline 167 个事件/657 点，唯一 owner 为 `cmsis-dap`，Flash operation 0，断开后无残留 helper/owner。
 
 ### Bug: CMSIS-DAP RTT 控制块地址需要手工维护
@@ -57,7 +57,6 @@
   - `src/debug/dap-session-target-read-gate.test.ts:19` - 事件驱动交接、优先级、control 排他、timeout、AbortSignal、generation/termination、无双重获取和无残留资源回归
   - `src/debug/dap-session-scopes.test.ts` - stopped-state scope 使用真实 `endControl()` 通知路径
   - `scripts/cmsis-dap/verify-dap07-timeline-hw.js:140,184` - 硬件 evidence 持久化 target-read gate 指标
-  - `docs/dap07-timeline-performance-report.md:90,156` - 实现、四组真机矩阵和验收结论
 - **验证结果**:
   - **自动化**: 新增 gate 测试 11/11 通过；全量 Vitest 30 个文件、252/252 项通过；`npm run typecheck`、`npm run build`、`npm run build:native`、J-Link mock、CMSIS-DAP mock 和 `git diff --check` 均通过。
   - **CMSIS-DAP v1 HID 真机**: 3 Watch 的 Timeline flush/实际采样由 42.67/66.48 提升至 56.16/87.58 Hz，Watch P50/P95/max 降至 17/23/31 ms；6 Watch 由 41.17/61.99 提升至 52.27/80.95 Hz，Watch 降至 23/28/34 ms。Watch 成功率均为 100%，Pause 为 30/34 ms。

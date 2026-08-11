@@ -15,6 +15,39 @@ export interface TimelineSampleSnapshot {
 type FrameScheduler = (callback: () => void) => number;
 type FrameCanceller = (handle: number) => void;
 
+function appendItems<T>(target: T[], source: readonly T[]) {
+  for (const item of source) target.push(item);
+}
+
+function mergePointsInPlace(target: TimelineDataPoint[], source: readonly TimelineDataPoint[]) {
+  if (source.length === 0) return;
+  if (target.length === 0 || target[target.length - 1].timestamp < source[0].timestamp) {
+    appendItems(target, source);
+    return;
+  }
+
+  const merged: TimelineDataPoint[] = [];
+  let targetIndex = 0;
+  let sourceIndex = 0;
+  while (targetIndex < target.length || sourceIndex < source.length) {
+    const targetPoint = target[targetIndex];
+    const sourcePoint = source[sourceIndex];
+    if (sourcePoint === undefined || (targetPoint !== undefined && targetPoint.timestamp < sourcePoint.timestamp)) {
+      merged.push(targetPoint);
+      targetIndex++;
+    } else if (targetPoint === undefined || sourcePoint.timestamp < targetPoint.timestamp) {
+      merged.push(sourcePoint);
+      sourceIndex++;
+    } else {
+      merged.push(sourcePoint);
+      targetIndex++;
+      sourceIndex++;
+    }
+  }
+  target.length = 0;
+  appendItems(target, merged);
+}
+
 /** Coalesces host messages so React and canvas update at most once per frame. */
 export class TimelineFrameBatcher {
   private pending = new Map<string, TimelineSampleSnapshot>();
@@ -40,8 +73,11 @@ export class TimelineFrameBatcher {
         this.pending.set(snapshot.expression, pending);
       }
       pending.color = snapshot.color;
-      pending.currentValue = snapshot.currentValue;
-      pending.data.push(...snapshot.data);
+      const previousLatestTimestamp = pending.data.at(-1)?.timestamp ?? Number.NEGATIVE_INFINITY;
+      mergePointsInPlace(pending.data, snapshot.data);
+      if (snapshot.data.at(-1)!.timestamp >= previousLatestTimestamp) {
+        pending.currentValue = snapshot.currentValue;
+      }
     }
 
     if (this.pending.size > 0 && this.frameHandle === null) {
@@ -69,7 +105,7 @@ export function appendTimelineSamples(
   for (const snapshot of snapshots) {
     if (snapshot.data.length === 0) continue;
     const existing = dataByExpression.get(snapshot.expression) || [];
-    existing.push(...snapshot.data);
+    mergePointsInPlace(existing, snapshot.data);
     trimTimelineHistory(existing);
     dataByExpression.set(snapshot.expression, existing);
     const timestamp = snapshot.data[snapshot.data.length - 1].timestamp;

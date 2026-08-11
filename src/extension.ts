@@ -176,7 +176,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
       vscode.window.registerWebviewViewProvider('ozoneWatch', wvp),
-      vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider),
+      vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
+        webviewOptions: { retainContextWhenHidden: true },
+      }),
       vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
         if (event.session.type === 'ozone' && event.event === 'ozoneClearDebugConsole') {

@@ -7,6 +7,11 @@ import {
 } from './timeline-sample-buffer';
 import { buildTimelineTraceCommands, firstPointAtOrAfter } from './timeline-trace-path';
 import {
+  clampTimelineViewportEnd,
+  TimelineRangeController,
+  type TimelineHistoryBounds,
+} from './timeline-range';
+import {
   createTimelineEntry,
   mergeTimelineEntryRefresh,
   type TimelineEntryState as Entry,
@@ -67,6 +72,11 @@ export function TimelineApp() {
   const initedRef = useRef(false);
   const applySamplesRef = useRef<(snapshots: SampleSnapshot[]) => void>(() => {});
   const sampleBatcherRef = useRef<TimelineFrameBatcher | null>(null);
+  const rangeControllerRef = useRef<TimelineRangeController | null>(null);
+  const historyBoundsRef = useRef<TimelineHistoryBounds | null>(null);
+  const rangeRequestTimerRef = useRef<number | null>(null);
+
+  if (!rangeControllerRef.current) rangeControllerRef.current = new TimelineRangeController();
 
   applySamplesRef.current = (snapshots) => {
     const map = allDataRef.current;
@@ -104,6 +114,29 @@ export function TimelineApp() {
     );
   }
 
+  const requestVisibleRange = () => {
+    if (!initedRef.current) return;
+    const tEnd = tEndRef.current;
+    const tStart = tEnd - timePerDivRef.current * H_DIV;
+    for (const request of rangeControllerRef.current!.requestViewport(tStart, tEnd)) {
+      vscode.postMessage({ command: 'loadRange', ...request });
+    }
+  };
+
+  const scheduleVisibleRangeRequest = () => {
+    if (rangeRequestTimerRef.current !== null) return;
+    rangeRequestTimerRef.current = window.setTimeout(() => {
+      rangeRequestTimerRef.current = null;
+      requestVisibleRange();
+    }, 40);
+  };
+
+  const updateHistoryBounds = (bounds: TimelineHistoryBounds | null) => {
+    historyBoundsRef.current = bounds;
+    rangeControllerRef.current!.setHistoryBounds(bounds);
+    latestSampleTimestampRef.current = bounds?.end ?? 0;
+  };
+
   const saveState = useCallback(() => {
     vscode.postMessage({
       command: 'saveState',
@@ -136,12 +169,17 @@ export function TimelineApp() {
           }
           if (msg.timePerDiv !== undefined) {
             setTimePerDiv(msg.timePerDiv);
+            timePerDivRef.current = msg.timePerDiv;
           }
           const m = new Map<string, DataPoint[]>();
           for (const e of eList) m.set(e.expression, []);
           allDataRef.current = m;
+          rangeControllerRef.current!.clearCoverage();
+          updateHistoryBounds(msg.historyBounds ?? null);
+          if (msg.historyBounds) tEndRef.current = msg.historyBounds.end;
           setRenderTick(t => t + 1);
           initedRef.current = true;
+          requestVisibleRange();
           break;
         }
         case 'entries': {
@@ -152,7 +190,33 @@ export function TimelineApp() {
         }
         case 'samples': {
           const snapshots: SampleSnapshot[] = msg.snapshots || [];
+          if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
+          let start = Number.POSITIVE_INFINITY;
+          let end = Number.NEGATIVE_INFINITY;
+          for (const snapshot of snapshots) {
+            if (snapshot.data.length === 0) continue;
+            start = Math.min(start, snapshot.data[0].timestamp);
+            end = Math.max(end, snapshot.data[snapshot.data.length - 1].timestamp);
+          }
+          if (Number.isFinite(start) && Number.isFinite(end)) {
+            rangeControllerRef.current!.markLoadedRange({ start, end });
+          }
           sampleBatcherRef.current?.enqueue(snapshots);
+          break;
+        }
+        case 'rangeSamples': {
+          if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
+          if (!rangeControllerRef.current!.completeRequest(msg.requestId, msg.range ?? null)) break;
+          sampleBatcherRef.current?.enqueue(msg.snapshots || []);
+          requestVisibleRange();
+          break;
+        }
+        case 'historyBounds': {
+          rangeControllerRef.current!.cancelPendingRequests();
+          updateHistoryBounds(msg.bounds ?? null);
+          if (msg.bounds && autoFollowRef.current) tEndRef.current = msg.bounds.end;
+          setRenderTick(t => t + 1);
+          requestVisibleRange();
           break;
         }
       }
@@ -162,7 +226,10 @@ export function TimelineApp() {
     return () => window.removeEventListener('message', handler);
   }, []);
 
-  useEffect(() => () => sampleBatcherRef.current?.dispose(), []);
+  useEffect(() => () => {
+    sampleBatcherRef.current?.dispose();
+    if (rangeRequestTimerRef.current !== null) window.clearTimeout(rangeRequestTimerRef.current);
+  }, []);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -324,6 +391,13 @@ export function TimelineApp() {
 
   useEffect(() => { draw(); }, [draw]);
 
+  useEffect(() => {
+    if (!initedRef.current) return;
+    const width = timePerDiv * H_DIV;
+    tEndRef.current = clampTimelineViewportEnd(tEndRef.current, width, historyBoundsRef.current);
+    scheduleVisibleRangeRequest();
+  }, [timePerDiv]);
+
   // Save state to extension whenever entries or timePerDiv change (after init)
   useEffect(() => {
     if (initedRef.current) saveState();
@@ -403,6 +477,7 @@ export function TimelineApp() {
   const clearAll = () => {
     const map = allDataRef.current;
     for (const key of map.keys()) map.set(key, []);
+    updateHistoryBounds(null);
     setRenderTick(t => t + 1);
     vscode.postMessage({ command: 'clearData' });
   };
@@ -492,17 +567,28 @@ export function TimelineApp() {
       if (plotW <= 0) return;
       const deltaX = e.clientX - dragStartXRef.current;
       const deltaTime = (deltaX / plotW) * timePerDiv * H_DIV;
-      tEndRef.current = dragStartTEndRef.current - deltaTime;
+      const viewportWidth = timePerDivRef.current * H_DIV;
+      tEndRef.current = clampTimelineViewportEnd(
+        dragStartTEndRef.current - deltaTime,
+        viewportWidth,
+        historyBoundsRef.current,
+      );
       setRenderTick(t => t + 1);
+      scheduleVisibleRangeRequest();
     }
     computeHover(e.clientX, e.clientY);
   };
 
   const handleMouseUp = () => {
     isDraggingRef.current = false;
+    if (rangeRequestTimerRef.current !== null) {
+      window.clearTimeout(rangeRequestTimerRef.current);
+      rangeRequestTimerRef.current = null;
+    }
+    requestVisibleRange();
   };
   const handleCanvasMouseLeave = () => {
-    isDraggingRef.current = false;
+    handleMouseUp();
     setMousePos(null);
     setHoverVals(null);
   };
@@ -514,6 +600,7 @@ export function TimelineApp() {
     if (follow && latestSampleTimestampRef.current > 0) {
       tEndRef.current = latestSampleTimestampRef.current;
     }
+    requestVisibleRange();
   };
 
   // wheel + drag via ref (passive:false for preventDefault)

@@ -3,6 +3,11 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '../ozone-backend/types';
 import { trimTimelineHistory } from '../utils/timeline-history';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+import {
+  getTimelineHistoryBounds,
+  sliceTimelineRange,
+  type TimelineHistoryBounds,
+} from '../webview/timeline/timeline-range';
 
 const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
@@ -127,6 +132,14 @@ export class DataSamplingManager {
 
   getAllData(expression: string): DataPoint[] {
     return this.dataMap.get(expression) || [];
+  }
+
+  getHistoryBounds(): TimelineHistoryBounds | null {
+    return getTimelineHistoryBounds(this.dataMap.values());
+  }
+
+  getDataRange(expression: string, start: number, end: number): DataPoint[] {
+    return sliceTimelineRange(this.dataMap.get(expression) || [], start, end);
   }
 
   clearData() {

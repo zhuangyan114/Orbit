@@ -3,13 +3,19 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '../ozone-backend/types';
 import { trimTimelineHistory } from '../utils/timeline-history';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
+<<<<<<< HEAD
 import { isOrbitDebugSessionType } from '../utils/debug-session-type';
+=======
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 import {
   getTimelineHistoryBounds,
   sliceTimelineRange,
   type TimelineHistoryBounds,
 } from '../webview/timeline/timeline-range';
+<<<<<<< HEAD
 import { decimateTimelineRange } from '../webview/timeline/timeline-decimation';
+=======
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 
 const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
@@ -148,10 +154,13 @@ export class DataSamplingManager {
     return sliceTimelineRange(this.dataMap.get(expression) || [], start, end);
   }
 
+<<<<<<< HEAD
   getDataRangeForDisplay(expression: string, start: number, end: number, targetBuckets: number): DataPoint[] {
     return decimateTimelineRange(this.dataMap.get(expression) || [], start, end, targetBuckets);
   }
 
+=======
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
   clearData() {
     for (const [expr] of this.dataMap) {
       this.dataMap.set(expr, []);

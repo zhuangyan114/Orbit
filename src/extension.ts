@@ -181,7 +181,10 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
         webviewOptions: { retainContextWhenHidden: true },
       }),
+<<<<<<< HEAD
       vscode.debug.registerDebugConfigurationProvider('orbit', new OzoneDebugConfigurationProvider()),
+=======
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
       vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
         if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneClearDebugConsole') {

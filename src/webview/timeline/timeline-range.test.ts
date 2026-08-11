@@ -4,8 +4,11 @@ import {
   clampTimelineViewportEnd,
   getTimelineHistoryBounds,
   intersectTimelineRange,
+<<<<<<< HEAD
   parseTimelineRangeLoadRequest,
   quantizeTimelineResolution,
+=======
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
   sliceTimelineRange,
   TimelineRangeController,
 } from './timeline-range';
@@ -13,8 +16,13 @@ import {
 const point = (timestamp: number) => ({ timestamp, value: timestamp, display: String(timestamp) });
 
 describe('calculateBufferedRange', () => {
+<<<<<<< HEAD
   it('prefetches two visible widths on both sides', () => {
     expect(calculateBufferedRange(300, 400, { start: 0, end: 800 })).toEqual({ start: 100, end: 600 });
+=======
+  it('prefetches half a visible width on both sides', () => {
+    expect(calculateBufferedRange(100, 200, { start: 0, end: 300 })).toEqual({ start: 50, end: 250 });
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
   });
 
   it('clamps the prefetch range to both history boundaries', () => {
@@ -84,6 +92,7 @@ describe('getTimelineHistoryBounds', () => {
   });
 });
 
+<<<<<<< HEAD
 describe('quantizeTimelineResolution', () => {
   it('quantizes milliseconds per pixel to stable power-of-two levels', () => {
     expect(quantizeTimelineResolution(800, 100)).toBe(8);
@@ -174,6 +183,15 @@ describe('TimelineRangeController', () => {
 
     expect(controller.requestViewport(300, 400)).toEqual([
       { requestId: 1, start: 100, end: 600 },
+=======
+describe('TimelineRangeController', () => {
+  it('requests the visible range with a half-screen margin on both sides', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 300 });
+
+    expect(controller.requestViewport(100, 200)).toEqual([
+      { requestId: 1, start: 50, end: 250 },
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     ]);
   });
 
@@ -182,13 +200,21 @@ describe('TimelineRangeController', () => {
     controller.setHistoryBounds({ start: 0, end: 300 });
 
     expect(controller.requestViewport(0, 100)).toEqual([
+<<<<<<< HEAD
       { requestId: 1, start: 0, end: 300 },
+=======
+      { requestId: 1, start: 0, end: 150 },
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     ]);
 
     const latest = new TimelineRangeController();
     latest.setHistoryBounds({ start: 0, end: 300 });
     expect(latest.requestViewport(200, 300)).toEqual([
+<<<<<<< HEAD
       { requestId: 1, start: 0, end: 300 },
+=======
+      { requestId: 1, start: 150, end: 300 },
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     ]);
   });
 
@@ -202,6 +228,7 @@ describe('TimelineRangeController', () => {
     expect(controller.requestViewport(100, 200)).toEqual([]);
   });
 
+<<<<<<< HEAD
   it('does not refresh while at least a half-screen margin remains', () => {
     const controller = new TimelineRangeController();
     controller.setHistoryBounds({ start: 0, end: 1000 });
@@ -231,6 +258,17 @@ describe('TimelineRangeController', () => {
 
     expect(controller.requestViewport(460, 560)).toEqual([
       { requestId: 2, start: 600, end: 760 },
+=======
+  it('requests only missing ranges on both sides after zooming out', () => {
+    const controller = new TimelineRangeController();
+    controller.setHistoryBounds({ start: 0, end: 300 });
+    const [request] = controller.requestViewport(100, 200);
+    controller.completeRequest(request.requestId, { start: request.start, end: request.end });
+
+    expect(controller.requestViewport(75, 225)).toEqual([
+      { requestId: 2, start: 0, end: 50 },
+      { requestId: 3, start: 250, end: 300 },
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     ]);
   });
 
@@ -290,7 +328,11 @@ describe('TimelineRangeController', () => {
     controller.cancelPendingRequests();
 
     expect(controller.requestViewport(100, 200)).toEqual([
+<<<<<<< HEAD
       { requestId: lostRequest.requestId + 1, start: 0, end: 300 },
+=======
+      { requestId: lostRequest.requestId + 1, start: 50, end: 250 },
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     ]);
   });
 });

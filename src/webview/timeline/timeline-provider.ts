@@ -1,7 +1,11 @@
 import * as vscode from 'vscode';
 import { DataSamplingManager } from '../../debug-providers/data-sampling-manager';
 import { DataSampleSnapshot } from '../../ozone-backend/types';
+<<<<<<< HEAD
 import { intersectTimelineRange, parseTimelineRangeLoadRequest } from './timeline-range';
+=======
+import { intersectTimelineRange } from './timeline-range';
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 
 interface TimelineState {
   autoFollow: boolean;
@@ -66,7 +70,11 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'loadRange': {
+<<<<<<< HEAD
           this.sendRange(msg);
+=======
+          this.sendRange(msg.requestId, msg.start, msg.end);
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
           break;
         }
         case 'addExpression':
@@ -155,6 +163,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ command: 'historyBounds', bounds: this.sampleManager.getHistoryBounds() });
   }
 
+<<<<<<< HEAD
   private sendRange(message: unknown) {
     const request = parseTimelineRangeLoadRequest(message);
     if (!request) return;
@@ -165,17 +174,29 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       this.postMessage({
         command: 'rangeSamples', requestId, generation, resolutionKey, historyBounds, range: null, snapshots: [],
       });
+=======
+  private sendRange(requestId: unknown, start: unknown, end: unknown) {
+    if (!Number.isSafeInteger(requestId) || typeof start !== 'number' || typeof end !== 'number') return;
+    const historyBounds = this.sampleManager.getHistoryBounds();
+    const range = intersectTimelineRange({ start, end }, historyBounds);
+    if (!range) {
+      this.postMessage({ command: 'rangeSamples', requestId, historyBounds, range: null, snapshots: [] });
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
       return;
     }
 
     const snapshots: DataSampleSnapshot[] = [];
     for (const entry of this.sampleManager.entriesList) {
+<<<<<<< HEAD
       const data = this.sampleManager.getDataRangeForDisplay(
         entry.expression,
         range.start,
         range.end,
         targetBuckets,
       );
+=======
+      const data = this.sampleManager.getDataRange(entry.expression, range.start, range.end);
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
       if (data.length === 0) continue;
       snapshots.push({
         expression: entry.expression,
@@ -184,9 +205,13 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         data,
       });
     }
+<<<<<<< HEAD
     this.postMessage({
       command: 'rangeSamples', requestId, generation, resolutionKey, historyBounds, range, snapshots,
     });
+=======
+    this.postMessage({ command: 'rangeSamples', requestId, historyBounds, range, snapshots });
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
   }
 
   private postMessage(msg: any) {

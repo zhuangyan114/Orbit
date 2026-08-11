@@ -9,6 +9,7 @@ export interface TimelineRangeRequest extends TimelineRange {
   requestId: number;
 }
 
+<<<<<<< HEAD
 export interface TimelineRangeLoadRequest extends TimelineRangeRequest {
   generation: number;
   resolutionKey: number;
@@ -57,6 +58,9 @@ export function quantizeTimelineResolution(viewportWidthMs: number, plotWidthPx:
   const millisecondsPerPixel = viewportWidthMs / plotWidthPx;
   return 2 ** Math.round(Math.log2(millisecondsPerPixel));
 }
+=======
+const PREFETCH_RATIO = 0.5;
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 
 export function clampTimelineViewportEnd(
   requestedEnd: number,
@@ -84,11 +88,18 @@ export function intersectTimelineRange(
   return start <= end ? { start, end } : null;
 }
 
+<<<<<<< HEAD
 function calculateRangeWithMargin(
   viewStart: number,
   viewEnd: number,
   historyBounds: TimelineHistoryBounds | null,
   marginRatio: number,
+=======
+export function calculateBufferedRange(
+  viewStart: number,
+  viewEnd: number,
+  historyBounds: TimelineHistoryBounds | null,
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 ): TimelineRange | null {
   if (!historyBounds
     || !Number.isFinite(viewStart)
@@ -99,6 +110,7 @@ function calculateRangeWithMargin(
     || historyBounds.end < historyBounds.start) {
     return null;
   }
+<<<<<<< HEAD
   if (viewEnd < historyBounds.start || viewStart > historyBounds.end) return null;
 
   const width = viewEnd - viewStart;
@@ -115,6 +127,15 @@ export function calculateBufferedRange(
   return calculateRangeWithMargin(viewStart, viewEnd, historyBounds, PREFETCH_RATIO);
 }
 
+=======
+
+  const width = viewEnd - viewStart;
+  const start = Math.max(historyBounds.start, viewStart - width * PREFETCH_RATIO);
+  const end = Math.min(historyBounds.end, viewEnd + width * PREFETCH_RATIO);
+  return start <= end ? { start, end } : null;
+}
+
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 function firstPointAtOrAfter<T extends { timestamp: number }>(points: readonly T[], timestamp: number): number {
   let low = 0;
   let high = points.length;
@@ -192,6 +213,7 @@ function uncoveredRanges(target: TimelineRange, coverage: TimelineRange[]): Time
 export class TimelineRangeController {
   private historyBounds: TimelineHistoryBounds | null = null;
   private loaded: TimelineRange[] = [];
+<<<<<<< HEAD
   private pending = new Map<number, PendingTimelineRange>();
   private nextRequestId = 1;
   private activeResolutionKey: number | null = null;
@@ -214,6 +236,10 @@ export class TimelineRangeController {
     this.clearCoverage();
     return true;
   }
+=======
+  private pending = new Map<number, TimelineRange>();
+  private nextRequestId = 1;
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
 
   setHistoryBounds(bounds: TimelineHistoryBounds | null) {
     this.historyBounds = bounds;
@@ -224,9 +250,15 @@ export class TimelineRangeController {
     this.loaded = this.loaded
       .map(range => intersectTimelineRange(range, bounds))
       .filter((range): range is TimelineRange => range !== null);
+<<<<<<< HEAD
     for (const [requestId, pending] of this.pending) {
       const clipped = intersectTimelineRange(pending.range, bounds);
       if (clipped) this.pending.set(requestId, { ...pending, range: clipped });
+=======
+    for (const [requestId, range] of this.pending) {
+      const clipped = intersectTimelineRange(range, bounds);
+      if (clipped) this.pending.set(requestId, clipped);
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
       else this.pending.delete(requestId);
     }
   }
@@ -234,6 +266,7 @@ export class TimelineRangeController {
   requestViewport(viewStart: number, viewEnd: number): TimelineRangeRequest[] {
     const target = calculateBufferedRange(viewStart, viewEnd, this.historyBounds);
     if (!target) return [];
+<<<<<<< HEAD
     const coverage = [...this.loaded, ...[...this.pending.values()].map(pending => pending.range)];
     const refreshRange = calculateRangeWithMargin(
       viewStart,
@@ -249,10 +282,17 @@ export class TimelineRangeController {
         generation: this.activeGeneration,
         resolutionKey: this.activeResolutionKey,
       });
+=======
+    const coverage = [...this.loaded, ...this.pending.values()];
+    return uncoveredRanges(target, coverage).map(range => {
+      const request = { requestId: this.nextRequestId++, ...range };
+      this.pending.set(request.requestId, range);
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
       return request;
     });
   }
 
+<<<<<<< HEAD
   completeRequest(
     requestId: number,
     actualRange: TimelineRange | null,
@@ -266,6 +306,10 @@ export class TimelineRangeController {
       return false;
     }
     this.pending.delete(requestId);
+=======
+  completeRequest(requestId: number, actualRange: TimelineRange | null): boolean {
+    if (!this.pending.delete(requestId)) return false;
+>>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     if (actualRange) this.markLoadedRange(actualRange);
     return true;
   }

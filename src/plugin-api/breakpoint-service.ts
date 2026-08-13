@@ -99,6 +99,17 @@ function optionalText(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Column identity: the frozen SourceLocation column is 1-based, so "first
+ * character" is column 1. `buildLocation` defaults an unspecified column to
+ * character 0, which reads back as column 1; canonicalizing keeps "unspecified"
+ * and "first column" on the same stable breakpointId across the add/list/remove
+ * round-trip (a source location's identity is its line, not its leading column).
+ */
+function canonicalColumn(column: number | undefined): number | undefined {
+  return column !== undefined && column > 1 ? column : undefined;
+}
+
 /** Constructs a vscode.Location from a frozen SourceLocation (1-based → 0-based). */
 function buildLocation(input: BreakpointInput): vscode.Location {
   const source = input.source;
@@ -316,12 +327,13 @@ export class BreakpointService {
       const location = sourceLocationOf(bp);
       if (!location) continue;
       const anyBp = bp as unknown as Record<string, unknown>;
+      const column = canonicalColumn(location.column);
       result.push({
         ref: bp,
         source: {
           path: location.path,
           line: location.line,
-          ...(location.column !== undefined ? { column: location.column } : {}),
+          ...(column !== undefined ? { column } : {}),
         },
         enabled: anyBp.enabled !== false,
         condition: optionalText(anyBp.condition),
@@ -447,7 +459,7 @@ export class BreakpointService {
     return this.computeBreakpointId(
       input.source.path,
       input.source.line,
-      input.source.column,
+      canonicalColumn(input.source.column),
       input.condition,
       input.hitCondition,
       input.logMessage,

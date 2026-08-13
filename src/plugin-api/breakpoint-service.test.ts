@@ -89,8 +89,10 @@ function makeService(overrides: Partial<BreakpointServiceOptions> = {}): TestCon
     addBreakpoints: async inputs => {
       addCalls.push([...inputs]);
       for (const item of inputs) {
+        // Mirror buildLocation: VS Code always materializes a character, so an
+        // unspecified column becomes character 0 and reads back as column 1.
         requested.push(bp(item.source.path, item.source.line - 1, {
-          column0: item.source.column !== undefined ? item.source.column - 1 : undefined,
+          column0: (item.source.column ?? 1) - 1,
           enabled: item.enabled,
           condition: item.condition,
           hitCondition: item.hitCondition,
@@ -198,6 +200,18 @@ describe('BreakpointService', () => {
     ctx.dap.push({ path: 'c:/ws/main.c', line: 10, verified: true, slot: 0 });
     const result = await ctx.service.add(input('C:\\ws\\main.c', 10), 1000, 'op1');
     expect(result.items[0]).toMatchObject({ verified: true, slot: 0, sessionId: 'sess-1' });
+  });
+
+  it('keeps the breakpointId stable across the add -> list round-trip (column canonicalization)', async () => {
+    // Regression: an unspecified column is materialized by VS Code as character
+    // 0 (column 1 on read-back), which must not change the derived id.
+    ctx.startSession();
+    ctx.dap.push({ path: 'c:/ws/main.c', line: 10, verified: true, slot: 0 });
+    const added = await ctx.service.add(input('C:\\ws\\main.c', 10), 0, 'op1');
+    const listed = await ctx.service.list({ sourcePath: 'C:\\ws\\main.c' });
+    expect(added.items[0].breakpointId).toBe(listed.items[0].breakpointId);
+    expect(added.items[0].source.column).toBeUndefined();
+    expect(listed.items[0].source.column).toBeUndefined();
   });
 
   it('add throws BreakpointUnverified when verification times out', async () => {

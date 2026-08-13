@@ -677,7 +677,7 @@ export class SessionRegistry {
 - [x] Run: focused tests + `src/plugin-api/runtime-router.test.ts` + typecheck。
 - [x] Commit: `feat(api): fence automation calls by debug session generation`。
 
-### Task 4: 可见会话启动、停止、重启与配置
+### Task 4: 可见会话启动、停止、重启与配置 已完成
 
 **Depends on:** Task 3
 
@@ -704,13 +704,13 @@ export class SessionService {
 }
 ```
 
-- [ ] 测试命名 launch、inline config、无 ELF、配置类型错误、start 返回 false、start event timeout、重复 start 返回 `SessionAlreadyActive`、精确 stop 和 session replacement。
-- [ ] `start()` 只能调用 `vscode.debug.startDebugging()`；必须复用 `OzoneDebugConfigurationProvider` 的归一化规则。
-- [ ] API 启动后，VS Code 必须出现 Debug toolbar、Call Stack session 和标准 initialized/stopped 状态。
-- [ ] `stop()` 必须传入精确 session，禁止无参数停止所有 VS Code sessions。
-- [ ] 注册 `orbit.project.listLaunchConfigurations`、`orbit.session.list/start/stop/snapshot`。`orbit.session.restart` 由 Task 5 的 DAP bridge 唯一实现，本 Task 不创建第二条 restart 路径。
-- [ ] Run focused tests、typecheck、build。
-- [ ] Commit: `feat(api): control visible VS Code debug sessions`。
+- [x] 测试命名 launch、inline config、无 ELF、配置类型错误、start 返回 false、start event timeout、重复 start 返回 `SessionAlreadyActive`、精确 stop 和 session replacement。
+- [x] `start()` 只能调用 `vscode.debug.startDebugging()`；必须复用 `OzoneDebugConfigurationProvider` 的归一化规则。
+- [x] API 启动后，VS Code 必须出现 Debug toolbar、Call Stack session 和标准 initialized/stopped 状态。
+- [x] `stop()` 必须传入精确 session，禁止无参数停止所有 VS Code sessions。
+- [x] 注册 `orbit.project.listLaunchConfigurations`、`orbit.session.list/start/stop/snapshot`。`orbit.session.restart` 由 Task 5 的 DAP bridge 唯一实现，本 Task 不创建第二条 restart 路径。
+- [x] Run focused tests、typecheck、build。
+- [x] Commit: `feat(api): control visible VS Code debug sessions`。
 
 ### Task 5: DAP Automation Bridge 与基础控制
 

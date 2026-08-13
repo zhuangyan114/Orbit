@@ -259,13 +259,20 @@ export interface CapabilitySnapshot {
   sessionPhase?: string;
 }
 
-/** OpenRPC LaunchConfiguration summary (data of project.describe / listLaunchConfigurations). */
-export interface LaunchConfigurationSummary {
+/** OpenRPC LaunchConfiguration (items of project.listLaunchConfigurations). */
+export interface LaunchConfiguration {
   name: string;
   type: 'orbit' | 'ozone';
   request: 'launch' | 'attach';
   workspaceFolderUri: string;
 }
+
+/**
+ * Backwards-compatible name for the same frozen shape; the OpenRPC document
+ * calls it LaunchConfiguration and uses it for both project.describe and
+ * project.listLaunchConfigurations.
+ */
+export type LaunchConfigurationSummary = LaunchConfiguration;
 
 /** OpenRPC ProjectDescription (data of orbit.project.describe). */
 export interface ProjectDescription {
@@ -332,6 +339,13 @@ export interface SessionSnapshot {
 export interface SessionListData {
   items: SessionSnapshot[];
   nextCursor?: string | null;
+}
+
+/** OpenRPC OperationAck (data of session.start / session.stop). */
+export interface OperationAck {
+  operationId: string;
+  accepted: boolean;
+  session?: SessionSnapshot;
 }
 
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */

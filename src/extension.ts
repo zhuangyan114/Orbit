@@ -9,6 +9,7 @@ import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { EventHub } from './plugin-api/event-hub';
 import { SessionRegistry } from './plugin-api/session-registry';
+import { SessionService } from './plugin-api/session-service';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
@@ -159,8 +160,9 @@ export async function activate(context: vscode.ExtensionContext) {
       projectId: () => pluginApiServer?.getProjectId() ?? '',
     });
     sessionRegistry = new SessionRegistry({ eventHub });
+    const sessionService = new SessionService({ registry: sessionRegistry });
 
-    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry });
+    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry, sessionService });
     const apiEndpoint = await pluginApiServer.start();
     context.subscriptions.push(pluginApiServer);
       console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);

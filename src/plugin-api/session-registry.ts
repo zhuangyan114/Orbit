@@ -318,6 +318,12 @@ export class SessionRegistry {
     return this.activeRecord ? this.toSnapshot(this.activeRecord) : undefined;
   }
 
+  /** Snapshot of any tracked session by id, including terminated history. */
+  getSessionSnapshot(sessionId: string): SessionSnapshot | undefined {
+    const record = this.records.get(sessionId);
+    return record ? this.toSnapshot(record) : undefined;
+  }
+
   /** Active session first, then terminated history (most recent first). */
   snapshot(options: { includeTerminated?: boolean } = {}): SessionSnapshot[] {
     const items: SessionSnapshot[] = [];

@@ -26,6 +26,8 @@ import {
   AutomationScope,
   BootstrapContext,
   ConnectionContext,
+  ProjectMutationContext,
+  TargetMutationContext,
 } from './protocol';
 import { buildMethodDefinition, RpcDispatcher } from './rpc-dispatcher';
 import {
@@ -38,8 +40,9 @@ import {
   detectProfile,
 } from './instance-registry';
 import { HandshakeService } from './handshake-service';
-import { LaunchConfigurationSummary, WorkspaceFolderInfo } from './protocol';
+import { WorkspaceFolderInfo } from './protocol';
 import { SessionRegistry } from './session-registry';
+import { SessionService, listOrbitLaunchConfigurations } from './session-service';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -74,6 +77,39 @@ interface ConnectionCloseWireParams {
   reason?: string;
 }
 
+interface ProjectListLaunchConfigurationsWireParams {
+  context: ConnectionContext;
+  page?: { cursor?: string; limit?: number };
+  includeLegacyAlias?: boolean;
+}
+
+interface SessionListWireParams {
+  context: ConnectionContext;
+  cursor?: string;
+  limit?: number;
+  includeTerminated?: boolean;
+}
+
+interface SessionSnapshotWireParams {
+  context: ConnectionContext;
+  sessionId: string;
+  includeCapabilities?: boolean;
+}
+
+interface SessionStartWireParams {
+  context: ProjectMutationContext;
+  configurationId: string;
+  configurationName?: string;
+  noDebug?: boolean;
+  timeoutMs?: number;
+}
+
+interface SessionStopWireParams {
+  context: TargetMutationContext;
+  terminateDebuggee?: boolean;
+  restartArguments?: { preserveBreakpoints?: boolean };
+}
+
 export interface PluginApiServerOptions {
   /** Injected for tests; defaults to an Extension-Host-backed registry. */
   registry?: InstanceRegistry;
@@ -81,6 +117,8 @@ export interface PluginApiServerOptions {
   handshakeFactory?: (registry: InstanceRegistry) => HandshakeService;
   /** Exact DebugSession registration and generation fence (plan Task 3). */
   sessionRegistry?: SessionRegistry;
+  /** Visible session start/stop and launch configuration service (plan Task 4). */
+  sessionService?: SessionService;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -116,22 +154,7 @@ export function collectElfFiles(): string[] {
 }
 
 /** `orbit`/`ozone` launch configurations of this workspace, normalized. */
-export function listOrbitLaunchConfigurations(): LaunchConfigurationSummary[] {
-  const configs = vscode.workspace
-    .getConfiguration('launch')
-    .get<Array<Record<string, unknown>>>('configurations', []);
-  const firstFolderUri = vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? '';
-  return configs
-    .filter((config): config is Record<string, unknown> => typeof config === 'object' && config !== null)
-    .filter(config => config.type === 'orbit' || config.type === 'ozone')
-    .map(config => ({
-      name: String(config.name ?? ''),
-      type: config.type as 'orbit' | 'ozone',
-      request: (config.request === 'attach' ? 'attach' : 'launch') as 'launch' | 'attach',
-      workspaceFolderUri: firstFolderUri,
-    }))
-    .filter(config => config.name.length > 0);
-}
+export { listOrbitLaunchConfigurations } from './session-service';
 
 export class PluginApiServer implements vscode.Disposable {
   private server: http.Server | null = null;
@@ -142,6 +165,7 @@ export class PluginApiServer implements vscode.Disposable {
   private registry: InstanceRegistry;
   private handshake: HandshakeService | null = null;
   private dispatcher: RpcDispatcher | null = null;
+  private sessionService: SessionService;
   private startedAtMs = 0;
 
   constructor(
@@ -162,6 +186,9 @@ export class PluginApiServer implements vscode.Disposable {
     this.recorder = new WaveRecorder(this.runtime);
     this.experiment = new ExperimentService(this.runtime, this.recorder);
     this.registry = this.options.registry ?? this.buildRegistry();
+    this.sessionService =
+      this.options.sessionService ??
+      new SessionService({ registry: sessionRegistry ?? new SessionRegistry() });
     if (this.options.handshakeFactory) {
       this.handshake = this.options.handshakeFactory(this.registry);
     }
@@ -306,6 +333,56 @@ export class PluginApiServer implements vscode.Disposable {
     dispatcher.register(
       buildMethodDefinition('orbit.system.capabilities', async (params: SystemCapabilitiesParams) => ({
         data: this.registry.getCapabilitySnapshot(params.includeUnavailable ?? true),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition(
+        'orbit.project.listLaunchConfigurations',
+        async (params: ProjectListLaunchConfigurationsWireParams) => ({
+          data: this.sessionService.listLaunchConfigurationsPage(
+            params.page,
+            params.includeLegacyAlias ?? true,
+          ),
+        }),
+      ),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.session.list', async (params: SessionListWireParams) => ({
+        data: this.sessionService.list({
+          includeTerminated: params.includeTerminated ?? false,
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.session.snapshot', async (params: SessionSnapshotWireParams) => ({
+        data: this.sessionService.snapshot(params.sessionId, params.includeCapabilities ?? true),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.session.start', async (params: SessionStartWireParams, call) => ({
+        data: await this.sessionService.start(
+          {
+            context: params.context,
+            configurationId: params.configurationId,
+            configurationName: params.configurationName,
+            noDebug: params.noDebug ?? false,
+            timeoutMs: params.timeoutMs,
+          },
+          call.operationId,
+        ),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.session.stop', async (params: SessionStopWireParams, call) => ({
+        data: await this.sessionService.stop(
+          {
+            sessionId: params.context.sessionId,
+            sessionGeneration: params.context.sessionGeneration,
+          },
+          call.operationId,
+        ),
       })),
     );
   }

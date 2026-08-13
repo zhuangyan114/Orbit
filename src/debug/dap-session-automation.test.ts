@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DapSession, DebugProtocolMessage } from './dap-session';
 import { OzoneBackend } from '../ozone-backend/commander';
 import {
@@ -327,6 +327,10 @@ describe('DapSession automation flash', () => {
     });
     const session = connectedJlinkSession(backend as unknown as OzoneBackend);
     (session as any)._probe = 'cmsis-dap';
+    // rttLogEnabled + rttAvailable=false: the restore path is invoked (and
+    // no-ops internally), letting us assert it without RTT poll timers.
+    (session as any).rttLogEnabled = true;
+    const startRttSpy = vi.spyOn(session as any, 'startRttLogPolling');
     const messages = collect(session);
 
     await (session as any).handleRequest(automationRequest(1, {
@@ -362,9 +366,11 @@ describe('DapSession automation flash', () => {
       owner: 'cmsis-dap', verified: true,
     });
     expect((backend as any).calls).toEqual([
-      'halt', 'getTargetState', 'flash', 'getPerformanceDiagnostics',
+      'stopRtt', 'halt', 'getTargetState', 'flash', 'getPerformanceDiagnostics',
       'reset', 'halt', 'getTargetState', 'readRegister',
     ]);
+    // M1: RTT polling is paused before the flash and restored after it.
+    expect(startRttSpy).toHaveBeenCalledWith({ retryInvalidControlBlock: true });
   });
 
   it('flash with resetAfter run leaves the target running', async () => {
@@ -412,8 +418,37 @@ describe('DapSession automation flash', () => {
 
     expect(responseFor(messages, 1)).toMatchObject({
       success: false,
-      body: { errorCode: 'FlashFailed', message: 'sector erase rejected' },
+      body: { errorCode: 'FlashFailed', message: 'sector erase rejected', targetState: 'halted' },
     });
+    // M2: the failed flash re-syncs the UI to the recovered halted state.
+    expect(eventsOf(messages, 'stopped')[0]?.body).toMatchObject({ reason: 'pause', threadId: 1 });
+  });
+
+  it('a flash failure reconciles a running target without a spurious stopped event', async () => {
+    let stateCalls = 0;
+    const backend = jlinkControlBackend({
+      flash: () => ({ ok: false, errorCode: 'FlashFailed', error: 'sector erase rejected' }),
+      getTargetState: () => {
+        stateCalls += 1;
+        // First call is the pre-flash halt confirm; the recovery reads running.
+        return { ok: true, data: stateCalls === 1 ? 'halted' : 'running' };
+      },
+    });
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    (session as any)._probe = 'cmsis-dap';
+    const messages = collect(session);
+
+    await (session as any).handleRequest(automationRequest(1, {
+      action: 'flash', sessionGeneration: 2, elfPath: 'missing.elf',
+    }));
+    (session as any).stopPolling();
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: false,
+      body: { errorCode: 'FlashFailed', targetState: 'running' },
+    });
+    expect(eventsOf(messages, 'stopped')).toHaveLength(0);
+    expect(eventsOf(messages, 'continued')).toHaveLength(0);
   });
 });
 
@@ -438,6 +473,20 @@ describe('automation request validation', () => {
       .toMatchObject({ ok: false });
     expect(parseAutomationControlRequest({ action: 'reset', sessionGeneration: 1, mode: 'sleep' })).toMatchObject({ ok: false });
     expect(parseAutomationControlRequest({ action: 'flash', sessionGeneration: 1 })).toMatchObject({ ok: false });
+  });
+
+  it('maps DAP failure messages onto the frozen error codes (L2)', () => {
+    const session = connectedJlinkSession({} as OzoneBackend);
+    const normalize = (body: Record<string, unknown>, message: string) =>
+      (session as any).normalizeAutomationErrorCode(body, message);
+    // Step-lock "Target busy" is the frozen TargetBusy, not InternalError.
+    expect(normalize({}, 'Target busy')).toBe('TargetBusy');
+    // A structured body code always wins.
+    expect(normalize({ errorCode: 'TargetControlFailed' }, 'anything')).toBe('TargetControlFailed');
+    // A leading Code: prefix is preserved.
+    expect(normalize({}, 'TargetStateInvalid: pause returned running')).toBe('TargetStateInvalid');
+    // Unknown failures fall back to InternalError.
+    expect(normalize({}, 'something broke')).toBe('InternalError');
   });
 
   it('maps actions to the standard DAP commands', () => {

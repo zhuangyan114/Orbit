@@ -3054,6 +3054,10 @@ export class DapSession extends EventEmitter {
     let flashReport: AutomationFlashReport | undefined;
     await this.withStepLock(async () => {
       this.beginControl();
+      // Mirror handleRestart: a re-flash invalidates the RTT control-block
+      // state, so background RTT polling is paused for the whole critical
+      // section and restored afterwards.
+      this.stopRttLogPolling();
       this.stopPolling();
       this.setTargetRunning(false);
       try {
@@ -3090,7 +3094,34 @@ export class DapSession extends EventEmitter {
         });
         if (!flashResult.ok) {
           this.sendEvent('output', { category: 'stderr', output: `Automation flash failed: ${flashResult.error}\n` });
-          this.recordAutomationFailure(capture, this.failureBodyFromResult(flashResult), flashResult.error);
+          if (this._probe === 'cmsis-dap') {
+            // Reconcile the post-failure target state exactly like
+            // handleRestart: a halt re-syncs the UI and a running target
+            // resumes polling instead of leaving the session stuck "halted".
+            const stateResult = await this.queryTargetState('automation-flash-failure-recovery');
+            const failure: OzoneCommandResult = stateResult.ok
+              ? {
+                  ...flashResult,
+                  targetState: stateResult.data === TargetState.Halted
+                    ? 'halted'
+                    : stateResult.data === TargetState.Running
+                      ? 'running'
+                      : String(stateResult.data),
+                }
+              : flashResult;
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(failure), failure.error);
+            if (stateResult.ok && stateResult.data === TargetState.Halted) {
+              this.markStoppedForUi();
+              this.lastHaltReason = 'pause';
+              if (this.rttLogEnabled) this.startRttLogPolling();
+              this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
+            } else if (stateResult.ok && stateResult.data === TargetState.Running) {
+              this.setTargetRunning(true);
+              this.startPolling();
+            }
+          } else {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(flashResult), flashResult.error);
+          }
           return;
         }
         this.sendEvent('output', { category: 'console', output: 'Automation flash: flash successful\n' });
@@ -3101,11 +3132,13 @@ export class DapSession extends EventEmitter {
           if (stateResult.ok && stateResult.data === TargetState.Halted) {
             this.markStoppedForUi();
             this.lastHaltReason = 'entry';
+            if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
             this.recordAutomationSuccess(capture);
             this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
           } else if (stateResult.ok && stateResult.data === TargetState.Running) {
             this.setTargetRunning(true);
             this.advanceReadCancelEpoch();
+            if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
             this.recordAutomationSuccess(capture);
             this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
             this.startPolling();
@@ -3139,6 +3172,7 @@ export class DapSession extends EventEmitter {
           }
           this.setTargetRunning(true);
           this.advanceReadCancelEpoch();
+          if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
           this.recordAutomationSuccess(capture);
           this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
           this.startPolling();
@@ -3161,6 +3195,7 @@ export class DapSession extends EventEmitter {
         await new Promise<void>(r => setTimeout(r, 200));
         this.markStoppedForUi();
         this.lastHaltReason = 'entry';
+        if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
         this.recordAutomationSuccess(capture);
         this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
       } finally {
@@ -3201,6 +3236,18 @@ export class DapSession extends EventEmitter {
       errorCode: 'TargetStateInvalid',
       message: `TargetStateInvalid: ${operation} returned ${result.ok ? result.data : result.error}`,
     };
+  }
+
+  /**
+   * Maps a DAP handler failure onto a frozen automation error code. A
+   * structured `body.errorCode` always wins; otherwise known DAP messages
+   * (e.g. the step-lock "Target busy") map to their frozen code before
+   * falling back to a leading `Code:` prefix or InternalError.
+   */
+  private normalizeAutomationErrorCode(body: Record<string, unknown>, message: string): string {
+    if (typeof body.errorCode === 'string' && body.errorCode.length > 0) return body.errorCode;
+    if (/target busy/i.test(message)) return 'TargetBusy';
+    return extractErrorCodePrefix(message) ?? 'InternalError';
   }
 
   private async completeAutomation(
@@ -3257,9 +3304,7 @@ export class DapSession extends EventEmitter {
 
     const body = capture.body && typeof capture.body === 'object' ? capture.body : {};
     const fallbackMessage = capture.message ?? 'automation control failed';
-    const errorCode = typeof body.errorCode === 'string' && body.errorCode.length > 0
-      ? body.errorCode
-      : extractErrorCodePrefix(fallbackMessage) ?? 'InternalError';
+    const errorCode = this.normalizeAutomationErrorCode(body, fallbackMessage);
     const failureMessage = typeof body.message === 'string' && body.message.length > 0
       ? body.message
       : fallbackMessage;

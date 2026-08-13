@@ -94,15 +94,23 @@ export const AUTOMATION_ERROR_CODES: Readonly<Record<AutomationErrorCode, number
 };
 
 /**
- * Typed business error for the v1 automation path. `details` is merged into
- * the JSON-RPC error `data` next to `errorCode` and `retryable`, mirroring
- * ErrorDataBase in the OpenRPC document.
+ * Typed business error for the v1 automation path.
+ *
+ * The wire `data` mirrors the frozen OpenRPC error schemas exactly:
+ * `errorCode` and `retryable` are always present, `data` carries only the
+ * structured fields the contract declares at the top level (ErrorDataBase
+ * plus each error's own schema, e.g. `timeoutKind`, `operationId`,
+ * `expectedGeneration`, `actualGeneration`), and anything ad-hoc (e.g.
+ * `issues`, `requiredScopes`) is nested under `details`, which is the
+ * catch-all ErrorDataBase declares for exactly that purpose. No invented
+ * top-level fields may reach the wire.
  */
 export class AutomationError extends Error {
   constructor(
     public readonly errorCode: AutomationErrorCode,
     message?: string,
     public readonly retryable = false,
+    public readonly data?: Record<string, unknown>,
     public readonly details?: Record<string, unknown>,
   ) {
     super(message ?? errorCode);
@@ -110,10 +118,18 @@ export class AutomationError extends Error {
   }
 
   toJsonRpcErrorObject(): { code: number; message: string; data: Record<string, unknown> } {
+    const data: Record<string, unknown> = {
+      errorCode: this.errorCode,
+      retryable: this.retryable,
+      ...this.data,
+    };
+    if (this.details && Object.keys(this.details).length > 0) {
+      data.details = this.details;
+    }
     return {
       code: AUTOMATION_ERROR_CODES[this.errorCode],
       message: this.errorCode,
-      data: { errorCode: this.errorCode, retryable: this.retryable, ...this.details },
+      data,
     };
   }
 }

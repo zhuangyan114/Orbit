@@ -197,8 +197,10 @@ describe('RpcDispatcher JSON-RPC envelope', () => {
     registerTestMethods(dispatcher);
     const response = await dispatcher.dispatch(rpc('1', 'orbit.session.list', {}), AUTH);
     const error = expectRpcError(response, -32602, 'InvalidParams', '1');
-    const issues = (error.data as { issues: Array<{ path: string }> }).issues;
-    expect(issues.some(issue => issue.path === 'context')).toBe(true);
+    // ad-hoc diagnostics live under data.details; no invented top-level fields
+    expect(error.data).not.toHaveProperty('issues');
+    const details = (error.data as { details: { issues: Array<{ path: string }> } }).details;
+    expect(details.issues.some(issue => issue.path === 'context')).toBe(true);
   });
 
   it('rejects schema violations with InvalidParams', async () => {
@@ -311,7 +313,9 @@ describe('RpcDispatcher fences', () => {
       AUTH,
     );
     const error = expectRpcError(denied, -32001, 'Unauthorized', '1');
-    expect((error.data as { requiredScopes: string[] }).requiredScopes).toEqual(['session.control']);
+    expect(error.data).not.toHaveProperty('requiredScopes');
+    const details = (error.data as { details: { requiredScopes: string[] } }).details;
+    expect(details.requiredScopes).toEqual(['session.control']);
   });
 
   it('runs the handler when the connection scope is granted', async () => {
@@ -566,7 +570,7 @@ describe('RpcDispatcher idempotency and operation store', () => {
   it('maps handler AutomationError values onto the frozen error codes', async () => {
     const harness = makeHarness();
     const handler = vi.fn(async () => {
-      throw new AutomationError('TargetRunning', undefined, false, { targetState: 'running' });
+      throw new AutomationError('TargetRunning', undefined, false, undefined, { targetState: 'running' });
     });
     registerTestMethods(harness.dispatcher, { continueTarget: handler });
     grant(harness, ['session.control']);
@@ -704,6 +708,24 @@ describe('RpcDispatcher timeouts', () => {
     const error = expectRpcError(response, -32027, 'RequestTimeout', '1');
     expect(error.data).toMatchObject({ timeoutKind: 'queueTimeout', retryable: true });
     gate.resolve({ data: { items: [] } });
+  });
+
+  it('times out the bootstrap handshake mutation as retryable queueTimeout without an operationId', async () => {
+    // handshake has no connection-scoped operation entry (its context is
+    // BootstrapContext), and the frozen contract only allows outcomeUnknown
+    // together with an operationId, so a timed-out handshake must fall back
+    // to the retryable queueTimeout shape instead.
+    const harness = makeHarness();
+    const gate = deferred<unknown>();
+    registerTestMethods(harness.dispatcher, { handshake: async () => gate.promise });
+
+    const pending = harness.dispatcher.dispatch(rpc('1', 'orbit.handshake', VALID_HANDSHAKE_PARAMS), AUTH);
+    await vi.advanceTimersByTimeAsync(2_000);
+    const response = await pending;
+    const error = expectRpcError(response, -32027, 'RequestTimeout', '1');
+    expect(error.data).toMatchObject({ timeoutKind: 'queueTimeout', retryable: true });
+    expect(error.data).not.toHaveProperty('operationId');
+    gate.resolve({ data: { connectionId: 'conn-new' } });
   });
 });
 

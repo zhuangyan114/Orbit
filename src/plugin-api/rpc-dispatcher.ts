@@ -229,7 +229,7 @@ export class RpcDispatcher {
       }
       const parsed = definition.paramsSchema.safeParse(envelope.data.params ?? {});
       if (!parsed.success) {
-        throw new AutomationError('InvalidParams', `invalid params for ${definition.name}`, false, {
+        throw new AutomationError('InvalidParams', `invalid params for ${definition.name}`, false, undefined, {
           issues: zodErrorIssues(parsed.error),
         });
       }
@@ -334,7 +334,7 @@ export class RpcDispatcher {
     }
     for (const scope of definition.requiredScopes) {
       if (!lease.scopes.has(scope)) {
-        throw new AutomationError('Unauthorized', `connection lacks required scope ${scope}`, false, {
+        throw new AutomationError('Unauthorized', `connection lacks required scope ${scope}`, false, undefined, {
           requiredScopes: [...definition.requiredScopes],
         });
       }
@@ -460,18 +460,22 @@ export class RpcDispatcher {
         );
       });
       if (outcome === 'timeout') {
-        if (definition.mutation) {
+        if (definition.mutation && entry) {
           // The mutation was dispatched and cannot be proven complete: keep the
           // handler running, record the outcome for orbit.operation.get, and
           // never let the same key execute again (plan §2.4).
           timedOutMutation = true;
-          if (entry) entry.status = 'outcomeUnknown';
-          throw new AutomationError('RequestTimeout', `operation ${entry?.operationId ?? ''} outcome unknown`, false, {
+          entry.status = 'outcomeUnknown';
+          throw new AutomationError('RequestTimeout', `operation ${entry.operationId} outcome unknown`, false, {
             timeoutKind: 'outcomeUnknown',
-            ...(entry ? { operationId: entry.operationId } : {}),
+            operationId: entry.operationId,
           });
         }
         // Read-only work is safe to retry and has no operation record.
+        // Bootstrap mutations (orbit.handshake) have no connection-scoped
+        // operation entry either, and the frozen contract only allows
+        // outcomeUnknown together with an operationId, so they report a
+        // retryable queueTimeout instead.
         throw new AutomationError('RequestTimeout', undefined, true, { timeoutKind: 'queueTimeout' });
       }
       const rawResult = await handlerPromise;

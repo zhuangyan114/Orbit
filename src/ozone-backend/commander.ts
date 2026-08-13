@@ -384,7 +384,7 @@ export class OzoneBackend {
         }
         case 'flash':
           return await this.doFlash(command.elfPath, command.device, command.interface, command.speedKHz,
-            command.signal, command.probe, command.flashBeforeDebug, command.cmsisDapFlashAlgorithmPath);
+            command.signal, command.probe, command.flashBeforeDebug, command.cmsisDapFlashAlgorithmPath, command.verify);
 case 'readVariableRuntime':
           return await this.readVariableAtRuntime(command.name);
         case 'clearBreakpointAtAddr':
@@ -2599,6 +2599,7 @@ case 'readVariableRuntime':
     probe: DebugProbe = 'jlink',
     flashBeforeDebug = true,
     algorithmPath?: string,
+    verify?: boolean,
   ): Promise<OzoneCommandResult> {
     if (flashBeforeDebug === false) return { ok: true, data: { skipped: true, reason: 'flashBeforeDebug=false' } };
     let result: {
@@ -2610,7 +2611,7 @@ case 'readVariableRuntime':
     };
     if (probe === 'cmsis-dap') {
       if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'CMSIS-DAP target owner is unavailable' };
-      const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000 };
+      const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000, verify: verify ?? true };
       const flashResult = 'ownerKind' in this.sessionTarget
         ? await this.sessionTarget.flash(elfPath, device, options)
         : this.sessionTarget.flash

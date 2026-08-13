@@ -314,6 +314,20 @@ describe('SessionRegistry lifecycle and generation fence', () => {
     expect(events()).toHaveLength(2);
   });
 
+  it('clears stale halt metadata when a patch sets stopReason/pc to null', () => {
+    const { registry } = setup();
+    const s1 = makeSession('s1');
+    registry.onStarted(s1);
+    registry.update(s1, { phase: 'halted', targetState: 'halted', stopReason: 'pause', pc: '0x08001234' });
+    expect(registry.snapshot()[0]).toMatchObject({ stopReason: 'pause', pc: '0x08001234' });
+
+    registry.update(s1, { phase: 'running', targetState: 'running', stopReason: null, pc: null });
+    const snapshot = registry.snapshot()[0];
+    expect(snapshot).toMatchObject({ phase: 'running', targetState: 'running' });
+    expect(snapshot.stopReason).toBeUndefined();
+    expect(snapshot.pc).toBeUndefined();
+  });
+
   it('ignores patches for unknown session objects', () => {
     const { registry } = setup();
     const s1 = makeSession('s1');

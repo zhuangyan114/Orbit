@@ -332,6 +332,51 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
     }
   });
 
+  it('skips verification entirely when verify is false', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-no-verify-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      const binaryPath = path.join(tempDir, 'algorithm.bin');
+      const manifestPath = path.join(tempDir, 'algorithm.json');
+      fs.writeFileSync(elfPath, makeElf([{ address: 0x08000000, bytes: [1, 2, 3, 4, 5, 6, 7, 8] }]));
+      const algorithm = Buffer.alloc(0x600, 0xBF);
+      algorithm[0x500] = 0x00;
+      algorithm[0x501] = 0xBE;
+      fs.writeFileSync(binaryPath, algorithm);
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        binary: 'algorithm.bin',
+        pageSize: 4,
+        preservesPageBuffer: true,
+        entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
+      }));
+      const calls: Array<{ operation: string }> = [];
+      const transport = {
+        async readDp() { return { ok: true, value: STM32F407VET6.dpIdcode }; },
+        async readMemory(address: number, size: number) {
+          if (address === 0xE0042000) return { ok: true, bytes: [0x13, 0x64, 0x00, 0x10].slice(0, size) };
+          if (address === 0x1FFF7A22) return { ok: true, bytes: [0x00, 0x02].slice(0, size) };
+          return { ok: false, errorCode: 'DapInvalidRequest', message: 'unexpected read' };
+        },
+        async runAlgorithm(request: { operation: string; targetAddress: number; size: number }) {
+          calls.push({ operation: request.operation });
+          return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: 0x20000500, dhcsr: 0x00030003 } };
+        },
+      };
+
+      const result = await flashCmsisDapElf(transport, elfPath, 'STM32F407VET6', {
+        algorithmPath: manifestPath,
+        verify: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(calls.some(call => call.operation === 'verify')).toBe(false);
+      expect(result.reports.some(report => report.operation === 'verify')).toBe(false);
+      expect(calls.map(call => call.operation)).toContain('programPage');
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('programs initialized SRAM data at its Flash LMA and ignores RAM-only segments', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-flash-lma-'));
     try {

@@ -2932,24 +2932,26 @@ export class DapSession extends EventEmitter {
       this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode });
       return;
     }
-    if (request.action === 'stepOut' && request.granularity === 'instruction') {
-      const result: AutomationControlResult = {
-        state: 'unknown',
-        errorCode: 'CapabilityUnavailable',
-        message: 'instruction-granularity stepOut is not available on the selected owner',
-      };
-      this.sendResponse(msg, result, false, 'CapabilityUnavailable: instruction-granularity stepOut is not available on the selected owner');
-      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode: 'CapabilityUnavailable' });
-      return;
-    }
 
     const standard = standardCommandForAction(request);
     if (standard === null) {
+      // reset / flash have dedicated automation cores; instruction-granularity
+      // stepOut has no selected-owner capability (no standard mapping either).
       if (request.action === 'reset') {
         await this.handleAutomationReset(msg, request, startedAt);
         return;
       }
-      await this.handleAutomationFlash(msg, request, startedAt);
+      if (request.action === 'flash') {
+        await this.handleAutomationFlash(msg, request, startedAt);
+        return;
+      }
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: 'CapabilityUnavailable',
+        message: `${request.action} is not available on the selected owner`,
+      };
+      this.sendResponse(msg, result, false, `CapabilityUnavailable: ${request.action} is not available on the selected owner`);
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode: 'CapabilityUnavailable' });
       return;
     }
 
@@ -3078,20 +3080,34 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: 'console', output: `Automation flash: ${elfPath}...\n` });
         // The flash executes only through the session's selected owner; the
         // explicit action always programs (never the launch skip path). The
-        // `verify` param is advisory: each owner verifies per its own
-        // capability and the report reflects what actually happened.
-        const flashResult = await this.backend.execute({
-          cmd: 'flash',
-          elfPath,
-          device: this._device,
-          interface: this._interface as 'SWD' | 'JTAG',
-          speedKHz: this._speedKHz,
-          probe: this._probe,
-          flashBeforeDebug: true,
-          ...(this._cmsisDapFlashAlgorithmPath
-            ? { cmsisDapFlashAlgorithmPath: this._cmsisDapFlashAlgorithmPath }
-            : {}),
-        });
+        // per-request timeout aborts the owner operation, and `verify: false`
+        // is honored by owners that can skip verification (CMSIS-DAP); owners
+        // that always verify (J-Link) still do, and the report reflects that.
+        const flashTimeoutMs = request.timeoutMs ?? 180000;
+        const flashController = new AbortController();
+        const flashTimer = setTimeout(
+          () => flashController.abort(`automation flash timed out after ${flashTimeoutMs}ms`),
+          flashTimeoutMs,
+        );
+        let flashResult: OzoneCommandResult = { ok: false, error: 'automation flash produced no result' };
+        try {
+          flashResult = await this.backend.execute({
+            cmd: 'flash',
+            elfPath,
+            device: this._device,
+            interface: this._interface as 'SWD' | 'JTAG',
+            speedKHz: this._speedKHz,
+            probe: this._probe,
+            flashBeforeDebug: true,
+            verify: request.verify ?? true,
+            signal: flashController.signal,
+            ...(this._cmsisDapFlashAlgorithmPath
+              ? { cmsisDapFlashAlgorithmPath: this._cmsisDapFlashAlgorithmPath }
+              : {}),
+          });
+        } finally {
+          clearTimeout(flashTimer);
+        }
         if (!flashResult.ok) {
           this.sendEvent('output', { category: 'stderr', output: `Automation flash failed: ${flashResult.error}\n` });
           if (this._probe === 'cmsis-dap') {

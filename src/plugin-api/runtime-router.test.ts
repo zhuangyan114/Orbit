@@ -195,4 +195,52 @@ describe('RuntimeRouter explicit session routing', () => {
     ).rejects.toMatchObject({ errorCode: 'NoActiveSession' });
     expect(backend.execute).not.toHaveBeenCalled();
   });
+
+  it('only stepping controls map a running target-state message to TargetRunning', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const customRequest = vi.fn(async () => {
+      throw new Error('TargetStateInvalid: reset-run returned running');
+    });
+    const router = new RuntimeRouter(backend, { resolveSession: () => fakeSession(customRequest) });
+
+    // Non-step (reset): the "still running" message must NOT leak the
+    // step-only frozen TargetRunning code.
+    await expect(
+      router.control({ sessionId: 'session-1', sessionGeneration: 2 }, { action: 'reset', sessionGeneration: 2 }),
+    ).rejects.toMatchObject({ errorCode: 'InternalError' });
+    // Step: TargetRunning is valid for stepping controls.
+    await expect(
+      router.control(
+        { sessionId: 'session-1', sessionGeneration: 2 },
+        { action: 'stepOver', sessionGeneration: 2, threadId: 1 },
+      ),
+    ).rejects.toMatchObject({ errorCode: 'TargetRunning', retryable: true });
+  });
+
+  it('resolveSession throws NoActiveSession without hooks and controlSession drives the session', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const router = new RuntimeRouter(backend);
+    let thrown: unknown;
+    try {
+      router.resolveSession({ sessionId: 's', sessionGeneration: 1 });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ errorCode: 'NoActiveSession' });
+    thrown = undefined;
+    try {
+      router.resolveSession(undefined);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ errorCode: 'NoActiveSession' });
+    expect(backend.execute).not.toHaveBeenCalled();
+
+    const customRequest = vi.fn(async () => ({ state: 'halted', stopReason: 'pause' }));
+    const session = fakeSession(customRequest);
+    await expect(
+      router.controlSession(session, { action: 'pause', sessionGeneration: 2 }),
+    ).resolves.toEqual({ state: 'halted', stopReason: 'pause' });
+    expect(customRequest).toHaveBeenCalledWith('orbitAutomationControl', { action: 'pause', sessionGeneration: 2 });
+  });
 });

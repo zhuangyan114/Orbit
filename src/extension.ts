@@ -221,8 +221,14 @@ export async function activate(context: vscode.ExtensionContext) {
           const state = event.body?.state;
           if (state === 'running' || state === 'halted') {
             const patch: SessionUpdatePatch = { phase: state, targetState: state };
-            if (typeof event.body?.stopReason === 'string') patch.stopReason = event.body.stopReason;
-            if (typeof event.body?.pc === 'string') patch.pc = event.body.pc;
+            if (state === 'halted') {
+              if (typeof event.body?.stopReason === 'string') patch.stopReason = event.body.stopReason;
+              if (typeof event.body?.pc === 'string') patch.pc = event.body.pc;
+            } else {
+              // Running clears any stale halted reason/PC.
+              patch.stopReason = null;
+              patch.pc = null;
+            }
             sessionRegistry.update(event.session, patch);
           }
         }

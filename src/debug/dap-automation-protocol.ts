@@ -86,6 +86,11 @@ const STEP_ACTIONS: readonly AutomationControlAction[] = [
   'stepOver', 'stepInto', 'stepOut', 'stepInstruction',
 ];
 
+/** Whether an action is a stepping control (the only controls with a frozen `TargetRunning` error). */
+export function isStepAction(action: AutomationControlAction): boolean {
+  return (STEP_ACTIONS as readonly string[]).includes(action);
+}
+
 export interface AutomationParseFailure {
   ok: false;
   errorCode: string;
@@ -218,10 +223,10 @@ export function standardCommandForAction(request: AutomationControlRequest): Sta
         ? { command: 'stepIn', arguments: { granularity: 'instruction' } }
         : { command: 'stepIn' };
     case 'stepOut':
-      // The selected owners have no instruction-level stepOut; the frozen
-      // catalog allows the granularity field but the capability is reported
-      // unavailable by the caller-facing layer.
-      return request.granularity === 'instruction' ? { command: 'stepOut', arguments: { granularity: 'instruction' } } : { command: 'stepOut' };
+      // The selected owners have no instruction-level stepOut; returning null
+      // lets the caller report CapabilityUnavailable instead of silently
+      // degrading an instruction step to a source-level stepOut.
+      return request.granularity === 'instruction' ? null : { command: 'stepOut' };
     case 'stepInstruction':
       return { command: 'stepIn', arguments: { granularity: 'instruction' } };
     case 'reset':

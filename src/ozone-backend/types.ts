@@ -177,6 +177,8 @@ export type OzoneCommand =
     signal?: AbortSignal;
     probe?: DebugProbe;
     flashBeforeDebug?: boolean;
+    /** Advisory verification request; owners that can skip it honor `false`. */
+    verify?: boolean;
     cmsisDapFlashAlgorithmPath?: string;
   }
   | { cmd: 'readVariableRuntime'; name: string }

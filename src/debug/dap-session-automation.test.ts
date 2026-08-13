@@ -502,6 +502,10 @@ describe('automation request validation', () => {
       .toEqual({ command: 'next', arguments: { granularity: 'instruction' } });
     expect(standardCommandForAction({ action: 'stepInstruction', sessionGeneration: 1, threadId: 1 }))
       .toEqual({ command: 'stepIn', arguments: { granularity: 'instruction' } });
+    expect(standardCommandForAction({ action: 'stepOut', sessionGeneration: 1, threadId: 1, granularity: 'source' }))
+      .toEqual({ command: 'stepOut' });
+    expect(standardCommandForAction({ action: 'stepOut', sessionGeneration: 1, threadId: 1, granularity: 'instruction' }))
+      .toBeNull();
     expect(standardCommandForAction({ action: 'reset', sessionGeneration: 1 })).toBeNull();
     expect(standardCommandForAction({ action: 'flash', sessionGeneration: 1, elfPath: 'f.elf' })).toBeNull();
   });

@@ -5,6 +5,7 @@ import {
   AUTOMATION_CONTROL_COMMAND,
   AutomationControlRequest,
   AutomationControlResult,
+  isStepAction,
 } from '../debug/dap-automation-protocol';
 import { AutomationError, SessionRef } from './protocol';
 import {
@@ -166,15 +167,33 @@ export class RuntimeRouter {
    * backend control attempt.
    */
   async control(ref: SessionRef | undefined, request: AutomationControlRequest): Promise<AutomationControlResult> {
+    return this.controlSession(this.resolveSession(ref), request);
+  }
+
+  /**
+   * Resolves an explicit `SessionRef` to its exact active session, throwing
+   * the frozen fencing errors. Callers that also need the `vscode.DebugSession`
+   * object (e.g. to mirror state into the registry) resolve once and pass it
+   * to `controlSession` instead of re-resolving.
+   */
+  resolveSession(ref: SessionRef | undefined): vscode.DebugSession {
     const session = this.resolveTargetSession(ref);
     if (!session) {
       throw new AutomationError('NoActiveSession', 'no active Orbit session to control', false);
     }
+    return session;
+  }
+
+  /** Drives one automation control request through an already-resolved session. */
+  async controlSession(
+    session: vscode.DebugSession,
+    request: AutomationControlRequest,
+  ): Promise<AutomationControlResult> {
     let response: unknown;
     try {
       response = await session.customRequest(AUTOMATION_CONTROL_COMMAND, request);
     } catch (error) {
-      throw this.mapControlFailure(error);
+      throw this.mapControlFailure(error, request.action);
     }
     if (response && typeof response === 'object') {
       const outcome = response as Partial<AutomationControlResult>;
@@ -182,7 +201,7 @@ export class RuntimeRouter {
         return response as AutomationControlResult;
       }
       if (typeof outcome.errorCode === 'string') {
-        throw this.mapControlFailure(response);
+        throw this.mapControlFailure(response, request.action);
       }
     }
     throw new AutomationError('InternalError', 'DAP automation control returned an invalid outcome', false);
@@ -193,8 +212,12 @@ export class RuntimeRouter {
    * failure outcome) onto the frozen automation error codes. VS Code attaches
    * the response body to the rejection as `.body`; the leading `ErrorCode:`
    * message prefix is the fallback when the body is unavailable.
+   *
+   * `action` keeps the mapping honest: only stepping controls may surface the
+   * frozen `TargetRunning` code, so a target-state message that implies
+   * "still running" never leaks `TargetRunning` onto a non-step method.
    */
-  private mapControlFailure(failure: unknown): AutomationError {
+  private mapControlFailure(failure: unknown, action: AutomationControlRequest['action']): AutomationError {
     const record = failure && typeof failure === 'object' ? failure as Record<string, unknown> : {};
     const body = record.body && typeof record.body === 'object'
       ? record.body as Record<string, unknown>
@@ -221,7 +244,8 @@ export class RuntimeRouter {
     if (errorCode === 'SessionTerminating' || /terminat/i.test(rawMessage)) {
       return new AutomationError('SessionTerminating', rawMessage, false, undefined, details);
     }
-    if (errorCode === 'TargetRunning' || /TargetStateInvalid.*[Rr]unning/.test(rawMessage)) {
+    const runningImplied = isStepAction(action) && /TargetStateInvalid.*[Rr]unning/.test(rawMessage);
+    if (errorCode === 'TargetRunning' || runningImplied) {
       return new AutomationError('TargetRunning', rawMessage, true, undefined, details);
     }
     if (errorCode === 'CapabilityUnavailable' || errorCode === 'UnsupportedCapability' || /unavailable|unsupported/i.test(rawMessage)) {

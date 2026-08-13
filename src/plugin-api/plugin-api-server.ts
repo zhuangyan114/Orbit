@@ -517,8 +517,8 @@ export class PluginApiServer implements vscode.Disposable {
     operationId: string | undefined,
   ): Promise<ControlOutcome> {
     const ref: SessionRef = { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
-    const session = this.requireExactSession(ref);
-    const result = await this.runtime.control(ref, request);
+    const session = this.runtime.resolveSession(ref);
+    const result = await this.runtime.controlSession(session, request);
     this.applyControlPatch(session, result);
     return this.controlOutcomeData(ref.sessionId, result, operationId);
   }
@@ -534,8 +534,8 @@ export class PluginApiServer implements vscode.Disposable {
   ): Promise<ControlOutcome> {
     const ref: SessionRef = { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
     const registry = this.requireSessionRegistry();
-    const session = registry.requireExact(ref);
-    const result = await this.runtime.control(ref, {
+    const session = this.runtime.resolveSession(ref);
+    const result = await this.runtime.controlSession(session, {
       action: 'restart',
       sessionGeneration: ref.sessionGeneration,
     });
@@ -555,8 +555,8 @@ export class PluginApiServer implements vscode.Disposable {
   ): Promise<FlashReport> {
     const context = params.context;
     const ref: SessionRef = { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
-    const session = this.requireExactSession(ref);
-    const result = await this.runtime.control(ref, {
+    const session = this.runtime.resolveSession(ref);
+    const result = await this.runtime.controlSession(session, {
       action: 'flash',
       sessionGeneration: ref.sessionGeneration,
       elfPath: params.elfPath,
@@ -588,19 +588,24 @@ export class PluginApiServer implements vscode.Disposable {
     return registry;
   }
 
-  private requireExactSession(ref: SessionRef): vscode.DebugSession {
-    return this.requireSessionRegistry().requireExact(ref);
-  }
-
-  /** Mirrors the settled control state into the registry snapshot. */
+  /**
+   * Mirrors the settled control state into the registry snapshot. Running
+   * clears any stale halted metadata (stopReason/pc) so the snapshot never
+   * pairs a "running" target with a previous halt's reason and PC.
+   */
   private applyControlPatch(session: vscode.DebugSession, result: AutomationControlResult): void {
     if (result.state !== 'running' && result.state !== 'halted') return;
     const patch: SessionUpdatePatch = {
       phase: result.state,
       targetState: result.state,
     };
-    if (result.stopReason) patch.stopReason = result.stopReason;
-    if (result.pc) patch.pc = result.pc;
+    if (result.state === 'halted') {
+      if (result.stopReason) patch.stopReason = result.stopReason;
+      if (result.pc) patch.pc = result.pc;
+    } else {
+      patch.stopReason = null;
+      patch.pc = null;
+    }
     this.options.sessionRegistry?.update(session, patch);
   }
 

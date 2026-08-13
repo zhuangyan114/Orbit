@@ -49,8 +49,10 @@ export interface SessionUpdatePatch {
   ownerKind?: OwnerKind;
   probe?: ProbeKind;
   transport?: TransportKind;
-  stopReason?: string;
-  pc?: string;
+  /** `null` clears a previously recorded halt reason (e.g. when running). */
+  stopReason?: string | null;
+  /** `null` clears a previously recorded halted PC (e.g. when running). */
+  pc?: string | null;
   threadId?: number;
   location?: SessionLocation;
   capabilities?: Capability[];
@@ -268,8 +270,8 @@ export class SessionRegistry {
     if (patch.ownerKind !== undefined) record.ownerKind = patch.ownerKind;
     if (patch.probe !== undefined) record.probe = patch.probe;
     if (patch.transport !== undefined) record.transport = patch.transport;
-    if (patch.stopReason !== undefined) record.stopReason = patch.stopReason;
-    if (patch.pc !== undefined) record.pc = patch.pc;
+    if (patch.stopReason !== undefined) record.stopReason = patch.stopReason ?? undefined;
+    if (patch.pc !== undefined) record.pc = patch.pc ?? undefined;
     if (patch.threadId !== undefined) record.threadId = patch.threadId;
     if (patch.location !== undefined) record.location = patch.location;
     if (patch.capabilities !== undefined) {

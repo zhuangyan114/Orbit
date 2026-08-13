@@ -29,6 +29,7 @@ import {
 import { SessionRegistry } from './session-registry';
 import {
   AUTOMATION_BREAKPOINTS_COMMAND,
+  AutomationBreakpointCapabilities,
   AutomationBreakpointsResult,
   AutomationBreakpointSnapshot,
 } from '../debug/dap-automation-protocol';
@@ -174,7 +175,16 @@ export class BreakpointService {
     return data;
   }
 
-  /** `orbit.breakpoints.add`: one requested breakpoint via vscode, then DAP verify. */
+  /** Count of source breakpoints the API exposes (function/data breakpoints excluded). */
+  countSourceBreakpoints(): number {
+    return this.readRequestedBreakpoints().length;
+  }
+
+  /**
+   * `orbit.breakpoints.add`: one requested breakpoint via vscode, then DAP verify.
+   * A `BreakpointUnverified` outcome is NOT a rollback: the breakpoint has already
+   * been added to `vscode.debug.breakpoints`; reconcile with `breakpoints.list`.
+   */
   async add(
     input: BreakpointInput,
     waitForVerificationMs = DEFAULT_VERIFY_WAIT_MS,
@@ -271,7 +281,21 @@ export class BreakpointService {
       await this.opts.removeBreakpoints(existing.map(bp => bp.ref));
     }
     if (inputs.length > 0) {
-      await this.opts.addBreakpoints([...inputs]);
+      try {
+        await this.opts.addBreakpoints([...inputs]);
+      } catch (error) {
+        // VS Code has no atomic replace primitive; a failed add would leave the
+        // source empty, so best-effort restore the removed set before rethrowing
+        // (clients can verify the exact state via breakpoints.list).
+        if (existing.length > 0) {
+          try {
+            await this.opts.addBreakpoints(existing.map(bp => this.toInput(bp)));
+          } catch {
+            // Restore is best-effort only.
+          }
+        }
+        throw error;
+      }
       await this.waitForVerification(
         inputs.map(input => this.locationKey(input.source.path, input.source.line)),
         waitForVerificationMs,
@@ -348,12 +372,29 @@ export class BreakpointService {
     return this.readRequestedBreakpoints().find(bp => this.breakpointId(bp) === breakpointId);
   }
 
+  /** Reconstructs a `BreakpointInput` from a captured requested breakpoint (for replace rollback). */
+  private toInput(bp: RequestedBreakpoint): BreakpointInput {
+    return {
+      source: { ...bp.source },
+      enabled: bp.enabled,
+      ...(bp.condition !== undefined ? { condition: bp.condition } : {}),
+      ...(bp.hitCondition !== undefined ? { hitCondition: bp.hitCondition } : {}),
+      ...(bp.logMessage !== undefined ? { logMessage: bp.logMessage } : {}),
+    };
+  }
+
   /**
    * Resolves the exact active session (if any) and its DAP verified snapshot.
    * A generation race or a snapshot failure degrades to an empty verified map —
-   * reads are never forwarded past the fence.
+   * reads are never forwarded past the fence. The returned snapshot is
+   * eventually consistent: VS Code re-syncs a source's breakpoints to the DAP
+   * asynchronously after a mutation, so an immediate read may be transient.
    */
-  private async resolveDap(): Promise<{ ref?: SessionRef; map: Map<string, AutomationBreakpointSnapshot> }> {
+  private async resolveDap(): Promise<{
+    ref?: SessionRef;
+    map: Map<string, AutomationBreakpointSnapshot>;
+    capabilities?: AutomationBreakpointCapabilities;
+  }> {
     const ref = this.opts.registry.currentRef();
     if (!ref) return { map: new Map() };
     let session: vscode.DebugSession;
@@ -369,7 +410,7 @@ export class BreakpointService {
         if (!item || typeof item.line !== 'number' || !Number.isInteger(item.line)) continue;
         map.set(this.locationKey(item.path, item.line), item);
       }
-      return { ref, map };
+      return { ref, map, capabilities: result?.capabilities };
     } catch {
       return { ref, map: new Map() };
     }
@@ -378,7 +419,7 @@ export class BreakpointService {
   /** Merges the requested set with the DAP verified snapshot, optionally filtered by source. */
   private async mergeItems(filter: { sourcePath?: string } = {}): Promise<AutomationBreakpoint[]> {
     const requested = this.readRequestedBreakpoints();
-    const { ref, map } = await this.resolveDap();
+    const { ref, map, capabilities } = await this.resolveDap();
     const items: AutomationBreakpoint[] = [];
     for (const bp of requested) {
       if (
@@ -392,6 +433,7 @@ export class BreakpointService {
         map.get(this.locationKey(bp.source.path, bp.source.line)),
         ref?.sessionId,
         ref?.sessionGeneration,
+        capabilities,
       ));
     }
     return items;
@@ -399,12 +441,13 @@ export class BreakpointService {
 
   /** Merged view of a single requested breakpoint against the current DAP state. */
   private async toMerged(bp: RequestedBreakpoint): Promise<AutomationBreakpoint> {
-    const { ref, map } = await this.resolveDap();
+    const { ref, map, capabilities } = await this.resolveDap();
     return this.toAutomationBreakpoint(
       bp,
       map.get(this.locationKey(bp.source.path, bp.source.line)),
       ref?.sessionId,
       ref?.sessionGeneration,
+      capabilities,
     );
   }
 
@@ -413,6 +456,7 @@ export class BreakpointService {
     dapEntry: AutomationBreakpointSnapshot | undefined,
     sessionId: string | undefined,
     sessionGeneration: number | undefined,
+    capabilities: AutomationBreakpointCapabilities | undefined,
   ): AutomationBreakpoint {
     const result: AutomationBreakpoint = {
       breakpointId: this.breakpointId(bp),
@@ -424,9 +468,36 @@ export class BreakpointService {
     if (bp.hitCondition !== undefined) result.hitCondition = bp.hitCondition;
     if (bp.logMessage !== undefined) result.logMessage = bp.logMessage;
     if (dapEntry?.slot !== undefined) result.slot = dapEntry.slot;
+    if (dapEntry?.address !== undefined) result.address = dapEntry.address;
     if (sessionId !== undefined) result.sessionId = sessionId;
     if (sessionGeneration !== undefined) result.sessionGeneration = sessionGeneration;
+    const capabilityMessage = this.capabilityMessage(bp, capabilities);
+    if (capabilityMessage !== undefined) result.message = capabilityMessage;
     return result;
+  }
+
+  /**
+   * Honest `message` for breakpoint fields the active adapter accepts but does
+   * not enforce (conditional / hit-conditional / log points). Without a session
+   * there is no capability snapshot, so unverified breakpoints carry no message
+   * (their `verified=false` already signals they are inactive).
+   */
+  private capabilityMessage(
+    bp: RequestedBreakpoint,
+    capabilities: AutomationBreakpointCapabilities | undefined,
+  ): string | undefined {
+    if (!capabilities) return undefined;
+    const notes: string[] = [];
+    if (bp.condition !== undefined && !capabilities.conditional) {
+      notes.push('condition is not enforced by the active debug adapter');
+    }
+    if (bp.hitCondition !== undefined && !capabilities.hitConditional) {
+      notes.push('hit condition is not enforced by the active debug adapter');
+    }
+    if (bp.logMessage !== undefined && !capabilities.logPoints) {
+      notes.push('log message is not enforced by the active debug adapter');
+    }
+    return notes.length > 0 ? notes.join('; ') : undefined;
   }
 
   /** Polls the DAP snapshot until every target location is verified or the deadline. */

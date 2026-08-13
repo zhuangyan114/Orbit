@@ -308,8 +308,11 @@ export type TransportKind = 'native' | 'legacy' | 'hid' | 'winusb';
 
 /** OpenRPC SourceLocation (`#/components/schemas/SourceLocation`). */
 export interface SourceLocation {
+  /** Absolute filesystem path (not a `file://` URI). */
   path: string;
+  /** 1-based line number. */
   line: number;
+  /** 1-based column; omitted means the first character (column 1). */
   column?: number;
   endLine?: number;
   endColumn?: number;

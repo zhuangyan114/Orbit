@@ -250,8 +250,9 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.debug.onDidChangeBreakpoints(() => {
         // VS Code breakpoint set is the single authority (plan Task 6); publish
         // the derived change so SSE clients (Task 11) re-read breakpoints.list.
+        // Count only source breakpoints — the same set breakpoints.list exposes.
         eventHub?.publish('breakpoints.changed', {
-          data: { breakpointCount: vscode.debug.breakpoints.length },
+          data: { breakpointCount: breakpointService.countSourceBreakpoints() },
         });
       }),
 

@@ -189,6 +189,8 @@ export class DapSession extends EventEmitter {
   private activeMemoryReadAbortController: AbortController | null = null;
 
   private breakpoints = new Map<string, number>();
+  /** Resolved instruction address per `${path}:${line}` key, for the automation snapshot. */
+  private breakpointAddresses = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
   private automationCapture: AutomationCapture | null = null;
 
@@ -1976,7 +1978,7 @@ export class DapSession extends EventEmitter {
     this.flashAbortController?.abort('DAP disconnect requested');
     (this.backend as any).cancelFlash?.('DAP disconnect requested');
     try {
-      this.breakpoints.clear();
+      this.forgetAllBreakpoints();
       await this.backend.execute({ cmd: 'disconnect' });
       await this.backend.dispose(true);
       this.backend.configureNativeSteps(false);
@@ -1989,6 +1991,30 @@ export class DapSession extends EventEmitter {
     } finally {
       this.endControl();
     }
+  }
+
+  /**
+   * Records one verified breakpoint entry. `address` is optional because some
+   * legacy owners report only a slot id; both maps stay in sync so the
+   * automation snapshot can expose resolved addresses.
+   */
+  private rememberBreakpoint(key: string, id: number, address?: number): void {
+    this.breakpoints.set(key, id);
+    if (typeof address === 'number' && Number.isFinite(address)) {
+      this.breakpointAddresses.set(key, address);
+    } else {
+      this.breakpointAddresses.delete(key);
+    }
+  }
+
+  private forgetBreakpoint(key: string): void {
+    this.breakpoints.delete(key);
+    this.breakpointAddresses.delete(key);
+  }
+
+  private forgetAllBreakpoints(): void {
+    this.breakpoints.clear();
+    this.breakpointAddresses.clear();
   }
 
   private async handleSetBreakpoints(msg: DebugProtocolMessage) {
@@ -2060,7 +2086,7 @@ export class DapSession extends EventEmitter {
         const referencedByAnotherSource = Array.from(this.breakpoints.entries())
           .some(([key, mappedIndex]) => !key.startsWith(sourcePrefix) && mappedIndex === bpIndex);
         if (referencedByAnotherSource) {
-          for (const key of sourceKeys) this.breakpoints.delete(key);
+          for (const key of sourceKeys) this.forgetBreakpoint(key);
           continue;
         }
         log.dap(`handleSetBreakpoints: clearing old slot index=${bpIndex} source=${filePath}`);
@@ -2075,7 +2101,7 @@ export class DapSession extends EventEmitter {
           sendFailure(clearResult, lines);
           return;
         }
-        for (const key of sourceKeys) this.breakpoints.delete(key);
+        for (const key of sourceKeys) this.forgetBreakpoint(key);
       }
 
       for (let index = 0; index < lines.length; ++index) {
@@ -2103,7 +2129,7 @@ export class DapSession extends EventEmitter {
           sendFailure(result, lines.slice(index + 1));
           return;
         }
-        const data = result.data as { id?: unknown } | undefined;
+        const data = result.data as { id?: unknown; address?: unknown } | undefined;
         if (!data || !Number.isInteger(data.id) || (data.id as number) < 0) {
           const failure = {
             error: 'setBreakpoint returned no valid hardware slot id',
@@ -2115,7 +2141,7 @@ export class DapSession extends EventEmitter {
         }
         const id = data.id as number;
         const key = `${filePath}:${line}`;
-        this.breakpoints.set(key, id);
+        this.rememberBreakpoint(key, id, typeof data.address === 'number' ? data.address : undefined);
         results.push({ verified: true, line, id });
       }
 
@@ -2858,7 +2884,7 @@ export class DapSession extends EventEmitter {
         }
         if (this._probe !== 'cmsis-dap') {
           await this.backend.execute({ cmd: 'clearAllBreakpoints' });
-          this.breakpoints.clear();
+          this.forgetAllBreakpoints();
         }
 
         if (this._probe !== 'cmsis-dap') {
@@ -2866,7 +2892,7 @@ export class DapSession extends EventEmitter {
             const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
             if (result.ok) {
               const data = result.data as any;
-              this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+              this.rememberBreakpoint(`${bp.file}:${bp.line}`, data.id, typeof data.address === 'number' ? data.address : undefined);
             }
           }
         }
@@ -2904,9 +2930,22 @@ export class DapSession extends EventEmitter {
       const path = key.slice(0, separator);
       const line = Number(key.slice(separator + 1));
       if (!Number.isInteger(line) || line <= 0) continue;
-      breakpoints.push({ path, line, verified: true, slot });
+      const address = this.breakpointAddresses.get(key);
+      breakpoints.push({
+        path,
+        line,
+        verified: true,
+        slot,
+        ...(typeof address === 'number' ? { address: `0x${(address >>> 0).toString(16)}` } : {}),
+      });
     }
-    this.sendResponse(msg, { breakpoints });
+    // These mirror the adapter's `initialize` capabilities (all unsupported in
+    // this build): the Extension Host uses them to annotate condition/hit/log
+    // breakpoints that are accepted but not enforced.
+    this.sendResponse(msg, {
+      breakpoints,
+      capabilities: { conditional: false, hitConditional: false, logPoints: false },
+    });
   }
 
   private async handleAutomationControl(msg: DebugProtocolMessage) {

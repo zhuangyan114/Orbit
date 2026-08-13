@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BreakpointInput, SessionRef } from './protocol';
 import { SessionRegistry } from './session-registry';
 import { BreakpointService, BreakpointServiceOptions } from './breakpoint-service';
+import { AutomationBreakpointCapabilities } from '../debug/dap-automation-protocol';
 
 // The service only touches vscode values inside its default seams; every seam
 // is overridden in these tests, so an empty module mock is enough for the
@@ -23,6 +24,7 @@ interface DapEntry {
   line: number;
   verified: boolean;
   slot?: number;
+  address?: string;
 }
 
 function bp(path: string, line0: number, opts: {
@@ -68,6 +70,7 @@ interface TestContext {
   registry: SessionRegistry;
   requested: FakeBreakpoint[];
   dap: DapEntry[];
+  caps: AutomationBreakpointCapabilities;
   addCalls: BreakpointInput[][];
   removeCalls: unknown[][];
   advance: (ms: number) => void;
@@ -79,6 +82,7 @@ function makeService(overrides: Partial<BreakpointServiceOptions> = {}): TestCon
   const registry = new SessionRegistry();
   const requested: FakeBreakpoint[] = [];
   const dap: DapEntry[] = [];
+  const caps: AutomationBreakpointCapabilities = { conditional: false, hitConditional: false, logPoints: false };
   const addCalls: BreakpointInput[][] = [];
   const removeCalls: unknown[][] = [];
   let clock = 0;
@@ -91,7 +95,13 @@ function makeService(overrides: Partial<BreakpointServiceOptions> = {}): TestCon
       for (const item of inputs) {
         // Mirror buildLocation: VS Code always materializes a character, so an
         // unspecified column becomes character 0 and reads back as column 1.
-        requested.push(bp(item.source.path, item.source.line - 1, {
+        // VS Code also dedupes a same-location breakpoint instead of adding a
+        // second gutter marker.
+        const line0 = item.source.line - 1;
+        if (requested.some(b => b.location.uri.fsPath === item.source.path && b.location.range.start.line === line0)) {
+          continue;
+        }
+        requested.push(bp(item.source.path, line0, {
           column0: (item.source.column ?? 1) - 1,
           enabled: item.enabled,
           condition: item.condition,
@@ -107,7 +117,7 @@ function makeService(overrides: Partial<BreakpointServiceOptions> = {}): TestCon
         if (index >= 0) requested.splice(index, 1);
       }
     },
-    snapshotDap: async () => ({ breakpoints: dap.map(entry => ({ ...entry })) }),
+    snapshotDap: async () => ({ breakpoints: dap.map(entry => ({ ...entry })), capabilities: { ...caps } }),
     sleep: async ms => {
       clock += ms;
     },
@@ -121,6 +131,7 @@ function makeService(overrides: Partial<BreakpointServiceOptions> = {}): TestCon
     registry,
     requested,
     dap,
+    caps,
     addCalls,
     removeCalls,
     advance: ms => {
@@ -354,5 +365,72 @@ describe('BreakpointService', () => {
   it('rejects an unknown cursor', async () => {
     ctx.requested.push(bp('C:\\ws\\main.c', 0));
     await expect(ctx.service.list({ cursor: 'bp_unknown' })).rejects.toMatchObject({ errorCode: 'InvalidRequest' });
+  });
+
+  it('annotates condition/hit/log breakpoints the adapter does not enforce (M1)', async () => {
+    ctx.startSession();
+    ctx.requested.push(bp('C:\\ws\\main.c', 9, { condition: 'x > 5', logMessage: 'hit {x}' }));
+    const data = await ctx.service.list();
+    expect(data.items[0].message).toContain('condition is not enforced');
+    expect(data.items[0].message).toContain('log message is not enforced');
+  });
+
+  it('does not annotate when the adapter reports the capability as supported', async () => {
+    ctx.startSession();
+    ctx.caps.conditional = true;
+    ctx.caps.logPoints = true;
+    ctx.requested.push(bp('C:\\ws\\main.c', 9, { condition: 'x > 5', logMessage: 'hit {x}' }));
+    const data = await ctx.service.list();
+    expect(data.items[0].message).toBeUndefined();
+  });
+
+  it('surfaces the resolved breakpoint address from the DAP snapshot (L2)', async () => {
+    ctx.startSession();
+    ctx.requested.push(bp('C:\\ws\\main.c', 9));
+    ctx.dap.push({ path: 'c:/ws/main.c', line: 10, verified: true, slot: 0, address: '0x8004e9c' });
+    const data = await ctx.service.list();
+    expect(data.items[0]).toMatchObject({ verified: true, slot: 0, address: '0x8004e9c' });
+  });
+
+  it('restores the previous set when replace add fails (M2 rollback)', async () => {
+    const registry = new SessionRegistry();
+    const requested: FakeBreakpoint[] = [bp('C:\\ws\\main.c', 9), bp('C:\\ws\\main.c', 19)];
+    const service = new BreakpointService({
+      registry,
+      listBreakpoints: () => requested as unknown as never[],
+      addBreakpoints: async inputs => {
+        if (inputs.some(i => i.source.line === 11)) throw new Error('add failed');
+        for (const i of inputs) {
+          requested.push(bp(i.source.path, i.source.line - 1, {
+            column0: (i.source.column ?? 1) - 1, enabled: i.enabled,
+            condition: i.condition, hitCondition: i.hitCondition, logMessage: i.logMessage,
+          }));
+        }
+      },
+      removeBreakpoints: async bps => {
+        for (const t of bps) {
+          const idx = requested.indexOf(t as unknown as FakeBreakpoint);
+          if (idx >= 0) requested.splice(idx, 1);
+        }
+      },
+      snapshotDap: async () => ({ breakpoints: [], capabilities: { conditional: false, hitConditional: false, logPoints: false } }),
+      sleep: async () => {},
+      now: () => 0,
+      normalizePath: p => p.replace(/\\/g, '/').toLowerCase(),
+    });
+
+    await expect(
+      service.replace('C:\\ws\\main.c', [input('C:\\ws\\main.c', 11)], 0, 'op'),
+    ).rejects.toThrow('add failed');
+    // The previous set (lines 10 and 20) was restored.
+    expect(requested.map(b => b.location.range.start.line).sort((a, b) => a - b)).toEqual([9, 19]);
+  });
+
+  it('treats a duplicate add as idempotent and returns the existing breakpoint (L5)', async () => {
+    ctx.requested.push(bp('C:\\ws\\main.c', 9));
+    const first = await ctx.service.add(input('C:\\ws\\main.c', 10), 0, 'op1');
+    const second = await ctx.service.add(input('C:\\ws\\main.c', 10), 0, 'op2');
+    expect(ctx.requested).toHaveLength(1);
+    expect(first.items[0].breakpointId).toBe(second.items[0].breakpointId);
   });
 });

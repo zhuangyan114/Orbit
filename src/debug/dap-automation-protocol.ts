@@ -241,16 +241,32 @@ export function standardCommandForAction(request: AutomationControlRequest): Sta
 /**
  * DAP-side verified breakpoint (plan Task 6). The adapter tracks verified
  * hardware breakpoints by normalized source location; unverified breakpoints
- * are simply absent. `slot` is the selected owner's hardware slot id.
+ * are simply absent. `slot` is the selected owner's hardware slot id and
+ * `address` the resolved instruction address (0x-prefixed hex) when the owner
+ * reports it.
  */
 export interface AutomationBreakpointSnapshot {
   path: string;
   line: number;
   verified: boolean;
   slot?: number;
+  address?: string;
+}
+
+/**
+ * Adapter capabilities for the breakpoint kinds the frozen public DTO carries.
+ * These mirror the adapter's `initialize` response; a `false` value means the
+ * corresponding field (condition/hitCondition/logMessage) is accepted by the
+ * Extension Host but NOT enforced by the adapter.
+ */
+export interface AutomationBreakpointCapabilities {
+  conditional: boolean;
+  hitConditional: boolean;
+  logPoints: boolean;
 }
 
 /** Result of the `orbitBreakpointsSnapshot` custom request. */
 export interface AutomationBreakpointsResult {
   breakpoints: AutomationBreakpointSnapshot[];
+  capabilities: AutomationBreakpointCapabilities;
 }

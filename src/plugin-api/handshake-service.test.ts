@@ -165,6 +165,29 @@ describe('HandshakeService.handshake', () => {
     service.close(connectionId);
     expect(service.handshake(request(), CONTEXT).connectionId).toMatch(/^conn_/);
   });
+
+  it('prunes expired leases so they never occupy connection slots', () => {
+    const { service, advance } = makeService({ maxConnections: 2 });
+    const first = service.handshake(request(), CONTEXT);
+    service.handshake(request(), CONTEXT);
+    advance(10 * 60_000 + 1); // both leases now expired
+    // Without pruning this would be RateLimited forever: close is refused for
+    // expired connections, so the slots could never be freed.
+    const third = service.handshake(request(), CONTEXT);
+    expect(third.connectionId).toMatch(/^conn_/);
+    expect(service.get(first.connectionId)).toBeUndefined();
+    expect([...service.connections()]).toHaveLength(1);
+  });
+
+  it('rejects workspaceRoot containing .. segments', () => {
+    const { service } = makeService();
+    expect(() =>
+      service.handshake(
+        request({ expected: { projectId: 'sha256:project-1', workspaceRoot: 'C:\\work\\robot\\..\\secret' } }),
+        CONTEXT,
+      ),
+    ).toThrowError(expect.objectContaining({ errorCode: 'ProjectMismatch' }));
+  });
 });
 
 describe('HandshakeService lease lifecycle', () => {

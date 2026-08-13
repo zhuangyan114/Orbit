@@ -250,7 +250,27 @@ export function defaultCapabilities(): Capability[] {
   ];
 }
 
+/**
+ * Health probes must never leave the machine: endpoint files are per-user
+ * writable, so a tampered `healthUrl` must not turn startup cleanup into an
+ * outbound request to an arbitrary host.
+ */
+export function isLoopbackHealthUrl(healthUrl: string): boolean {
+  try {
+    const parsed = new URL(healthUrl);
+    return (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1')
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function probeHealthUrl(healthUrl: string, timeoutMs = 300): Promise<HealthProbeResult> {
+  if (!isLoopbackHealthUrl(healthUrl)) {
+    return Promise.resolve({ ok: false });
+  }
   return new Promise(resolve => {
     const request = http.get(healthUrl, { timeout: timeoutMs }, response => {
       let body = '';
@@ -327,6 +347,9 @@ export class InstanceRegistry {
   private bound?: BoundServerInfo & { healthUrl: string };
   private startedAtMs?: number;
   private heartbeatTimer?: NodeJS.Timeout;
+  private beatInFlight?: Promise<void>;
+  /** Directories this instance already hardened; on Windows their (OI)(CI) ACLs inherit to new files. */
+  private readonly hardenedDirectories = new Set<string>();
   private disposed = false;
 
   constructor(private readonly options: InstanceRegistryOptions) {}
@@ -368,9 +391,7 @@ export class InstanceRegistry {
       throw error;
     }
     const timer = setInterval(() => {
-      void this.beat().catch(error => {
-        console.error(`[Orbit] automation endpoint heartbeat failed: ${(error as Error)?.message ?? String(error)}`);
-      });
+      this.beatInFlight = this.runBeat();
     }, this.options.heartbeatIntervalMs ?? 5000);
     timer.unref?.();
     this.heartbeatTimer = timer;
@@ -440,6 +461,15 @@ export class InstanceRegistry {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
     if (!this.instanceId) return;
+    // Wait for an in-flight heartbeat so its atomic rename cannot resurrect
+    // the endpoint file after the unlink below.
+    if (this.beatInFlight) {
+      try {
+        await this.beatInFlight;
+      } catch {
+        // runBeat never rejects; this is defensive only.
+      }
+    }
     await this.fs.unlink(this.endpointFilePath()).catch(error => {
       if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
         console.error(`[Orbit] failed to remove automation endpoint: ${(error as Error)?.message ?? String(error)}`);
@@ -493,6 +523,7 @@ export class InstanceRegistry {
     await this.assertNoReparse(directory);
     await this.fs.mkdir(directory, { recursive: true, mode: 0o700 });
     await this.harden(directory, 'directory');
+    this.hardenedDirectories.add(path.normalize(directory));
   }
 
   /** Rejects symlink/junction/reparse points on the parent, target and temp file before writing (§2.6). */
@@ -516,7 +547,14 @@ export class InstanceRegistry {
     const tempPath = `${targetPath}.${randomUUID().replace(/-/g, '').slice(0, 12)}.tmp`;
     await this.fs.writeFile(tempPath, data, { mode: 0o600 });
     try {
-      await this.harden(tempPath, 'file');
+      // On Windows a directory hardened with /grant:r (OI)(CI) propagates its
+      // ACL to every new child, so per-heartbeat icacls spawns on temp files
+      // under directories this instance already hardened are redundant — and
+      // each spawn is a process the heartbeat must not create every 5 s.
+      const parentHardened = this.hardenedDirectories.has(path.normalize(path.dirname(targetPath)));
+      if (!(this.platform === 'win32' && parentHardened)) {
+        await this.harden(tempPath, 'file');
+      }
     } catch (error) {
       await this.fs.unlink(tempPath).catch(() => undefined);
       throw error;
@@ -557,10 +595,18 @@ export class InstanceRegistry {
     await this.writeAtomic(this.endpointFilePath(), content);
   }
 
-  private async beat(): Promise<void> {
-    if (this.disposed || !this.bound) return;
-    await this.writeEndpointFile();
-    await this.syncLegacyPointer();
+  /** One heartbeat tick; never rejects so dispose() can safely await the in-flight tick. */
+  private runBeat(): Promise<void> {
+    return (async () => {
+      if (this.disposed || !this.bound) return;
+      try {
+        await this.writeEndpointFile();
+        if (this.disposed) return;
+        await this.syncLegacyPointer();
+      } catch (error) {
+        console.error(`[Orbit] automation endpoint heartbeat failed: ${(error as Error)?.message ?? String(error)}`);
+      }
+    })();
   }
 
   private async readRegistryPointer(pointerPath: string): Promise<RegistryPointerFile | undefined> {
@@ -684,6 +730,9 @@ export class InstanceRegistry {
         live.push(summary);
         continue;
       }
+      if (!isLoopbackHealthUrl(summary.healthUrl)) {
+        continue; // untrusted health URL: keep the file, never probe it
+      }
       const probe = await this.probeHealth(summary.healthUrl, this.options.healthTimeoutMs ?? 300);
       if (!probe.ok) {
         dead.push(filePath);
@@ -713,6 +762,13 @@ export class InstanceRegistry {
    */
   private async syncLegacyPointer(): Promise<void> {
     if (!this.options.legacyPointerPath) return;
+    // The legacy pointer parent (this extension's globalStorage) is hardened
+    // once per session so its children inherit the ACL on Windows; after that
+    // the five-second heartbeat writes no further icacls processes.
+    const parent = path.normalize(path.dirname(this.options.legacyPointerPath));
+    if (!this.hardenedDirectories.has(parent)) {
+      await this.ensureDirectory(parent);
+    }
     const { live } = await this.scanEndpointFiles();
     if (live.length === 0) {
       await this.fs.unlink(this.options.legacyPointerPath).catch(error => {

@@ -28,6 +28,7 @@ class MemoryFs implements RegistryFileSystem {
   symlinks = new Set<string>();
   writeErrors = new Map<string, string>();
   writtenPaths: string[] = [];
+  renameDelayMs = 0;
 
   private notFound(p: string): NodeJS.ErrnoException {
     const error = new Error(`ENOENT: no such file or directory '${p}'`) as NodeJS.ErrnoException;
@@ -90,6 +91,9 @@ class MemoryFs implements RegistryFileSystem {
   }
 
   async rename(from: string, to: string) {
+    if (this.renameDelayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, this.renameDelayMs));
+    }
     const nf = this.norm(from);
     const nt = this.norm(to);
     const data = this.files.get(nf);
@@ -343,7 +347,7 @@ describe('InstanceRegistry start/describe', () => {
     expect(harness.memoryFs.files.has(path.normalize(endpointFile(harness, instanceId)))).toBe(false);
   });
 
-  it('hardens directories and files and fails closed when hardening fails', async () => {
+  it('hardens directories once (Windows ACL inheritance) and keeps per-file hardening on POSIX', async () => {
     const harness = makeRegistry();
     await harness.registry.start(boundServer());
     const calls = harness.harden.mock.calls.map(([p, kind]) => [path.normalize(p), kind] as const);
@@ -352,13 +356,31 @@ describe('InstanceRegistry start/describe', () => {
       expect.arrayContaining([
         [path.normalize(ENDPOINT_DIR), 'directory'],
         [path.normalize(path.dirname(POINTER_PATH)), 'directory'],
+        [path.normalize(path.dirname(LEGACY_POINTER)), 'directory'],
       ]),
     );
-    // files are hardened while still temp, before the atomic rename makes them visible
-    const files = calls.filter(([, kind]) => kind === 'file');
-    expect(files.length).toBeGreaterThanOrEqual(2);
-    for (const [filePath] of files) expect(filePath).toContain('.tmp');
+    // On Windows the hardened directories propagate (OI)(CI) ACLs to children,
+    // so the heartbeat must not spawn per-file hardening processes.
+    expect(calls.filter(([, kind]) => kind === 'file')).toEqual([]);
 
+    const posix = makeRegistry({ platform: 'linux' });
+    await posix.registry.start(boundServer());
+    expect(posix.harden.mock.calls.some(([, kind]) => kind === 'file')).toBe(true);
+  });
+
+  it('performs no hardening work during heartbeats', async () => {
+    vi.useFakeTimers();
+    const harness = makeRegistry();
+    await harness.registry.start(boundServer());
+    const callsAtStart = harness.harden.mock.calls.length;
+    harness.clock.now += 5000;
+    await vi.advanceTimersByTimeAsync(5000);
+    harness.clock.now += 5000;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(harness.harden.mock.calls.length).toBe(callsAtStart);
+  });
+
+  it('fails closed when hardening fails', async () => {
     const failing = makeRegistry({ harden: vi.fn(async () => Promise.reject(new Error('icacls denied'))) });
     await expect(failing.registry.start(boundServer())).rejects.toThrow(/icacls denied/);
   });
@@ -396,6 +418,27 @@ describe('InstanceRegistry start/describe', () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(memoryFs.files.get(victim)).toBe('VICTIM');
     expect(memoryFs.symlinks.has(endpointPath)).toBe(true);
+  });
+
+  it('dispose waits for an in-flight heartbeat so the endpoint cannot resurrect', async () => {
+    vi.useFakeTimers();
+    const memoryFs = new MemoryFs();
+    const harness = makeRegistry({}, memoryFs);
+    await harness.registry.start(boundServer());
+    const instanceId = harness.registry.getInstanceId();
+    memoryFs.renameDelayMs = 10_000; // the next atomic rename takes 10 s of timer time
+    harness.clock.now += 5000;
+    await vi.advanceTimersByTimeAsync(5000); // heartbeat starts, its rename is pending
+    memoryFs.renameDelayMs = 0; // dispose's own writes must not be delayed
+    const disposing = harness.registry.dispose();
+    await vi.advanceTimersByTimeAsync(10_000); // completes the in-flight rename inside dispose's wait
+    await disposing;
+    expect(memoryFs.files.has(path.normalize(endpointFile(harness, instanceId)))).toBe(false);
+    // no further heartbeat writes after dispose
+    const writtenAtDispose = memoryFs.writtenPaths.length;
+    harness.clock.now += 15_000;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(memoryFs.writtenPaths.length).toBe(writtenAtDispose);
   });
 });
 
@@ -520,6 +563,39 @@ describe('InstanceRegistry stale cleanup', () => {
     expect(names).toContain('garbage.json');
     // the live instance never deletes its own endpoint
     expect(names).toContain(`${harness.registry.getInstanceId()}.json`);
+  });
+
+  it('never probes health urls that are not loopback', async () => {
+    const memoryFs = new MemoryFs();
+    const now = 1786540000000;
+    const stale = now - 60_000;
+    memoryFs.files.set(
+      path.join(ENDPOINT_DIR, 'evil.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        instanceId: 'evil',
+        projectId: 'sha256:seed',
+        channel: 'stable',
+        profile: '',
+        extensionHost: 'local',
+        workspaceFolders: [],
+        host: '127.0.0.1',
+        port: 47000,
+        rpcUrl: 'http://127.0.0.1:47000/v1/rpc',
+        eventsUrl: 'http://127.0.0.1:47000/v1/events',
+        healthUrl: 'http://evil.example/health',
+        token: '',
+        processId: 1,
+        startedAt: stale,
+        heartbeatAt: stale,
+        apiVersions: ['1.0'],
+      }),
+    );
+    const probe = vi.fn(async (_healthUrl: string) => ({ ok: false }));
+    const harness = makeRegistry({ probeHealth: probe }, memoryFs);
+    await harness.registry.start(boundServer());
+    expect(probe).not.toHaveBeenCalled();
+    expect(await memoryFs.readdir(ENDPOINT_DIR)).toContain('evil.json');
   });
 });
 

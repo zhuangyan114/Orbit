@@ -91,6 +91,10 @@ export class HandshakeService {
         false,
       );
     }
+    // Expired leases must never occupy connection slots: without pruning, a
+    // client could fill all 32 slots with expired leases (close is refused
+    // for expired connections) and block every future handshake.
+    this.pruneExpired();
     if (this.leases.size >= (this.options.maxConnections ?? MAX_CONNECTIONS)) {
       throw new AutomationError(
         'RateLimited',
@@ -135,7 +139,11 @@ export class HandshakeService {
   /** Any successful request renews the lease (§2.3). */
   touch(connectionId: string): void {
     const lease = this.leases.get(connectionId);
-    if (!lease || lease.expiresAt <= this.now()) return;
+    if (!lease) return;
+    if (lease.expiresAt <= this.now()) {
+      this.leases.delete(connectionId);
+      return;
+    }
     lease.expiresAt = this.now() + (this.options.leaseTtlMs ?? DEFAULT_CONNECTION_LEASE_MS);
   }
 
@@ -167,7 +175,17 @@ export class HandshakeService {
     return this.leases.keys();
   }
 
+  private pruneExpired(): void {
+    const now = this.now();
+    for (const [connectionId, lease] of this.leases) {
+      if (lease.expiresAt <= now) this.leases.delete(connectionId);
+    }
+  }
+
   private workspaceRootMatches(root: string): boolean {
+    // Reject `..` segments: the prefix check must never accept a path that
+    // resolves outside the workspace root.
+    if (root.split(/[\\/]/).includes('..')) return false;
     const normalized = normalizeFsPath(root, this.options.platform ?? process.platform);
     return this.options.getWorkspaceFolders().some(folder => {
       const folderPath = normalizeFsPath(folder.path, this.options.platform ?? process.platform);

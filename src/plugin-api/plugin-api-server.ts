@@ -22,10 +22,10 @@ import {
 } from './types';
 import {
   AUTOMATION_SCOPES,
+  AutomationError,
   AutomationScope,
   BootstrapContext,
   ConnectionContext,
-  JsonRpcResponse as JsonRpc20Response,
 } from './protocol';
 import { buildMethodDefinition, RpcDispatcher } from './rpc-dispatcher';
 import {
@@ -330,19 +330,23 @@ export class PluginApiServer implements vscode.Disposable {
 
   /** /health exposes only non-sensitive instance identity; never the token (§2.6). */
   private handleHealth(res: http.ServerResponse): void {
-    if (!this.startedAtMs) {
+    try {
+      if (!this.startedAtMs) {
+        this.writeJson(res, 503, { ok: false, status: 'starting' });
+        return;
+      }
+      this.writeJson(res, 200, {
+        ok: true,
+        status: 'ok',
+        instanceId: this.registry.getInstanceId(),
+        projectId: this.registry.getProjectId(),
+        apiVersion: API_VERSION,
+        uptimeMs: Date.now() - this.startedAtMs,
+        pid: process.pid,
+      });
+    } catch {
       this.writeJson(res, 503, { ok: false, status: 'starting' });
-      return;
     }
-    this.writeJson(res, 200, {
-      ok: true,
-      status: 'ok',
-      instanceId: this.registry.getInstanceId(),
-      projectId: this.registry.getProjectId(),
-      apiVersion: API_VERSION,
-      uptimeMs: Date.now() - this.startedAtMs,
-      pid: process.pid,
-    });
   }
 
   private async handleV1Rpc(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -352,7 +356,18 @@ export class PluginApiServer implements vscode.Disposable {
     }
     try {
       const body = await this.readBody(req);
-      const request = JSON.parse(body) as unknown;
+      let request: unknown;
+      try {
+        request = JSON.parse(body) as unknown;
+      } catch {
+        // Malformed JSON must still produce a JSON-RPC 2.0 ParseError envelope.
+        this.writeJson(res, 200, {
+          jsonrpc: '2.0',
+          id: null,
+          error: new AutomationError('ParseError', 'invalid JSON body', false).toJsonRpcErrorObject(),
+        });
+        return;
+      }
       if (!this.dispatcher) {
         this.writeJson(res, 503, { ok: false, error: 'Automation API is starting' });
         return;

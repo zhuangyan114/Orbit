@@ -277,6 +277,63 @@ export interface ProjectDescription {
   registryGeneration: number;
 }
 
+// --- Session DTOs (OpenRPC, plan Task 3). Frozen shapes; Task 4+ register the
+// --- methods that return them, the SessionRegistry owns the runtime values.
+
+/** OpenRPC SessionPhase. */
+export type SessionPhase =
+  | 'starting'
+  | 'connected'
+  | 'running'
+  | 'halted'
+  | 'terminating'
+  | 'terminated'
+  | 'error';
+
+/** OpenRPC TargetStateKind. */
+export type TargetStateKind = 'unknown' | 'disconnected' | 'running' | 'halted' | 'resetting';
+
+/** OpenRPC ProbeKind (launch configuration probe selection). */
+export type ProbeKind = 'jlink' | 'cmsis-dap';
+
+/** OpenRPC TransportKind (owner transport / CMSIS-DAP interface). */
+export type TransportKind = 'native' | 'legacy' | 'hid' | 'winusb';
+
+/** OpenRPC SourceLocation as used inside SessionSnapshot (`location`). */
+export interface SessionLocation {
+  path: string;
+  line: number;
+  column?: number;
+  endLine?: number;
+  endColumn?: number;
+}
+
+/** OpenRPC SessionSnapshot. */
+export interface SessionSnapshot {
+  sessionId: string;
+  sessionGeneration: number;
+  registryGeneration: number;
+  name: string;
+  type: 'orbit' | 'ozone';
+  phase: SessionPhase;
+  targetState: TargetStateKind;
+  owner?: OwnerKind;
+  probe?: ProbeKind;
+  transport?: TransportKind;
+  stopReason?: string;
+  /** OpenRPC Address: 0x-prefixed hex string. */
+  pc?: string;
+  threadId?: number;
+  location?: SessionLocation;
+  capabilities: Capability[];
+}
+
+/** OpenRPC SessionListData (data of orbit.session.list). */
+export interface SessionListData {
+  items: SessionSnapshot[];
+  nextCursor?: string | null;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

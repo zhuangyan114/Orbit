@@ -39,6 +39,7 @@ import {
 } from './instance-registry';
 import { HandshakeService } from './handshake-service';
 import { LaunchConfigurationSummary, WorkspaceFolderInfo } from './protocol';
+import { SessionRegistry } from './session-registry';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -78,6 +79,8 @@ export interface PluginApiServerOptions {
   registry?: InstanceRegistry;
   /** Injected for tests; defaults to a registry-backed HandshakeService. */
   handshakeFactory?: (registry: InstanceRegistry) => HandshakeService;
+  /** Exact DebugSession registration and generation fence (plan Task 3). */
+  sessionRegistry?: SessionRegistry;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -141,13 +144,26 @@ export class PluginApiServer implements vscode.Disposable {
   private dispatcher: RpcDispatcher | null = null;
   private startedAtMs = 0;
 
-  constructor(private context: vscode.ExtensionContext, backend: OzoneBackend, options: PluginApiServerOptions = {}) {
-    this.runtime = new RuntimeRouter(backend);
+  constructor(
+    private context: vscode.ExtensionContext,
+    backend: OzoneBackend,
+    private readonly options: PluginApiServerOptions = {},
+  ) {
+    const sessionRegistry = this.options.sessionRegistry;
+    this.runtime = new RuntimeRouter(
+      backend,
+      sessionRegistry
+        ? {
+            resolveSession: ref => sessionRegistry.requireExact(ref),
+            currentRef: () => sessionRegistry.currentRef(),
+          }
+        : undefined,
+    );
     this.recorder = new WaveRecorder(this.runtime);
     this.experiment = new ExperimentService(this.runtime, this.recorder);
-    this.registry = options.registry ?? this.buildRegistry();
-    if (options.handshakeFactory) {
-      this.handshake = options.handshakeFactory(this.registry);
+    this.registry = this.options.registry ?? this.buildRegistry();
+    if (this.options.handshakeFactory) {
+      this.handshake = this.options.handshakeFactory(this.registry);
     }
   }
 
@@ -194,6 +210,7 @@ export class PluginApiServer implements vscode.Disposable {
         getProjectDescription: () => this.registry.getProjectDescription(),
         getCapabilitySnapshot: () => this.registry.getCapabilitySnapshot(),
         getWorkspaceFolders: () => this.registry.getProjectDescription().workspaceFolders,
+        getSessionSnapshot: () => this.options.sessionRegistry?.currentSnapshot(),
       });
     }
     this.dispatcher = new RpcDispatcher({
@@ -201,7 +218,7 @@ export class PluginApiServer implements vscode.Disposable {
       projectId: this.registry.getProjectId(),
       verifyAuthorization: authorization => authorization === `Bearer ${this.token}`,
       getConnection: connectionId => this.handshake!.get(connectionId),
-      getSessionGeneration: () => undefined, // Task 3 wires the SessionRegistry
+      getSessionGeneration: sessionId => this.options.sessionRegistry?.getSessionGeneration(sessionId),
     });
     this.registerV1Methods();
     return this.endpointInfo();
@@ -209,6 +226,16 @@ export class PluginApiServer implements vscode.Disposable {
 
   getEndpointInfo(): ApiEndpointInfo {
     return this.endpointInfo();
+  }
+
+  /** Instance identity of the running API registry (for the event ring). */
+  getInstanceId(): string {
+    return this.registry.getInstanceId();
+  }
+
+  /** Stable project identity of the running API registry (for the event ring). */
+  getProjectId(): string {
+    return this.registry.getProjectId();
   }
 
   dispose() {
@@ -241,7 +268,7 @@ export class PluginApiServer implements vscode.Disposable {
       getWorkspace: () => snapshotWorkspace(),
       listElfFiles: () => collectElfFiles(),
       listLaunchConfigurations: () => listOrbitLaunchConfigurations(),
-      getRegistryGeneration: () => 0, // Task 3 wires the SessionRegistry
+      getRegistryGeneration: () => this.options.sessionRegistry?.registryGeneration ?? 0,
     });
   }
 

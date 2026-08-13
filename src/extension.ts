@@ -7,6 +7,8 @@ import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
+import { EventHub } from './plugin-api/event-hub';
+import { SessionRegistry } from './plugin-api/session-registry';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
@@ -22,6 +24,8 @@ let watchPollTimer: NodeJS.Timeout | null = null;
 let watchPollGeneration = 0;
 let activeWatchSession: vscode.DebugSession | null = null;
 let pluginApiServer: PluginApiServer;
+let eventHub: EventHub;
+let sessionRegistry: SessionRegistry;
 let rttLogTerminal: vscode.Terminal | null = null;
 let rttLogPty: RttLogTerminal | null = null;
 
@@ -146,10 +150,26 @@ export async function activate(context: vscode.ExtensionContext) {
     const tl = new TimelineWebviewProvider(context, dsm);
     timelineProvider = tl;
 
-    pluginApiServer = new PluginApiServer(context, backend);
+    // Bounded automation event ring and the exact DebugSession registry with
+    // the instance-level generation fence (plan Task 3). The ring pulls its
+    // identity from the API server so events published after startup carry the
+    // real instanceId/projectId.
+    eventHub = new EventHub({
+      instanceId: () => pluginApiServer?.getInstanceId() ?? '',
+      projectId: () => pluginApiServer?.getProjectId() ?? '',
+    });
+    sessionRegistry = new SessionRegistry({ eventHub });
+
+    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry });
     const apiEndpoint = await pluginApiServer.start();
     context.subscriptions.push(pluginApiServer);
       console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);
+
+    // Adopt a session that was already running when this Extension Host
+    // activated; its start event fired before the registry existed.
+    if (initialSession && isOrbitDebugSessionType(initialSession.type)) {
+      sessionRegistry.onStarted(initialSession);
+    }
 
     // Track both the canonical Orbit DAP type and the legacy ozone alias.
     for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
@@ -194,12 +214,15 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
       vscode.debug.onDidStartDebugSession((session) => {
         if (isOrbitDebugSessionType(session.type)) setActiveWatchSession(session);
+        sessionRegistry.onStarted(session);
       }),
       vscode.debug.onDidChangeActiveDebugSession((session) => {
         setActiveWatchSession(session);
+        sessionRegistry.onActiveChanged(session);
       }),
       vscode.debug.onDidTerminateDebugSession((session) => {
         terminateWatchSession(session);
+        sessionRegistry.onTerminated(session);
       }),
 
       vscode.commands.registerCommand('ozone.addWatch', async () => {
@@ -461,5 +484,7 @@ export function deactivate() {
   stopWatchPolling();
   rttLogTerminal?.dispose();
   dataSamplingManager?.dispose();
+  sessionRegistry?.dispose();
+  eventHub?.dispose();
   pluginApiServer?.dispose();
 }

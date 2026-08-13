@@ -594,7 +594,7 @@ export interface RpcCallContext {
 - [ ] Run: `npm run typecheck`，预期 exit 0。
 - [ ] Commit: `feat(api): add versioned RPC contract and dispatcher`。
 
-### Task 2: 多 VS Code 实例发现与项目握手
+### Task 2: 多 VS Code 实例发现与项目握手 已完成
 
 **Depends on:** Task 1
 
@@ -632,7 +632,7 @@ export class HandshakeService {
 - [ ] Run focused Vitest，预期全部通过；再运行 `npm run typecheck` 和 `npm run build`。
 - [ ] Commit: `feat(api): add multi-instance discovery and project handshake`。
 
-### Task 3: 精确 DebugSession 注册与 generation fence
+### Task 3: 精确 DebugSession 注册与 generation fence 已完成
 
 **Depends on:** Task 2
 
@@ -669,13 +669,13 @@ export class SessionRegistry {
 }
 ```
 
-- [ ] 测试启动中、active 切换、termination、相同 session object、replacement、stale async completion 和非 Orbit session。
-- [ ] instance-level `registryGeneration` 在 start/terminate/replacement/owner-loss 边界按 §2.3 递增；新建或 restart 后当前 session 的 `sessionGeneration` 取递增后的 registry generation，active editor focus 变化不得无故递增。
-- [ ] 所有 registry 比较使用 `DebugSession.id` 和对象 identity，不只比较 `type`。
-- [ ] 建立 `EventHub` 有界 ring，但本任务只接 session lifecycle；SSE transport 留给 Task 11。
-- [ ] RuntimeRouter 接受明确 `SessionRef`，不再自行每次读取 `activeDebugSession`。
-- [ ] Run: focused tests + `src/plugin-api/runtime-router.test.ts` + typecheck。
-- [ ] Commit: `feat(api): fence automation calls by debug session generation`。
+- [x] 测试启动中、active 切换、termination、相同 session object、replacement、stale async completion 和非 Orbit session。
+- [x] instance-level `registryGeneration` 在 start/terminate/replacement/owner-loss 边界按 §2.3 递增；新建或 restart 后当前 session 的 `sessionGeneration` 取递增后的 registry generation，active editor focus 变化不得无故递增。
+- [x] 所有 registry 比较使用 `DebugSession.id` 和对象 identity，不只比较 `type`。
+- [x] 建立 `EventHub` 有界 ring，但本任务只接 session lifecycle；SSE transport 留给 Task 11。
+- [x] RuntimeRouter 接受明确 `SessionRef`，不再自行每次读取 `activeDebugSession`。
+- [x] Run: focused tests + `src/plugin-api/runtime-router.test.ts` + typecheck。
+- [x] Commit: `feat(api): fence automation calls by debug session generation`。
 
 ### Task 4: 可见会话启动、停止、重启与配置
 

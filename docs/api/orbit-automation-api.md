@@ -28,6 +28,18 @@ The user-scoped registry pointer defaults to `%LOCALAPPDATA%\Orbit\automation\re
 
 Windows files are restricted to the current user and SYSTEM. POSIX directories use `0700` and files `0600`. Startup fails if these permissions cannot be guaranteed. Registry and endpoint paths must reject symlinks, junctions, reparse points, non-regular files, and owner mismatches.
 
+### Channel, profile, and portable/remote behavior
+
+Each Extension Host derives its registry entry identity from the running VS Code:
+
+- `stable` — production VS Code; `insiders` — VS Code Insiders.
+- `portable` — portable VS Code still writes the same user-scope pointer, but its registry entry's `endpointDirectory` points at the portable global storage. If that location is not writable, `ORBIT_AUTOMATION_REGISTRY` must be set or API startup fails with an explicit error.
+- `remote` — SSH/WSL/Container Extension Hosts run the API and endpoint on the Extension Host machine; the loopback address is that machine's loopback, and nothing is automatically forwarded to the local desktop.
+
+The profile identity is derived from the globalStorage path (`.../User/profiles/<id>/globalStorage`, empty for the default profile). It distinguishes registry entries but never affects `projectId`. An extension upserts only its own entry; pointers with an unknown schema are rejected. Endpoint files and pointer updates are written atomically (temp + rename with hardening before rename). Startup removes residue only when `/health` fails and the heartbeat is over 30 seconds old, and never when `/health` answers with a different `instanceId`.
+
+During one compatibility cycle the legacy `plugin-api-endpoint.json` pointer is still written, but it only marks the shared endpoint directory as `unique` (exactly one live instance; legacy fields and token present) or `ambiguous` (every live instance listed, no token). It never silently selects a window.
+
 ## Transport and authorization
 
 RPC uses JSON-RPC 2.0 over authenticated `POST /v1/rpc`. Requests contain exactly one method-specific `params` object. Success is an `OperationResult<T>` JSON-RPC result; failure is a JSON-RPC error whose `data` requires stable `errorCode` and `retryable` fields. The contract defines the five standard JSON-RPC errors and the Orbit server errors in the `-32099..-32000` range. HTTP bodies are limited to 1 MiB and RPC results to 8 MiB.

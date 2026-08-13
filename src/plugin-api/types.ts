@@ -141,6 +141,42 @@ export interface ApiEndpointInfo {
   updatedAt: number;
 }
 
+/**
+ * Legacy `plugin-api-endpoint.json` pointer kept for one compatibility cycle
+ * (plan §2.6 / Task 2). It only marks the shared endpoint directory as
+ * `unique` (exactly one live instance) or `ambiguous` (several windows); it
+ * never silently selects a window. The bearer token appears only in unique
+ * mode, mirroring the pre-v1 pointer shape.
+ */
+export interface LegacyEndpointPointerInstance {
+  instanceId: string;
+  projectId: string;
+  host: string;
+  port: number;
+  rpcUrl: string;
+  eventsUrl: string;
+  healthUrl: string;
+}
+
+export interface LegacyEndpointPointer {
+  schemaVersion: 1;
+  status: 'unique' | 'ambiguous';
+  updatedAt: number;
+  // unique mode:
+  instanceId?: string;
+  projectId?: string;
+  host?: string;
+  port?: number;
+  rpcUrl?: string;
+  eventsUrl?: string;
+  healthUrl?: string;
+  /** Legacy alias of rpcUrl for pre-v1 readers. */
+  url?: string;
+  token?: string;
+  // ambiguous mode:
+  instances?: LegacyEndpointPointerInstance[];
+}
+
 export function normalizeWatchValue(alias: string, expression: string, value: WatchValue | null | undefined): RuntimeReadValue {
   if (!value) {
     return { alias, expression, value: 0, display: '', error: 'No value returned' };

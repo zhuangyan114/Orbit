@@ -206,6 +206,89 @@ export interface ConnectionLease {
   expiresAt: number;
 }
 
+// --- Frozen public DTOs (OpenRPC #/components/schemas, plan §1.8). ---
+// These are the exact wire shapes of the discovery/handshake methods. Do not
+// add, rename or change fields without a new major API version.
+
+/** OpenRPC WorkspaceFolder: display path plus file URI. */
+export interface WorkspaceFolderInfo {
+  name: string;
+  uri: string;
+  path: string;
+}
+
+/** OpenRPC EndpointInfo + EndpointDescriptor. Never carries the bearer token on the wire. */
+export interface EndpointDescriptor {
+  schemaVersion: 1;
+  host: '127.0.0.1';
+  port: number;
+  rpcUrl: string;
+  eventsUrl: string;
+  healthUrl: string;
+  apiVersions: string[];
+}
+
+/** OpenRPC InstanceDescription (data of orbit.instance.describe). */
+export interface InstanceDescription {
+  instanceId: string;
+  version: string;
+  channel: 'stable' | 'insiders' | 'portable' | 'remote';
+  processId: number;
+  /** UInt64 epoch-ms string on the wire. */
+  startedAt: string;
+  workspaceFolders: WorkspaceFolderInfo[];
+  endpoint: EndpointDescriptor;
+}
+
+/** OpenRPC OwnerKind. */
+export type OwnerKind = 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
+
+/** OpenRPC Capability. */
+export interface Capability {
+  name: string;
+  available: boolean;
+  reason?: string;
+  ownerKinds?: OwnerKind[];
+}
+
+/** OpenRPC CapabilitySnapshot. owner/sessionPhase appear once Task 3 exists. */
+export interface CapabilitySnapshot {
+  apiVersion: '1.0';
+  capabilities: Capability[];
+  owner?: OwnerKind;
+  sessionPhase?: string;
+}
+
+/** OpenRPC LaunchConfiguration summary (data of project.describe / listLaunchConfigurations). */
+export interface LaunchConfigurationSummary {
+  name: string;
+  type: 'orbit' | 'ozone';
+  request: 'launch' | 'attach';
+  workspaceFolderUri: string;
+}
+
+/** OpenRPC ProjectDescription (data of orbit.project.describe). */
+export interface ProjectDescription {
+  projectId: string;
+  workspaceFileUri?: string;
+  workspaceFolders: WorkspaceFolderInfo[];
+  elfFiles: string[];
+  launchConfigurations: LaunchConfigurationSummary[];
+  registryGeneration: number;
+}
+
+/** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
+export interface HandshakeData {
+  connectionId: string;
+  /** UInt64 epoch-ms string on the wire. */
+  expiresAt: string;
+  grantedScopes: AutomationScope[];
+  instance: InstanceDescription;
+  project: ProjectDescription;
+  capabilities: CapabilitySnapshot;
+  session?: unknown;
+}
+
 // --- JSON-RPC 2.0 wire envelope for the /v1/rpc transport.
 
 export interface JsonRpcSuccess {

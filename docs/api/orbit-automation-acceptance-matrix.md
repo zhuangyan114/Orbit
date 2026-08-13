@@ -115,3 +115,17 @@ Status: Hardware-only
 Probe: CMSIS-DAP
 Methods: `orbit.session.start`, `orbit.target.pause`, `orbit.target.continue`, `orbit.target.reset`, `orbit.target.stepOver`, `orbit.target.stepInto`, `orbit.target.stepOut`, `orbit.target.stepInstruction`, `orbit.target.flash`, `orbit.breakpoints.add`, `orbit.expression.readMany`, `orbit.expression.writeMany`, `orbit.memory.read`, `orbit.memory.write`, `orbit.record.start`, `orbit.rtt.start`, `orbit.rtt.read`, `orbit.rtt.stop`, `orbit.record.stop`, `orbit.session.stop`
 Acceptance: With explicit authorization, record VID/PID/serial/transport/helper/VTref/DPIDR/ACK/state/PC and Flash verify evidence; prove the sole CMSIS-DAP helper owner, no J-Link fallback, target-memory RTT, scheduler ordering, and no claim beyond the exercised target and transport.
+
+### API-017: Channel, profile, and registry location matrix
+
+Category: Discovery
+Status: Automated
+Methods: `orbit.instance.describe`, `orbit.project.describe`
+Acceptance: Derive Stable/Insiders/portable/remote channels and local/ssh/wsl/container hosts, per-platform pointer defaults with `ORBIT_AUTOMATION_REGISTRY` override, portable entries pointing at portable global storage, atomic temp+rename endpoint/heartbeat files, per-user ACL or 0700/0600 hardening, symlink/junction/reparse rejection, health-plus-30-second stale cleanup that never deletes a live identity, profile-isolated pointer entries, and legacy pointer `unique`/`ambiguous` marking that never selects a window.
+
+### API-018: Handshake scopes and lease lifecycle
+
+Category: Handshake
+Status: Automated
+Methods: `orbit.handshake`, `orbit.connection.close`
+Acceptance: Intersect requested and allowed scopes without token self-granting, reject API/instance/project/workspace mismatches, enforce the 32-connection cap, expire idle leases after ten minutes, renew on any successful request, free leases on close, and return the frozen `HandshakeData` shape with a string `expiresAt`.

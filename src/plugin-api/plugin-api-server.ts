@@ -1,11 +1,13 @@
-import * as fs from 'fs/promises';
 import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { OzoneBackend } from '../ozone-backend/commander';
+import { findElfFiles } from '../ozone-backend/flasher';
+import { getOrbitConfiguration } from '../utils/orbit-settings';
 import { ExperimentService } from './experiment-service';
 import { RuntimeRouter } from './runtime-router';
+import { WaveRecorder } from './wave-recorder';
 import {
   ApiEndpointInfo,
   JsonRpcRequest,
@@ -18,11 +20,115 @@ import {
   SignalSpec,
   WriteManyParams,
 } from './types';
-import { WaveRecorder } from './wave-recorder';
+import {
+  AUTOMATION_SCOPES,
+  AutomationScope,
+  BootstrapContext,
+  ConnectionContext,
+  JsonRpcResponse as JsonRpc20Response,
+} from './protocol';
+import { buildMethodDefinition, RpcDispatcher } from './rpc-dispatcher';
+import {
+  BoundServerInfo,
+  InstanceRegistry,
+  WorkspaceSnapshot,
+  defaultRegistryPointerPath,
+  detectChannel,
+  detectExtensionHost,
+  detectProfile,
+} from './instance-registry';
+import { HandshakeService } from './handshake-service';
+import { LaunchConfigurationSummary, WorkspaceFolderInfo } from './protocol';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
-const ENDPOINT_FILE = 'plugin-api-endpoint.json';
+const LEGACY_ENDPOINT_FILE = 'plugin-api-endpoint.json';
+const API_VERSION = '1.0';
+
+interface InstanceDescribeParams {
+  context: BootstrapContext;
+  includeEndpoint?: boolean;
+}
+
+interface ProjectDescribeParams {
+  context: BootstrapContext;
+  includeLaunchConfigurations?: boolean;
+}
+
+interface SystemCapabilitiesParams {
+  context: BootstrapContext;
+  includeUnavailable?: boolean;
+}
+
+interface HandshakeWireParams {
+  context: BootstrapContext;
+  apiVersion: '1.0';
+  client: { name: string; version?: string; pid?: number };
+  expected: { projectId: string; instanceId?: string; workspaceRoot?: string };
+  requestedScopes?: AutomationScope[];
+}
+
+interface ConnectionCloseWireParams {
+  context: ConnectionContext;
+  reason?: string;
+}
+
+export interface PluginApiServerOptions {
+  /** Injected for tests; defaults to an Extension-Host-backed registry. */
+  registry?: InstanceRegistry;
+  /** Injected for tests; defaults to a registry-backed HandshakeService. */
+  handshakeFactory?: (registry: InstanceRegistry) => HandshakeService;
+}
+
+/** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
+export function snapshotWorkspace(): WorkspaceSnapshot {
+  const folders: WorkspaceFolderInfo[] = (vscode.workspace.workspaceFolders ?? []).map(folder => ({
+    name: folder.name,
+    uri: folder.uri.toString(),
+    path: folder.uri.fsPath,
+  }));
+  const workspaceFile = vscode.workspace.workspaceFile;
+  const isCodeWorkspace =
+    workspaceFile?.scheme === 'file' && workspaceFile.fsPath.toLowerCase().endsWith('.code-workspace');
+  return {
+    workspaceFileUri: isCodeWorkspace ? workspaceFile.toString() : undefined,
+    workspaceFilePath: isCodeWorkspace ? workspaceFile.fsPath : undefined,
+    folders,
+  };
+}
+
+/** Configured default program plus ELF/AXF candidates under the workspace roots. */
+export function collectElfFiles(): string[] {
+  const paths: string[] = [];
+  const configured = getOrbitConfiguration().get<string>('defaultProgram', '');
+  if (configured) paths.push(configured);
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    for (const candidate of findElfFiles(folder.uri.fsPath)) {
+      if (!paths.includes(candidate.path)) paths.push(candidate.path);
+      if (paths.length >= 64) break;
+    }
+    if (paths.length >= 64) break;
+  }
+  return paths;
+}
+
+/** `orbit`/`ozone` launch configurations of this workspace, normalized. */
+export function listOrbitLaunchConfigurations(): LaunchConfigurationSummary[] {
+  const configs = vscode.workspace
+    .getConfiguration('launch')
+    .get<Array<Record<string, unknown>>>('configurations', []);
+  const firstFolderUri = vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? '';
+  return configs
+    .filter((config): config is Record<string, unknown> => typeof config === 'object' && config !== null)
+    .filter(config => config.type === 'orbit' || config.type === 'ozone')
+    .map(config => ({
+      name: String(config.name ?? ''),
+      type: config.type as 'orbit' | 'ozone',
+      request: (config.request === 'attach' ? 'attach' : 'launch') as 'launch' | 'attach',
+      workspaceFolderUri: firstFolderUri,
+    }))
+    .filter(config => config.name.length > 0);
+}
 
 export class PluginApiServer implements vscode.Disposable {
   private server: http.Server | null = null;
@@ -30,11 +136,19 @@ export class PluginApiServer implements vscode.Disposable {
   private runtime: RuntimeRouter;
   private recorder: WaveRecorder;
   private experiment: ExperimentService;
+  private registry: InstanceRegistry;
+  private handshake: HandshakeService | null = null;
+  private dispatcher: RpcDispatcher | null = null;
+  private startedAtMs = 0;
 
-  constructor(private context: vscode.ExtensionContext, backend: OzoneBackend) {
+  constructor(private context: vscode.ExtensionContext, backend: OzoneBackend, options: PluginApiServerOptions = {}) {
     this.runtime = new RuntimeRouter(backend);
     this.recorder = new WaveRecorder(this.runtime);
     this.experiment = new ExperimentService(this.runtime, this.recorder);
+    this.registry = options.registry ?? this.buildRegistry();
+    if (options.handshakeFactory) {
+      this.handshake = options.handshakeFactory(this.registry);
+    }
   }
 
   async start(): Promise<ApiEndpointInfo> {
@@ -49,9 +163,48 @@ export class PluginApiServer implements vscode.Disposable {
       this.server!.listen(0, HOST, () => resolve());
     });
 
-    const info = this.endpointInfo();
-    await this.writeEndpointInfo(info);
-    return info;
+    this.startedAtMs = Date.now();
+    const address = this.server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Plugin API server address unavailable');
+    }
+    const bound: BoundServerInfo = {
+      host: HOST,
+      port: address.port,
+      rpcUrl: `http://${HOST}:${address.port}/v1/rpc`,
+      eventsUrl: `http://${HOST}:${address.port}/v1/events`,
+      token: this.token,
+      processId: process.pid,
+      startedAt: this.startedAtMs,
+      apiVersions: [API_VERSION],
+    };
+    try {
+      await this.registry.start(bound);
+    } catch (error) {
+      this.server.close();
+      this.server = null;
+      throw error;
+    }
+    if (!this.handshake) {
+      this.handshake = new HandshakeService({
+        instanceId: () => this.registry.getInstanceId(),
+        projectId: () => this.registry.getProjectId(),
+        allowedScopes: () => this.readAllowedScopes(),
+        getInstanceDescription: () => this.registry.describe(),
+        getProjectDescription: () => this.registry.getProjectDescription(),
+        getCapabilitySnapshot: () => this.registry.getCapabilitySnapshot(),
+        getWorkspaceFolders: () => this.registry.getProjectDescription().workspaceFolders,
+      });
+    }
+    this.dispatcher = new RpcDispatcher({
+      instanceId: this.registry.getInstanceId(),
+      projectId: this.registry.getProjectId(),
+      verifyAuthorization: authorization => authorization === `Bearer ${this.token}`,
+      getConnection: connectionId => this.handshake!.get(connectionId),
+      getSessionGeneration: () => undefined, // Task 3 wires the SessionRegistry
+    });
+    this.registerV1Methods();
+    return this.endpointInfo();
   }
 
   getEndpointInfo(): ApiEndpointInfo {
@@ -60,10 +213,74 @@ export class PluginApiServer implements vscode.Disposable {
 
   dispose() {
     this.recorder.dispose();
+    this.dispatcher?.dispose();
+    this.dispatcher = null;
+    void this.registry.dispose();
     if (this.server) {
       this.server.close();
       this.server = null;
     }
+  }
+
+  private buildRegistry(): InstanceRegistry {
+    return new InstanceRegistry({
+      endpointDirectory: path.join(this.context.globalStorageUri.fsPath, 'automation-api', 'endpoints'),
+      registryPointerPath: defaultRegistryPointerPath(process.env, process.platform),
+      legacyPointerPath: path.join(this.context.globalStorageUri.fsPath, LEGACY_ENDPOINT_FILE),
+      identity: {
+        channel: detectChannel({
+          remoteName: vscode.env.remoteName,
+          appName: vscode.env.appName,
+          portableEnv: process.env.VSCODE_PORTABLE,
+        }),
+        profile: detectProfile(this.context.globalStorageUri.fsPath),
+        extensionHost: detectExtensionHost(vscode.env.remoteName),
+      },
+      extensionVersion: String(this.context.extension.packageJSON?.version ?? '0.0.0'),
+      processId: process.pid,
+      getWorkspace: () => snapshotWorkspace(),
+      listElfFiles: () => collectElfFiles(),
+      listLaunchConfigurations: () => listOrbitLaunchConfigurations(),
+      getRegistryGeneration: () => 0, // Task 3 wires the SessionRegistry
+    });
+  }
+
+  private readAllowedScopes(): AutomationScope[] {
+    const configured = getOrbitConfiguration().get<unknown>('automation.allowedScopes', ['read']);
+    const scopes = (Array.isArray(configured) ? configured : []).filter(
+      (scope): scope is AutomationScope =>
+        typeof scope === 'string' && (AUTOMATION_SCOPES as readonly string[]).includes(scope),
+    );
+    return scopes.length > 0 ? scopes : ['read'];
+  }
+
+  private registerV1Methods(): void {
+    const dispatcher = this.dispatcher!;
+    dispatcher.register(
+      buildMethodDefinition('orbit.instance.describe', async (params: InstanceDescribeParams) => ({
+        data: this.registry.describe(),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.project.describe', async (params: ProjectDescribeParams) => ({
+        data: this.registry.getProjectDescription(),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.handshake', async (params: HandshakeWireParams) => ({
+        data: this.handshake!.handshake(params, params.context),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.connection.close', async (params: ConnectionCloseWireParams) => ({
+        data: this.handshake!.close(params.context.connectionId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.system.capabilities', async (params: SystemCapabilitiesParams) => ({
+        data: this.registry.getCapabilitySnapshot(params.includeUnavailable ?? true),
+      })),
+    );
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -76,7 +293,18 @@ export class PluginApiServer implements vscode.Disposable {
     }
 
     if (req.method === 'GET' && req.url === '/health') {
-      this.writeJson(res, 200, { ok: true, data: { status: 'ready' } });
+      this.handleHealth(res);
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/v1/events') {
+      // SSE transport lands in Task 11.
+      this.writeJson(res, 501, { ok: false, error: 'SSE event stream is not implemented yet' });
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/v1/rpc') {
+      await this.handleV1Rpc(req, res);
       return;
     }
 
@@ -98,6 +326,50 @@ export class PluginApiServer implements vscode.Disposable {
     } catch (err: any) {
       this.writeJson(res, 400, { ok: false, error: err?.message || String(err) });
     }
+  }
+
+  /** /health exposes only non-sensitive instance identity; never the token (§2.6). */
+  private handleHealth(res: http.ServerResponse): void {
+    if (!this.startedAtMs) {
+      this.writeJson(res, 503, { ok: false, status: 'starting' });
+      return;
+    }
+    this.writeJson(res, 200, {
+      ok: true,
+      status: 'ok',
+      instanceId: this.registry.getInstanceId(),
+      projectId: this.registry.getProjectId(),
+      apiVersion: API_VERSION,
+      uptimeMs: Date.now() - this.startedAtMs,
+      pid: process.pid,
+    });
+  }
+
+  private async handleV1Rpc(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!this.isAuthorized(req)) {
+      this.writeJson(res, 401, { ok: false, error: 'Unauthorized' });
+      return;
+    }
+    try {
+      const body = await this.readBody(req);
+      const request = JSON.parse(body) as unknown;
+      if (!this.dispatcher) {
+        this.writeJson(res, 503, { ok: false, error: 'Automation API is starting' });
+        return;
+      }
+      const response = await this.dispatcher.dispatch(request, req.headers.authorization);
+      if ('result' in response) this.touchConnection(request);
+      this.writeJson(res, 200, response);
+    } catch (err: any) {
+      this.writeJson(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  /** Any successful request renews the connection lease (§2.3). */
+  private touchConnection(request: unknown): void {
+    const params = (request as { params?: { context?: { connectionId?: unknown } } })?.params;
+    const connectionId = params?.context?.connectionId;
+    if (typeof connectionId === 'string') this.handshake?.touch(connectionId);
   }
 
   private async handleRpc(request: JsonRpcRequest): Promise<JsonRpcResponse> {
@@ -181,12 +453,6 @@ export class PluginApiServer implements vscode.Disposable {
       url: `http://${HOST}:${address.port}/rpc`,
       updatedAt: Date.now(),
     };
-  }
-
-  private async writeEndpointInfo(info: ApiEndpointInfo): Promise<void> {
-    const dir = this.context.globalStorageUri.fsPath;
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, ENDPOINT_FILE), JSON.stringify(info, null, 2), 'utf8');
   }
 
   private writeJson(res: http.ServerResponse, statusCode: number, payload: unknown) {

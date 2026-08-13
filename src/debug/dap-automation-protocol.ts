@@ -15,6 +15,9 @@
 export const AUTOMATION_CONTROL_COMMAND = 'orbitAutomationControl';
 export const AUTOMATION_CONTROL_EVENT = 'orbitAutomationControl';
 
+/** Internal custom request the Extension Host uses to pull the DAP-side verified snapshot (plan Task 6). */
+export const AUTOMATION_BREAKPOINTS_COMMAND = 'orbitBreakpointsSnapshot';
+
 export type AutomationControlAction =
   | 'pause' | 'continue' | 'reset' | 'restart'
   | 'stepOver' | 'stepInto' | 'stepOut' | 'stepInstruction'
@@ -233,4 +236,21 @@ export function standardCommandForAction(request: AutomationControlRequest): Sta
     case 'flash':
       return null;
   }
+}
+
+/**
+ * DAP-side verified breakpoint (plan Task 6). The adapter tracks verified
+ * hardware breakpoints by normalized source location; unverified breakpoints
+ * are simply absent. `slot` is the selected owner's hardware slot id.
+ */
+export interface AutomationBreakpointSnapshot {
+  path: string;
+  line: number;
+  verified: boolean;
+  slot?: number;
+}
+
+/** Result of the `orbitBreakpointsSnapshot` custom request. */
+export interface AutomationBreakpointsResult {
+  breakpoints: AutomationBreakpointSnapshot[];
 }

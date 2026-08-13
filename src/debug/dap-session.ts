@@ -21,6 +21,8 @@ import {
   AutomationFlashReport,
   parseAutomationControlRequest,
   standardCommandForAction,
+  AUTOMATION_BREAKPOINTS_COMMAND,
+  AutomationBreakpointSnapshot,
 } from './dap-automation-protocol';
 
 export interface DebugProtocolMessage {
@@ -1608,6 +1610,8 @@ export class DapSession extends EventEmitter {
           return this.handleRtosInfo(msg);
         case AUTOMATION_CONTROL_COMMAND:
           return this.handleAutomationControl(msg);
+        case AUTOMATION_BREAKPOINTS_COMMAND:
+          return this.handleAutomationBreakpoints(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
     }
@@ -2885,6 +2889,25 @@ export class DapSession extends EventEmitter {
   // handler cores as the standard DAP requests, so the VS Code UI updates
   // through the standard continued/stopped events while the caller receives a
   // structured outcome and the Extension Host a sanitized custom event.
+
+  /**
+   * Read-only `orbitBreakpointsSnapshot` (plan Task 6): exposes the adapter's
+   * verified hardware-breakpoint map so the Extension Host can merge the
+   * VS Code requested set with DAP verified/address/slot state. Reading the
+   * in-memory map needs no target access, so no control/read barrier applies.
+   */
+  private handleAutomationBreakpoints(msg: DebugProtocolMessage) {
+    const breakpoints: AutomationBreakpointSnapshot[] = [];
+    for (const [key, slot] of this.breakpoints) {
+      const separator = key.lastIndexOf(':');
+      if (separator <= 0) continue;
+      const path = key.slice(0, separator);
+      const line = Number(key.slice(separator + 1));
+      if (!Number.isInteger(line) || line <= 0) continue;
+      breakpoints.push({ path, line, verified: true, slot });
+    }
+    this.sendResponse(msg, { breakpoints });
+  }
 
   private async handleAutomationControl(msg: DebugProtocolMessage) {
     const startedAt = Date.now();

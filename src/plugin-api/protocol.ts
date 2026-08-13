@@ -306,14 +306,21 @@ export type ProbeKind = 'jlink' | 'cmsis-dap';
 /** OpenRPC TransportKind (owner transport / CMSIS-DAP interface). */
 export type TransportKind = 'native' | 'legacy' | 'hid' | 'winusb';
 
-/** OpenRPC SourceLocation as used inside SessionSnapshot (`location`). */
-export interface SessionLocation {
+/** OpenRPC SourceLocation (`#/components/schemas/SourceLocation`). */
+export interface SourceLocation {
   path: string;
   line: number;
   column?: number;
   endLine?: number;
   endColumn?: number;
 }
+
+/**
+ * OpenRPC SourceLocation as used inside SessionSnapshot (`location`). The
+ * frozen schema is the same `SourceLocation`; this alias keeps the older
+ * session-facing name without a second, driftable shape.
+ */
+export type SessionLocation = SourceLocation;
 
 /** OpenRPC SessionSnapshot. */
 export interface SessionSnapshot {
@@ -374,6 +381,50 @@ export interface ControlOutcome {
   pc?: string;
   stopReason?: string;
   session: SessionSnapshot;
+}
+
+/** OpenRPC BreakpointInput (breakpoint being added/updated/replaced). */
+export interface BreakpointInput {
+  source: SourceLocation;
+  enabled: boolean;
+  condition?: string;
+  hitCondition?: string;
+  logMessage?: string;
+}
+
+/**
+ * OpenRPC Breakpoint: the merged requested + DAP-verified view (plan Task 6).
+ * `verified` and `sessionId`/`sessionGeneration` come from the exact active
+ * Orbit session's DAP snapshot; without one, `verified` is `false` and the
+ * session fields are absent. `slot` is the selected owner's hardware slot.
+ */
+export interface AutomationBreakpoint {
+  breakpointId: string;
+  source: SourceLocation;
+  enabled: boolean;
+  condition?: string;
+  hitCondition?: string;
+  logMessage?: string;
+  verified: boolean;
+  message?: string;
+  /** OpenRPC Address: 0x-prefixed hex string, when the owner reports one. */
+  address?: string;
+  slot?: number;
+  sessionId?: string;
+  sessionGeneration?: number;
+}
+
+/** OpenRPC BreakpointListData (data of orbit.breakpoints.list). */
+export interface BreakpointListData {
+  items: AutomationBreakpoint[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC BreakpointMutationData (data of add/update/remove/replace). */
+export interface BreakpointMutationData {
+  operationId: string;
+  items: AutomationBreakpoint[];
+  nextCursor?: string | null;
 }
 
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */

@@ -10,6 +10,7 @@ import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { EventHub } from './plugin-api/event-hub';
 import { SessionRegistry, SessionUpdatePatch } from './plugin-api/session-registry';
 import { SessionService } from './plugin-api/session-service';
+import { BreakpointService } from './plugin-api/breakpoint-service';
 import { AUTOMATION_CONTROL_EVENT } from './debug/dap-automation-protocol';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
@@ -162,8 +163,9 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     sessionRegistry = new SessionRegistry({ eventHub });
     const sessionService = new SessionService({ registry: sessionRegistry });
+    const breakpointService = new BreakpointService({ registry: sessionRegistry });
 
-    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry, sessionService });
+    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry, sessionService, breakpointService });
     const apiEndpoint = await pluginApiServer.start();
     context.subscriptions.push(pluginApiServer);
       console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);
@@ -244,6 +246,13 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.debug.onDidTerminateDebugSession((session) => {
         terminateWatchSession(session);
         sessionRegistry.onTerminated(session);
+      }),
+      vscode.debug.onDidChangeBreakpoints(() => {
+        // VS Code breakpoint set is the single authority (plan Task 6); publish
+        // the derived change so SSE clients (Task 11) re-read breakpoints.list.
+        eventHub?.publish('breakpoints.changed', {
+          data: { breakpointCount: vscode.debug.breakpoints.length },
+        });
       }),
 
       vscode.commands.registerCommand('ozone.addWatch', async () => {

@@ -25,7 +25,9 @@ import {
   AutomationError,
   AutomationScope,
   BootstrapContext,
+  BreakpointInput,
   ConnectionContext,
+  ConnectionMutationContext,
   ProjectMutationContext,
   TargetMutationContext,
 } from './protocol';
@@ -43,6 +45,7 @@ import { HandshakeService } from './handshake-service';
 import { WorkspaceFolderInfo } from './protocol';
 import { SessionRegistry, SessionUpdatePatch } from './session-registry';
 import { SessionService, listOrbitLaunchConfigurations } from './session-service';
+import { BreakpointService } from './breakpoint-service';
 import {
   AutomationControlRequest,
   AutomationControlResult,
@@ -151,6 +154,38 @@ interface TargetFlashWireParams {
   timeoutMs?: number;
 }
 
+interface BreakpointsListWireParams {
+  context: ConnectionContext;
+  sourcePath?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+interface BreakpointsAddWireParams {
+  context: ConnectionMutationContext;
+  breakpoint: BreakpointInput;
+  waitForVerificationMs?: number;
+}
+
+interface BreakpointsUpdateWireParams {
+  context: ConnectionMutationContext;
+  breakpointId: string;
+  breakpoint: BreakpointInput;
+  waitForVerificationMs?: number;
+}
+
+interface BreakpointsRemoveWireParams {
+  context: ConnectionMutationContext;
+  breakpointId: string;
+}
+
+interface BreakpointsReplaceWireParams {
+  context: ConnectionMutationContext;
+  sourcePath: string;
+  breakpoints: BreakpointInput[];
+  waitForVerificationMs?: number;
+}
+
 export interface PluginApiServerOptions {
   /** Injected for tests; defaults to an Extension-Host-backed registry. */
   registry?: InstanceRegistry;
@@ -160,6 +195,8 @@ export interface PluginApiServerOptions {
   sessionRegistry?: SessionRegistry;
   /** Visible session start/stop and launch configuration service (plan Task 4). */
   sessionService?: SessionService;
+  /** Unified VS Code breakpoint service (plan Task 6). */
+  breakpointService?: BreakpointService;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -207,6 +244,7 @@ export class PluginApiServer implements vscode.Disposable {
   private handshake: HandshakeService | null = null;
   private dispatcher: RpcDispatcher | null = null;
   private sessionService: SessionService;
+  private breakpointService: BreakpointService;
   private startedAtMs = 0;
 
   constructor(
@@ -230,6 +268,9 @@ export class PluginApiServer implements vscode.Disposable {
     this.sessionService =
       this.options.sessionService ??
       new SessionService({ registry: sessionRegistry ?? new SessionRegistry() });
+    this.breakpointService =
+      this.options.breakpointService ??
+      new BreakpointService({ registry: sessionRegistry ?? new SessionRegistry() });
     if (this.options.handshakeFactory) {
       this.handshake = this.options.handshakeFactory(this.registry);
     }
@@ -503,6 +544,50 @@ export class PluginApiServer implements vscode.Disposable {
     dispatcher.register(
       buildMethodDefinition('orbit.target.flash', async (params: TargetFlashWireParams, call) => ({
         data: await this.flashOutcome(params, call.operationId),
+      })),
+    );
+    // --- plan Task 6: unified VS Code breakpoint API ---
+    dispatcher.register(
+      buildMethodDefinition('orbit.breakpoints.list', async (params: BreakpointsListWireParams) => ({
+        data: await this.breakpointService.list({
+          sourcePath: params.sourcePath,
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.breakpoints.add', async (params: BreakpointsAddWireParams, call) => ({
+        data: await this.breakpointService.add(
+          params.breakpoint,
+          params.waitForVerificationMs,
+          call.operationId,
+        ),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.breakpoints.update', async (params: BreakpointsUpdateWireParams, call) => ({
+        data: await this.breakpointService.update(
+          params.breakpointId,
+          params.breakpoint,
+          params.waitForVerificationMs,
+          call.operationId,
+        ),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.breakpoints.remove', async (params: BreakpointsRemoveWireParams, call) => ({
+        data: await this.breakpointService.remove(params.breakpointId, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.breakpoints.replace', async (params: BreakpointsReplaceWireParams, call) => ({
+        data: await this.breakpointService.replace(
+          params.sourcePath,
+          params.breakpoints,
+          params.waitForVerificationMs,
+          call.operationId,
+        ),
       })),
     );
   }

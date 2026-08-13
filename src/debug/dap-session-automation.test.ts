@@ -4,6 +4,7 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import {
   parseAutomationControlRequest,
   standardCommandForAction,
+  AUTOMATION_BREAKPOINTS_COMMAND,
 } from './dap-automation-protocol';
 
 function automationRequest(seq: number, args: Record<string, unknown>): DebugProtocolMessage {
@@ -508,5 +509,44 @@ describe('automation request validation', () => {
       .toBeNull();
     expect(standardCommandForAction({ action: 'reset', sessionGeneration: 1 })).toBeNull();
     expect(standardCommandForAction({ action: 'flash', sessionGeneration: 1, elfPath: 'f.elf' })).toBeNull();
+  });
+});
+
+describe('DapSession automation breakpoints snapshot', () => {
+  it('reports the verified hardware breakpoint map by normalized source location', async () => {
+    const session = connectedJlinkSession({} as OzoneBackend);
+    (session as any).breakpoints = new Map([
+      ['c:\\ws\\main.c:10', 2],
+      ['c:\\ws\\main.c:12', 5],
+    ]);
+    const messages = collect(session);
+
+    await (session as any).handleRequest({
+      type: 'request',
+      seq: 1,
+      command: AUTOMATION_BREAKPOINTS_COMMAND,
+      arguments: {},
+    });
+
+    const response = responseFor(messages, 1);
+    expect(response).toMatchObject({ success: true, command: AUTOMATION_BREAKPOINTS_COMMAND });
+    expect(response?.body?.breakpoints).toEqual(expect.arrayContaining([
+      { path: 'c:\\ws\\main.c', line: 10, verified: true, slot: 2 },
+      { path: 'c:\\ws\\main.c', line: 12, verified: true, slot: 5 },
+    ]));
+  });
+
+  it('returns an empty snapshot when no breakpoints are tracked', async () => {
+    const session = connectedJlinkSession({} as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest({
+      type: 'request',
+      seq: 1,
+      command: AUTOMATION_BREAKPOINTS_COMMAND,
+      arguments: {},
+    });
+
+    expect(responseFor(messages, 1)?.body?.breakpoints).toEqual([]);
   });
 });

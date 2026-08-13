@@ -348,6 +348,34 @@ export interface OperationAck {
   session?: SessionSnapshot;
 }
 
+/** OpenRPC FlashSegment (inside FlashReport.segments). */
+export interface FlashSegment {
+  /** Frozen Address: 0x-prefixed hex. */
+  startAddress: string;
+  endAddress: string;
+  bytes: number;
+}
+
+/** OpenRPC FlashReport (data of orbit.target.flash). */
+export interface FlashReport {
+  operationId: string;
+  elfPath: string;
+  owner: OwnerKind;
+  bytesProgrammed: number;
+  verified: boolean;
+  segments: FlashSegment[];
+  elapsedMs: number;
+}
+
+/** OpenRPC ControlOutcome (data of every orbit.target.* control method). */
+export interface ControlOutcome {
+  operationId: string;
+  state: string;
+  pc?: string;
+  stopReason?: string;
+  session: SessionSnapshot;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

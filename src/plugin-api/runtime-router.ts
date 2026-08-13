@@ -1,7 +1,12 @@
 import * as vscode from 'vscode';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { WatchValue } from '../ozone-backend/types';
-import { SessionRef } from './protocol';
+import {
+  AUTOMATION_CONTROL_COMMAND,
+  AutomationControlRequest,
+  AutomationControlResult,
+} from '../debug/dap-automation-protocol';
+import { AutomationError, SessionRef } from './protocol';
 import {
   RuntimeReadValue,
   RuntimeWriteResult,
@@ -152,6 +157,80 @@ export class RuntimeRouter {
       }
     }
     return results;
+  }
+
+  /**
+   * Automation control (plan Task 5). Control is exclusively routed through
+   * the exact active DAP session — there is no extension-host backend
+   * fallback; a missing or stale session is a frozen error, never a local
+   * backend control attempt.
+   */
+  async control(ref: SessionRef | undefined, request: AutomationControlRequest): Promise<AutomationControlResult> {
+    const session = this.resolveTargetSession(ref);
+    if (!session) {
+      throw new AutomationError('NoActiveSession', 'no active Orbit session to control', false);
+    }
+    let response: unknown;
+    try {
+      response = await session.customRequest(AUTOMATION_CONTROL_COMMAND, request);
+    } catch (error) {
+      throw this.mapControlFailure(error);
+    }
+    if (response && typeof response === 'object') {
+      const outcome = response as Partial<AutomationControlResult>;
+      if (typeof outcome.state === 'string' && !outcome.errorCode) {
+        return response as AutomationControlResult;
+      }
+      if (typeof outcome.errorCode === 'string') {
+        throw this.mapControlFailure(response);
+      }
+    }
+    throw new AutomationError('InternalError', 'DAP automation control returned an invalid outcome', false);
+  }
+
+  /**
+   * Maps a DAP automation failure (a rejected customRequest or a structured
+   * failure outcome) onto the frozen automation error codes. VS Code attaches
+   * the response body to the rejection as `.body`; the leading `ErrorCode:`
+   * message prefix is the fallback when the body is unavailable.
+   */
+  private mapControlFailure(failure: unknown): AutomationError {
+    const record = failure && typeof failure === 'object' ? failure as Record<string, unknown> : {};
+    const body = record.body && typeof record.body === 'object'
+      ? record.body as Record<string, unknown>
+      : record;
+    const rawMessage = typeof record.message === 'string'
+      ? record.message
+      : typeof body.message === 'string'
+        ? body.message
+        : String(record.error ?? record ?? 'DAP automation control failed');
+    const prefix = /^([A-Za-z][A-Za-z0-9]*):/.exec(String(rawMessage).trim())?.[1];
+    const errorCode = typeof body.errorCode === 'string' && body.errorCode.length > 0
+      ? body.errorCode
+      : prefix ?? '';
+    const details: Record<string, unknown> = { dapMessage: rawMessage };
+    if (typeof body.targetState === 'string') details.targetState = body.targetState;
+    if (body.diagnostics && typeof body.diagnostics === 'object') details.diagnostics = body.diagnostics;
+
+    if (errorCode === 'TargetBusy' || /target busy|another automation control/i.test(rawMessage)) {
+      return new AutomationError('TargetBusy', rawMessage, true, undefined, details);
+    }
+    if (errorCode === 'SessionStarting' || /phase (idle|flashing|connecting) cannot run/i.test(rawMessage)) {
+      return new AutomationError('SessionStarting', rawMessage, true, undefined, details);
+    }
+    if (errorCode === 'SessionTerminating' || /terminat/i.test(rawMessage)) {
+      return new AutomationError('SessionTerminating', rawMessage, false, undefined, details);
+    }
+    if (errorCode === 'TargetRunning' || /TargetStateInvalid.*[Rr]unning/.test(rawMessage)) {
+      return new AutomationError('TargetRunning', rawMessage, true, undefined, details);
+    }
+    if (errorCode === 'CapabilityUnavailable' || errorCode === 'UnsupportedCapability' || /unavailable|unsupported/i.test(rawMessage)) {
+      return new AutomationError('CapabilityUnavailable', rawMessage, false, undefined, details);
+    }
+    if (errorCode === 'TargetDisconnected' || errorCode === 'NativeOwnerLost' || errorCode === 'TargetOwnerUnavailable' || errorCode === 'DeviceRemoved') {
+      return new AutomationError('TargetDisconnected', rawMessage, false, undefined, details);
+    }
+    return new AutomationError('InternalError', rawMessage, false, undefined, details);
   }
 
   /**

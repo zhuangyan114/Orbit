@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import { BoundedMetric } from '../utils/bounded-metric';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
@@ -6,11 +7,21 @@ import {
   DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock,
   OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
 } from '../ozone-backend/types';
+import { parseElf32LoadSegments } from '../ozone-backend/cmsis-dap-flasher';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
 import { normalizeDapLaunchConfig } from './dap-launch-config';
 import { parseConstantExpression } from '../utils/constant-expression';
+import {
+  AUTOMATION_CONTROL_COMMAND,
+  AUTOMATION_CONTROL_EVENT,
+  AutomationControlRequest,
+  AutomationControlResult,
+  AutomationFlashReport,
+  parseAutomationControlRequest,
+  standardCommandForAction,
+} from './dap-automation-protocol';
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -41,6 +52,12 @@ const targetReadPriorityRank: Record<TargetReadPriority, number> = {
 
 function normalizeTargetReadPriority(priority: TargetReadRequestPriority): TargetReadPriority {
   return priority === 'low' ? 'background' : priority;
+}
+
+/** Parses a leading `ErrorCode: ...` prefix from a DAP failure message. */
+function extractErrorCodePrefix(message: string): string | null {
+  const match = /^([A-Za-z][A-Za-z0-9]*):/.exec(String(message ?? '').trim());
+  return match ? match[1] : null;
 }
 
 interface TargetReadWaiter {
@@ -78,6 +95,20 @@ interface DapVariableHandle {
   children?: WatchValue[];
   rtosExpansion?: RtosVariableExpansion;
   stopGeneration: number;
+}
+
+/**
+ * In-flight automation control capture. The synthetic standard request runs
+ * through the same handlers as UI control; `sendResponse` records the first
+ * response the handler produces instead of emitting it, and the automation
+ * entry point translates it into the structured outcome.
+ */
+interface AutomationCapture {
+  synthetic: DebugProtocolMessage;
+  recorded: boolean;
+  body?: any;
+  success: boolean;
+  message?: string;
 }
 
 function createTargetReadMetricSet(): TargetReadMetricSet {
@@ -157,6 +188,7 @@ export class DapSession extends EventEmitter {
 
   private breakpoints = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
+  private automationCapture: AutomationCapture | null = null;
 
   private _elfPath = '';
   private _device = '';
@@ -790,6 +822,19 @@ export class DapSession extends EventEmitter {
   }
 
   private sendResponse(msg: DebugProtocolMessage, body?: any, success = true, message?: string) {
+    const capture = this.automationCapture;
+    if (capture && capture.synthetic === msg) {
+      // Automation requests run the same handlers; the handler's first
+      // response is recorded and translated into the structured outcome
+      // instead of being emitted as a raw standard DAP response.
+      if (!capture.recorded) {
+        capture.recorded = true;
+        capture.body = body;
+        capture.success = success;
+        capture.message = message;
+      }
+      return;
+    }
     const response = {
       type: 'response', seq: this.seq++,
       request_seq: msg.seq, success, command: msg.command || '', body, message,
@@ -1458,7 +1503,19 @@ export class DapSession extends EventEmitter {
         this.sendResponse(msg, undefined, false, 'Debug session is terminating');
         return;
       }
-      switch (msg.command) {
+      await this.dispatchRequest(msg);
+    } catch (err: any) {
+      this.sendResponse(msg, undefined, false, err.message);
+    }
+  }
+
+  /**
+   * Single dispatch table shared by standard DAP requests and automation
+   * control requests (plan Task 5): automation requests run through the same
+   * cases, so the same handler core drives both paths.
+   */
+  private async dispatchRequest(msg: DebugProtocolMessage) {
+    switch (msg.command) {
         case 'initialize':
           return this.sendResponse(msg, {
             supportsConfigurationDoneRequest: true,
@@ -1549,11 +1606,10 @@ export class DapSession extends EventEmitter {
           return this.handleGetTargetState(msg);
         case 'rtosInfo':
           return this.handleRtosInfo(msg);
+        case AUTOMATION_CONTROL_COMMAND:
+          return this.handleAutomationControl(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
-      }
-    } catch (err: any) {
-      this.sendResponse(msg, undefined, false, err.message);
     }
   }
 
@@ -2822,6 +2878,494 @@ export class DapSession extends EventEmitter {
         this.endControl();
       }
     });
+  }
+
+  // --- automation control bridge (plan Task 5) -----------------------------
+  // `session.customRequest('orbitAutomationControl', ...)` drives the same
+  // handler cores as the standard DAP requests, so the VS Code UI updates
+  // through the standard continued/stopped events while the caller receives a
+  // structured outcome and the Extension Host a sanitized custom event.
+
+  private async handleAutomationControl(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationControlRequest(msg.arguments);
+    if (!parsed.ok) {
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: parsed.errorCode,
+        message: parsed.message,
+      };
+      this.sendResponse(msg, result, false, `${parsed.errorCode}: ${parsed.message}`);
+      this.sendAutomationEvent({
+        action: typeof msg.arguments?.action === 'string' ? msg.arguments.action : 'unknown',
+        ok: false,
+        state: 'unknown',
+        errorCode: parsed.errorCode,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return;
+    }
+    const request = parsed.request;
+    const eventBase = {
+      action: request.action,
+      sessionGeneration: request.sessionGeneration,
+      elapsedMs: Date.now() - startedAt,
+    };
+    if (this.automationCapture) {
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: 'TargetBusy',
+        message: 'another automation control is in progress',
+      };
+      this.sendResponse(msg, result, false, 'TargetBusy: another automation control is in progress');
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode: 'TargetBusy' });
+      return;
+    }
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode,
+        message: `session phase ${this.phase} cannot run automation control`,
+      };
+      this.sendResponse(msg, result, false, `${errorCode}: session phase ${this.phase} cannot run automation control`);
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode });
+      return;
+    }
+    if (request.action === 'stepOut' && request.granularity === 'instruction') {
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: 'CapabilityUnavailable',
+        message: 'instruction-granularity stepOut is not available on the selected owner',
+      };
+      this.sendResponse(msg, result, false, 'CapabilityUnavailable: instruction-granularity stepOut is not available on the selected owner');
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode: 'CapabilityUnavailable' });
+      return;
+    }
+
+    const standard = standardCommandForAction(request);
+    if (standard === null) {
+      if (request.action === 'reset') {
+        await this.handleAutomationReset(msg, request, startedAt);
+        return;
+      }
+      await this.handleAutomationFlash(msg, request, startedAt);
+      return;
+    }
+
+    // The synthetic standard request exercises exactly the same dispatch
+    // cases as a UI request; `sendResponse` records the handler's first
+    // response instead of emitting it.
+    const synthetic: DebugProtocolMessage = {
+      type: 'request',
+      seq: msg.seq,
+      command: standard.command,
+      arguments: standard.arguments,
+    };
+    const capture: AutomationCapture = { synthetic, recorded: false, success: false };
+    this.automationCapture = capture;
+    try {
+      await this.dispatchRequest(synthetic);
+    } catch (error) {
+      if (!capture.recorded) {
+        capture.recorded = true;
+        capture.success = false;
+        capture.message = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      this.automationCapture = null;
+    }
+    await this.completeAutomation(msg, request, capture, startedAt);
+  }
+
+  private async handleAutomationReset(
+    msg: DebugProtocolMessage,
+    request: AutomationControlRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const mode = request.mode ?? 'halt';
+    const capture: AutomationCapture = { synthetic: msg, recorded: false, success: false };
+    await this.withStepLock(async () => {
+      this.beginControl();
+      this.stopPolling();
+      this.setTargetRunning(false);
+      try {
+        const resetResult = await this.backend.execute({ cmd: 'reset' });
+        if (!resetResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(resetResult), resetResult.error);
+          return;
+        }
+        if (mode === 'run') {
+          const runResult = await this.backend.execute({ cmd: 'run' });
+          if (!runResult.ok) {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(runResult), runResult.error);
+            return;
+          }
+          if (this._probe === 'cmsis-dap') {
+            const stateResult = await this.queryTargetState('automation-reset-run-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Running) {
+              this.recordAutomationFailure(capture, this.stateConfirmFailureBody('reset-run', stateResult), stateResult.ok
+                ? `TargetStateInvalid: reset-run returned ${stateResult.data}`
+                : stateResult.error);
+              return;
+            }
+          }
+          this.setTargetRunning(true);
+          this.advanceReadCancelEpoch();
+          this.lastHaltReason = 'entry';
+          this.recordAutomationSuccess(capture);
+          this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+          this.startPolling();
+          return;
+        }
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (!haltResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(haltResult), haltResult.error);
+          return;
+        }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('automation-reset-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.recordAutomationFailure(capture, this.stateConfirmFailureBody('reset-halt', stateResult), stateResult.ok
+              ? `TargetStateInvalid: reset-halt returned ${stateResult.data}`
+              : stateResult.error);
+            return;
+          }
+        }
+        this.markStoppedForUi();
+        this.lastHaltReason = 'entry';
+        this.recordAutomationSuccess(capture);
+        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+      } finally {
+        this.endControl();
+      }
+    });
+    await this.completeAutomation(msg, request, capture, startedAt);
+  }
+
+  private async handleAutomationFlash(
+    msg: DebugProtocolMessage,
+    request: AutomationControlRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const elfPath = request.elfPath!;
+    const resetAfter = request.resetAfter ?? 'halt';
+    const capture: AutomationCapture = { synthetic: msg, recorded: false, success: false };
+    let flashReport: AutomationFlashReport | undefined;
+    await this.withStepLock(async () => {
+      this.beginControl();
+      this.stopPolling();
+      this.setTargetRunning(false);
+      try {
+        if (this._probe === 'cmsis-dap') {
+          const haltResult = await this.backend.execute({ cmd: 'halt' });
+          if (!haltResult.ok) {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(haltResult), haltResult.error);
+            return;
+          }
+          const stateResult = await this.queryTargetState('automation-flash-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.recordAutomationFailure(capture, this.stateConfirmFailureBody('flash-pre-halt', stateResult), stateResult.ok
+              ? `TargetStateInvalid: flash pre-halt returned ${stateResult.data}`
+              : stateResult.error);
+            return;
+          }
+        }
+        this.sendEvent('output', { category: 'console', output: `Automation flash: ${elfPath}...\n` });
+        // The flash executes only through the session's selected owner; the
+        // explicit action always programs (never the launch skip path). The
+        // `verify` param is advisory: each owner verifies per its own
+        // capability and the report reflects what actually happened.
+        const flashResult = await this.backend.execute({
+          cmd: 'flash',
+          elfPath,
+          device: this._device,
+          interface: this._interface as 'SWD' | 'JTAG',
+          speedKHz: this._speedKHz,
+          probe: this._probe,
+          flashBeforeDebug: true,
+          ...(this._cmsisDapFlashAlgorithmPath
+            ? { cmsisDapFlashAlgorithmPath: this._cmsisDapFlashAlgorithmPath }
+            : {}),
+        });
+        if (!flashResult.ok) {
+          this.sendEvent('output', { category: 'stderr', output: `Automation flash failed: ${flashResult.error}\n` });
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(flashResult), flashResult.error);
+          return;
+        }
+        this.sendEvent('output', { category: 'console', output: 'Automation flash: flash successful\n' });
+        flashReport = await this.buildFlashReport(elfPath, flashResult.data, request, startedAt);
+
+        if (resetAfter === 'none') {
+          const stateResult = await this.queryTargetState('automation-flash-state');
+          if (stateResult.ok && stateResult.data === TargetState.Halted) {
+            this.markStoppedForUi();
+            this.lastHaltReason = 'entry';
+            this.recordAutomationSuccess(capture);
+            this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+          } else if (stateResult.ok && stateResult.data === TargetState.Running) {
+            this.setTargetRunning(true);
+            this.advanceReadCancelEpoch();
+            this.recordAutomationSuccess(capture);
+            this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+            this.startPolling();
+          } else {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(stateResult), stateResult.ok
+              ? `TargetStateInvalid: flash state ${stateResult.data}`
+              : stateResult.error);
+          }
+          return;
+        }
+
+        const resetResult = await this.backend.execute({ cmd: 'reset' });
+        if (!resetResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(resetResult), resetResult.error);
+          return;
+        }
+        if (resetAfter === 'run') {
+          const runResult = await this.backend.execute({ cmd: 'run' });
+          if (!runResult.ok) {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(runResult), runResult.error);
+            return;
+          }
+          if (this._probe === 'cmsis-dap') {
+            const stateResult = await this.queryTargetState('automation-flash-run-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Running) {
+              this.recordAutomationFailure(capture, this.stateConfirmFailureBody('flash-run', stateResult), stateResult.ok
+                ? `TargetStateInvalid: flash-run returned ${stateResult.data}`
+                : stateResult.error);
+              return;
+            }
+          }
+          this.setTargetRunning(true);
+          this.advanceReadCancelEpoch();
+          this.recordAutomationSuccess(capture);
+          this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+          this.startPolling();
+          return;
+        }
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (!haltResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(haltResult), haltResult.error);
+          return;
+        }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('automation-flash-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.recordAutomationFailure(capture, this.stateConfirmFailureBody('flash-halt', stateResult), stateResult.ok
+              ? `TargetStateInvalid: flash-halt returned ${stateResult.data}`
+              : stateResult.error);
+            return;
+          }
+        }
+        await new Promise<void>(r => setTimeout(r, 200));
+        this.markStoppedForUi();
+        this.lastHaltReason = 'entry';
+        this.recordAutomationSuccess(capture);
+        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+      } finally {
+        this.endControl();
+      }
+    });
+    await this.completeAutomation(msg, request, capture, startedAt, flashReport ? { flash: flashReport } : undefined);
+  }
+
+  private recordAutomationSuccess(capture: AutomationCapture, body?: any) {
+    if (capture.recorded) return;
+    capture.recorded = true;
+    capture.success = true;
+    capture.body = body;
+  }
+
+  private recordAutomationFailure(capture: AutomationCapture, body: any, message?: string) {
+    if (capture.recorded) return;
+    capture.recorded = true;
+    capture.success = false;
+    capture.body = body;
+    capture.message = message;
+  }
+
+  private failureBodyFromResult(result: OzoneCommandResult): Record<string, unknown> {
+    if (!('error' in result) || !result.error) {
+      return { message: 'target control failed' };
+    }
+    const body: Record<string, unknown> = { message: result.error };
+    if (result.errorCode) body.errorCode = result.errorCode;
+    if (result.targetState) body.targetState = result.targetState;
+    if (result.diagnostics) body.diagnostics = result.diagnostics;
+    return body;
+  }
+
+  private stateConfirmFailureBody(operation: string, result: OzoneCommandResult): Record<string, unknown> {
+    return {
+      errorCode: 'TargetStateInvalid',
+      message: `TargetStateInvalid: ${operation} returned ${result.ok ? result.data : result.error}`,
+    };
+  }
+
+  private async completeAutomation(
+    msg: DebugProtocolMessage,
+    request: AutomationControlRequest,
+    capture: AutomationCapture,
+    startedAt: number,
+    extra?: { flash?: AutomationFlashReport },
+  ): Promise<void> {
+    const elapsedMs = Date.now() - startedAt;
+    const eventBase = {
+      action: request.action,
+      sessionGeneration: request.sessionGeneration,
+      elapsedMs,
+    };
+    if (!capture.recorded) {
+      capture.recorded = true;
+      capture.success = false;
+      capture.message = 'control handler produced no response';
+    }
+    if (capture.success) {
+      // The handler completed; the target state the core settled in drives
+      // the outcome (halted stop reasons come from the same lastHaltReason
+      // the UI events used).
+      const state: AutomationControlResult['state'] = this.targetRunning ? 'running' : 'halted';
+      const stopReason = state === 'halted' ? this.lastHaltReason : undefined;
+      const pc = state === 'halted' ? await this.readCurrentPc() : undefined;
+      const result: AutomationControlResult = {
+        state,
+        ...(stopReason ? { stopReason } : {}),
+        ...(pc ? { pc } : {}),
+        diagnostics: { action: request.action, elapsedMs, sessionGeneration: request.sessionGeneration },
+        ...(extra?.flash ? { flash: extra.flash } : {}),
+      };
+      this.sendResponse(msg, result);
+      this.sendAutomationEvent({
+        ...eventBase,
+        ok: true,
+        state,
+        ...(stopReason ? { stopReason } : {}),
+        ...(pc ? { pc } : {}),
+        ...(extra?.flash ? {
+          flash: {
+            elfPath: extra.flash.elfPath,
+            owner: extra.flash.owner,
+            bytesProgrammed: extra.flash.bytesProgrammed,
+            verified: extra.flash.verified,
+            segments: extra.flash.segments,
+          },
+        } : {}),
+      });
+      return;
+    }
+
+    const body = capture.body && typeof capture.body === 'object' ? capture.body : {};
+    const fallbackMessage = capture.message ?? 'automation control failed';
+    const errorCode = typeof body.errorCode === 'string' && body.errorCode.length > 0
+      ? body.errorCode
+      : extractErrorCodePrefix(fallbackMessage) ?? 'InternalError';
+    const failureMessage = typeof body.message === 'string' && body.message.length > 0
+      ? body.message
+      : fallbackMessage;
+    const result: AutomationControlResult = {
+      state: 'unknown',
+      errorCode,
+      message: failureMessage,
+      ...(typeof body.targetState === 'string' ? { targetState: body.targetState } : {}),
+      diagnostics: {
+        action: request.action,
+        elapsedMs,
+        sessionGeneration: request.sessionGeneration,
+        ...(body.diagnostics && typeof body.diagnostics === 'object' ? body.diagnostics : {}),
+      },
+    };
+    const responseMessage = failureMessage.startsWith(`${errorCode}:`) || failureMessage === errorCode
+      ? failureMessage
+      : `${errorCode}: ${failureMessage}`;
+    this.sendResponse(msg, result, false, responseMessage);
+    this.sendAutomationEvent({
+      ...eventBase,
+      ok: false,
+      state: 'unknown',
+      errorCode,
+    });
+  }
+
+  private sendAutomationEvent(payload: Record<string, unknown>) {
+    // Sanitized event for the Extension Host: states, counts, error codes and
+    // elapsed times only — no diagnostics details, memory or variable values.
+    this.sendEvent(AUTOMATION_CONTROL_EVENT, payload);
+  }
+
+  private async readCurrentPc(): Promise<string | undefined> {
+    try {
+      const result = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+      if (result.ok && result.data && typeof result.data === 'object') {
+        const value = (result.data as { value?: unknown }).value;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return `0x${(value >>> 0).toString(16)}`;
+        }
+      }
+    } catch (error) {
+      log.dap(`automation readCurrentPc failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return undefined;
+  }
+
+  private async currentOwnerKind(): Promise<AutomationFlashReport['owner']> {
+    try {
+      const result = await this.backend.execute({ cmd: 'getPerformanceDiagnostics' });
+      if (result.ok && result.data && typeof result.data === 'object') {
+        const owner = String((result.data as { owner?: unknown }).owner ?? '');
+        if (owner.includes('cmsis-dap')) return 'cmsis-dap';
+        if (owner.includes('jlink-native')) return 'jlink-native';
+        if (owner.includes('legacy')) return 'jlink-legacy';
+      }
+    } catch (_) {
+      // Owner reporting is best-effort; the probe is the fallback authority.
+    }
+    return this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-legacy';
+  }
+
+  private async buildFlashReport(
+    elfPath: string,
+    flashData: unknown,
+    request: AutomationControlRequest,
+    startedAt: number,
+  ): Promise<AutomationFlashReport> {
+    const diagnostics: Record<string, unknown> = { verifyRequested: request.verify ?? true };
+    const segments: AutomationFlashReport['segments'] = [];
+    let bytesProgrammed = 0;
+    try {
+      const bytes = await fs.promises.readFile(elfPath);
+      const parsed = parseElf32LoadSegments(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+      for (const segment of parsed) {
+        if (segment.fileSize <= 0) continue;
+        segments.push({
+          startAddress: `0x${(segment.loadAddress >>> 0).toString(16)}`,
+          endAddress: `0x${((segment.loadAddress + segment.fileSize) >>> 0).toString(16)}`,
+          bytes: segment.fileSize,
+        });
+        bytesProgrammed += segment.fileSize;
+      }
+    } catch (error) {
+      diagnostics.elfSegmentParseError = error instanceof Error ? error.message : String(error);
+    }
+    let verified = false;
+    if (flashData && typeof flashData === 'object') {
+      const data = flashData as { reports?: Array<{ operation?: string; ok?: boolean }>; message?: string };
+      if (Array.isArray(data.reports)) {
+        verified = data.reports.some(report => report.operation === 'verify' && report.ok === true);
+      } else if (typeof data.message === 'string' && /verified|verif/i.test(data.message)) {
+        verified = true;
+      }
+    }
+    const owner = await this.currentOwnerKind();
+    return {
+      elfPath,
+      owner,
+      bytesProgrammed,
+      verified,
+      segments,
+      elapsedMs: Date.now() - startedAt,
+      diagnostics,
+    };
   }
 
   private async handleEvaluate(msg: DebugProtocolMessage) {

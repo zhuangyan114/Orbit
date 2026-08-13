@@ -2601,7 +2601,13 @@ case 'readVariableRuntime':
     algorithmPath?: string,
   ): Promise<OzoneCommandResult> {
     if (flashBeforeDebug === false) return { ok: true, data: { skipped: true, reason: 'flashBeforeDebug=false' } };
-    let result: { success: boolean; message: string; elfPath?: string };
+    let result: {
+      success: boolean;
+      message: string;
+      elfPath?: string;
+      reports?: Array<{ operation: string; address: number; size: number; elapsedMs: number; ok: boolean; errorCode?: string; message?: string }>;
+      erasedSectors?: Array<{ number: number; address: number; size: number }>;
+    };
     if (probe === 'cmsis-dap') {
       if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'CMSIS-DAP target owner is unavailable' };
       const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000 };
@@ -2624,7 +2630,15 @@ case 'readVariableRuntime':
           diagnostics: flashResult.diagnostics,
         };
       }
-      result = { success: true, message: flashResult.message, elfPath };
+      result = {
+        success: true,
+        message: flashResult.message,
+        elfPath,
+        // Per-operation reports (including verify) stay additive so the
+        // automation flash outcome can report what the owner verified.
+        reports: flashResult.data?.reports,
+        erasedSectors: flashResult.data?.erasedSectors,
+      };
     } else {
       result = await flashElf(elfPath, device, interface_, speedKHz, { signal });
     }

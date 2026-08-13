@@ -8,8 +8,9 @@ import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { EventHub } from './plugin-api/event-hub';
-import { SessionRegistry } from './plugin-api/session-registry';
+import { SessionRegistry, SessionUpdatePatch } from './plugin-api/session-registry';
 import { SessionService } from './plugin-api/session-service';
+import { AUTOMATION_CONTROL_EVENT } from './debug/dap-automation-protocol';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
@@ -212,6 +213,18 @@ export async function activate(context: vscode.ExtensionContext) {
           showRttLogTerminal();
         } else if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneRttOutput') {
           writeRttLogTerminal(String(event.body?.text || ''));
+        } else if (isOrbitDebugSessionType(event.session.type) && event.event === AUTOMATION_CONTROL_EVENT) {
+          // Sanitized automation control outcome from the DAP adapter (plan
+          // Task 5): mirror the settled target state into the exact session
+          // record. `update` checks object identity itself, so stale events
+          // from replaced sessions are ignored.
+          const state = event.body?.state;
+          if (state === 'running' || state === 'halted') {
+            const patch: SessionUpdatePatch = { phase: state, targetState: state };
+            if (typeof event.body?.stopReason === 'string') patch.stopReason = event.body.stopReason;
+            if (typeof event.body?.pc === 'string') patch.pc = event.body.pc;
+            sessionRegistry.update(event.session, patch);
+          }
         }
       }),
       vscode.debug.onDidStartDebugSession((session) => {

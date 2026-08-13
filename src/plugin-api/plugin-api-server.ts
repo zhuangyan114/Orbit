@@ -1,7 +1,7 @@
 import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { findElfFiles } from '../ozone-backend/flasher';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
@@ -41,8 +41,13 @@ import {
 } from './instance-registry';
 import { HandshakeService } from './handshake-service';
 import { WorkspaceFolderInfo } from './protocol';
-import { SessionRegistry } from './session-registry';
+import { SessionRegistry, SessionUpdatePatch } from './session-registry';
 import { SessionService, listOrbitLaunchConfigurations } from './session-service';
+import {
+  AutomationControlRequest,
+  AutomationControlResult,
+} from '../debug/dap-automation-protocol';
+import { ControlOutcome, FlashReport, SessionRef } from './protocol';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -108,6 +113,42 @@ interface SessionStopWireParams {
   context: TargetMutationContext;
   terminateDebuggee?: boolean;
   restartArguments?: { preserveBreakpoints?: boolean };
+}
+
+interface SessionRestartWireParams {
+  context: TargetMutationContext;
+  terminateDebuggee?: boolean;
+  restartArguments?: { preserveBreakpoints?: boolean };
+}
+
+interface TargetPauseWireParams {
+  context: TargetMutationContext;
+  threadId?: number;
+}
+
+interface TargetContinueWireParams {
+  context: TargetMutationContext;
+  threadId?: number;
+  singleThread?: boolean;
+}
+
+interface TargetResetWireParams {
+  context: TargetMutationContext;
+  mode?: 'halt' | 'run';
+}
+
+interface TargetStepWireParams {
+  context: TargetMutationContext;
+  threadId: number;
+  granularity?: 'source' | 'instruction';
+}
+
+interface TargetFlashWireParams {
+  context: TargetMutationContext;
+  elfPath: string;
+  verify?: boolean;
+  resetAfter?: 'none' | 'halt' | 'run';
+  timeoutMs?: number;
 }
 
 export interface PluginApiServerOptions {
@@ -385,6 +426,200 @@ export class PluginApiServer implements vscode.Disposable {
         ),
       })),
     );
+    // --- plan Task 5: automation control routed through the DAP session ---
+    dispatcher.register(
+      buildMethodDefinition('orbit.session.restart', async (params: SessionRestartWireParams, call) => ({
+        data: await this.restartOutcome(params.context, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.pause', async (params: TargetPauseWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'pause',
+          sessionGeneration: params.context.sessionGeneration,
+          threadId: params.threadId,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.continue', async (params: TargetContinueWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'continue',
+          sessionGeneration: params.context.sessionGeneration,
+          threadId: params.threadId,
+          singleThread: params.singleThread,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.reset', async (params: TargetResetWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'reset',
+          sessionGeneration: params.context.sessionGeneration,
+          mode: params.mode,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.stepOver', async (params: TargetStepWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'stepOver',
+          sessionGeneration: params.context.sessionGeneration,
+          threadId: params.threadId,
+          granularity: params.granularity,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.stepInto', async (params: TargetStepWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'stepInto',
+          sessionGeneration: params.context.sessionGeneration,
+          threadId: params.threadId,
+          granularity: params.granularity,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.stepOut', async (params: TargetStepWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'stepOut',
+          sessionGeneration: params.context.sessionGeneration,
+          threadId: params.threadId,
+          granularity: params.granularity,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.stepInstruction', async (params: TargetStepWireParams, call) => ({
+        data: await this.controlOutcome(params.context, {
+          action: 'stepInstruction',
+          sessionGeneration: params.context.sessionGeneration,
+          threadId: params.threadId,
+          granularity: params.granularity,
+        }, call.operationId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.target.flash', async (params: TargetFlashWireParams, call) => ({
+        data: await this.flashOutcome(params, call.operationId),
+      })),
+    );
+  }
+
+  /**
+   * One `orbit.target.*` control call: exact-session DAP control, registry
+   * state patch from the settled outcome, and the frozen ControlOutcome data.
+   */
+  private async controlOutcome(
+    context: TargetMutationContext,
+    request: AutomationControlRequest,
+    operationId: string | undefined,
+  ): Promise<ControlOutcome> {
+    const ref: SessionRef = { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
+    const session = this.requireExactSession(ref);
+    const result = await this.runtime.control(ref, request);
+    this.applyControlPatch(session, result);
+    return this.controlOutcomeData(ref.sessionId, result, operationId);
+  }
+
+  /**
+   * `orbit.session.restart`: the same DAP restart core as the UI restart
+   * request. The VS Code sessionId never changes; exactly one registry
+   * generation increment invalidates every old reference/context (§2.3).
+   */
+  private async restartOutcome(
+    context: TargetMutationContext,
+    operationId: string | undefined,
+  ): Promise<ControlOutcome> {
+    const ref: SessionRef = { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
+    const registry = this.requireSessionRegistry();
+    const session = registry.requireExact(ref);
+    const result = await this.runtime.control(ref, {
+      action: 'restart',
+      sessionGeneration: ref.sessionGeneration,
+    });
+    registry.onRestarted(session);
+    this.applyControlPatch(session, result);
+    return this.controlOutcomeData(ref.sessionId, result, operationId);
+  }
+
+  /**
+   * `orbit.target.flash`: explicit ELF path through the current session's
+   * selected owner only; the frozen FlashReport mirrors what the owner
+   * actually programmed and verified.
+   */
+  private async flashOutcome(
+    params: TargetFlashWireParams,
+    operationId: string | undefined,
+  ): Promise<FlashReport> {
+    const context = params.context;
+    const ref: SessionRef = { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
+    const session = this.requireExactSession(ref);
+    const result = await this.runtime.control(ref, {
+      action: 'flash',
+      sessionGeneration: ref.sessionGeneration,
+      elfPath: params.elfPath,
+      verify: params.verify,
+      resetAfter: params.resetAfter,
+      timeoutMs: params.timeoutMs,
+    });
+    this.applyControlPatch(session, result);
+    const report = result.flash;
+    if (!report) {
+      throw new AutomationError('InternalError', 'flash outcome is missing the flash report', false);
+    }
+    return {
+      operationId: operationId ?? `op_${randomUUID()}`,
+      elfPath: report.elfPath,
+      owner: report.owner,
+      bytesProgrammed: report.bytesProgrammed,
+      verified: report.verified,
+      segments: report.segments.map(segment => ({ ...segment })),
+      elapsedMs: report.elapsedMs,
+    };
+  }
+
+  private requireSessionRegistry(): SessionRegistry {
+    const registry = this.options.sessionRegistry;
+    if (!registry) {
+      throw new AutomationError('NoActiveSession', 'no session registry is wired for control', false);
+    }
+    return registry;
+  }
+
+  private requireExactSession(ref: SessionRef): vscode.DebugSession {
+    return this.requireSessionRegistry().requireExact(ref);
+  }
+
+  /** Mirrors the settled control state into the registry snapshot. */
+  private applyControlPatch(session: vscode.DebugSession, result: AutomationControlResult): void {
+    if (result.state !== 'running' && result.state !== 'halted') return;
+    const patch: SessionUpdatePatch = {
+      phase: result.state,
+      targetState: result.state,
+    };
+    if (result.stopReason) patch.stopReason = result.stopReason;
+    if (result.pc) patch.pc = result.pc;
+    this.options.sessionRegistry?.update(session, patch);
+  }
+
+  private controlOutcomeData(
+    sessionId: string,
+    result: AutomationControlResult,
+    operationId: string | undefined,
+  ): ControlOutcome {
+    const snapshot = this.options.sessionRegistry?.getSessionSnapshot(sessionId);
+    if (!snapshot) {
+      throw new AutomationError('NoActiveSession', `session ${sessionId} has no snapshot`, false);
+    }
+    return {
+      operationId: operationId ?? `op_${randomUUID()}`,
+      state: result.state,
+      ...(result.pc ? { pc: result.pc } : {}),
+      ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+      session: snapshot,
+    };
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

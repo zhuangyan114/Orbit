@@ -122,4 +122,77 @@ describe('RuntimeRouter explicit session routing', () => {
     });
     expect(backend.execute).not.toHaveBeenCalled();
   });
+
+  it('control routes through the exact DAP session and returns the structured outcome', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const customRequest = vi.fn(async () => ({
+      state: 'halted',
+      stopReason: 'pause',
+      pc: '0x8000480',
+    }));
+    const router = new RuntimeRouter(backend, { resolveSession: () => fakeSession(customRequest) });
+    const ref = { sessionId: 'session-1', sessionGeneration: 2 };
+
+    await expect(
+      router.control(ref, { action: 'pause', sessionGeneration: 2, threadId: 1 }),
+    ).resolves.toEqual({ state: 'halted', stopReason: 'pause', pc: '0x8000480' });
+    expect(customRequest).toHaveBeenCalledWith('orbitAutomationControl', {
+      action: 'pause',
+      sessionGeneration: 2,
+      threadId: 1,
+    });
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
+
+  it('control maps a structured DAP failure onto the frozen error codes', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const customRequest = vi.fn(async () => ({
+      state: 'unknown',
+      errorCode: 'TargetBusy',
+      message: 'another automation control is in progress',
+    }));
+    const router = new RuntimeRouter(backend, { resolveSession: () => fakeSession(customRequest) });
+
+    await expect(
+      router.control({ sessionId: 'session-1', sessionGeneration: 2 }, { action: 'continue', sessionGeneration: 2 }),
+    ).rejects.toMatchObject({ errorCode: 'TargetBusy', retryable: true });
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
+
+  it('control maps a rejected customRequest with a body onto the frozen error codes', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const rejection = Object.assign(
+      new Error('TargetControlFailed: run rejected'),
+      { body: { errorCode: 'TargetControlFailed', message: 'run rejected', targetState: 'halted' } },
+    );
+    const customRequest = vi.fn(async () => { throw rejection; });
+    const router = new RuntimeRouter(backend, { resolveSession: () => fakeSession(customRequest) });
+
+    await expect(
+      router.control({ sessionId: 'session-1', sessionGeneration: 2 }, { action: 'continue', sessionGeneration: 2 }),
+    ).rejects.toMatchObject({ errorCode: 'InternalError', retryable: false });
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
+
+  it('control maps a bodiless rejection message prefix onto the frozen error codes', async () => {
+    const backend = { execute: vi.fn() } as unknown as OzoneBackend;
+    const customRequest = vi.fn(async () => {
+      throw new Error('TargetRunning: step requested while running');
+    });
+    const router = new RuntimeRouter(backend, { resolveSession: () => fakeSession(customRequest) });
+
+    await expect(
+      router.control({ sessionId: 'session-1', sessionGeneration: 2 }, { action: 'stepOver', sessionGeneration: 2, threadId: 1 }),
+    ).rejects.toMatchObject({ errorCode: 'TargetRunning', retryable: true });
+  });
+
+  it('control never falls back to the extension backend without a session', async () => {
+    const backend = { execute: vi.fn(async () => ({ ok: true, data: 'halted' })) } as unknown as OzoneBackend;
+    const router = new RuntimeRouter(backend);
+
+    await expect(
+      router.control({ sessionId: 'session-1', sessionGeneration: 2 }, { action: 'pause', sessionGeneration: 2 }),
+    ).rejects.toMatchObject({ errorCode: 'NoActiveSession' });
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
 });

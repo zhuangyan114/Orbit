@@ -745,17 +745,17 @@ interface AutomationControlResult {
 }
 ```
 
-- [ ] 先写 DAP framing 测试，证明 automation control 未实现时失败。
-- [ ] 抽取/复用现有 continue、pause、restart、step handler 的核心逻辑；标准 DAP request 和 automation request 必须调用同一实现。
-- [ ] Automation 调用成功时仍发送标准 `continued`/`stopped` event，使 VS Code UI 更新；同时发送脱敏 custom event 给 Extension Host。
-- [ ] 保持现有 control/read barrier、step lock、断点 cleanup、native PC/source hint 和 CMSIS-DAP 状态确认。
-- [ ] 失败响应必须包含 `errorCode`、target state 和 diagnostics；不得在 RuntimeRouter 回退本地 backend。
-- [ ] 注册所有 `orbit.target.*` 基础控制方法。
-- [ ] 将 `orbit.session.restart` 映射到同一个 DAP restart core；restart 不更换 VS Code `sessionId`，成功后递增 session generation 一次并使旧 references/context 失效。
-- [ ] `orbit.target.flash` 必须携带明确 ELF path 或已解析 launch configuration、`flash` scope 和幂等 key，只通过当前 session 的 selected owner 执行；未经硬件授权只能实现和运行 Mock 测试。
-- [ ] Run: `src/debug/dap-session-automation.test.ts`、realtime variables、native executor、CMSIS-DAP focused tests。
-- [ ] Run: typecheck、build、全量 Vitest。
-- [ ] Commit: `feat(api): route automation control through the active DAP session`。
+- [x] 先写 DAP framing 测试，证明 automation control 未实现时失败。
+- [x] 抽取/复用现有 continue、pause、restart、step handler 的核心逻辑；标准 DAP request 和 automation request 必须调用同一实现。
+- [x] Automation 调用成功时仍发送标准 `continued`/`stopped` event，使 VS Code UI 更新；同时发送脱敏 custom event 给 Extension Host。
+- [x] 保持现有 control/read barrier、step lock、断点 cleanup、native PC/source hint 和 CMSIS-DAP 状态确认。
+- [x] 失败响应必须包含 `errorCode`、target state 和 diagnostics；不得在 RuntimeRouter 回退本地 backend。
+- [x] 注册所有 `orbit.target.*` 基础控制方法。
+- [x] 将 `orbit.session.restart` 映射到同一个 DAP restart core；restart 不更换 VS Code `sessionId`，成功后递增 session generation 一次并使旧 references/context 失效。
+- [x] `orbit.target.flash` 必须携带明确 ELF path 或已解析 launch configuration、`flash` scope 和幂等 key，只通过当前 session 的 selected owner 执行；未经硬件授权只能实现和运行 Mock 测试。
+- [x] Run: `src/debug/dap-session-automation.test.ts`、realtime variables、native executor、CMSIS-DAP focused tests。
+- [x] Run: typecheck、build、全量 Vitest。
+- [x] Commit: `feat(api): route automation control through the active DAP session`。
 
 ### Task 6: VS Code 统一断点 API
 

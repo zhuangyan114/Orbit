@@ -79,8 +79,20 @@ interface SessionRecord {
 
 const USABLE_PHASES: readonly SessionPhase[] = ['starting', 'connected', 'running', 'halted'];
 
+/**
+ * DAP-reported target phases `update()` may apply. `starting` is owned by
+ * onStarted/onRestarted, `terminating` by markOwnerLost (each increments the
+ * registry generation exactly once); a state patch must never smuggle a
+ * lifecycle transition through the generation fence (§2.3).
+ */
+const PATCHABLE_PHASES: readonly SessionPhase[] = ['connected', 'running', 'halted'];
+
 function isUsablePhase(phase: SessionPhase): boolean {
   return (USABLE_PHASES as readonly string[]).includes(phase);
+}
+
+function isPatchablePhase(phase: SessionPhase): boolean {
+  return (PATCHABLE_PHASES as readonly string[]).includes(phase);
 }
 
 export class SessionRegistry {
@@ -238,7 +250,8 @@ export class SessionRegistry {
   /**
    * Merges a DAP-reported state patch into the exact session record. Phase
    * changes publish `session.phaseChanged` but never increment a generation.
-   * Termination must go through `onTerminated`.
+   * Only target-driven phases (connected/running/halted) are accepted;
+   * termination and owner loss must go through onTerminated/markOwnerLost.
    */
   update(session: vscode.DebugSession, patch: SessionUpdatePatch): void {
     if (!isOrbitDebugSessionType(session.type)) return;
@@ -246,8 +259,10 @@ export class SessionRegistry {
     if (!record || record.session !== session) return;
     const previousPhase = record.phase;
     const nextPhase = patch.phase;
-    if (nextPhase !== undefined && nextPhase !== 'terminated') {
+    let appliedPhase: SessionPhase | undefined;
+    if (nextPhase !== undefined && isPatchablePhase(nextPhase)) {
       record.phase = nextPhase;
+      appliedPhase = nextPhase;
     }
     if (patch.targetState !== undefined) record.targetState = patch.targetState;
     if (patch.ownerKind !== undefined) record.ownerKind = patch.ownerKind;
@@ -260,8 +275,8 @@ export class SessionRegistry {
     if (patch.capabilities !== undefined) {
       record.capabilities = patch.capabilities.map(capability => ({ ...capability }));
     }
-    if (nextPhase !== undefined && nextPhase !== 'terminated' && nextPhase !== previousPhase) {
-      this.publish('session.phaseChanged', record, { phase: nextPhase, previousPhase });
+    if (appliedPhase !== undefined && appliedPhase !== previousPhase) {
+      this.publish('session.phaseChanged', record, { phase: appliedPhase, previousPhase });
     }
   }
 
@@ -404,7 +419,11 @@ export class SessionRegistry {
     record: SessionRecord,
     data?: unknown,
   ): void {
-    this.options.eventHub?.publish(type, {
+    const hub = this.options.eventHub;
+    // A disposed hub (extension deactivate) must not turn a late VS Code
+    // debug-session event into an unhandled throw inside the event callback.
+    if (!hub || hub.isDisposed()) return;
+    hub.publish(type, {
       sessionId: record.sessionId,
       sessionGeneration: record.generation,
       data: data === undefined ? undefined : (data as Record<string, unknown>),

@@ -129,6 +129,10 @@ export class EventHub {
     return this.ring.length;
   }
 
+  isDisposed(): boolean {
+    return this.disposed;
+  }
+
   /** True when the cursor is still inside the retention window. */
   hasEvent(eventId: string): boolean {
     return this.ring.some(event => event.eventId === eventId);

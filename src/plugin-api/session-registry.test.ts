@@ -322,6 +322,36 @@ describe('SessionRegistry lifecycle and generation fence', () => {
     expect(registry.snapshot()[0]).toMatchObject({ phase: 'starting' });
   });
 
+  it('refuses lifecycle phases through update() so transitions stay generation-fenced', () => {
+    const { registry, events } = setup();
+    const s1 = makeSession('s1');
+    registry.onStarted(s1);
+
+    // Target-driven fields still apply, but terminating/terminated/error
+    // phases must go through markOwnerLost/onTerminated, which increment.
+    registry.update(s1, { phase: 'terminating', targetState: 'disconnected' });
+    expect(registry.snapshot()[0]).toMatchObject({ phase: 'starting', targetState: 'disconnected' });
+    expect(registry.registryGeneration).toBe(1);
+    expect(registry.getSessionGeneration('s1')).toBe(1);
+    expect(registry.requireExact({ sessionId: 's1', sessionGeneration: 1 })).toBe(s1);
+
+    registry.update(s1, { phase: 'terminated' });
+    registry.update(s1, { phase: 'error' });
+    expect(registry.snapshot()[0]).toMatchObject({ phase: 'starting' });
+    expect(events()).toHaveLength(1); // only session.started
+  });
+
+  it('tolerates a disposed event hub without throwing from lifecycle callbacks', () => {
+    const { hub, registry } = setup();
+    const s1 = makeSession('s1');
+
+    hub.dispose();
+    expect(() => registry.onStarted(s1)).not.toThrow();
+    expect(() => registry.onTerminated(s1)).not.toThrow();
+    expect(registry.registryGeneration).toBe(2);
+    expect(registry.getSessionGeneration('s1')).toBeUndefined();
+  });
+
   it('bounds the terminated history and keeps the newest records', () => {
     const { registry } = setup({ maxTerminatedRecords: 2 });
     for (let i = 1; i <= 3; i += 1) {

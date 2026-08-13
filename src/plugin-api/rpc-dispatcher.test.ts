@@ -69,6 +69,7 @@ interface TestHandlers {
   describeInstance?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
   handshake?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
   sessionList?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
+  sessionStart?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
   threads?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
   continueTarget?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
   removeBreakpoint?: (params: unknown, call: RpcCallContext) => Promise<unknown>;
@@ -92,6 +93,12 @@ function registerTestMethods(dispatcher: RpcDispatcher, handlers: TestHandlers =
     buildMethodDefinition(
       'orbit.session.list',
       handlers.sessionList ?? (async () => ({ data: { items: [] } })),
+    ),
+  );
+  dispatcher.register(
+    buildMethodDefinition(
+      'orbit.session.start',
+      handlers.sessionStart ?? (async () => ({ data: { operationId: 'op-1', accepted: true } })),
     ),
   );
   dispatcher.register(
@@ -487,6 +494,29 @@ describe('RpcDispatcher idempotency and operation store', () => {
       AUTH,
     );
     expectRpcError(staleReplay, -32002, 'InvalidRequest', '2');
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('never replays a session.start across a registry generation change', async () => {
+    const harness = makeHarness();
+    const handler = vi.fn(async () => ({ data: { operationId: 'op-1', accepted: true } }));
+    registerTestMethods(harness.dispatcher, { sessionStart: handler });
+    grant(harness, ['session.control']);
+
+    const params = (registryGeneration: number) => ({
+      context: { ...CONNECTION_CONTEXT, idempotencyKey: 'key-1', registryGeneration },
+      configurationId: 'Orbit Launch',
+    });
+    const first = await harness.dispatcher.dispatch(rpc('1', 'orbit.session.start', params(0)), AUTH);
+    expect('result' in first).toBe(true);
+
+    const staleReplay = await harness.dispatcher.dispatch(rpc('2', 'orbit.session.start', params(1)), AUTH);
+    expectRpcError(staleReplay, -32002, 'InvalidRequest', '2');
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    // Identical registry generation still replays the cached result.
+    const sameGeneration = await harness.dispatcher.dispatch(rpc('3', 'orbit.session.start', params(0)), AUTH);
+    expect('result' in sameGeneration).toBe(true);
     expect(handler).toHaveBeenCalledTimes(1);
   });
 

@@ -386,6 +386,12 @@ export class RpcDispatcher {
       identity.sessionId = context.sessionId;
       identity.sessionGeneration = context.sessionGeneration;
     }
+    // ProjectMutationContext (orbit.session.start) fences on registryGeneration:
+    // the same key at a different registry generation must conflict (§2.4),
+    // never replay across generations.
+    if (typeof context.registryGeneration === 'number') {
+      identity.registryGeneration = context.registryGeneration;
+    }
     return `${stableStringify(rest)}\u0000${stableStringify(identity)}`;
   }
 

@@ -134,6 +134,7 @@ describe('EventHub bounded ring', () => {
     const { hub } = makeHub();
     const event = hub.publish('session.started', { sessionId: 's1' });
     hub.dispose();
+    expect(hub.isDisposed()).toBe(true);
     expect(() => hub.publish('session.started', { sessionId: 's1' })).toThrowError(/disposed/);
     expect(hub.eventCount()).toBe(0);
     expect(hub.eventsAfter(undefined)).toEqual({ events: [], reset: false, latestEventId: undefined });

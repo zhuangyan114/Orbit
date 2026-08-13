@@ -134,7 +134,7 @@ describe('SessionService.start', () => {
     vscodeState.workspaceFolders = [{ uri: { toString: () => 'file:///ws' }, fsPath: 'C:\\ws', name: 'ws' }];
 
     // Simulate the extension host wiring: the start event registers the session.
-    const session = fakeSession('session-1');
+    const session = fakeSession('session-1', 'orbit', 'Orbit Launch');
     const promise = ctx.service.start(
       { context: context(0), configurationId: 'Orbit Launch', timeoutMs: 500 },
       'op-1',
@@ -155,7 +155,7 @@ describe('SessionService.start', () => {
     const ctx = makeService({
       startDebugging: undefined, // fall back to the module default (mocked vscode)
     });
-    const session = fakeSession('session-2');
+    const session = fakeSession('session-2', 'orbit', 'Inline');
     const promise = ctx.service.start(
       {
         context: context(0),
@@ -181,7 +181,7 @@ describe('SessionService.start', () => {
     vscodeState.launchConfigs = [
       { name: 'Orbit Launch', type: 'orbit', request: 'launch', program: 'C:\\ws\\build\\app.elf' },
     ];
-    const session = fakeSession('session-3');
+    const session = fakeSession('session-3', 'orbit', 'Trial 17');
     const promise = ctx.service.start(
       { context: context(0), configurationId: 'Orbit Launch', configurationName: 'Trial 17', timeoutMs: 500 },
       'op-3',
@@ -295,7 +295,7 @@ describe('SessionService.start', () => {
     vscodeState.launchConfigs = [
       { name: 'EnvElf', type: 'orbit', request: 'launch', program: '${env:BUILD_DIR}/app.elf' },
     ];
-    const session = fakeSession('session-env');
+    const session = fakeSession('session-env', 'orbit', 'EnvElf');
     const promise = ctx.service.start(
       { context: context(0), configurationId: 'EnvElf', timeoutMs: 500 },
       'op-env',
@@ -357,7 +357,7 @@ describe('SessionService.start', () => {
     ctx.registry.onStarted(old);
     ctx.registry.onTerminated(old);
 
-    const fresh = fakeSession('fresh-1');
+    const fresh = fakeSession('fresh-1', 'orbit', 'Orbit Launch');
     const promise = ctx.service.start(
       { context: context(2), configurationId: 'Orbit Launch', timeoutMs: 500 },
       'op-fresh',
@@ -365,6 +365,24 @@ describe('SessionService.start', () => {
     ctx.registry.onStarted(fresh);
     const ack = await promise;
     expect(ack.session).toMatchObject({ sessionId: 'fresh-1', sessionGeneration: 3 });
+  });
+
+  it('never attributes a concurrent manually started session to this call', async () => {
+    const ctx = makeService();
+    vscodeState.launchConfigs = [
+      { name: 'Orbit Launch', type: 'orbit', request: 'launch', program: 'C:\\ws\\build\\app.elf' },
+    ];
+    const promise = ctx.service.start(
+      { context: context(0), configurationId: 'Orbit Launch', timeoutMs: 300 },
+      'op-race',
+    );
+    // Registered during the in-flight awaits (after the pre-existing capture):
+    // its displayed name differs from the started configuration, so the wait
+    // must keep polling instead of adopting it.
+    ctx.registry.onStarted(fakeSession('manual-1', 'orbit', 'Manual Debug'));
+    const error = await catchAsyncError(promise);
+    expect(error.errorCode).toBe('RequestTimeout');
+    expect(error.data).toEqual({ timeoutKind: 'outcomeUnknown', operationId: 'op-race' });
   });
 
   it('requires a non-empty operationId', async () => {
@@ -507,9 +525,10 @@ describe('SessionService.listLaunchConfigurations', () => {
 
     const page = ctx.service.listLaunchConfigurationsPage({ limit: 2 });
     expect(page.items.map(item => item.name)).toEqual(['Orbit', 'Legacy']);
-    expect(page.nextCursor).toBe('2');
-    expect(ctx.service.listLaunchConfigurationsPage({ cursor: '2', limit: 2 }).items.map(item => item.name))
-      .toEqual(['Attach']);
+    expect(page.nextCursor).toBe('file:///ws\u0000Legacy');
+    expect(
+      ctx.service.listLaunchConfigurationsPage({ cursor: 'file:///ws\u0000Legacy', limit: 2 }).items.map(item => item.name),
+    ).toEqual(['Attach']);
   });
 
   it('rejects an invalid page cursor', () => {

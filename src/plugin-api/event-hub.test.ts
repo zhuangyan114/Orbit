@@ -57,6 +57,18 @@ describe('EventHub bounded ring', () => {
     expect(event.sessionGeneration).toBeUndefined();
   });
 
+  it('stores a deep copy so later publisher mutations cannot corrupt the ring', () => {
+    const { hub } = makeHub();
+    const data = { phase: 'starting', nested: { line: 1 } };
+    const event = hub.publish('session.started', { sessionId: 's1', data });
+
+    data.phase = 'halted';
+    data.nested.line = 99;
+
+    expect(event.data).toEqual({ phase: 'starting', nested: { line: 1 } });
+    expect(hub.eventsAfter(undefined).events[0].data).toEqual({ phase: 'starting', nested: { line: 1 } });
+  });
+
   it('rejects an empty event type', () => {
     const { hub } = makeHub();
     expect(() => hub.publish('   ')).toThrowError(/type is required/);

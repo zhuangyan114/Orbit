@@ -89,7 +89,12 @@ export class EventHub {
     };
     if (payload.sessionId !== undefined) event.sessionId = payload.sessionId;
     if (payload.sessionGeneration !== undefined) event.sessionGeneration = payload.sessionGeneration;
-    if (payload.data !== undefined) event.data = payload.data;
+    if (payload.data !== undefined) {
+      // The ring is the durable history (SSE replay reads it later): store a
+      // deep copy so a publisher mutating its own object cannot corrupt
+      // already-published events.
+      event.data = JSON.parse(JSON.stringify(payload.data)) as Record<string, unknown>;
+    }
 
     const bytes = Buffer.byteLength(JSON.stringify(event), 'utf8');
     if (bytes > MAX_EVENT_BYTES) {

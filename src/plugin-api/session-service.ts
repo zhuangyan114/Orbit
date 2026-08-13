@@ -9,6 +9,11 @@
 //
 // All vscode/file-system access is injectable so the generation fences and
 // error mapping are unit-testable without the Extension Host.
+//
+// `start()` and `stop()` are dispatcher-dispatched mutations: the dispatcher
+// always injects an operationId (requiresIdempotency creates the operation
+// entry). A missing operationId is an InternalError — it can only happen if
+// the service is called outside the v1 dispatch path.
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { OzoneDebugConfigurationProvider } from '../debug/ozone-debug-config';
@@ -113,17 +118,21 @@ export class SessionService {
     return includeLegacyAlias ? items : items.filter(config => config.type === 'orbit');
   }
 
-  /** Paged form backing `orbit.project.listLaunchConfigurations` (index cursor). */
+  /**
+   * Paged form backing `orbit.project.listLaunchConfigurations`. The cursor
+   * is a stable `${workspaceFolderUri}\u0000${name}` key, so pages survive
+   * unrelated list changes; reordering around the cursor still re-pages.
+   */
   listLaunchConfigurationsPage(
     page: { cursor?: string; limit?: number } = {},
     includeLegacyAlias = true,
   ): LaunchConfigurationPage {
     const limit = this.clampLimit(page.limit);
     const items = this.listLaunchConfigurations(includeLegacyAlias);
-    const start = this.resolvePageStart(page.cursor, items.length);
+    const start = this.resolveCursorIndex(page.cursor, items);
     const slice = items.slice(start, start + limit);
     const result: LaunchConfigurationPage = { items: slice };
-    if (start + limit < items.length) result.nextCursor = String(start + limit);
+    if (start + limit < items.length) result.nextCursor = this.launchConfigurationCursor(slice[slice.length - 1]);
     return result;
   }
 
@@ -194,9 +203,20 @@ export class SessionService {
 
     const timeoutMs = this.clampTimeout(request.timeoutMs);
     const deadline = this.opts.now() + timeoutMs;
+    // Attribute only the session this call actually started: it must not have
+    // existed before the call, its generation must postdate the fence, and its
+    // displayed name must match the started configuration. A concurrently
+    // manually started session (same name is the only residual ambiguity) is
+    // never silently adopted.
+    const expectedName = String(finalConfig.name ?? '').trim();
+    const fenceGeneration = request.context.registryGeneration;
     while (this.opts.now() < deadline) {
       const snapshot = registry.currentSnapshot();
-      if (snapshot && !preExisting.has(snapshot.sessionId)) {
+      if (
+        snapshot &&
+        !preExisting.has(snapshot.sessionId) &&
+        this.isSessionStartedByThisCall(snapshot, expectedName, fenceGeneration)
+      ) {
         return { operationId: operationId!, accepted: true, session: snapshot };
       }
       await this.opts.sleep(START_POLL_INTERVAL_MS);
@@ -212,7 +232,13 @@ export class SessionService {
     );
   }
 
-  /** Stops the exact session; never stops sessions without the precise ref. */
+  /**
+   * Stops the exact session; never stops sessions without the precise ref.
+   * The ack is accepted-semantics: `vscode.debug.stopDebugging` resolves once
+   * the stop is issued and the terminate event may land just afterwards, so
+   * `session` reports the registry state at that moment (clients watch
+   * `session.terminated` / `orbit.session.list` for the final phase).
+   */
   async stop(ref: SessionRef, operationId?: string): Promise<OperationAck> {
     this.requireOperationId(operationId);
     const session = this.opts.registry.requireExact(ref);
@@ -261,6 +287,16 @@ export class SessionService {
     }
   }
 
+  /** The started session postdates the fence and displays the started config name. */
+  private isSessionStartedByThisCall(
+    snapshot: SessionSnapshot,
+    expectedName: string,
+    fenceGeneration: number,
+  ): boolean {
+    if (snapshot.sessionGeneration <= fenceGeneration) return false;
+    return expectedName.length === 0 || snapshot.name === expectedName;
+  }
+
   private clampTimeout(timeoutMs: number | undefined): number {
     const value = timeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     if (!Number.isFinite(value)) return DEFAULT_START_TIMEOUT_MS;
@@ -273,13 +309,17 @@ export class SessionService {
     return Math.max(1, Math.min(Math.floor(value), MAX_PAGE_LIMIT));
   }
 
-  private resolvePageStart(cursor: string | undefined, length: number): number {
+  private launchConfigurationCursor(item: LaunchConfiguration): string {
+    return `${item.workspaceFolderUri}\u0000${item.name}`;
+  }
+
+  private resolveCursorIndex(cursor: string | undefined, items: LaunchConfiguration[]): number {
     if (cursor === undefined) return 0;
-    const start = Number(cursor);
-    if (!Number.isInteger(start) || start < 0 || start >= length) {
+    const index = items.findIndex(item => this.launchConfigurationCursor(item) === cursor);
+    if (index === -1) {
       throw new AutomationError('InvalidRequest', `unknown cursor ${cursor}`, false);
     }
-    return start;
+    return index + 1;
   }
 
   private resolveConfiguration(request: StartSessionRequest): {

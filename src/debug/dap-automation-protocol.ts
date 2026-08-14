@@ -432,3 +432,235 @@ export function parseAutomationRuntimeRequest(args: unknown): AutomationRuntimeP
   }
   return { ok: true, request };
 }
+
+// --- expression & symbol snapshot (plan Task 8) -----------------------------
+// `orbitExpressionSnapshot` reuses the standard DAP evaluate / watch-read /
+// setWatchValue cores and the loaded ELF symbol cache, so automation
+// expressions and symbol discovery share the exact handlers (and read gates)
+// of the UI path. The adapter returns adapter-internal integer
+// `variablesReference` values; the service stringifies them to the frozen
+// UInt64 shape and records their session generation.
+
+export const AUTOMATION_EXPRESSION_COMMAND = 'orbitExpressionSnapshot';
+
+export type AutomationExpressionKind =
+  | 'evaluate'
+  | 'readMany'
+  | 'writeMany'
+  | 'inspect'
+  | 'symbolSearch'
+  | 'symbolResolve';
+
+export type AutomationExpressionContextKind = 'watch' | 'hover' | 'repl' | 'clipboard' | 'variables';
+
+export interface AutomationExpressionWriteItem {
+  expression: string;
+  /** Numeric value parsed by the service; the backend writes it verbatim. */
+  value: number;
+}
+
+export interface AutomationExpressionRequest {
+  kind: AutomationExpressionKind;
+  sessionGeneration: number;
+  /** evaluate/inspect/symbolResolve(name): the target expression or symbol name. */
+  expression?: string;
+  frameId?: number;
+  contextKind?: AutomationExpressionContextKind;
+  /** inspect: expansion depth (0 = no children) and per-level child cap. */
+  depth?: number;
+  maxChildren?: number;
+  /** readMany: the expressions to read, in request order. */
+  expressions?: string[];
+  forceRealtime?: boolean;
+  /** writeMany: the writes to apply through the control barrier. */
+  writes?: AutomationExpressionWriteItem[];
+  /** symbolSearch: the case-insensitive name substring query. */
+  query?: string;
+  kinds?: AutomationSymbolKind[];
+  /** symbolResolve(address): the 0x-prefixed address to resolve. */
+  address?: string;
+}
+
+export type AutomationSymbolKind = 'function' | 'variable' | 'type' | 'section' | 'unknown';
+
+/** Adapter-internal evaluated value (mirrors the frozen public ExpressionValue). */
+export interface AutomationExpressionValue {
+  expression: string;
+  value: string;
+  type?: string;
+  /** Adapter-internal integer variablesReference (0 for a leaf). */
+  variablesReference: number;
+  memoryReference?: string;
+  available: boolean;
+  stale: boolean;
+  error?: { errorCode: string; message?: string };
+}
+
+/** Adapter-internal write outcome (mirrors the frozen public ExpressionWriteOutcome). */
+export interface AutomationExpressionWriteOutcome {
+  expression: string;
+  written: boolean;
+  value?: string;
+  error?: { errorCode: string; message?: string };
+}
+
+/** Adapter-internal symbol (mirrors the frozen public Symbol, raw nm type char). */
+export interface AutomationSymbol {
+  name: string;
+  address: number;
+  size: number;
+  /** Raw ELF `nm` type character; the service maps it to the frozen SymbolKind. */
+  typeChar: string;
+  exact?: boolean;
+}
+
+/** Outcome of `orbitExpressionSnapshot`: one kind-specific payload or a failure. */
+export interface AutomationExpressionResult {
+  /** evaluate/readMany/inspect root (single value). */
+  value?: AutomationExpressionValue;
+  values?: AutomationExpressionValue[];
+  /** writeMany outcomes, in request order. */
+  writes?: AutomationExpressionWriteOutcome[];
+  /** inspect children, in request order. */
+  inspectItems?: AutomationVariable[];
+  /** symbolSearch matches. */
+  symbols?: AutomationSymbol[];
+  /** symbolResolve single symbol. */
+  symbol?: AutomationSymbol;
+  exact?: boolean;
+  errorCode?: string;
+  message?: string;
+  targetState?: string;
+  elapsedMs?: number;
+}
+
+export type AutomationExpressionParseResult =
+  | { ok: true; request: AutomationExpressionRequest }
+  | { ok: false; errorCode: string; message: string };
+
+const EXPRESSION_KINDS: readonly AutomationExpressionKind[] = [
+  'evaluate', 'readMany', 'writeMany', 'inspect', 'symbolSearch', 'symbolResolve',
+];
+
+const CONTEXT_KINDS: readonly AutomationExpressionContextKind[] = [
+  'watch', 'hover', 'repl', 'clipboard', 'variables',
+];
+
+const SYMBOL_KINDS: readonly AutomationSymbolKind[] = [
+  'function', 'variable', 'type', 'section', 'unknown',
+];
+
+/**
+ * Validates the wire arguments of `orbitExpressionSnapshot`. Never throws;
+ * every rejection carries a machine-readable errorCode the RuntimeService maps
+ * to the frozen automation error codes.
+ */
+export function parseAutomationExpressionRequest(args: unknown): AutomationExpressionParseResult {
+  if (!isRecord(args)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'automation expression requires request arguments' };
+  }
+  if (!isOneOf(args.kind, EXPRESSION_KINDS)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: `unknown automation expression kind ${String(args.kind)}` };
+  }
+  if (!isPositiveInt(args.sessionGeneration)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'sessionGeneration must be a positive integer' };
+  }
+  const request: AutomationExpressionRequest = {
+    kind: args.kind,
+    sessionGeneration: args.sessionGeneration,
+  };
+
+  if (args.kind === 'evaluate' || args.kind === 'inspect' || args.kind === 'symbolResolve') {
+    if (args.kind === 'evaluate' || args.kind === 'inspect') {
+      if (typeof args.expression !== 'string' || args.expression.trim().length === 0) {
+        return { ok: false, errorCode: 'InvalidRequest', message: `${args.kind} requires a non-empty expression` };
+      }
+      request.expression = args.expression.trim();
+    }
+    if (args.frameId !== undefined) {
+      if (!isPositiveInt(args.frameId)) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'frameId must be a positive integer' };
+      }
+      request.frameId = args.frameId;
+    }
+  }
+
+  if (args.kind === 'evaluate') {
+    if (args.contextKind !== undefined) {
+      if (!isOneOf(args.contextKind, CONTEXT_KINDS)) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'contextKind is invalid' };
+      }
+      request.contextKind = args.contextKind;
+    }
+  }
+
+  if (args.kind === 'inspect') {
+    if (args.depth !== undefined) {
+      if (typeof args.depth !== 'number' || !Number.isInteger(args.depth) || args.depth < 0 || args.depth > 8) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'depth must be an integer between 0 and 8' };
+      }
+      request.depth = args.depth;
+    }
+    if (args.maxChildren !== undefined) {
+      if (typeof args.maxChildren !== 'number' || !Number.isInteger(args.maxChildren) || args.maxChildren < 1 || args.maxChildren > 1000) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'maxChildren must be an integer between 1 and 1000' };
+      }
+      request.maxChildren = args.maxChildren;
+    }
+  }
+
+  if (args.kind === 'readMany') {
+    if (!Array.isArray(args.expressions) || args.expressions.length < 1
+      || args.expressions.some(expression => typeof expression !== 'string' || expression.trim().length === 0)) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'readMany requires a non-empty array of expressions' };
+    }
+    request.expressions = args.expressions.map(expression => String(expression).trim());
+    if (args.forceRealtime !== undefined) {
+      if (typeof args.forceRealtime !== 'boolean') {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'forceRealtime must be a boolean' };
+      }
+      request.forceRealtime = args.forceRealtime;
+    }
+  }
+
+  if (args.kind === 'writeMany') {
+    if (!Array.isArray(args.writes) || args.writes.length < 1
+      || args.writes.some(write => !isRecord(write)
+        || typeof write.expression !== 'string' || write.expression.trim().length === 0
+        || typeof write.value !== 'number' || !Number.isFinite(write.value))) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'writeMany requires a non-empty array of {expression, value} writes' };
+    }
+    request.writes = args.writes.map(write => ({
+      expression: String(write.expression).trim(),
+      value: write.value as number,
+    }));
+  }
+
+  if (args.kind === 'symbolSearch') {
+    if (typeof args.query !== 'string' || args.query.trim().length === 0) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'symbolSearch requires a non-empty query' };
+    }
+    request.query = args.query.trim();
+    if (args.kinds !== undefined) {
+      if (!Array.isArray(args.kinds) || args.kinds.some(kind => !isOneOf(kind, SYMBOL_KINDS))) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'kinds must be a subset of function/variable/type/section/unknown' };
+      }
+      request.kinds = [...args.kinds] as AutomationSymbolKind[];
+    }
+  }
+
+  if (args.kind === 'symbolResolve') {
+    const name = typeof args.expression === 'string' ? args.expression.trim() : undefined;
+    const address = typeof args.address === 'string' ? args.address : undefined;
+    if (!name && !address) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'symbolResolve requires a name or an address' };
+    }
+    if (name) request.expression = name;
+    if (address !== undefined && !/^0x[0-9A-Fa-f]+$/.test(address)) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'address must be a 0x-prefixed hex string' };
+    }
+    if (address !== undefined) request.address = address;
+  }
+
+  return { ok: true, request };
+}

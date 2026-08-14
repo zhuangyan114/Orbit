@@ -183,7 +183,8 @@ export type OzoneCommand =
   }
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }
-  | { cmd: 'resolveSymbol'; name: string }
+  | { cmd: 'resolveSymbol'; name?: string; address?: number }
+  | { cmd: 'searchSymbols'; query: string; maxResults: number }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
   | {

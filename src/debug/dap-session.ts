@@ -30,6 +30,13 @@ import {
   AutomationRegister,
   AutomationVariable,
   parseAutomationRuntimeRequest,
+  AUTOMATION_EXPRESSION_COMMAND,
+  AutomationExpressionRequest,
+  AutomationExpressionResult,
+  AutomationExpressionValue,
+  AutomationExpressionWriteOutcome,
+  AutomationSymbol,
+  parseAutomationExpressionRequest,
 } from './dap-automation-protocol';
 
 export interface DebugProtocolMessage {
@@ -1623,6 +1630,8 @@ export class DapSession extends EventEmitter {
           return this.handleAutomationBreakpoints(msg);
         case AUTOMATION_RUNTIME_COMMAND:
           return this.handleAutomationRuntime(msg);
+        case AUTOMATION_EXPRESSION_COMMAND:
+          return this.handleAutomationExpression(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
     }
@@ -3210,6 +3219,230 @@ export class DapSession extends EventEmitter {
     return extractErrorCodePrefix(captured.message ?? '') ?? 'InternalError';
   }
 
+  // --- expression & symbol bridge (plan Task 8) ------------------------------
+  // `session.customRequest('orbitExpressionSnapshot', ...)` reuses the standard
+  // DAP evaluate/watch-read/setWatchValue cores and the loaded ELF symbol cache
+  // so automation expressions and symbol discovery share the exact handlers
+  // (and read gates) of the UI path. Reads map `readWatchExpressions` results
+  // onto the frozen ExpressionValue shape; writes go through the same
+  // `withStepLock` + target-write barrier as `setWatchValue`.
+
+  private async handleAutomationExpression(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationExpressionRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationExpressionFailure(msg, parsed.errorCode, parsed.message, this.automationTargetState(), startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationExpressionFailure(msg, errorCode, `session phase ${this.phase} cannot evaluate expressions`, this.automationTargetState(), startedAt);
+      return;
+    }
+    switch (request.kind) {
+      case 'evaluate':
+        await this.handleAutomationEvaluate(msg, request, startedAt);
+        return;
+      case 'readMany':
+        await this.handleAutomationReadMany(msg, request, startedAt);
+        return;
+      case 'writeMany':
+        await this.handleAutomationWriteMany(msg, request, startedAt);
+        return;
+      case 'inspect':
+        await this.handleAutomationInspect(msg, request, startedAt);
+        return;
+      case 'symbolSearch':
+        await this.handleAutomationSymbolSearch(msg, request, startedAt);
+        return;
+      case 'symbolResolve':
+        await this.handleAutomationSymbolResolve(msg, request, startedAt);
+        return;
+    }
+  }
+
+  private sendAutomationExpressionFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    targetState: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationExpressionResult = {
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  /** One expression read through the shared stopped/realtime watch-read core. */
+  private async handleAutomationEvaluate(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const results = await this.readWatchExpressions([request.expression!], false);
+    const value = this.mapWatchValueToAutomationRoot(results[0]);
+    this.sendResponse(msg, { value, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationReadMany(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const results = await this.readWatchExpressions(request.expressions!, request.forceRealtime ?? false);
+    const values = results.map(value => this.mapWatchValueToAutomationValue(value));
+    this.sendResponse(msg, { values, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationWriteMany(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const writes: AutomationExpressionWriteOutcome[] = [];
+    for (const write of request.writes ?? []) {
+      const result = await this.writeWatchValueCore(write.expression, write.value);
+      writes.push(result.ok
+        ? { expression: write.expression, written: true }
+        : {
+            expression: write.expression,
+            written: false,
+            error: { errorCode: result.errorCode ?? 'InternalError', message: result.error },
+          });
+    }
+    this.sendResponse(msg, { writes, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationInspect(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const results = await this.readWatchExpressions([request.expression!], false);
+    const rootWatch = results[0];
+    const value = this.mapWatchValueToAutomationRoot(rootWatch);
+    const inspectItems: AutomationVariable[] = [];
+    if (value.available && (request.depth ?? 2) > 0 && rootWatch.children) {
+      const maxChildren = request.maxChildren ?? 100;
+      for (const child of rootWatch.children.slice(0, maxChildren)) {
+        inspectItems.push(this.automationVariableFromWatch(child));
+      }
+    }
+    this.sendResponse(msg, { value, inspectItems, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationSymbolSearch(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const result = await this.backend.execute({ cmd: 'searchSymbols', query: request.query!, maxResults: 2000 });
+    if (!result.ok) {
+      const errorCode = result.errorCode === 'SymbolsUnavailable' ? 'CapabilityUnavailable' : (result.errorCode ?? 'InternalError');
+      this.sendAutomationExpressionFailure(msg, errorCode, result.error, this.automationTargetState(), startedAt);
+      return;
+    }
+    const symbols: AutomationSymbol[] = ((result.data as any[]) ?? []).map((symbol: any) => ({
+      name: symbol.name,
+      address: symbol.address,
+      size: symbol.size ?? 0,
+      typeChar: symbol.type ?? '?',
+    }));
+    this.sendResponse(msg, { symbols, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationSymbolResolve(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const result = request.expression !== undefined
+      ? await this.backend.execute({ cmd: 'resolveSymbol', name: request.expression })
+      : await this.backend.execute({ cmd: 'resolveSymbol', address: Number.parseInt(request.address!.replace(/^0x/i, ''), 16) });
+    if (!result.ok) {
+      const errorCode = result.errorCode === 'SymbolsUnavailable'
+        ? 'CapabilityUnavailable'
+        : result.errorCode === 'SymbolNotFound'
+          ? 'InvalidRequest'
+          : (result.errorCode ?? 'InternalError');
+      this.sendAutomationExpressionFailure(msg, errorCode, result.error, this.automationTargetState(), startedAt);
+      return;
+    }
+    const raw = result.data as any;
+    const symbol: AutomationSymbol = {
+      name: raw.name,
+      address: raw.address,
+      size: raw.size ?? 0,
+      typeChar: raw.type ?? '?',
+      exact: raw.exact ?? false,
+    };
+    this.sendResponse(msg, {
+      symbol,
+      exact: raw.exact ?? false,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  /** Maps a shared watch-read value onto the frozen ExpressionValue shape. */
+  private mapWatchValueToAutomationValue(watch: WatchValue): AutomationExpressionValue {
+    if (watch.error && watch.error !== 'running') {
+      return {
+        expression: watch.expression,
+        value: watch.display || watch.hex || String(watch.value),
+        variablesReference: 0,
+        available: false,
+        stale: false,
+        error: { errorCode: watch.errorCode ?? 'InternalError', message: watch.error },
+      };
+    }
+    if (watch.error === 'running') {
+      return {
+        expression: watch.expression,
+        value: '',
+        variablesReference: 0,
+        available: false,
+        stale: true,
+        error: { errorCode: 'TargetRunning', message: 'target is running' },
+      };
+    }
+    return {
+      expression: watch.expression,
+      value: watch.display || watch.hex || String(watch.value),
+      type: watch.typeName,
+      variablesReference: 0,
+      memoryReference: this.memoryReferenceForWatch(watch),
+      available: true,
+      stale: false,
+    };
+  }
+
+  /** As above, but allocates a DAP variablesReference for expandable values. */
+  private mapWatchValueToAutomationRoot(watch: WatchValue): AutomationExpressionValue {
+    const mapped = this.mapWatchValueToAutomationValue(watch);
+    if (mapped.available) mapped.variablesReference = this.allocateVariableHandle(watch);
+    return mapped;
+  }
+
+  /** Maps an already-expanded child onto the frozen Variable shape. */
+  private automationVariableFromWatch(watch: WatchValue): AutomationVariable {
+    const dap = this.toDapVariable(watch);
+    const result: AutomationVariable = {
+      name: dap.name,
+      value: dap.value,
+      variablesReference: dap.variablesReference,
+    };
+    if (dap.type !== undefined) result.type = dap.type;
+    if (dap.evaluateName !== undefined) result.evaluateName = dap.evaluateName;
+    if (dap.memoryReference !== undefined) result.memoryReference = dap.memoryReference;
+    return result;
+  }
+
   private async handleAutomationControl(msg: DebugProtocolMessage) {
     const startedAt = Date.now();
     const parsed = parseAutomationControlRequest(msg.arguments);
@@ -4140,10 +4373,25 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, { ok: false, error: 'Invalid watch value request' });
       return;
     }
-    await this.withStepLock(async () => {
+    const result = await this.writeWatchValueCore(expression, value, address, typeName);
+    this.sendResponse(msg, result);
+  }
+
+  /**
+   * Shared write core used by the standard DAP `setWatchValue` request and the
+   * automation `writeMany` handler. The whole write runs under the step lock
+   * and the target-write barrier so automation writes are control work, never
+   * a bypass of the read/control handoff.
+   */
+  private async writeWatchValueCore(
+    expression: string,
+    value: number,
+    address?: number,
+    typeName?: string,
+  ): Promise<OzoneCommandResult> {
+    return this.withStepLock(async () => {
       if (!(await this.beginTargetWrite())) {
-        this.sendResponse(msg, { ok: false, error: 'Target busy' });
-        return;
+        return { ok: false, error: 'Target busy', errorCode: 'TargetBusy' };
       }
       try {
         // Preserve timestamp order: publish samples captured before the write before acknowledging it.
@@ -4153,7 +4401,7 @@ export class DapSession extends EventEmitter {
           this.runtimeWatchCache.delete(expression);
           this.runtimeWatchCacheTime.delete(expression);
         }
-        this.sendResponse(msg, result);
+        return result;
       } finally {
         this.endTargetWrite();
       }

@@ -17,6 +17,14 @@
 import * as vscode from 'vscode';
 import {
   AutomationError,
+  ExpressionContextKind,
+  ExpressionErrorData,
+  ExpressionInspectData,
+  ExpressionReadManyData,
+  ExpressionValue,
+  ExpressionWrite,
+  ExpressionWriteManyData,
+  ExpressionWriteOutcome,
   RuntimeListData,
   RuntimeRegister,
   RuntimeScope,
@@ -24,6 +32,10 @@ import {
   RuntimeThread,
   RuntimeVariable,
   SessionRef,
+  SymbolDescriptor,
+  SymbolKind,
+  SymbolResolveData,
+  SymbolSearchData,
 } from './protocol';
 import { SessionRegistry } from './session-registry';
 import {
@@ -31,7 +43,14 @@ import {
   AutomationRegisterGroup,
   AutomationRuntimeRequest,
   AutomationRuntimeResult,
+  AUTOMATION_EXPRESSION_COMMAND,
+  AutomationExpressionRequest,
+  AutomationExpressionResult,
+  AutomationExpressionValue,
+  AutomationExpressionWriteOutcome,
+  AutomationSymbol,
 } from '../debug/dap-automation-protocol';
+import { normalizeAutomationExpression, parseWriteValue } from '../utils/watch-expression-validation';
 
 const DEFAULT_PAGE_LIMIT = 100;
 const MAX_PAGE_LIMIT = 1000;
@@ -45,6 +64,8 @@ export interface RuntimeServiceOptions {
   registry: SessionRegistry;
   /** Pulls one runtime snapshot from an exact active session. */
   snapshotDap?(session: vscode.DebugSession, request: AutomationRuntimeRequest): Promise<AutomationRuntimeResult>;
+  /** Pulls one expression/symbol snapshot from an exact active session. */
+  snapshotExpressionDap?(session: vscode.DebugSession, request: AutomationExpressionRequest): Promise<AutomationExpressionResult>;
 }
 
 export interface RuntimeThreadsParams {
@@ -79,6 +100,43 @@ export interface RuntimeRegistersParams {
   limit?: number;
 }
 
+export interface ExpressionEvaluateParams {
+  expression: string;
+  frameId?: number;
+  contextKind?: ExpressionContextKind;
+}
+
+export interface ExpressionReadManyParams {
+  expressions: string[];
+  frameId?: number;
+  forceRealtime?: boolean;
+}
+
+export interface ExpressionWriteManyParams {
+  writes: ExpressionWrite[];
+  frameId?: number;
+  resumeIntent?: 'preserve' | 'halted' | 'running';
+}
+
+export interface ExpressionInspectParams {
+  expression: string;
+  frameId?: number;
+  depth?: number;
+  maxChildren?: number;
+}
+
+export interface SymbolSearchParams {
+  query: string;
+  kinds?: SymbolKind[];
+  cursor?: string;
+  limit?: number;
+}
+
+export interface SymbolResolveParams {
+  name?: string;
+  address?: string;
+}
+
 export class RuntimeService {
   private readonly opts: Required<RuntimeServiceOptions>;
   /**
@@ -104,6 +162,16 @@ export class RuntimeService {
           // errorCode. A transport error without a body is rethrown.
           const body = (error as { body?: unknown } | undefined)?.body;
           if (isRecord(body)) return body as AutomationRuntimeResult;
+          throw error;
+        }
+      },
+      snapshotExpressionDap: async (session, request) => {
+        try {
+          const response: unknown = await session.customRequest(AUTOMATION_EXPRESSION_COMMAND, request);
+          return (isRecord(response) ? response : {}) as AutomationExpressionResult;
+        } catch (error) {
+          const body = (error as { body?: unknown } | undefined)?.body;
+          if (isRecord(body)) return body as AutomationExpressionResult;
           throw error;
         }
       },
@@ -233,6 +301,349 @@ export class RuntimeService {
       return mapped;
     });
     return this.paginate(items, params.cursor, params.limit, item => item.name);
+  }
+
+  // --- expression & symbol methods (plan Task 8) ----------------------------
+
+  /** `orbit.expression.evaluate`: one expression read with a child reference. */
+  async evaluate(ref: SessionRef, params: ExpressionEvaluateParams): Promise<ExpressionValue> {
+    const normalized = normalizeAutomationExpression(params.expression);
+    if (!normalized.ok) throw new AutomationError('InvalidExpression', normalized.reason, false);
+    const { session, generation } = this.resolve(ref);
+    const result = await this.expressionSnapshot(session, {
+      kind: 'evaluate',
+      sessionGeneration: generation,
+      expression: normalized.expression,
+      ...(params.frameId !== undefined ? { frameId: params.frameId } : {}),
+      ...(params.contextKind !== undefined ? { contextKind: params.contextKind } : {}),
+    });
+    return this.mapExpressionValue(result.value, generation);
+  }
+
+  /** `orbit.expression.readMany`: ordered reads; a per-item failure never masks others. */
+  async readMany(ref: SessionRef, params: ExpressionReadManyParams): Promise<ExpressionReadManyData> {
+    const { session, generation } = this.resolve(ref);
+    type Normalized = { expression: string } | { original: string; error: ExpressionErrorData };
+    const normalized: Normalized[] = [];
+    const toSend: string[] = [];
+    for (const raw of params.expressions) {
+      const result = normalizeAutomationExpression(raw);
+      if (!result.ok) {
+        normalized.push({
+          original: raw,
+          error: { errorCode: 'InvalidExpression', retryable: false, details: { reason: result.reason } },
+        });
+      } else {
+        normalized.push({ expression: result.expression });
+        toSend.push(result.expression);
+      }
+    }
+    let values: AutomationExpressionValue[] = [];
+    if (toSend.length > 0) {
+      const result = await this.expressionSnapshot(session, {
+        kind: 'readMany',
+        sessionGeneration: generation,
+        expressions: toSend,
+        ...(params.frameId !== undefined ? { frameId: params.frameId } : {}),
+        ...(params.forceRealtime !== undefined ? { forceRealtime: params.forceRealtime } : {}),
+      });
+      values = result.values ?? [];
+    }
+    let valueCursor = 0;
+    const items: ExpressionValue[] = normalized.map(entry => {
+      if ('error' in entry) {
+        return {
+          expression: entry.original,
+          value: '',
+          variablesReference: '0',
+          available: false,
+          stale: false,
+          error: entry.error,
+        };
+      }
+      return this.mapExpressionValue(values[valueCursor++], generation);
+    });
+    return { items };
+  }
+
+  /**
+   * `orbit.expression.writeMany`: whole-batch control-barrier writes, per-item
+   * outcomes. `resumeIntent` is accepted but not forwarded: the shared write
+   * core already restores the pre-write run state, which is the `preserve`
+   * semantics the frozen contract defaults to.
+   */
+  async writeMany(
+    ref: SessionRef,
+    params: ExpressionWriteManyParams,
+    operationId?: string,
+  ): Promise<ExpressionWriteManyData> {
+    this.requireOperationId(operationId);
+    const { session, generation } = this.resolve(ref);
+
+    type Slot = { outcome?: ExpressionWriteOutcome; expression?: string; value?: number; valueString?: string };
+    const slots: Slot[] = params.writes.map(write => {
+      const expr = normalizeAutomationExpression(write.expression);
+      if (!expr.ok) {
+        return {
+          outcome: this.invalidWriteOutcome(write.expression, 'InvalidExpression', expr.reason),
+        };
+      }
+      const value = normalizeAutomationExpression(write.value);
+      if (!value.ok) {
+        return {
+          outcome: this.invalidWriteOutcome(expr.expression, 'InvalidExpression', value.reason),
+        };
+      }
+      const numeric = parseWriteValue(value.expression);
+      if (numeric === undefined) {
+        return {
+          outcome: this.invalidWriteOutcome(expr.expression, 'ExpressionNotWritable', `value ${JSON.stringify(write.value)} is not a finite number`),
+        };
+      }
+      return { expression: expr.expression, value: numeric, valueString: value.expression };
+    });
+
+    const dapSlots = slots.filter(slot => slot.expression !== undefined);
+    let dapOutcomes: AutomationExpressionWriteOutcome[] = [];
+    if (dapSlots.length > 0) {
+      const result = await this.expressionSnapshot(session, {
+        kind: 'writeMany',
+        sessionGeneration: generation,
+        writes: dapSlots.map(slot => ({ expression: slot.expression!, value: slot.value! })),
+        ...(params.frameId !== undefined ? { frameId: params.frameId } : {}),
+      });
+      dapOutcomes = result.writes ?? [];
+    }
+
+    let dapCursor = 0;
+    const items: ExpressionWriteOutcome[] = slots.map(slot => {
+      if (slot.outcome) return slot.outcome;
+      const dap = dapOutcomes[dapCursor++];
+      const expression = slot.expression!;
+      if (!dap) {
+        return { expression, written: false, error: { errorCode: 'InternalError', retryable: false } };
+      }
+      return {
+        expression,
+        written: dap.written,
+        ...(dap.written ? { value: slot.valueString } : {}),
+        ...(dap.error ? { error: this.mapExpressionErrorData(dap.error.errorCode, dap.error.message) } : {}),
+      };
+    });
+
+    return { operationId: operationId!, items };
+  }
+
+  /** `orbit.expression.inspect`: root value plus its expanded direct children. */
+  async inspect(ref: SessionRef, params: ExpressionInspectParams): Promise<ExpressionInspectData> {
+    const normalized = normalizeAutomationExpression(params.expression);
+    if (!normalized.ok) throw new AutomationError('InvalidExpression', normalized.reason, false);
+    const { session, generation } = this.resolve(ref);
+    const result = await this.expressionSnapshot(session, {
+      kind: 'inspect',
+      sessionGeneration: generation,
+      expression: normalized.expression,
+      ...(params.frameId !== undefined ? { frameId: params.frameId } : {}),
+      ...(params.depth !== undefined ? { depth: params.depth } : {}),
+      ...(params.maxChildren !== undefined ? { maxChildren: params.maxChildren } : {}),
+    });
+    const root = this.mapExpressionValue(result.value, generation);
+    const items: RuntimeVariable[] = (result.inspectItems ?? []).map(variable => {
+      const childReference = variable.variablesReference > 0 ? String(variable.variablesReference) : '0';
+      if (variable.variablesReference > 0) this.rememberReference(childReference, generation);
+      const mapped: RuntimeVariable = {
+        name: variable.name,
+        value: variable.value,
+        variablesReference: childReference,
+      };
+      if (variable.type !== undefined) mapped.type = variable.type;
+      if (variable.evaluateName !== undefined) mapped.evaluateName = variable.evaluateName;
+      if (variable.memoryReference !== undefined) mapped.memoryReference = variable.memoryReference;
+      return mapped;
+    });
+    return { root, items };
+  }
+
+  /** `orbit.symbol.search`: name-substring search over the loaded ELF cache. */
+  async symbolSearch(ref: SessionRef, params: SymbolSearchParams): Promise<SymbolSearchData> {
+    const query = params.query.trim();
+    if (!query) throw new AutomationError('InvalidRequest', 'symbol query must not be empty', false);
+    const { session, generation } = this.resolve(ref);
+    const result = await this.expressionSnapshot(session, {
+      kind: 'symbolSearch',
+      sessionGeneration: generation,
+      query,
+    });
+    let descriptors: SymbolDescriptor[] = (result.symbols ?? []).map(symbol => this.mapSymbol(symbol));
+    if (params.kinds && params.kinds.length > 0) {
+      const allowed = new Set<string>(params.kinds);
+      descriptors = descriptors.filter(symbol => allowed.has(symbol.kind));
+    }
+    return this.paginate(descriptors, params.cursor, params.limit, item => item.name);
+  }
+
+  /** `orbit.symbol.resolve`: resolve by exact name or by address over the ELF cache. */
+  async symbolResolve(ref: SessionRef, params: SymbolResolveParams): Promise<SymbolResolveData> {
+    const name = params.name !== undefined ? params.name.trim() : undefined;
+    const address = params.address;
+    if (!name && !address) throw new AutomationError('InvalidRequest', 'symbol resolve requires a name or an address', false);
+    if (name !== undefined && !name) throw new AutomationError('InvalidRequest', 'symbol name must not be empty', false);
+    const { session, generation } = this.resolve(ref);
+    const result = await this.expressionSnapshot(session, {
+      kind: 'symbolResolve',
+      sessionGeneration: generation,
+      ...(name !== undefined ? { expression: name } : {}),
+      ...(address !== undefined ? { address } : {}),
+    });
+    const symbol = result.symbol;
+    if (!symbol) throw new AutomationError('InvalidRequest', 'symbol resolve returned no symbol', false);
+    return { symbol: this.mapSymbol(symbol), exact: result.exact ?? false };
+  }
+
+  // --- expression/symbol internals ------------------------------------------
+
+  private async expressionSnapshot(session: vscode.DebugSession, request: AutomationExpressionRequest): Promise<AutomationExpressionResult> {
+    let result: AutomationExpressionResult;
+    try {
+      result = await this.opts.snapshotExpressionDap(session, request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new AutomationError('TargetDisconnected', `expression snapshot failed: ${message}`, false, undefined, {
+        dapMessage: message,
+      });
+    }
+    this.throwOnExpressionFailure(result);
+    return result;
+  }
+
+  /** Maps a structured DAP expression failure onto the frozen automation codes. */
+  private throwOnExpressionFailure(result: AutomationExpressionResult): void {
+    if (!result.errorCode) return;
+    const code = result.errorCode;
+    const message = result.message ?? code;
+    const details: Record<string, unknown> = { dapMessage: message };
+    if (result.targetState !== undefined) details.targetState = result.targetState;
+    if (code === 'TargetRunning') {
+      throw new AutomationError('TargetRunning', message, true, undefined, details);
+    }
+    if (code === 'TargetReadCancelled' || code === 'TargetReadUnavailable'
+      || code === 'EvaluateCancelled' || code === 'RtosReadCancelled'
+      || code === 'RtosVariableUnavailable' || code === 'RtosVariableExpansionFailed') {
+      throw new AutomationError('TargetReadCancelled', message, true, undefined, details);
+    }
+    if (code === 'TargetBusy') {
+      throw new AutomationError('TargetBusy', message, true, undefined, details);
+    }
+    if (code === 'SessionStarting') {
+      throw new AutomationError('SessionStarting', message, true, undefined, details);
+    }
+    if (code === 'SessionTerminating') {
+      throw new AutomationError('SessionTerminating', message, false, undefined, details);
+    }
+    if (code === 'TargetDisconnected' || code === 'NativeOwnerLost' || code === 'DeviceRemoved') {
+      throw new AutomationError('TargetDisconnected', message, false, undefined, details);
+    }
+    if (code === 'CapabilityUnavailable' || code === 'SymbolsUnavailable') {
+      throw new AutomationError('CapabilityUnavailable', message, false, undefined, details);
+    }
+    if (code === 'SymbolNotFound') {
+      throw new AutomationError('InvalidRequest', message, false, undefined, details);
+    }
+    if (code === 'InvalidExpression') {
+      throw new AutomationError('InvalidExpression', message, false, undefined, details);
+    }
+    throw new AutomationError('InternalError', message, false, undefined, details);
+  }
+
+  private mapExpressionValue(value: AutomationExpressionValue | undefined, generation: number): ExpressionValue {
+    if (!value) {
+      return {
+        expression: '',
+        value: '',
+        variablesReference: '0',
+        available: false,
+        stale: false,
+        error: { errorCode: 'InternalError', retryable: false },
+      };
+    }
+    const reference = value.variablesReference > 0 ? String(value.variablesReference) : '0';
+    if (value.variablesReference > 0) this.rememberReference(reference, generation);
+    const mapped: ExpressionValue = {
+      expression: value.expression,
+      value: value.value,
+      variablesReference: reference,
+      available: value.available,
+      stale: value.stale,
+    };
+    if (value.type !== undefined) mapped.type = value.type;
+    if (value.memoryReference !== undefined) mapped.memoryReference = value.memoryReference;
+    if (value.error) mapped.error = this.mapExpressionErrorData(value.error.errorCode, value.error.message);
+    return mapped;
+  }
+
+  private mapExpressionErrorData(errorCode: string, message?: string): ExpressionErrorData {
+    const mapped = this.mapExpressionErrorCode(errorCode);
+    return {
+      errorCode: mapped.code,
+      retryable: mapped.retryable,
+      ...(message !== undefined ? { details: { dapMessage: message } } : {}),
+    };
+  }
+
+  private mapExpressionErrorCode(errorCode: string): { code: string; retryable: boolean } {
+    switch (errorCode) {
+      case 'TargetRunning': return { code: 'TargetRunning', retryable: true };
+      case 'TargetBusy': return { code: 'TargetBusy', retryable: true };
+      case 'TargetReadCancelled':
+      case 'TargetReadUnavailable':
+      case 'EvaluateCancelled':
+      case 'RtosReadCancelled':
+      case 'RtosVariableUnavailable':
+      case 'RtosVariableExpansionFailed':
+        return { code: 'TargetReadCancelled', retryable: true };
+      case 'TargetDisconnected':
+      case 'NativeOwnerLost':
+      case 'DeviceRemoved':
+        return { code: 'TargetDisconnected', retryable: false };
+      case 'SessionStarting': return { code: 'SessionStarting', retryable: true };
+      case 'SessionTerminating': return { code: 'SessionTerminating', retryable: false };
+      case 'CapabilityUnavailable': return { code: 'CapabilityUnavailable', retryable: false };
+      case 'ExpressionNotWritable': return { code: 'ExpressionNotWritable', retryable: false };
+      case 'InvalidExpression': return { code: 'InvalidExpression', retryable: false };
+      default: return { code: 'InternalError', retryable: false };
+    }
+  }
+
+  private mapSymbol(symbol: AutomationSymbol): SymbolDescriptor {
+    const mapped: SymbolDescriptor = {
+      name: symbol.name,
+      kind: this.symbolKindFromNmType(symbol.typeChar),
+      // 8-digit zero-padded hex matches the register `hex` convention so symbol
+      // addresses stay string-comparable/sortable on the wire.
+      address: `0x${(symbol.address >>> 0).toString(16).toUpperCase().padStart(8, '0')}`,
+    };
+    if (symbol.size > 0) mapped.size = String(symbol.size);
+    return mapped;
+  }
+
+  private symbolKindFromNmType(typeChar: string): SymbolKind {
+    if (/^[TtWw]$/.test(typeChar)) return 'function';
+    if (/^[BbDdGgRrSsVvCc]$/.test(typeChar)) return 'variable';
+    return 'unknown';
+  }
+
+  private invalidWriteOutcome(expression: string, errorCode: 'InvalidExpression' | 'ExpressionNotWritable', reason: string): ExpressionWriteOutcome {
+    return {
+      expression,
+      written: false,
+      error: { errorCode, retryable: false, details: { reason } },
+    };
+  }
+
+  private requireOperationId(operationId: string | undefined): void {
+    if (!operationId) {
+      throw new AutomationError('InternalError', 'expression writeMany dispatched without an operationId', false);
+    }
   }
 
   // --- internals -----------------------------------------------------------

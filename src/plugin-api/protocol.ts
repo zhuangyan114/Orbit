@@ -485,6 +485,98 @@ export interface RuntimeListData<T> {
   nextCursor?: string | null;
 }
 
+// --- Expression & symbol DTOs (OpenRPC, plan Task 8). Frozen shapes returned
+// --- by orbit.expression.* and orbit.symbol.*. `variablesReference` is a
+// --- UInt64 string (the adapter-internal integer is stringified by the
+// --- service), addresses are 0x-prefixed hex strings, and per-item errors
+// --- carry the frozen ErrorDataBase subset (errorCode + retryable).
+
+/** OpenRPC ExpressionContextKind (orbit.expression.evaluate contextKind). */
+export type ExpressionContextKind = 'watch' | 'hover' | 'repl' | 'clipboard' | 'variables';
+
+/** OpenRPC error payload carried inside ExpressionValue / ExpressionWriteOutcome. */
+export interface ExpressionErrorData {
+  errorCode: string;
+  retryable: boolean;
+  details?: Record<string, unknown>;
+}
+
+/** OpenRPC ExpressionValue (data of evaluate / items of readMany / root of inspect). */
+export interface ExpressionValue {
+  expression: string;
+  value: string;
+  type?: string;
+  /** UInt64 string of the adapter-internal variablesReference (0 for a leaf). */
+  variablesReference: string;
+  /** OpenRPC Address: 0x-prefixed hex string, when the owner reports one. */
+  memoryReference?: string;
+  available: boolean;
+  stale: boolean;
+  error?: ExpressionErrorData;
+}
+
+/** OpenRPC ExpressionWrite (one item of expression.writeMany writes). */
+export interface ExpressionWrite {
+  expression: string;
+  /** Frozen `Expression` string: a numeric literal for this adapter's backend. */
+  value: string;
+}
+
+/** OpenRPC ExpressionWriteOutcome (one item of expression.writeMany result). */
+export interface ExpressionWriteOutcome {
+  expression: string;
+  written: boolean;
+  value?: string;
+  error?: ExpressionErrorData;
+}
+
+/** OpenRPC SymbolKind. */
+export type SymbolKind = 'function' | 'variable' | 'type' | 'section' | 'unknown';
+
+/** OpenRPC Symbol (items of orbit.symbol.search / data of orbit.symbol.resolve). */
+export interface SymbolDescriptor {
+  name: string;
+  kind: SymbolKind;
+  /** OpenRPC Address: 0x-prefixed hex string. */
+  address: string;
+  /** UInt64 string, when the ELF symbol table reports a size. */
+  size?: string;
+  file?: string;
+  line?: number;
+}
+
+/** OpenRPC ExpressionReadManyResult data. */
+export interface ExpressionReadManyData {
+  items: ExpressionValue[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC ExpressionWriteManyResult data. */
+export interface ExpressionWriteManyData {
+  operationId: string;
+  items: ExpressionWriteOutcome[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC ExpressionInspectResult data. */
+export interface ExpressionInspectData {
+  root: ExpressionValue;
+  items: RuntimeVariable[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC SymbolSearchResult data. */
+export interface SymbolSearchData {
+  items: SymbolDescriptor[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC SymbolResolveResult data. */
+export interface SymbolResolveData {
+  symbol: SymbolDescriptor;
+  exact: boolean;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

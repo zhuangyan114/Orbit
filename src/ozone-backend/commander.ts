@@ -294,6 +294,7 @@ export class OzoneBackend {
         && command.cmd !== 'disconnect'
         && command.cmd !== 'loadSymbols'
         && command.cmd !== 'resolveSymbol'
+        && command.cmd !== 'searchSymbols'
         && command.cmd !== 'prepareFastDataSampling'
         && command.cmd !== 'getPerformanceDiagnostics') {
         return { ok: false, error: 'Target access is owned by the active ozone DAP session' };
@@ -540,18 +541,42 @@ case 'readVariableRuntime':
               error: 'SymbolsUnavailable: no ELF symbols are loaded',
             };
           }
-          const symbol = this.findSymbolByName(command.name);
+          const byName = command.name !== undefined ? this.findSymbolByName(command.name) : undefined;
+          const byAddress = command.address !== undefined ? this.findSymbolByAddress(command.address) : undefined;
+          const symbol = byName ?? byAddress;
           if (!symbol || !Number.isFinite(symbol.address)) {
             return {
               ok: false,
               errorCode: 'SymbolNotFound',
-              error: `SymbolNotFound: ${command.name}`,
+              error: `SymbolNotFound: ${command.name ?? `0x${command.address?.toString(16)}`}`,
             };
           }
-          log.eval(`resolveSymbol name=${command.name} address=0x${symbol.address.toString(16)} source=elf`);
+          const exact = command.name !== undefined
+            ? symbol.name === command.name
+            : (symbol.address >>> 0) === (command.address! >>> 0);
+          log.eval(`resolveSymbol name=${command.name ?? ''} address=${command.address ?? '0x0'} -> ${symbol.name} source=elf exact=${exact}`);
           return {
             ok: true,
-            data: { name: symbol.name, address: symbol.address, size: symbol.size, type: symbol.type },
+            data: { name: symbol.name, address: symbol.address, size: symbol.size, type: symbol.type, exact },
+          };
+        }
+        case 'searchSymbols': {
+          if (!this.elfPath || this.symbols.length === 0) {
+            return {
+              ok: false,
+              errorCode: 'SymbolsUnavailable',
+              error: 'SymbolsUnavailable: no ELF symbols are loaded',
+            };
+          }
+          const query = command.query.toLowerCase();
+          const matches = this.symbols
+            .filter(s => s.name.toLowerCase().includes(query))
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .slice(0, command.maxResults);
+          log.eval(`searchSymbols query=${command.query} matches=${matches.length}`);
+          return {
+            ok: true,
+            data: matches.map(s => ({ name: s.name, address: s.address, size: s.size, type: s.type })),
           };
         }
         default:
@@ -2875,6 +2900,25 @@ case 'readVariableRuntime':
   private findSymbolByName(name: string): SymbolInfo | undefined {
     return this.symbols.find(s => s.name === name)
       || this.symbols.find(s => s.name.toLowerCase() === name.toLowerCase());
+  }
+
+  /** Resolves a symbol whose exact address matches, or that contains the address. */
+  private findSymbolByAddress(address: number): SymbolInfo | undefined {
+    const normalized = address >>> 0;
+    let exact: SymbolInfo | undefined;
+    for (const sym of this.symbols) {
+      if ((sym.address >>> 0) === normalized) {
+        if (!exact || sym.size < exact.size) exact = sym;
+      }
+    }
+    if (exact) return exact;
+    let container: SymbolInfo | undefined;
+    for (const sym of this.symbols) {
+      if (sym.size > 0 && normalized > (sym.address >>> 0) && normalized < (sym.address >>> 0) + sym.size) {
+        if (!container || sym.size < container.size) container = sym;
+      }
+    }
+    return container;
   }
 
   private isFastScalarType(info: { kind?: string; byteSize?: number } | null): boolean {

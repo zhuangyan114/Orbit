@@ -52,7 +52,7 @@ import {
   AutomationControlResult,
   AutomationRegisterGroup,
 } from '../debug/dap-automation-protocol';
-import { ControlOutcome, FlashReport, SessionRef, TargetRequestContext } from './protocol';
+import { ControlOutcome, ExpressionContextKind, ExpressionWrite, FlashReport, SessionRef, SymbolKind, TargetRequestContext } from './protocol';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -223,6 +223,49 @@ interface RuntimeRegistersWireParams {
   groups?: AutomationRegisterGroup[];
   cursor?: string;
   limit?: number;
+}
+
+interface ExpressionEvaluateWireParams {
+  context: TargetRequestContext;
+  expression: string;
+  frameId?: number;
+  contextKind?: ExpressionContextKind;
+}
+
+interface ExpressionReadManyWireParams {
+  context: TargetRequestContext;
+  expressions: string[];
+  frameId?: number;
+  forceRealtime?: boolean;
+}
+
+interface ExpressionWriteManyWireParams {
+  context: TargetMutationContext;
+  writes: ExpressionWrite[];
+  frameId?: number;
+  resumeIntent?: 'preserve' | 'halted' | 'running';
+}
+
+interface ExpressionInspectWireParams {
+  context: TargetRequestContext;
+  expression: string;
+  frameId?: number;
+  depth?: number;
+  maxChildren?: number;
+}
+
+interface SymbolSearchWireParams {
+  context: TargetRequestContext;
+  query: string;
+  kinds?: SymbolKind[];
+  cursor?: string;
+  limit?: number;
+}
+
+interface SymbolResolveWireParams {
+  context: TargetRequestContext;
+  name?: string;
+  address?: string;
 }
 
 export interface PluginApiServerOptions {
@@ -680,6 +723,66 @@ export class PluginApiServer implements vscode.Disposable {
           groups: params.groups,
           cursor: params.cursor,
           limit: params.limit,
+        }),
+      })),
+    );
+    // --- plan Task 8: expressions, variable writes and symbol discovery ---
+    dispatcher.register(
+      buildMethodDefinition('orbit.expression.evaluate', async (params: ExpressionEvaluateWireParams) => ({
+        data: await this.runtimeService.evaluate(this.sessionRef(params.context), {
+          expression: params.expression,
+          frameId: params.frameId,
+          contextKind: params.contextKind,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.expression.readMany', async (params: ExpressionReadManyWireParams) => ({
+        data: await this.runtimeService.readMany(this.sessionRef(params.context), {
+          expressions: params.expressions,
+          frameId: params.frameId,
+          forceRealtime: params.forceRealtime,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.expression.writeMany', async (params: ExpressionWriteManyWireParams, call) => ({
+        data: await this.runtimeService.writeMany(
+          this.sessionRef(params.context),
+          {
+            writes: params.writes,
+            frameId: params.frameId,
+            resumeIntent: params.resumeIntent,
+          },
+          call.operationId,
+        ),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.expression.inspect', async (params: ExpressionInspectWireParams) => ({
+        data: await this.runtimeService.inspect(this.sessionRef(params.context), {
+          expression: params.expression,
+          frameId: params.frameId,
+          depth: params.depth,
+          maxChildren: params.maxChildren,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.symbol.search', async (params: SymbolSearchWireParams) => ({
+        data: await this.runtimeService.symbolSearch(this.sessionRef(params.context), {
+          query: params.query,
+          kinds: params.kinds,
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.symbol.resolve', async (params: SymbolResolveWireParams) => ({
+        data: await this.runtimeService.symbolResolve(this.sessionRef(params.context), {
+          name: params.name,
+          address: params.address,
         }),
       })),
     );

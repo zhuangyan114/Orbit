@@ -79,6 +79,30 @@
    后端 `setWatchValue` 对「Symbol not found」不返回 `errorCode`；真实信息在
    `error.details.dapMessage`，逐项隔离语义正确。
 
+## 已知限制（安全 review，经用户确认记录、暂不修复）
+
+1. **[M·继承] J-Link 写路径无 RAM 范围护栏**：`doSetWatchValue` 仅对 CMSIS-DAP
+   owner 强制 `0x20000000–0x20020000` SRAM 范围检查；J-Link（native/legacy）的
+   `targetWriteMemory` 直接 `WriteMem`，无等价护栏。对 flash 映射符号（如函数符号）
+   执行 `writeMany` 时，J-Link 会尝试原始写——运行时通常对 flash 失败，但无显式
+   保证。此缺口属 UI Watch 写变量的既有行为，Task 8 复用同一 `setWatchValue` core
+   而未新开洞。后续应给 J-Link 补一个与 CMSIS-DAP 对称的 SRAM 护栏。
+2. **[L] `writeMany` 批量非原子**：逐项 `withStepLock`+`beginTargetWrite` 获取/释放，
+   每项都过屏障但整批可被 step/continue 插入；Zod 上限 1000 兜底。
+3. **[L] `parseWriteValue` 64 位精度损失**：>2^53 的十六进制值经 `Number.parseInt`
+   损失精度，整数写再 `value >>> 0` 截断到 32 位；写入尺寸始终由符号 `size`（≤8 字节）
+   约束，不越界，仅静默截断。
+4. **[L] `symbol.search` 2000 条截断**：后端 `searchSymbols` cap `maxResults:2000`，
+   cursor 分页重拉同一窗口，宽泛 query 匹配 >2000 时看不到之后的符号；有界无 DoS。
+5. **[L·外观] 符号 query/name 未拒控制字符**：仅 `trim`+拒空，与表达式 normalize
+   不一致；因 `.includes`/精确匹配为字面量，无注入风险。
+6. **[L] `frameId`/`contextKind`/`resumeIntent` 被接受但不生效**：符号型后端无帧
+   作用域求值、写后恒 `preserve`。
+
+> 安全边界本身完好：`writeMany` 的 `variables.write` scope、`idempotencyKey`、
+> session generation fence 均强制生效；`writeMany` 只能写 ELF 符号地址，不能写
+> 任意地址（比 legacy `setWatchValue` 的 `address` 参数更安全）；无 shell/正则注入面。
+
 ## 提交
 
 - `feat(api): expose expressions variables and symbols`（`0279181`）

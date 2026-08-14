@@ -3,9 +3,10 @@
 //
 // Plan: locate the g_ram_data RAM test global, read it via orbit.memory.read,
 // then exercise write -> verify -> restore while the target is RUNNING
-// (memory.read/write must halt -> access -> resume like the MemoryView path),
-// and finally halt to a clean state. Negative cases (invalid address / invalid
-// base64) are checked last and never touch the target.
+// (Automation memory access must leave the CPU running; standard MemoryView
+// retains its separate halt/resume path), and finally halt to a clean state.
+// Negative cases (invalid address / invalid base64) are checked last and never
+// touch the target.
 const fs = require('fs');
 const path = require('path');
 
@@ -130,7 +131,7 @@ async function main() {
   });
   record('target.continue leaves the target running', cont.data?.state === 'running', { state: cont.data?.state });
 
-  // 4) read while running (backend must halt -> read -> resume)
+  // 4) read while running without halting the target
   const runningRead = await rpc('orbit.memory.read', { context: targetCtx, address: ramAddr, count: 4 });
   const runningValue = base64ToU32(runningRead.data?.data);
   record('memory.read succeeds while running', runningRead.data?.bytesRead === 4 && runningValue === original, { read: runningRead.data?.bytesRead, value: runningValue !== null ? `0x${runningValue.toString(16).toUpperCase()}` : null });

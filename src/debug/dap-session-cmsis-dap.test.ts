@@ -1950,6 +1950,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
       arguments: { memoryReference: '0xffffffff', count: 4 },
     });
 
+    expect((backend.execute as any).mock.calls[0][0]).not.toHaveProperty('liveAccess');
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'response',
       command: 'readMemory',

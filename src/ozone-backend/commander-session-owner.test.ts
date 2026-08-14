@@ -75,6 +75,90 @@ describe('OzoneBackend extension-host ownership guard', () => {
     });
   });
 
+  it('reads memory through the selected owner without halting in live-access mode', async () => {
+    const target = {
+      getState: vi.fn(async () => ({ ok: true, data: { state: 'Running' } })),
+      halt: vi.fn(async () => ({ ok: true })),
+      run: vi.fn(async () => ({ ok: true })),
+      readMemory: vi.fn(async () => ({
+        ok: true,
+        message: 'memory read',
+        targetState: 'Running' as const,
+        elapsedMs: 1,
+        data: { bytes: Uint8Array.from([1, 2, 3, 4]) },
+      })),
+    } as unknown as SessionTargetOwner;
+    const backend = new OzoneBackend(target, target);
+
+    const result = await backend.execute({
+      cmd: 'readMemory', address: 0x20000000, size: 4, liveAccess: true,
+    });
+
+    expect(result).toMatchObject({ ok: true, data: { address: 0x20000000, data: [1, 2, 3, 4] } });
+    expect(target.readMemory).toHaveBeenCalledOnce();
+    expect(target.getState).not.toHaveBeenCalled();
+    expect(target.halt).not.toHaveBeenCalled();
+    expect(target.run).not.toHaveBeenCalled();
+  });
+
+  it('writes memory through the selected owner without halting in live-access mode', async () => {
+    const target = {
+      getState: vi.fn(async () => ({ ok: true, data: { state: 'Running' } })),
+      halt: vi.fn(async () => ({ ok: true })),
+      run: vi.fn(async () => ({ ok: true })),
+      writeMemory: vi.fn(async () => ({
+        ok: true,
+        message: 'memory written',
+        targetState: 'Running' as const,
+        elapsedMs: 1,
+        data: { address: 0x20000000, bytesWritten: 4 },
+      })),
+    } as unknown as SessionTargetOwner;
+    const backend = new OzoneBackend(target, target);
+
+    const result = await backend.execute({
+      cmd: 'writeMemory', address: 0x20000000, data: [1, 2, 3, 4], liveAccess: true,
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(target.writeMemory).toHaveBeenCalledOnce();
+    expect(target.getState).not.toHaveBeenCalled();
+    expect(target.halt).not.toHaveBeenCalled();
+    expect(target.run).not.toHaveBeenCalled();
+  });
+
+  it('returns a structured live-write error without falling back to halt', async () => {
+    const target = {
+      getState: vi.fn(),
+      halt: vi.fn(),
+      run: vi.fn(),
+      writeMemory: vi.fn(async () => ({
+        ok: false,
+        message: 'running writes are unavailable',
+        errorCode: 'UnsupportedCapability',
+        targetState: 'Running' as const,
+        elapsedMs: 1,
+        diagnostics: { operation: 'writeMemory', mode: 'live' },
+      })),
+    } as unknown as SessionTargetOwner;
+    const backend = new OzoneBackend(target, target);
+
+    const result = await backend.execute({
+      cmd: 'writeMemory', address: 0x20000000, data: [1, 2, 3, 4], liveAccess: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+      error: 'UnsupportedCapability: running writes are unavailable',
+      targetState: 'Running',
+      diagnostics: { operation: 'writeMemory', mode: 'live' },
+    });
+    expect(target.getState).not.toHaveBeenCalled();
+    expect(target.halt).not.toHaveBeenCalled();
+    expect(target.run).not.toHaveBeenCalled();
+  });
+
   it('preserves structured RTT Flags failures from the selected owner', async () => {
     const target = {
       readRtt: vi.fn(async () => ({

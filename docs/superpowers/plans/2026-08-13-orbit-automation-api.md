@@ -74,7 +74,7 @@
 | `orbit.runtime.registers` | 读取核心/浮点/系统寄存器，保留精确值和 `memoryReference` |
 | `orbit.expression.evaluate` / `readMany` / `writeMany` / `inspect` | 读取、写入、展开并检查调试器表达式 |
 | `orbit.symbol.search` / `resolve` | 使用已加载 ELF/DWARF 搜索和解析符号，不扫描或猜测目标内存 |
-| `orbit.memory.read` / `write` | 按字节读取/写入目标内存，支持 partial read 和可选写后校验 |
+| `orbit.memory.read` / `write` | 按字节读取/写入目标内存，支持 partial read 和可选写后校验；运行态直接访问当前 owner，不暂停目标程序 |
 
 ### 1.5 Watch、Timeline、录波、RTT 与诊断
 
@@ -871,7 +871,11 @@ interface MemoryReadResult {
 - [ ] 复用 DAP readMemory/writeMemory 的 base64 byte contract；禁止增加 `uint32[]` 特殊语义。
 - [ ] 验证 32 位地址、offset overflow、0/负 count、1 MiB 上限、invalid base64、partial read。
 - [ ] 写入支持 `verify: true`：同 owner 写后读回并逐字节比较；不匹配返回 `MemoryVerifyFailed`。
-- [ ] running/halted 行为必须与现有 DAP MemoryView 相同；控制期间读返回有界错误，不悬挂。
+- [x] Automation API 的 running-state `memory.read` / `memory.write` 必须直接使用当前 session owner，不得执行隐式 `halt` / `run`；标准 DAP MemoryView 保持现有行为。
+- [ ] 探针、传输或地址不支持运行态访问时返回结构化错误，不得自动回退到 halt/read-or-write/resume，也不得创建第二个 owner。
+- [ ] 运行态大块读取不是原子快照；固件可与写入及 verify read-back 竞争，竞争导致的 read failure 或 `verified:false` 必须如实返回。
+- [ ] 读仍使用有界 background read gate；写及 verify 仍使用 control barrier 和同一 owner，排除并发 Watch/Timeline/native access，但不得暂停 CPU。
+- [ ] 覆盖 API 运行态读、写、verify 均不调用 halt/run，API 周期读取不再造成 Timeline 断段，并确认标准 DAP MemoryView 默认语义未改变。
 - [ ] 覆盖 session termination、read cancellation、owner lost 和 stale generation。
 - [ ] Run DAP memory focused tests、CMSIS/J-Link mock、typecheck/build。
 - [ ] Commit: `feat(api): add byte-oriented memory access`。

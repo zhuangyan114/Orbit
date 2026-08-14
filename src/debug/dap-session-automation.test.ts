@@ -717,12 +717,19 @@ const AA4 = Buffer.from([0xAA, 0xAA, 0xAA, 0xAA]).toString('base64');
 const AA3BB = Buffer.from([0xAA, 0xAA, 0xAA, 0xBB]).toString('base64');
 
 /** Byte-oriented memory backend: readMemory returns a fixed 4-byte block. */
-function memoryBackend(overrides: Record<string, unknown> = {}): { execute: (command: any) => Promise<any>; calls: string[] } {
+function memoryBackend(overrides: Record<string, unknown> = {}): {
+  execute: (command: any) => Promise<any>;
+  calls: string[];
+  commands: Array<{ cmd: string } & Record<string, unknown>>;
+} {
   const calls: string[] = [];
+  const commands: Array<{ cmd: string } & Record<string, unknown>> = [];
   const backend = {
     calls,
+    commands,
     execute: async (command: { cmd: string } & Record<string, unknown>) => {
       calls.push(command.cmd);
+      commands.push(command);
       if (overrides[command.cmd]) return (overrides[command.cmd] as () => unknown)();
       if (command.cmd === 'readMemory') {
         return { ok: true, data: { address: command.address, data: [0xAA, 0xAA, 0xAA, 0xAA], ascii: '....', unreadableBytes: 0 } };
@@ -752,6 +759,24 @@ describe('DapSession automation memory snapshot', () => {
       },
     });
     expect((backend as any).calls).toEqual(['readMemory']);
+    expect((backend as any).commands[0]).toMatchObject({
+      cmd: 'readMemory', address: 0x20000010, size: 4, liveAccess: true,
+    });
+  });
+
+  it('read leaves run-state polling active while the target is running', async () => {
+    const backend = memoryBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    (session as any).targetRunning = true;
+    const stopPolling = vi.spyOn(session as any, 'stopPolling').mockImplementation(() => undefined);
+    const startPolling = vi.spyOn(session as any, 'startPolling').mockImplementation(() => undefined);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'read', sessionGeneration: 2, address: '0x20000010', count: 4,
+    }));
+
+    expect(stopPolling).not.toHaveBeenCalled();
+    expect(startPolling).not.toHaveBeenCalled();
   });
 
   it('read during control surfaces the frozen retryable TargetReadCancelled', async () => {
@@ -783,6 +808,25 @@ describe('DapSession automation memory snapshot', () => {
       body: { address: '0x20000010', bytesWritten: 4, verified: true, data: AA4, targetState: 'Halted' },
     });
     expect((backend as any).calls).toEqual(['writeMemory', 'readMemory']);
+    expect((backend as any).commands).toEqual([
+      { cmd: 'writeMemory', address: 0x20000010, data: [0xAA, 0xAA, 0xAA, 0xAA], liveAccess: true },
+      { cmd: 'readMemory', address: 0x20000010, size: 4, liveAccess: true },
+    ]);
+  });
+
+  it('write leaves run-state polling active while the target is running', async () => {
+    const backend = memoryBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    (session as any).targetRunning = true;
+    const stopPolling = vi.spyOn(session as any, 'stopPolling').mockImplementation(() => undefined);
+    const startPolling = vi.spyOn(session as any, 'startPolling').mockImplementation(() => undefined);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'write', sessionGeneration: 2, address: '0x20000010', data: AA4, verify: true,
+    }));
+
+    expect(stopPolling).not.toHaveBeenCalled();
+    expect(startPolling).not.toHaveBeenCalled();
   });
 
   it('write verify mismatch reports verified false with the read-back bytes', async () => {

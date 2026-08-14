@@ -2438,7 +2438,7 @@ export class DapSession extends EventEmitter {
     }
   }
 
-  private async handleReadMemory(msg: DebugProtocolMessage) {
+  private async handleReadMemory(msg: DebugProtocolMessage, liveAccess = false) {
     const args = msg.arguments || {};
     const address = this.parseMemoryReference(args.memoryReference, args.offset);
     const count = Math.max(0, Math.min(Number(args.count) || 0, 1024 * 1024));
@@ -2462,7 +2462,9 @@ export class DapSession extends EventEmitter {
       this.activeMemoryReadAbortController = controller;
       let result: OzoneCommandResult;
       try {
-        result = await this.backend.execute({ cmd: 'readMemory', address, size: count, signal: controller.signal });
+        result = await this.backend.execute({
+          cmd: 'readMemory', address, size: count, signal: controller.signal, ...(liveAccess ? { liveAccess: true } : {}),
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const cancelled = controller.signal.aborted || readEpoch !== this.readCancelEpoch;
@@ -3040,6 +3042,7 @@ export class DapSession extends EventEmitter {
     msg: DebugProtocolMessage,
     command: string,
     args: Record<string, unknown>,
+    options: { liveMemoryAccess?: boolean } = {},
   ): Promise<{ body?: any; success: boolean; message?: string }> {
     const synthetic: DebugProtocolMessage = {
       type: 'request',
@@ -3050,7 +3053,11 @@ export class DapSession extends EventEmitter {
     const capture: AutomationCapture = { synthetic, recorded: false, success: false };
     this.automationCapture = capture;
     try {
-      await this.dispatchRequest(synthetic);
+      if (command === 'readMemory' && options.liveMemoryAccess === true) {
+        await this.handleReadMemory(synthetic, true);
+      } else {
+        await this.dispatchRequest(synthetic);
+      }
     } catch (error) {
       if (!capture.recorded) {
         capture.recorded = true;
@@ -3447,23 +3454,12 @@ export class DapSession extends EventEmitter {
     startedAt: number,
   ): Promise<void> {
     const address = this.parseAutomationAddress(request.address);
-    // The backend halts -> reads -> resumes while the target is running; pause
-    // the run-state poll loop so that brief halt is not mistaken for a real
-    // stop (which would fire a spurious stopped event and block low-priority
-    // reads for 150ms). Polling resumes afterwards when the target was running.
-    const wasRunning = this.targetRunning;
-    this.stopPolling();
-    let captured: { body?: any; success: boolean; message?: string };
-    try {
-      // Reuse the exact DAP readMemory handler so running/halted behavior, the
-      // read gate, and control cancellation match MemoryView byte-for-byte.
-      captured = await this.runAutomationRead(msg, 'readMemory', {
-        memoryReference: request.address,
-        count: request.count,
-      });
-    } finally {
-      if (wasRunning) this.startPolling();
-    }
+    // Reuse the DAP read gate, but keep the Automation API operation live so
+    // the target and Timeline continue running throughout the memory access.
+    const captured = await this.runAutomationRead(msg, 'readMemory', {
+      memoryReference: request.address,
+      count: request.count,
+    }, { liveMemoryAccess: true });
     if (!captured.success) {
       const code = this.memoryReadFailureCode(captured);
       this.sendAutomationMemoryFailure(msg, code, captured.message ?? 'memory read failed', this.automationTargetState(), startedAt);
@@ -3513,25 +3509,20 @@ export class DapSession extends EventEmitter {
       return;
     }
 
-    const wasRunning = this.targetRunning;
     const outcome = await this.withStepLock(async () => {
       if (!(await this.beginTargetWrite())) {
         return { ok: false as const, errorCode: 'TargetBusy', error: 'Target busy' };
       }
-      // Control work: pause the run-state poll loop so the write's internal
-      // halt -> write -> resume is not mistaken for a real stop (see the read
-      // handler for the same guard).
-      this.stopPolling();
       try {
         this.flushDataSampling();
-        const writeResult = await this.backend.execute({ cmd: 'writeMemory', address, data });
+        const writeResult = await this.backend.execute({ cmd: 'writeMemory', address, data, liveAccess: true });
         if (!writeResult.ok) {
           return { ok: false as const, errorCode: writeResult.errorCode ?? 'MemoryWriteFailed', error: writeResult.error };
         }
         if (request.verify === false) {
           return { ok: true as const, bytesWritten: data.length, verified: false };
         }
-        const readResult = await this.backend.execute({ cmd: 'readMemory', address, size: data.length });
+        const readResult = await this.backend.execute({ cmd: 'readMemory', address, size: data.length, liveAccess: true });
         if (!readResult.ok) {
           return {
             ok: false as const,
@@ -3553,7 +3544,6 @@ export class DapSession extends EventEmitter {
       }
     });
 
-    if (wasRunning) this.startPolling();
     if (!outcome.ok) {
       this.sendAutomationMemoryFailure(msg, outcome.errorCode, outcome.error, this.automationTargetState(), startedAt);
       return;

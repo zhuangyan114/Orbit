@@ -352,7 +352,7 @@ export class OzoneBackend {
         case 'getCallStack':
           return await this.doGetCallStack();
         case 'readMemory':
-          return await this.doReadMemory(command.address, command.size, command.signal);
+          return await this.doReadMemory(command.address, command.size, command.signal, command.liveAccess === true);
         case 'readRegister':
           return await this.doReadRegister(command.name);
         case 'getTargetState': {
@@ -442,7 +442,7 @@ case 'readVariableRuntime':
             },
           };
         case 'writeMemory':
-          return await this.doWriteMemory(command.address, command.data);
+          return await this.doWriteMemory(command.address, command.data, command.liveAccess === true);
         case 'setWatchValue':
           return await this.doSetWatchValue(command.expression, command.value, command.address, command.typeName);
         case 'startRtt':
@@ -2504,11 +2504,16 @@ case 'readVariableRuntime':
     return null;
   }
 
-  private async doReadMemory(address: number, size: number, signal?: AbortSignal): Promise<OzoneCommandResult> {
+  private async doReadMemory(
+    address: number,
+    size: number,
+    signal?: AbortSignal,
+    liveAccess = false,
+  ): Promise<OzoneCommandResult> {
     if (signal?.aborted) {
       return { ok: false, errorCode: 'TargetReadCancelled', error: 'Target read cancelled', targetState: 'Unknown', elapsedMs: 0 };
     }
-    const wasRunning = !(await this.targetIsHalted());
+    const wasRunning = liveAccess ? false : !(await this.targetIsHalted());
     if (wasRunning) {
       if (signal?.aborted) {
         return { ok: false, errorCode: 'TargetReadCancelled', error: 'Target read cancelled', targetState: 'Running', elapsedMs: 0 };
@@ -2520,9 +2525,11 @@ case 'readVariableRuntime':
 
     const readResult = await this.readMemoryChunked(address, size, signal);
     const resumed = wasRunning && !signal?.aborted ? await this.targetRun() : false;
-    const currentTargetState = wasRunning
-      ? (resumed ? 'Running' : readResult.targetState)
-      : 'Halted';
+    const currentTargetState = liveAccess
+      ? readResult.targetState
+      : wasRunning
+        ? (resumed ? 'Running' : readResult.targetState)
+        : 'Halted';
     if (!readResult.ok) {
       const errorCode = readResult.errorCode || 'MemoryReadFailed';
       log.dap(`readMemory failed owner=${this.targetRegisterSource()} errorCode=${errorCode}`
@@ -4215,15 +4222,43 @@ case 'readVariableRuntime':
     return result;
   }
 
-  private async doWriteMemory(address: number, data: number[]): Promise<OzoneCommandResult> {
+  private async doWriteMemory(address: number, data: number[], liveAccess = false): Promise<OzoneCommandResult> {
     log.eval(`doWriteMemory: addr=0x${address.toString(16)} len=${data.length}`);
+    const bytes = Uint8Array.from(data.map(b => b & 0xFF));
+    if (liveAccess) {
+      if (this.sessionTarget) {
+        const result = await this.sessionTarget.writeMemory(address, bytes);
+        if (!result.ok || result.data?.bytesWritten !== bytes.length) {
+          const errorCode = result.errorCode || 'MemoryWriteFailed';
+          return {
+            ok: false,
+            errorCode,
+            error: `${errorCode}: ${result.message}`,
+            targetState: result.targetState,
+            elapsedMs: result.elapsedMs,
+            diagnostics: result.diagnostics,
+          };
+        }
+        return { ok: true, data: `Wrote ${data.length} byte(s)` };
+      }
+      const ok = this.jlink.writeMemoryBytes(address, bytes);
+      return ok
+        ? { ok: true, data: `Wrote ${data.length} byte(s)` }
+        : {
+          ok: false,
+          errorCode: 'MemoryWriteFailed',
+          error: 'MemoryWriteFailed: live memory write failed',
+          targetState: this.state,
+        };
+    }
+
     const wasRunning = !(await this.targetIsHalted());
     if (wasRunning) {
       const halted = await this.targetHalt();
       if (!halted) return { ok: false, error: 'halt failed' };
       await new Promise<void>(r => setTimeout(r, 50));
     }
-    const ok = await this.targetWriteMemory(address, Uint8Array.from(data.map(b => b & 0xFF)));
+    const ok = await this.targetWriteMemory(address, bytes);
     if (wasRunning) {
       await this.targetRun();
     }

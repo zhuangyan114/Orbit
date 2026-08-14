@@ -3685,6 +3685,20 @@ export class DapSession extends EventEmitter {
     return this.automationRttStarted ? 'running' : 'stopped';
   }
 
+  /** Resolves `_SEGGER_RTT` on demand when the launch did not (RTT Log disabled). */
+  private async ensureRttControlBlockAddress(): Promise<boolean> {
+    if (this.rttControlBlockAddress !== undefined) return true;
+    const symbolResult = await this.backend.execute({ cmd: 'resolveSymbol', name: '_SEGGER_RTT' });
+    const address = symbolResult.ok && Number.isInteger((symbolResult.data as any)?.address)
+      ? Number((symbolResult.data as any).address)
+      : undefined;
+    if (address === undefined || address <= 0 || address > 0xFFFFFFFF) return false;
+    this.rttControlBlockAddress = address;
+    this.rttControlBlockSource = 'elf-symbol';
+    log.dap(`[rtt] control block address=0x${address.toString(16)} source=elf-symbol (automation)`);
+    return true;
+  }
+
   private async buildAutomationRttSnapshot(
     bufferIndex: number,
   ): Promise<AutomationRttSnapshot> {
@@ -3716,6 +3730,13 @@ export class DapSession extends EventEmitter {
   ): Promise<void> {
     if (!this.rttAvailable) {
       this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT is unavailable (no control block resolved)', startedAt);
+      return;
+    }
+    // The launch only resolves `_SEGGER_RTT` when the RTT Log is enabled; an
+    // automation start must resolve it on demand so `startRtt` never receives
+    // an undefined control-block address.
+    if (this.rttControlBlockAddress === undefined && !(await this.ensureRttControlBlockAddress())) {
+      this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT control block could not be resolved', startedAt);
       return;
     }
     const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;

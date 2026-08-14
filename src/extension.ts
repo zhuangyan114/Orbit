@@ -275,32 +275,36 @@ export async function activate(context: vscode.ExtensionContext) {
           }
         } else if (isOrbitDebugSessionType(event.session.type) && event.event === AUTOMATION_LIFECYCLE_EVENT) {
           // Structured lifecycle event from the DAP adapter (plan Task 11).
-          // Resolve the exact session identity and generation, then publish the
-          // public target.* event; a stale event from a replaced session is
-          // dropped because its record's session object no longer matches.
+          // Gate on the exact registered session object identity first: a stale
+          // event from a replaced session is dropped because its record's
+          // object no longer matches. `target.stopped`/`target.running` must
+          // still come from an active session; `target.connectionLost` is
+          // expected during termination, so only the object-identity gate
+          // applies and it is published even after the registry transitioned.
           const type = event.body?.type;
-          if (typeof type === 'string') {
+          if (typeof type === 'string' && eventHub) {
+            const recorded = sessionRegistry.getSessionObject(event.session.id);
+            if (recorded !== event.session) return;
             const snapshot = sessionRegistry.getSessionSnapshot(event.session.id);
-            if (snapshot) {
+            if (!snapshot) return;
+            if (type !== 'target.connectionLost') {
               try {
-                const exact = sessionRegistry.requireExact({
+                sessionRegistry.requireExact({
                   sessionId: snapshot.sessionId,
                   sessionGeneration: snapshot.sessionGeneration,
                 });
-                if (exact === event.session && eventHub) {
-                  const data: Record<string, unknown> = {};
-                  if (event.body?.reason !== undefined) data.reason = event.body.reason;
-                  if (event.body?.threadId !== undefined) data.threadId = event.body.threadId;
-                  eventHub.publish(type, {
-                    sessionId: snapshot.sessionId,
-                    sessionGeneration: snapshot.sessionGeneration,
-                    data,
-                  });
-                }
               } catch {
-                // Stale generation/terminated session: drop the event.
+                return; // stale generation/terminated session: drop the event
               }
             }
+            const data: Record<string, unknown> = {};
+            if (event.body?.reason !== undefined) data.reason = event.body.reason;
+            if (event.body?.threadId !== undefined) data.threadId = event.body.threadId;
+            eventHub.publish(type, {
+              sessionId: snapshot.sessionId,
+              sessionGeneration: snapshot.sessionGeneration,
+              data,
+            });
           }
         }
       }),

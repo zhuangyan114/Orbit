@@ -341,6 +341,18 @@ export class SessionRegistry {
     return record ? this.toSnapshot(record) : undefined;
   }
 
+  /**
+   * The registered `vscode.DebugSession` object for a session id, regardless
+   * of phase (including terminated). Used by the automation lifecycle handler
+   * to gate events on object identity without the phase/generation fence that
+   * `requireExact` imposes — so a `target.connectionLost` event that arrives
+   * after the session already terminated is still published.
+   */
+  getSessionObject(sessionId: string): vscode.DebugSession | undefined {
+    const record = this.records.get(sessionId);
+    return record ? record.session : undefined;
+  }
+
   /** Active session first, then terminated history (most recent first). */
   snapshot(options: { includeTerminated?: boolean } = {}): SessionSnapshot[] {
     const items: SessionSnapshot[] = [];

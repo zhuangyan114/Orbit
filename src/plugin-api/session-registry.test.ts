@@ -407,4 +407,21 @@ describe('SessionRegistry lifecycle and generation fence', () => {
     registry.onTerminated(s1);
     expect(registry.currentSnapshot()).toBeUndefined();
   });
+
+  it('returns the registered session object by id even after termination (getSessionObject)', () => {
+    const { registry } = setup();
+    const s1 = makeSession('s1');
+
+    registry.onStarted(s1);
+    expect(registry.getSessionObject('s1')).toBe(s1);
+
+    // requireExact throws for a terminated session, but getSessionObject must
+    // still resolve the object identity so target.connectionLost can publish.
+    registry.onTerminated(s1);
+    expect(registry.getSessionObject('s1')).toBe(s1);
+    expect(() => registry.requireExact({ sessionId: 's1', sessionGeneration: 1 }))
+      .toThrowError(/no active session/);
+
+    expect(registry.getSessionObject('unknown')).toBeUndefined();
+  });
 });

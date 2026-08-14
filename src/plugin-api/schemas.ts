@@ -703,6 +703,15 @@ export const rttReadParams = z
   })
   .strict();
 
+export const rttLogReadParams = z
+  .object({
+    context: targetRequestContextSchema,
+    count: z.number().int().min(1).max(1000),
+    cursor: cursorSchema.optional(),
+    stripAnsi: z.boolean().default(true),
+  })
+  .strict();
+
 export const diagnosticsSnapshotParams = z
   .object({
     context: connectionContextSchema,
@@ -788,6 +797,7 @@ const METHOD_ENTRIES: MethodCatalogEntry[] = [
   { name: 'orbit.rtt.start', bootstrap: false, requiredScopes: ['rtt.control'], mutation: true, requiresIdempotency: true, targetBound: true, timeoutMs: 15000, paramsSchemaRef: '#/components/schemas/RttStartParams', resultSchemaRef: '#/components/schemas/RttStartResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'NoActiveSession', 'SessionStarting', 'SessionChanged', 'SessionTerminating', 'TargetDisconnected', 'TargetBusy', 'CapabilityUnavailable', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: rttStartParams },
   { name: 'orbit.rtt.stop', bootstrap: false, requiredScopes: ['rtt.control'], mutation: true, requiresIdempotency: true, targetBound: true, timeoutMs: 15000, paramsSchemaRef: '#/components/schemas/RttStopParams', resultSchemaRef: '#/components/schemas/RttStopResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'NoActiveSession', 'SessionStarting', 'SessionChanged', 'SessionTerminating', 'TargetDisconnected', 'TargetBusy', 'CapabilityUnavailable', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: rttStopParams },
   { name: 'orbit.rtt.read', bootstrap: false, requiredScopes: ['read'], mutation: false, requiresIdempotency: false, targetBound: true, timeoutMs: 10000, paramsSchemaRef: '#/components/schemas/RttReadParams', resultSchemaRef: '#/components/schemas/RttReadResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'NoActiveSession', 'SessionStarting', 'SessionChanged', 'SessionTerminating', 'TargetDisconnected', 'TargetReadCancelled', 'CapabilityUnavailable', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: rttReadParams },
+  { name: 'orbit.rttlog.read', bootstrap: false, requiredScopes: ['read'], mutation: false, requiresIdempotency: false, targetBound: true, timeoutMs: 10000, paramsSchemaRef: '#/components/schemas/RttlogReadParams', resultSchemaRef: '#/components/schemas/RttlogReadResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'NoActiveSession', 'SessionStarting', 'SessionChanged', 'SessionTerminating', 'TargetDisconnected', 'CapabilityUnavailable', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: rttLogReadParams },
   { name: 'orbit.diagnostics.snapshot', bootstrap: false, requiredScopes: ['read'], mutation: false, requiresIdempotency: false, targetBound: false, timeoutMs: 5000, paramsSchemaRef: '#/components/schemas/DiagnosticsSnapshotParams', resultSchemaRef: '#/components/schemas/DiagnosticsSnapshotResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: diagnosticsSnapshotParams },
 ];
 

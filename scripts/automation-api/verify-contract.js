@@ -67,6 +67,7 @@ orbit.rtt.status
 orbit.rtt.start
 orbit.rtt.stop
 orbit.rtt.read
+orbit.rttlog.read
 orbit.diagnostics.snapshot
 `.trim().split(/\s+/);
 
@@ -91,7 +92,7 @@ const requiredDtos = [
   'Thread', 'StackFrame', 'Scope', 'Variable', 'Register',
   'ExpressionValue', 'Symbol', 'MemoryBlock', 'WatchSnapshot',
   'TimelineSnapshot', 'Recording', 'RecordingFrame', 'ExperimentReport',
-  'RttSnapshot', 'DiagnosticsSnapshot',
+  'RttSnapshot', 'RttLogEntry', 'RttLogReadData', 'DiagnosticsSnapshot',
 ];
 
 function policy(name) {
@@ -120,6 +121,7 @@ function policy(name) {
   if (/^orbit\.record\.(list|get)$/.test(name)) return [false, ['read'], false, false, true, 10000];
   if (/^orbit\.rtt\.(status|read)$/.test(name)) return [false, ['read'], false, false, true, 10000];
   if (/^orbit\.rtt\.(start|stop)$/.test(name)) return [false, ['rtt.control'], true, true, true, 15000];
+  if (/^orbit\.rttlog\.read$/.test(name)) return [false, ['read'], false, false, true, 10000];
   throw new Error(`No frozen policy for ${name}`);
 }
 

@@ -8,7 +8,7 @@
 // critical section by the scheduler. There is no extension-host backend
 // fallback; a missing/stale session is a frozen fence error.
 import * as vscode from 'vscode';
-import { AutomationError, RttReadData, RttSnapshot, SessionRef } from './protocol';
+import { AutomationError, RttLogEntry, RttLogReadData, RttReadData, RttSnapshot, SessionRef } from './protocol';
 import { SessionRegistry } from './session-registry';
 import { EventHub } from './event-hub';
 import {
@@ -16,6 +16,10 @@ import {
   AutomationRttRequest,
   AutomationRttResult,
   AutomationRttSnapshot,
+  AUTOMATION_RTT_LOG_COMMAND,
+  AutomationRttLogEntry,
+  AutomationRttLogRequest,
+  AutomationRttLogResult,
 } from '../debug/dap-automation-protocol';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -47,11 +51,14 @@ export interface RttServiceOptions {
   eventHub?: EventHub;
   /** Pulls one RTT operation from an exact active session. */
   snapshotRttDap?(session: vscode.DebugSession, request: AutomationRttRequest): Promise<AutomationRttResult>;
+  /** Pulls the decoded terminal log lines from an exact active session. */
+  snapshotRttLogDap?(session: vscode.DebugSession, request: AutomationRttLogRequest): Promise<AutomationRttLogResult>;
 }
 
 interface ResolvedRttOptions {
   registry: SessionRegistry;
   snapshotRttDap: (session: vscode.DebugSession, request: AutomationRttRequest) => Promise<AutomationRttResult>;
+  snapshotRttLogDap: (session: vscode.DebugSession, request: AutomationRttLogRequest) => Promise<AutomationRttLogResult>;
 }
 
 export interface RttStatusParams {
@@ -75,6 +82,13 @@ export interface RttReadParams {
   maxBytes?: number;
 }
 
+export interface RttLogReadParams {
+  /** Number of most recent log lines to return (1..1000). */
+  count: number;
+  cursor?: string;
+  stripAnsi?: boolean;
+}
+
 export class RttService {
   private readonly opts: ResolvedRttOptions;
   private readonly eventHub?: EventHub;
@@ -90,6 +104,16 @@ export class RttService {
         } catch (error) {
           const structured = rttFailureFromRejection(error);
           if (structured) return structured;
+          throw error;
+        }
+      }),
+      snapshotRttLogDap: options.snapshotRttLogDap ?? (async (session, request) => {
+        try {
+          const response: unknown = await session.customRequest(AUTOMATION_RTT_LOG_COMMAND, request);
+          return (isRecord(response) ? response : {}) as unknown as AutomationRttLogResult;
+        } catch (error) {
+          const structured = rttFailureFromRejection(error);
+          if (structured) return { entries: [], retained: 0, ...structured };
           throw error;
         }
       }),
@@ -134,6 +158,29 @@ export class RttService {
     const snapshot = this.toSnapshot(result);
     this.publish('rtt.stateChanged', { state: snapshot.state });
     return snapshot;
+  }
+
+  /** `orbit.rttlog.read`: the decoded terminal log lines, most recent `count`. */
+  async readLog(ref: SessionRef, params: RttLogReadParams): Promise<RttLogReadData> {
+    const { session, generation } = this.resolve(ref);
+    const count = Math.floor(params.count);
+    if (!Number.isInteger(count) || count < 1 || count > 1000) {
+      throw new AutomationError('InvalidRequest', 'count must be an integer between 1 and 1000', false);
+    }
+    const result = await this.opts.snapshotRttLogDap(session, {
+      sessionGeneration: generation,
+      count,
+      ...(params.cursor !== undefined ? { cursor: params.cursor } : {}),
+    });
+    this.throwOnRttFailure(result as AutomationRttResult);
+    const stripAnsi = params.stripAnsi ?? true;
+    const entries: RttLogEntry[] = (result.entries ?? []).map(entry => this.mapLogEntry(entry, stripAnsi));
+    const data: RttLogReadData = {
+      entries,
+      retained: typeof result.retained === 'number' ? result.retained : entries.length,
+    };
+    if (result.nextCursor !== undefined) data.nextCursor = result.nextCursor;
+    return data;
   }
 
   /** `orbit.rtt.read`: one base64 read block from the selected owner. */
@@ -225,6 +272,20 @@ export class RttService {
   private resolve(ref: SessionRef): { session: vscode.DebugSession; generation: number } {
     const session = this.opts.registry.requireExact(ref);
     return { session, generation: ref.sessionGeneration };
+  }
+
+  private mapLogEntry(entry: AutomationRttLogEntry, stripAnsi: boolean): RttLogEntry {
+    const mapped: RttLogEntry = {
+      id: entry.id,
+      timestamp: entry.timestamp,
+      kind: entry.kind,
+      text: stripAnsi ? this.stripAnsi(entry.text) : entry.text,
+    };
+    return mapped;
+  }
+
+  private stripAnsi(text: string): string {
+    return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
   }
 
   private publish(type: string, data?: Record<string, unknown>): void {

@@ -390,6 +390,13 @@ interface RttReadWireParams {
   maxBytes?: number;
 }
 
+interface RttLogReadWireParams {
+  context: TargetRequestContext;
+  count: number;
+  cursor?: string;
+  stripAnsi?: boolean;
+}
+
 interface DiagnosticsSnapshotWireParams {
   context: ConnectionContext;
   sessionId?: string;
@@ -1136,6 +1143,15 @@ export class PluginApiServer implements vscode.Disposable {
           bufferIndex: params.bufferIndex,
           cursor: params.cursor,
           maxBytes: params.maxBytes,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.rttlog.read', async (params: RttLogReadWireParams) => ({
+        data: await this.rtt.readLog(this.sessionRef(params.context), {
+          count: params.count,
+          cursor: params.cursor,
+          stripAnsi: params.stripAnsi,
         }),
       })),
     );

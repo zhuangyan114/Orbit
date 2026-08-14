@@ -768,6 +768,29 @@ export interface RttReadData {
   nextCursor?: string | null;
 }
 
+/** OpenRPC RttLogKind (RttLogEntry.kind): which decoder produced the line. */
+export type RttLogKind = 'decoded' | 'text';
+
+/** OpenRPC RttLogEntry (items of orbit.rttlog.read). */
+export interface RttLogEntry {
+  /** Session-scoped monotonic line id (decimal string). */
+  id: string;
+  /** UInt64 epoch-ms decimal string when the line was decoded. */
+  timestamp: string;
+  /** `decoded` = P-RTLog tokenized→format-string; `text` = raw RTT text. */
+  kind: RttLogKind;
+  /** The log line text; ANSI stripped when `stripAnsi` is true. */
+  text: string;
+}
+
+/** OpenRPC RttLogReadData (data of orbit.rttlog.read). */
+export interface RttLogReadData {
+  entries: RttLogEntry[];
+  /** Number of lines currently retained in the session log buffer. */
+  retained: number;
+  nextCursor?: string | null;
+}
+
 /** OpenRPC DiagnosticsApi (DiagnosticsSnapshot.api). */
 export interface DiagnosticsApi {
   version: string;

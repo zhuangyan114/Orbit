@@ -52,7 +52,15 @@ import {
   AutomationDiagnosticsResult,
   parseAutomationDiagnosticsRequest,
   normalizeSchedulerSnapshot,
+  AUTOMATION_RTT_LOG_COMMAND,
+  AutomationRttLogEntry,
+  AutomationRttLogRequest,
+  AutomationRttLogResult,
+  parseAutomationRttLogRequest,
 } from './dap-automation-protocol';
+
+/** Bound on the decoded RTT Log line ring exposed through `orbit.rttlog.read`. */
+const MAX_RTT_LOG_LINES = 2000;
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -177,6 +185,11 @@ export class DapSession extends EventEmitter {
   private automationRttPollIntervalMs = 50;
   private automationRttAnsi = true;
   private automationRttTargetName: string | undefined;
+  // Decoded terminal-log line ring (plan Task 11 extension, `orbit.rttlog.read`).
+  // Each finalized RTT Log line is retained here with its producing decoder kind
+  // so the API can distinguish P-RTLog-decoded logs from raw RTT text.
+  private rttLogEntries: AutomationRttLogEntry[] = [];
+  private rttLogSequence = 0;
   private _rtos = '';
   private rttLogTarget: 'terminal' | 'debugConsole' | 'both' = 'terminal';
   private rttDecoder = new StringDecoder('utf8');
@@ -1523,8 +1536,22 @@ export class DapSession extends EventEmitter {
     }
     const output = this.rttStripAnsi ? this.stripAnsi(text) : text;
     if (output.length <= 0) return;
+    this.appendRttLogLine(text);
     const category = this.isWarningOrErrorRttLine(text) ? 'stderr' : 'stdout';
     this.emitRttDebugConsoleLine(output, category);
+  }
+
+  /** Retains one finalized RTT Log line for `orbit.rttlog.read` (raw text, ANSI intact). */
+  private appendRttLogLine(text: string): void {
+    const line = text.replace(/[\r\n]+$/, '');
+    this.rttLogSequence += 1;
+    this.rttLogEntries.push({
+      id: String(this.rttLogSequence),
+      timestamp: String(Date.now()),
+      kind: this.pRtLogEnabled ? 'decoded' : 'text',
+      text: line,
+    });
+    while (this.rttLogEntries.length > MAX_RTT_LOG_LINES) this.rttLogEntries.shift();
   }
 
   private isWarningOrErrorRttLine(text: string): boolean {
@@ -1675,6 +1702,8 @@ export class DapSession extends EventEmitter {
           return this.handleAutomationMemory(msg);
         case AUTOMATION_RTT_COMMAND:
           return this.handleAutomationRtt(msg);
+        case AUTOMATION_RTT_LOG_COMMAND:
+          return this.handleAutomationRttLog(msg);
         case AUTOMATION_DIAGNOSTICS_COMMAND:
           return this.handleAutomationDiagnostics(msg);
         default:
@@ -3755,6 +3784,66 @@ export class DapSession extends EventEmitter {
       targetState: this.automationTargetState(),
       elapsedMs: Date.now() - startedAt,
     });
+  }
+
+  // --- RTT log snapshot bridge (plan Task 11 extension) ----------------------
+  // `session.customRequest('orbitRttLogSnapshot', ...)` returns the decoded
+  // terminal log lines the RTT Log path already produces. It carries only the
+  // line text and its producing decoder kind; the Extension Host strips ANSI.
+
+  private handleAutomationRttLog(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationRttLogRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationRttLogFailure(msg, parsed.errorCode, parsed.message, startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationRttLogFailure(msg, errorCode, `session phase ${this.phase} cannot read the RTT log`, startedAt);
+      return;
+    }
+    const entries = this.rttLogEntries;
+    let window: AutomationRttLogEntry[];
+    if (request.cursor !== undefined) {
+      const cursorNum = Number(request.cursor);
+      const after = entries.filter(entry => Number(entry.id) > cursorNum);
+      if (after.length === 0 && entries.length > 0) {
+        // No new lines: an evicted cursor predating the ring resets to the tail.
+        const oldest = Number(entries[0].id);
+        window = cursorNum < oldest ? entries.slice(-request.count) : [];
+      } else {
+        window = after.slice(0, request.count);
+      }
+    } else {
+      window = entries.slice(-request.count);
+    }
+    const result: AutomationRttLogResult = {
+      entries: window,
+      retained: entries.length,
+      nextCursor: window.length > 0 ? window[window.length - 1].id : null,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result);
+  }
+
+  private sendAutomationRttLogFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationRttLogResult = {
+      entries: [],
+      retained: 0,
+      errorCode,
+      message,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
   }
 
   // --- diagnostics snapshot bridge (plan Task 11) ----------------------------

@@ -6,7 +6,7 @@ import { SessionRef } from './protocol';
 import { SessionRegistry } from './session-registry';
 import { RttService } from './rtt-service';
 import { EventHub } from './event-hub';
-import { AutomationRttRequest, AutomationRttResult } from '../debug/dap-automation-protocol';
+import { AutomationRttRequest, AutomationRttResult, AutomationRttLogRequest, AutomationRttLogResult } from '../debug/dap-automation-protocol';
 
 vi.mock('vscode', () => ({}));
 
@@ -164,5 +164,66 @@ describe('RttService', () => {
     await service.stop(registry.currentRef()!, {});
     const types = hub.eventsAfter(undefined).events.map(event => event.type);
     expect(types).toEqual(['rtt.stateChanged', 'rtt.stateChanged']);
+  });
+});
+
+describe('RttService.readLog', () => {
+  it('maps decoded/text entries, strips ANSI by default, and forwards count+cursor', async () => {
+    const registry = new SessionRegistry();
+    const session = { id: 'sess-rttlog', type: 'orbit', name: 'test' };
+    const calls: AutomationRttLogRequest[] = [];
+    const service = new RttService({
+      registry,
+      snapshotRttLogDap: async (_session, request) => {
+        calls.push(request);
+        const result: AutomationRttLogResult = {
+          entries: [
+            { id: '1', timestamp: '1700000000000', kind: 'decoded', text: '\x1B[1;36mI:\x1B[0m hello' },
+            { id: '2', timestamp: '1700000000001', kind: 'text', text: 'raw line' },
+          ],
+          retained: 5,
+          nextCursor: '2',
+        };
+        return result;
+      },
+    });
+    registry.onStarted(session as never);
+    const data = await service.readLog(registry.currentRef()!, { count: 2, cursor: '0' });
+    expect(calls).toEqual([{ sessionGeneration: 1, count: 2, cursor: '0' }]);
+    expect(data.retained).toBe(5);
+    expect(data.nextCursor).toBe('2');
+    expect(data.entries).toEqual([
+      { id: '1', timestamp: '1700000000000', kind: 'decoded', text: 'I: hello' },
+      { id: '2', timestamp: '1700000000001', kind: 'text', text: 'raw line' },
+    ]);
+  });
+
+  it('preserves ANSI when stripAnsi is false', async () => {
+    const registry = new SessionRegistry();
+    const session = { id: 'sess-rttlog-ansi', type: 'orbit', name: 'test' };
+    const service = new RttService({
+      registry,
+      snapshotRttLogDap: async () => ({
+        entries: [{ id: '1', timestamp: '1', kind: 'decoded', text: '\x1B[1;36mI:\x1B[0m x' }],
+        retained: 1,
+        nextCursor: '1',
+      }),
+    });
+    registry.onStarted(session as never);
+    const data = await service.readLog(registry.currentRef()!, { count: 1, stripAnsi: false });
+    expect(data.entries[0].text).toBe('\x1B[1;36mI:\x1B[0m x');
+  });
+
+  it('rejects a count outside 1..1000 before any DAP call', async () => {
+    const registry = new SessionRegistry();
+    const session = { id: 'sess-rttlog-count', type: 'orbit', name: 'test' };
+    const calls: AutomationRttLogRequest[] = [];
+    const service = new RttService({
+      registry,
+      snapshotRttLogDap: async (_session, request) => { calls.push(request); return { entries: [], retained: 0 }; },
+    });
+    registry.onStarted(session as never);
+    await expect(service.readLog(registry.currentRef()!, { count: 1001 })).rejects.toMatchObject({ errorCode: 'InvalidRequest' });
+    expect(calls).toHaveLength(0);
   });
 });

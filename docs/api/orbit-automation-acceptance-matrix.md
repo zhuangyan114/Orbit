@@ -69,8 +69,8 @@ Acceptance: Enforce connection/channel/frame/budget caps, return paged synchroni
 
 Category: Variables
 Status: Automated
-Methods: `orbit.rtt.status`, `orbit.rtt.start`, `orbit.rtt.stop`, `orbit.rtt.read`, `orbit.diagnostics.snapshot`
-Acceptance: Keep RTT logically separate from Timeline, use background scheduling and selected-owner semantics, return Base64 bytes, pause around control work, and prove diagnostics never include the bearer token.
+Methods: `orbit.rtt.status`, `orbit.rtt.start`, `orbit.rtt.stop`, `orbit.rtt.read`, `orbit.rttlog.read`, `orbit.diagnostics.snapshot`
+Acceptance: Keep RTT logically separate from Timeline, use background scheduling and selected-owner semantics, return Base64 bytes, pause around control work, return decoded terminal log lines (distinguishing P-RTLog `decoded` from raw `text`) with a required line count, and prove diagnostics never include the bearer token.
 
 ### API-011: SSE ordering, replay, and reset
 

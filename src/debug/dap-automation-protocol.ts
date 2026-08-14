@@ -960,3 +960,73 @@ export function normalizeSchedulerSnapshot(snapshot: unknown): AutomationSchedul
     background: asCount(queued.background),
   };
 }
+
+// --- RTT log snapshot (plan Task 11 extension) -------------------------------
+// `orbitRttLogSnapshot` exposes the decoded terminal log lines that the adapter
+// already produces on the RTT Log path. It returns the raw line text (ANSI
+// intact); the Extension Host strips ANSI per-request. Two kinds are supported:
+// `decoded` (P-RTLog tokenized → format string) and `text` (raw RTT text).
+
+export const AUTOMATION_RTT_LOG_COMMAND = 'orbitRttLogSnapshot';
+
+export type AutomationRttLogKind = 'decoded' | 'text';
+
+export interface AutomationRttLogEntry {
+  /** Session-scoped monotonic line id (decimal string). */
+  id: string;
+  /** UInt64 epoch-ms decimal string when the line was decoded. */
+  timestamp: string;
+  kind: AutomationRttLogKind;
+  text: string;
+}
+
+export interface AutomationRttLogRequest {
+  sessionGeneration: number;
+  /** Number of most recent lines to return (1..1000). */
+  count: number;
+  /** Line id after which to resume (incremental read). */
+  cursor?: string;
+}
+
+export interface AutomationRttLogResult {
+  entries: AutomationRttLogEntry[];
+  /** Number of lines currently retained in the session log buffer. */
+  retained: number;
+  nextCursor?: string | null;
+  errorCode?: string;
+  message?: string;
+  targetState?: string;
+  elapsedMs?: number;
+}
+
+export type AutomationRttLogParseResult =
+  | { ok: true; request: AutomationRttLogRequest }
+  | { ok: false; errorCode: string; message: string };
+
+/**
+ * Validates the wire arguments of `orbitRttLogSnapshot`. Never throws; every
+ * rejection carries a machine-readable errorCode the RttService maps to the
+ * frozen automation error codes.
+ */
+export function parseAutomationRttLogRequest(args: unknown): AutomationRttLogParseResult {
+  if (!isRecord(args)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'automation RTT log requires request arguments' };
+  }
+  if (!isPositiveInt(args.sessionGeneration)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'sessionGeneration must be a positive integer' };
+  }
+  if (!isPositiveInt(args.count) || args.count > 1000) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'count must be an integer between 1 and 1000' };
+  }
+  const request: AutomationRttLogRequest = {
+    sessionGeneration: args.sessionGeneration,
+    count: args.count,
+  };
+  if (args.cursor !== undefined) {
+    if (typeof args.cursor !== 'string' || args.cursor.trim().length === 0 || !/^\d+$/.test(args.cursor)) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'cursor must be a non-empty numeric line id' };
+    }
+    request.cursor = args.cursor.trim();
+  }
+  return { ok: true, request };
+}

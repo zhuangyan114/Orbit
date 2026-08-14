@@ -77,7 +77,7 @@ The OpenRPC document freezes every method's bootstrap flag, scopes, mutation/ide
 - Runtime: `orbit.runtime.*` preserves DAP thread, frame, scope, expandable variable, register, `variablesReference`, and `memoryReference` semantics.
 - Expressions, symbols, and memory: `orbit.expression.*`, `orbit.symbol.*`, and `orbit.memory.*` use typed per-item outcomes, loaded ELF/DWARF, byte-oriented memory, partial reads, and optional write verification.
 - UI and sampling: `orbit.watch.*`, `orbit.timeline.*`, `orbit.record.*`, and `orbit.experiment.run` retain UI synchronization, generation fences, cancellation, paging, and separate logical consumers.
-- RTT and diagnostics: `orbit.rtt.*` uses the selected owner; J-Link DLL RTT and CMSIS-DAP target-memory RTT remain owner-specific implementations. `orbit.diagnostics.snapshot` reports API/DAP/owner/scheduler/sampling summaries and explicitly excludes the bearer token.
+- RTT and diagnostics: `orbit.rtt.*` uses the selected owner; J-Link DLL RTT and CMSIS-DAP target-memory RTT remain owner-specific implementations. `orbit.rtt.read` returns raw Base64 bytes, while `orbit.rttlog.read` returns the decoded terminal log lines (most recent `count`, distinguishing P-RTLog `decoded` from raw `text`, with optional `cursor` and `stripAnsi`). `orbit.diagnostics.snapshot` reports API/DAP/owner/scheduler/sampling summaries and explicitly excludes the bearer token.
 
 All list/search responses include typed `items` and optional `nextCursor`; default limit is 100 and maximum is 1,000. Recording reads additionally cap each page at 1,000 frames. Resource mutations return a complete resulting snapshot rather than a boolean.
 

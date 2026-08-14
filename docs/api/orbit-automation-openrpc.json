@@ -4624,6 +4624,96 @@
       }
     },
     {
+      "name": "orbit.rttlog.read",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/RttlogReadParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RttlogReadResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/NoActiveSession"
+        },
+        {
+          "$ref": "#/components/errors/SessionStarting"
+        },
+        {
+          "$ref": "#/components/errors/SessionChanged"
+        },
+        {
+          "$ref": "#/components/errors/SessionTerminating"
+        },
+        {
+          "$ref": "#/components/errors/TargetDisconnected"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": true,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/RttlogReadParams",
+        "resultSchemaRef": "#/components/schemas/RttlogReadResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "NoActiveSession",
+          "SessionStarting",
+          "SessionChanged",
+          "SessionTerminating",
+          "TargetDisconnected",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
       "name": "orbit.diagnostics.snapshot",
       "params": [
         {
@@ -9625,6 +9715,107 @@
           "snapshot",
           "data",
           "bytesRead"
+        ]
+      },
+      "RttLogEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "decoded",
+              "text"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "timestamp",
+          "kind",
+          "text"
+        ]
+      },
+      "RttLogReadData": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RttLogEntry"
+            }
+          },
+          "retained": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "entries",
+          "retained"
+        ]
+      },
+      "RttlogReadParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/TargetRequestContext"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          },
+          "stripAnsi": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "context",
+          "count"
+        ]
+      },
+      "RttlogReadResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/RttLogReadData"
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
         ]
       },
       "DiagnosticsSnapshot": {

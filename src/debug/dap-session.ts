@@ -3050,7 +3050,7 @@ export class DapSession extends EventEmitter {
 
   private async handleAutomationThreads(
     msg: DebugProtocolMessage,
-    request: AutomationRuntimeRequest,
+    _request: AutomationRuntimeRequest,
     startedAt: number,
   ): Promise<void> {
     const captured = await this.runAutomationRead(msg, 'threads', {});
@@ -3188,6 +3188,9 @@ export class DapSession extends EventEmitter {
         if (!requestedGroups.has(group)) continue;
         registers.push({
           name: register.name,
+          // `hex` keeps the exact 8-digit value; `memoryReference` reuses the
+          // existing formatMemoryReference (no leading-zero padding) so it stays
+          // consistent with the standard variables/Registers view.
           value: typeof register.hex === 'string' ? register.hex : `0x${(Number(register.value) >>> 0).toString(16)}`,
           group,
           bits: 32,

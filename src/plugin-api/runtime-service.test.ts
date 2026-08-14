@@ -186,6 +186,15 @@ describe('RuntimeService failures and pagination', () => {
     await expect(ctx.service.registers(ctx.ref)).rejects.toMatchObject({ errorCode: 'TargetReadCancelled' });
   });
 
+  it('maps the RTOS read-cancel codes to the frozen TargetReadCancelled', async () => {
+    const ctx = makeService();
+    for (const code of ['RtosReadCancelled', 'RtosVariableUnavailable', 'RtosVariableExpansionFailed']) {
+      ctx.setSnapshot(() => ({ errorCode: code, message: `${code}: read cancelled`, targetState: 'Halted' }));
+      await expect(ctx.service.variables(ctx.ref, { variablesReference: '1000' }))
+        .rejects.toMatchObject({ errorCode: 'TargetReadCancelled', retryable: true });
+    }
+  });
+
   it('falls back to InternalError for an unknown DAP failure code', async () => {
     const ctx = makeService();
     ctx.setSnapshot(() => ({ errorCode: 'WeirdBackendFailure', message: 'boom' }));

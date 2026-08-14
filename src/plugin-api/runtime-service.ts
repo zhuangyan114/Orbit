@@ -85,7 +85,9 @@ export class RuntimeService {
    * Generation each issued `variablesReference` (UInt64 string) belongs to.
    * Entries are never reset on generation change so a stale reference can be
    * detected as `SessionChanged`; the map is FIFO-bounded against unbounded
-   * growth across many restarts.
+   * growth across many restarts. The 4096 cap is far above the per-session
+   * handle count, so a stale marker is effectively never evicted in practice
+   * (see `rememberReference` for the theoretical residual).
    */
   private readonly referenceGeneration = new Map<string, number>();
 
@@ -146,7 +148,7 @@ export class RuntimeService {
     const start = params.cursor !== undefined
       ? this.cursorIndex(params.cursor, frames, frame => String(frame.frameId)) + 1
       : (params.startFrame ?? 0);
-    const levels = this.clampCount(params.levels ?? DEFAULT_PAGE_LIMIT);
+    const levels = this.clampPage(params.levels ?? DEFAULT_PAGE_LIMIT);
     const slice = frames.slice(start, start + levels);
     const data: RuntimeListData<RuntimeStackFrame> = { items: slice };
     if (start + levels < frames.length) data.nextCursor = String(slice[slice.length - 1].frameId);
@@ -169,11 +171,21 @@ export class RuntimeService {
     return this.paginate(items, params.cursor, params.limit, item => item.name);
   }
 
-  /** `orbit.runtime.variables`: expand one variablesReference (generation-fenced). */
+  /**
+   * `orbit.runtime.variables`: expand one variablesReference (generation-fenced).
+   *
+   * `params.filter` is accepted but intentionally not enforced: this adapter
+   * returns a flat variable list without DAP `namedVariables`/`indexedVariables`
+   * counts, so there is no named/indexed distinction to filter on. The field is
+   * preserved on the wire for forward compatibility with adapters that do.
+   */
   async variables(ref: SessionRef, params: RuntimeVariablesParams): Promise<RuntimeListData<RuntimeVariable>> {
     const { session, generation } = this.resolve(ref);
     const reference = String(params.variablesReference);
     this.requireReferenceGeneration(reference, generation);
+    // We only ever emit decimal references, so clients must round-trip the
+    // decimal string verbatim; `Number` accepts a hex UInt64 too, but such a
+    // value never appears in our map and is forwarded as a best-effort read.
     const result = await this.snapshot(session, {
       kind: 'variables',
       sessionGeneration: generation,
@@ -195,7 +207,7 @@ export class RuntimeService {
     const start = params.cursor !== undefined
       ? this.cursorIndex(params.cursor, items, item => item.name) + 1
       : (params.start ?? 0);
-    const count = this.clampCount(params.count ?? DEFAULT_PAGE_LIMIT);
+    const count = this.clampPage(params.count ?? DEFAULT_PAGE_LIMIT);
     const slice = items.slice(start, start + count);
     const data: RuntimeListData<RuntimeVariable> = { items: slice };
     if (start + count < items.length) data.nextCursor = slice[slice.length - 1].name;
@@ -235,6 +247,10 @@ export class RuntimeService {
     try {
       result = await this.opts.snapshotDap(session, request);
     } catch (error) {
+      // A bodiless rejection here means the transport (not the target read)
+      // failed — a vanished/replaced session or a DAP protocol error. `resolve`
+      // already fenced generation/phase before this point, so the conservative
+      // frozen TargetDisconnected is the honest fallback for the remaining race.
       const message = error instanceof Error ? error.message : String(error);
       throw new AutomationError('TargetDisconnected', `runtime snapshot failed: ${message}`, false, undefined, {
         dapMessage: message,
@@ -254,7 +270,16 @@ export class RuntimeService {
     if (code === 'TargetRunning') {
       throw new AutomationError('TargetRunning', message, true, undefined, details);
     }
-    if (code === 'TargetReadCancelled' || code === 'TargetReadUnavailable') {
+    if (
+      code === 'TargetReadCancelled'
+      || code === 'TargetReadUnavailable'
+      // Adapter read-gate failures from the RTOS variable-expansion path. They
+      // are surfaced here (rather than falling through to InternalError) so a
+      // cancelled/resumed read keeps the frozen retryable TargetReadCancelled.
+      || code === 'RtosReadCancelled'
+      || code === 'RtosVariableUnavailable'
+      || code === 'RtosVariableExpansionFailed'
+    ) {
       throw new AutomationError('TargetReadCancelled', message, true, undefined, details);
     }
     if (code === 'TargetBusy') {
@@ -291,6 +316,10 @@ export class RuntimeService {
   private rememberReference(reference: string, generation: number): void {
     this.referenceGeneration.set(reference, generation);
     if (this.referenceGeneration.size <= MAX_REFERENCE_TRACKING) return;
+    // FIFO eviction keeps the map bounded. In the theoretical case of >4096
+    // distinct references across restarts, evicting the oldest could drop a
+    // stale marker and let a reused reference resolve against a reallocated
+    // handle; at realistic per-session scale this is unreachable.
     const oldest = this.referenceGeneration.keys().next().value;
     if (oldest !== undefined) this.referenceGeneration.delete(oldest);
   }
@@ -301,7 +330,7 @@ export class RuntimeService {
     limit: number | undefined,
     keyOf: (item: T) => string,
   ): RuntimeListData<T> {
-    const effectiveLimit = this.clampLimit(limit);
+    const effectiveLimit = this.clampPage(limit);
     const start = cursor === undefined ? 0 : this.cursorIndex(cursor, items, keyOf) + 1;
     const slice = items.slice(start, start + effectiveLimit);
     const data: RuntimeListData<T> = { items: slice };
@@ -317,15 +346,9 @@ export class RuntimeService {
     return index;
   }
 
-  private clampLimit(limit: number | undefined): number {
-    const value = limit ?? DEFAULT_PAGE_LIMIT;
-    if (!Number.isFinite(value)) return DEFAULT_PAGE_LIMIT;
-    return Math.max(1, Math.min(Math.floor(value), MAX_PAGE_LIMIT));
-  }
-
-  private clampCount(count: number | undefined): number {
-    const value = count ?? DEFAULT_PAGE_LIMIT;
-    if (!Number.isFinite(value)) return DEFAULT_PAGE_LIMIT;
-    return Math.max(1, Math.min(Math.floor(value), MAX_PAGE_LIMIT));
+  private clampPage(value: number | undefined): number {
+    const page = value ?? DEFAULT_PAGE_LIMIT;
+    if (!Number.isFinite(page)) return DEFAULT_PAGE_LIMIT;
+    return Math.max(1, Math.min(Math.floor(page), MAX_PAGE_LIMIT));
   }
 }

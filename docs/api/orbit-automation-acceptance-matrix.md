@@ -56,7 +56,7 @@ Acceptance: Use string addresses and Base64 bytes, enforce the 1 MiB limit, repo
 Category: Recording
 Status: Automated
 Methods: `orbit.watch.list`, `orbit.watch.replace`, `orbit.watch.add`, `orbit.watch.remove`, `orbit.timeline.list`, `orbit.timeline.replace`, `orbit.timeline.start`, `orbit.timeline.stop`, `orbit.timeline.status`
-Acceptance: Synchronize persisted/UI expressions, page list results, fence sampling by exact session generation, prevent stale publication, enforce 5 ms minimum interval, and preserve scheduler fairness.
+Acceptance: Synchronize persisted/UI expressions, page list results, fence sampling by exact session generation, prevent stale publication, allow raw fast-sampler cadence (`intervalMs=0`, no throttle), and preserve scheduler fairness.
 
 ### API-009: Recording and experiment lifecycle
 

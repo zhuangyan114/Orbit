@@ -623,7 +623,7 @@ export const recordStartParams = z
     context: targetMutationContextSchema,
     name: z.string().min(1),
     channels: z.array(recordingChannelSchema).min(1).max(64),
-    intervalMs: z.number().int().min(5),
+    intervalMs: z.number().int().min(0),
     maxFrames: z.number().int().min(1).max(50000).default(50000),
   })
   .strict();

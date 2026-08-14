@@ -48,12 +48,15 @@ import { SessionService, listOrbitLaunchConfigurations } from './session-service
 import { BreakpointService } from './breakpoint-service';
 import { RuntimeService } from './runtime-service';
 import { MemoryService } from './memory-service';
+import { ViewStateService } from './view-state-service';
+import { RecordingService } from './recording-service';
+import { EventHub } from './event-hub';
 import {
   AutomationControlRequest,
   AutomationControlResult,
   AutomationRegisterGroup,
 } from '../debug/dap-automation-protocol';
-import { ControlOutcome, ExpressionContextKind, ExpressionWrite, FlashReport, SessionRef, SymbolKind, TargetRequestContext } from './protocol';
+import { ControlOutcome, ExperimentStep, ExpressionContextKind, ExpressionWrite, FlashReport, RecordingChannel, SessionRef, SymbolKind, TargetRequestContext } from './protocol';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -283,6 +286,82 @@ interface MemoryWriteWireParams {
   verify?: boolean;
 }
 
+interface WatchListWireParams {
+  context: ConnectionContext;
+  includeValues?: boolean;
+}
+
+interface WatchMutationWireParams {
+  context: ConnectionMutationContext;
+  expressions: string[];
+}
+
+interface TimelineListWireParams {
+  context: ConnectionContext;
+  includeStatus?: boolean;
+}
+
+interface TimelineReplaceWireParams {
+  context: ConnectionMutationContext;
+  expressions: string[];
+}
+
+interface TimelineStartWireParams {
+  context: TargetMutationContext;
+  intervalMs: number;
+  maxFrames?: number;
+}
+
+interface TimelineStopWireParams {
+  context: TargetMutationContext;
+  flush?: boolean;
+}
+
+interface TimelineStatusWireParams {
+  context: TargetRequestContext;
+  includePerformance?: boolean;
+}
+
+interface RecordStartWireParams {
+  context: TargetMutationContext;
+  name: string;
+  channels: RecordingChannel[];
+  intervalMs: number;
+  maxFrames?: number;
+}
+
+interface RecordStopWireParams {
+  context: TargetMutationContext;
+  recordingId: string;
+}
+
+interface RecordListWireParams {
+  context: TargetRequestContext;
+  cursor?: string;
+  limit?: number;
+  status?: string;
+}
+
+interface RecordGetWireParams {
+  context: TargetRequestContext;
+  recordingId: string;
+  cursor?: string;
+  limit?: number;
+}
+
+interface RecordClearWireParams {
+  context: TargetMutationContext;
+  recordingId: string;
+}
+
+interface ExperimentRunWireParams {
+  context: TargetMutationContext;
+  name: string;
+  steps: ExperimentStep[];
+  timeoutMs?: number;
+  continueOnError?: boolean;
+}
+
 export interface PluginApiServerOptions {
   /** Injected for tests; defaults to an Extension-Host-backed registry. */
   registry?: InstanceRegistry;
@@ -298,6 +377,16 @@ export interface PluginApiServerOptions {
   runtimeService?: RuntimeService;
   /** Byte-oriented memory access service (plan Task 9). */
   memoryService?: MemoryService;
+  /** Watch/Timeline view-state service (plan Task 10). */
+  viewStateService?: ViewStateService;
+  /** Unified automation recording service (plan Task 10). */
+  recordingService?: RecordingService;
+  /** High-rate sampler (UI Timeline channel) for recording frames (plan Task 10). */
+  fastSampleSink?: import('./fast-sample-sink').FastSampleSink;
+  /** Expressions (UI Timeline) that must keep sampling while recordings run. */
+  sharedSampleExpressions?: () => string[];
+  /** Bounded event ring Task 11's SSE stream consumes (plan §2.5). */
+  eventHub?: EventHub;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -348,6 +437,8 @@ export class PluginApiServer implements vscode.Disposable {
   private breakpointService: BreakpointService;
   private runtimeService: RuntimeService;
   private memoryService: MemoryService;
+  private viewState: ViewStateService;
+  private recording: RecordingService;
   private startedAtMs = 0;
 
   constructor(
@@ -366,7 +457,6 @@ export class PluginApiServer implements vscode.Disposable {
         : undefined,
     );
     this.recorder = new WaveRecorder(this.runtime);
-    this.experiment = new ExperimentService(this.runtime, this.recorder);
     this.registry = this.options.registry ?? this.buildRegistry();
     this.sessionService =
       this.options.sessionService ??
@@ -380,6 +470,24 @@ export class PluginApiServer implements vscode.Disposable {
     this.memoryService =
       this.options.memoryService ??
       new MemoryService({ registry: sessionRegistry ?? new SessionRegistry() });
+    this.recording =
+      this.options.recordingService ??
+      new RecordingService({
+        registry: sessionRegistry ?? new SessionRegistry(),
+        runtime: this.runtime,
+        eventHub: this.options.eventHub,
+        sampleSink: this.options.fastSampleSink,
+        sharedSampleExpressions: this.options.sharedSampleExpressions,
+      });
+    this.viewState =
+      this.options.viewStateService ??
+      new ViewStateService({
+        registry: sessionRegistry ?? new SessionRegistry(),
+        runtime: this.runtime,
+        eventHub: this.options.eventHub,
+        sampleSink: this.options.fastSampleSink,
+      });
+    this.experiment = new ExperimentService(this.runtime, this.recorder, this.recording, this.memoryService);
     if (this.options.handshakeFactory) {
       this.handshake = this.options.handshakeFactory(this.registry);
     }
@@ -458,6 +566,8 @@ export class PluginApiServer implements vscode.Disposable {
 
   dispose() {
     this.recorder.dispose();
+    this.recording.dispose();
+    this.viewState.dispose();
     this.dispatcher?.dispose();
     this.dispatcher = null;
     void this.registry.dispose();
@@ -827,6 +937,112 @@ export class PluginApiServer implements vscode.Disposable {
             verify: params.verify,
           },
           call.operationId,
+        ),
+      })),
+    );
+    // --- plan Task 10: Watch / Timeline view state and unified recording ---
+    dispatcher.register(
+      buildMethodDefinition('orbit.watch.list', async (params: WatchListWireParams) => ({
+        data: await this.viewState.watchSnapshot(params.includeValues ?? true),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.watch.replace', async (params: WatchMutationWireParams) => ({
+        data: await this.viewState.replaceWatch(params.expressions),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.watch.add', async (params: WatchMutationWireParams) => ({
+        data: await this.viewState.addWatch(params.expressions),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.watch.remove', async (params: WatchMutationWireParams) => ({
+        data: await this.viewState.removeWatch(params.expressions),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.timeline.list', async (params: TimelineListWireParams) => ({
+        data: this.viewState.timelineSnapshot(params.includeStatus ?? true),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.timeline.replace', async (params: TimelineReplaceWireParams) => ({
+        data: await this.viewState.replaceTimeline(params.expressions),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.timeline.start', async (params: TimelineStartWireParams) => ({
+        data: await this.viewState.startTimeline(
+          this.sessionRef(params.context),
+          params.intervalMs,
+          params.maxFrames,
+        ),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.timeline.stop', async (params: TimelineStopWireParams) => ({
+        data: await this.viewState.stopTimeline(this.sessionRef(params.context)),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.timeline.status', async (params: TimelineStatusWireParams) => ({
+        data: await this.viewState.timelineStatus(this.sessionRef(params.context)),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.record.start', async (params: RecordStartWireParams) => ({
+        data: await this.recording.start(this.sessionRef(params.context), {
+          name: params.name,
+          channels: params.channels,
+          intervalMs: params.intervalMs,
+          maxFrames: params.maxFrames,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.record.stop', async (params: RecordStopWireParams) => ({
+        data: await this.recording.stop(this.sessionRef(params.context), params.recordingId),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.record.list', async (params: RecordListWireParams) => ({
+        data: await this.recording.list(this.sessionRef(params.context), {
+          cursor: params.cursor,
+          limit: params.limit,
+          status: params.status,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.record.get', async (params: RecordGetWireParams) => ({
+        data: await this.recording.get(this.sessionRef(params.context), {
+          recordingId: params.recordingId,
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.record.clear', async (params: RecordClearWireParams) => ({
+        data: await this.recording.clear(this.sessionRef(params.context), {
+          recordingId: params.recordingId,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.experiment.run', async (params: ExperimentRunWireParams, call) => ({
+        data: await this.experiment.runV1(
+          this.sessionRef(params.context),
+          {
+            steps: params.steps,
+            timeoutMs: params.timeoutMs,
+            continueOnError: params.continueOnError,
+          },
+          {
+            operationId: call.operationId ?? `op_${randomUUID()}`,
+            scopes: call.connection?.scopes ?? new Set<string>(),
+          },
         ),
       })),
     );

@@ -12,6 +12,10 @@ import { SessionRegistry, SessionUpdatePatch } from './plugin-api/session-regist
 import { SessionService } from './plugin-api/session-service';
 import { BreakpointService } from './plugin-api/breakpoint-service';
 import { RuntimeService } from './plugin-api/runtime-service';
+import { RuntimeRouter } from './plugin-api/runtime-router';
+import { ViewStateService } from './plugin-api/view-state-service';
+import { RecordingService } from './plugin-api/recording-service';
+import { FastSampleSink } from './plugin-api/fast-sample-sink';
 import { AUTOMATION_CONTROL_EVENT } from './debug/dap-automation-protocol';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
@@ -30,6 +34,10 @@ let activeWatchSession: vscode.DebugSession | null = null;
 let pluginApiServer: PluginApiServer;
 let eventHub: EventHub;
 let sessionRegistry: SessionRegistry;
+/** Shared runtime router + view/recording services for the Automation API. */
+let apiRuntime: RuntimeRouter;
+let apiViewState: ViewStateService;
+let apiRecording: RecordingService;
 let rttLogTerminal: vscode.Terminal | null = null;
 let rttLogPty: RttLogTerminal | null = null;
 
@@ -128,7 +136,7 @@ export async function activate(context: vscode.ExtensionContext) {
     watchWebviewProvider = wvp;
     wvp.onExpressionsChanged = (exprs) => {
       wp.setExpressions(exprs);
-      context.workspaceState.update('ozoneWatchExpressions', exprs);
+      apiViewState?.setWatchFromUi(exprs);
     };
     const saved = context.workspaceState.get<string[]>('ozoneWatchExpressions', []);
     if (saved.length > 0) {
@@ -139,7 +147,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const dsm = new DataSamplingManager(b);
     dataSamplingManager = dsm;
     dsm.onExpressionsChanged = (exprs) => {
-      context.workspaceState.update('ozoneDataSamplingExpressions', exprs);
+      apiViewState?.setTimelineFromUi(exprs);
       timelineProvider?.refreshEntries();
     };
     wvp.onSendToTimeline = (exprs) => {
@@ -163,11 +171,41 @@ export async function activate(context: vscode.ExtensionContext) {
       projectId: () => pluginApiServer?.getProjectId() ?? '',
     });
     sessionRegistry = new SessionRegistry({ eventHub });
+    apiRuntime = new RuntimeRouter(
+      backend,
+      sessionRegistry
+        ? { resolveSession: ref => sessionRegistry.requireExact(ref), currentRef: () => sessionRegistry.currentRef() }
+        : undefined,
+    );
+    const fastSampleSink = new FastSampleSink({
+      // Keep the UI Timeline's own sampler alive: the sink never stops the
+      // adapter sampler while these expressions exist (plan Task 10).
+      persistentExpressions: () => dataSamplingManager?.expressionList ?? [],
+    });
+    apiViewState = new ViewStateService({ registry: sessionRegistry, runtime: apiRuntime, store: context.workspaceState, eventHub, sampleSink: fastSampleSink });
+    apiRecording = new RecordingService({
+      registry: sessionRegistry,
+      runtime: apiRuntime,
+      eventHub,
+      sampleSink: fastSampleSink,
+      // Keep the UI Timeline expressions live so the adapter sampler stays
+      // shared with the Timeline while a recording runs (plan Task 10).
+      sharedSampleExpressions: () => dataSamplingManager?.expressionList ?? [],
+    });
     const sessionService = new SessionService({ registry: sessionRegistry });
     const breakpointService = new BreakpointService({ registry: sessionRegistry });
     const runtimeService = new RuntimeService({ registry: sessionRegistry });
 
-    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry, sessionService, breakpointService, runtimeService });
+    pluginApiServer = new PluginApiServer(context, backend, {
+      sessionRegistry,
+      sessionService,
+      breakpointService,
+      runtimeService,
+      viewStateService: apiViewState,
+      recordingService: apiRecording,
+      fastSampleSink,
+      eventHub,
+    });
     const apiEndpoint = await pluginApiServer.start();
     context.subscriptions.push(pluginApiServer);
       console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);

@@ -9218,7 +9218,7 @@
           },
           "intervalMs": {
             "type": "integer",
-            "minimum": 5
+            "minimum": 0
           },
           "channels": {
             "type": "array",
@@ -10128,7 +10128,7 @@
           },
           "intervalMs": {
             "type": "integer",
-            "minimum": 5
+            "minimum": 0
           },
           "maxFrames": {
             "type": "integer",

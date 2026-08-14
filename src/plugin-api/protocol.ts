@@ -604,6 +604,135 @@ export interface MemoryWriteReport {
   verifyData?: string;
 }
 
+// --- View-state, sampling and experiment DTOs (OpenRPC, plan Task 10). Frozen
+// --- shapes returned by the orbit.watch.* / orbit.timeline.* / orbit.record.*
+// --- and orbit.experiment.run methods. Timestamps and frame ids are UInt64
+// --- decimal strings (never JSON numbers).
+
+/** OpenRPC ErrorDataBase — the shared error payload embedded in results. */
+export interface ErrorDataBase {
+  errorCode: string;
+  retryable: boolean;
+  requestId?: string;
+  operationId?: string;
+  expectedGeneration?: number;
+  actualGeneration?: number;
+  details?: Record<string, unknown>;
+}
+
+/** OpenRPC WatchSnapshot (data of every orbit.watch.* method). */
+export interface WatchSnapshot {
+  expressions: string[];
+  values: ExpressionValue[];
+  uiSynchronized: boolean;
+  revision: number;
+  items: ExpressionValue[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC TimelineSnapshot (data of every orbit.timeline.* method). */
+export interface TimelineSnapshot {
+  expressions: string[];
+  sampling: boolean;
+  intervalMs: number;
+  generation: number;
+  framesRetained: number;
+  droppedFrames: number;
+  revision: number;
+  items: string[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC RecordingChannel (items of RecordStartParams.channels). */
+export interface RecordingChannel {
+  channelId: string;
+  expression: string;
+  unit?: string;
+  valueType: string;
+}
+
+/** OpenRPC RecordingFrameValue (items of RecordingFrame.values). */
+export interface RecordingFrameValue {
+  channelId: string;
+  value: number | string | boolean | null;
+  available: boolean;
+}
+
+/** OpenRPC RecordingFrame (items of RecordingFramesPage.items). */
+export interface RecordingFrame {
+  frameId: string;
+  timestamp: string;
+  timestampNs?: string;
+  sessionGeneration: number;
+  values: RecordingFrameValue[];
+}
+
+/** OpenRPC RecordingStatus. */
+export type RecordingStatus = 'starting' | 'recording' | 'stopped' | 'failed';
+
+/** OpenRPC Recording (data of record.start/stop, items of list). */
+export interface Recording {
+  recordingId: string;
+  name: string;
+  status: RecordingStatus;
+  startedAt: string;
+  stoppedAt?: string;
+  intervalMs: number;
+  channels: RecordingChannel[];
+  frameCount: number;
+  bytesRetained: number;
+  failure?: ErrorDataBase;
+}
+
+/** OpenRPC RecordingListData (data of orbit.record.list). */
+export interface RecordingListData {
+  items: Recording[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC RecordingFramesPage (data of orbit.record.get). */
+export interface RecordingFramesPage {
+  recording: Recording;
+  items: RecordingFrame[];
+  nextCursor?: string | null;
+}
+
+/** OpenRPC RecordClearData (data of orbit.record.clear). */
+export interface RecordClearData {
+  operationId: string;
+  recordingId: string;
+  clearedFrames: number;
+}
+
+/** OpenRPC ExperimentStep (items of ExperimentRunParams.steps). */
+export type ExperimentStep =
+  | { kind: 'read'; expression: string; as?: string }
+  | { kind: 'write'; expression: string; value: string }
+  | { kind: 'memoryRead'; address: string; count: number }
+  | { kind: 'memoryWrite'; address: string; data: string }
+  | { kind: 'wait'; durationMs: number }
+  | { kind: 'record'; expressions: string[]; durationMs: number; intervalMs: number };
+
+/** OpenRPC ExperimentStepOutcome (items of ExperimentReport.steps). */
+export interface ExperimentStepOutcome {
+  index: number;
+  kind: string;
+  status: 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+  startedAt: string;
+  completedAt?: string;
+  value?: string | number | boolean | null;
+  error?: ErrorDataBase;
+}
+
+/** OpenRPC ExperimentReport (data of orbit.experiment.run). */
+export interface ExperimentReport {
+  operationId: string;
+  status: 'succeeded' | 'failed' | 'cancelled' | 'outcomeUnknown';
+  steps: ExperimentStepOutcome[];
+  recordingIds: string[];
+  elapsedMs: number;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

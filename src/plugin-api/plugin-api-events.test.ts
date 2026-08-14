@@ -131,6 +131,16 @@ describe('SseConnection', () => {
     expect(seen).toEqual(['watch.changed']);
   });
 
+  it('filters replayed events too, not only live events', () => {
+    const hub = makeHub();
+    const a = makeEvent(hub, 'session.started');
+    const b = makeEvent(hub, 'watch.changed');
+    const c = makeEvent(hub, 'rtt.stateChanged');
+    const { res } = makeConnection({ replay: [a, b, c], filter: new Set(['watch.changed']) });
+    const types = res.chunks.map(chunk => (JSON.parse(chunk.split('\ndata: ')[1]) as AutomationEvent).type);
+    expect(types).toEqual(['watch.changed']);
+  });
+
   it('closes on socket close and clears the subscription', () => {
     const hub = makeHub();
     const res = new FakeResponse();

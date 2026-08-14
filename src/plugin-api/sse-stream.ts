@@ -60,7 +60,7 @@ export class SseConnection {
     this.slowConsumerBytes = options.slowConsumerBytes ?? SSE_SLOW_CONSUMER_BYTES;
     this.buildResetEvent = options.buildResetEvent;
     this.writeHead();
-    for (const event of options.replay) this.write(event);
+    for (const event of options.replay) this.writeIfMatches(event);
   }
 
   /** Begins live delivery, the heartbeat and disconnect cleanup. */
@@ -96,6 +96,11 @@ export class SseConnection {
 
   private onEvent(event: AutomationEvent): void {
     if (this.closed) return;
+    this.writeIfMatches(event);
+  }
+
+  /** Applies the type filter to both replayed and live events. */
+  private writeIfMatches(event: AutomationEvent): void {
     if (this.filter && !this.filter.has(event.type)) return;
     this.write(event);
   }

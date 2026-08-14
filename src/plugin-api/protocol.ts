@@ -577,6 +577,33 @@ export interface SymbolResolveData {
   exact: boolean;
 }
 
+// --- Memory DTOs (OpenRPC, plan Task 9). Frozen shapes returned by
+// --- orbit.memory.read and orbit.memory.write. Addresses are 0x-prefixed hex
+// --- strings; memory payloads are Base64 (never JSON numbers/uint32 arrays).
+
+/** OpenRPC MemoryBlock (data of orbit.memory.read). */
+export interface MemoryBlockData {
+  /** OpenRPC Address: 0x-prefixed hex string. */
+  address: string;
+  requestedBytes: number;
+  bytesRead: number;
+  unreadableBytes: number;
+  /** Base64-encoded bytes (`contentEncoding: base64`, `x-orbit-bytes`). */
+  data: string;
+}
+
+/** OpenRPC MemoryWriteReport (data of orbit.memory.write). */
+export interface MemoryWriteReport {
+  operationId: string;
+  /** OpenRPC Address: 0x-prefixed hex string. */
+  address: string;
+  bytesWritten: number;
+  /** `true` only when verify was requested and the read-back matched. */
+  verified: boolean;
+  /** Base64-encoded bytes read back for verification, when verify ran. */
+  verifyData?: string;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

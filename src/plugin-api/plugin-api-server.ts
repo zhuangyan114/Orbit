@@ -47,6 +47,7 @@ import { SessionRegistry, SessionUpdatePatch } from './session-registry';
 import { SessionService, listOrbitLaunchConfigurations } from './session-service';
 import { BreakpointService } from './breakpoint-service';
 import { RuntimeService } from './runtime-service';
+import { MemoryService } from './memory-service';
 import {
   AutomationControlRequest,
   AutomationControlResult,
@@ -268,6 +269,20 @@ interface SymbolResolveWireParams {
   address?: string;
 }
 
+interface MemoryReadWireParams {
+  context: TargetRequestContext;
+  address: string;
+  count: number;
+  allowPartial?: boolean;
+}
+
+interface MemoryWriteWireParams {
+  context: TargetMutationContext;
+  address: string;
+  data: string;
+  verify?: boolean;
+}
+
 export interface PluginApiServerOptions {
   /** Injected for tests; defaults to an Extension-Host-backed registry. */
   registry?: InstanceRegistry;
@@ -281,6 +296,8 @@ export interface PluginApiServerOptions {
   breakpointService?: BreakpointService;
   /** Runtime inspection service (plan Task 7). */
   runtimeService?: RuntimeService;
+  /** Byte-oriented memory access service (plan Task 9). */
+  memoryService?: MemoryService;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -330,6 +347,7 @@ export class PluginApiServer implements vscode.Disposable {
   private sessionService: SessionService;
   private breakpointService: BreakpointService;
   private runtimeService: RuntimeService;
+  private memoryService: MemoryService;
   private startedAtMs = 0;
 
   constructor(
@@ -359,6 +377,9 @@ export class PluginApiServer implements vscode.Disposable {
     this.runtimeService =
       this.options.runtimeService ??
       new RuntimeService({ registry: sessionRegistry ?? new SessionRegistry() });
+    this.memoryService =
+      this.options.memoryService ??
+      new MemoryService({ registry: sessionRegistry ?? new SessionRegistry() });
     if (this.options.handshakeFactory) {
       this.handshake = this.options.handshakeFactory(this.registry);
     }
@@ -784,6 +805,29 @@ export class PluginApiServer implements vscode.Disposable {
           name: params.name,
           address: params.address,
         }),
+      })),
+    );
+    // --- plan Task 9: byte-oriented memory read/write ---
+    dispatcher.register(
+      buildMethodDefinition('orbit.memory.read', async (params: MemoryReadWireParams) => ({
+        data: await this.memoryService.read(this.sessionRef(params.context), {
+          address: params.address,
+          count: params.count,
+          allowPartial: params.allowPartial,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.memory.write', async (params: MemoryWriteWireParams, call) => ({
+        data: await this.memoryService.write(
+          this.sessionRef(params.context),
+          {
+            address: params.address,
+            data: params.data,
+            verify: params.verify,
+          },
+          call.operationId,
+        ),
       })),
     );
   }

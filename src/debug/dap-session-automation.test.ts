@@ -7,6 +7,8 @@ import {
   AUTOMATION_BREAKPOINTS_COMMAND,
   AUTOMATION_RUNTIME_COMMAND,
   parseAutomationRuntimeRequest,
+  AUTOMATION_MEMORY_COMMAND,
+  parseAutomationMemoryRequest,
 } from './dap-automation-protocol';
 
 function automationRequest(seq: number, args: Record<string, unknown>): DebugProtocolMessage {
@@ -702,6 +704,159 @@ describe('DapSession automation runtime snapshot', () => {
     await (session as any).handleRequest(runtimeRequest(1, { kind: 'threads', sessionGeneration: 2 }));
 
     expect(responseFor(messages, 1)).toMatchObject({ success: false, body: { errorCode: 'SessionStarting' } });
+  });
+});
+
+function memoryRequest(seq: number, args: Record<string, unknown>): DebugProtocolMessage {
+  return { type: 'request', seq, command: AUTOMATION_MEMORY_COMMAND, arguments: args };
+}
+
+/** Base64 of the 4-byte block the mock readMemory returns (0xAA x4). */
+const AA4 = Buffer.from([0xAA, 0xAA, 0xAA, 0xAA]).toString('base64');
+/** Base64 of the deliberate mismatch read-back (0xAA x3, 0xBB). */
+const AA3BB = Buffer.from([0xAA, 0xAA, 0xAA, 0xBB]).toString('base64');
+
+/** Byte-oriented memory backend: readMemory returns a fixed 4-byte block. */
+function memoryBackend(overrides: Record<string, unknown> = {}): { execute: (command: any) => Promise<any>; calls: string[] } {
+  const calls: string[] = [];
+  const backend = {
+    calls,
+    execute: async (command: { cmd: string } & Record<string, unknown>) => {
+      calls.push(command.cmd);
+      if (overrides[command.cmd]) return (overrides[command.cmd] as () => unknown)();
+      if (command.cmd === 'readMemory') {
+        return { ok: true, data: { address: command.address, data: [0xAA, 0xAA, 0xAA, 0xAA], ascii: '....', unreadableBytes: 0 } };
+      }
+      if (command.cmd === 'writeMemory') return { ok: true, data: 'Wrote 4 byte(s)' };
+      return { ok: true, data: {} };
+    },
+  };
+  return backend;
+}
+
+describe('DapSession automation memory snapshot', () => {
+  it('read reuses the readMemory handler and returns the base64 block', async () => {
+    const backend = memoryBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'read', sessionGeneration: 2, address: '0x20000010', count: 4,
+    }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: true,
+      command: AUTOMATION_MEMORY_COMMAND,
+      body: {
+        address: '0x20000010', requestedBytes: 4, bytesRead: 4, unreadableBytes: 0, data: AA4, targetState: 'Halted',
+      },
+    });
+    expect((backend as any).calls).toEqual(['readMemory']);
+  });
+
+  it('read during control surfaces the frozen retryable TargetReadCancelled', async () => {
+    const session = connectedJlinkSession(memoryBackend() as unknown as OzoneBackend);
+    (session as any).controlInProgress = true;
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'read', sessionGeneration: 2, address: '0x20000010', count: 4,
+    }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: false,
+      body: { errorCode: 'TargetReadCancelled' },
+    });
+  });
+
+  it('write runs under the control barrier and verifies by reading back', async () => {
+    const backend = memoryBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'write', sessionGeneration: 2, address: '0x20000010', data: AA4, verify: true,
+    }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: true,
+      body: { address: '0x20000010', bytesWritten: 4, verified: true, data: AA4, targetState: 'Halted' },
+    });
+    expect((backend as any).calls).toEqual(['writeMemory', 'readMemory']);
+  });
+
+  it('write verify mismatch reports verified false with the read-back bytes', async () => {
+    const backend = memoryBackend({
+      readMemory: () => ({ ok: true, data: { address: 0x20000010, data: [0xAA, 0xAA, 0xAA, 0xBB], ascii: '...', unreadableBytes: 0 } }),
+    });
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'write', sessionGeneration: 2, address: '0x20000010', data: AA4, verify: true,
+    }));
+
+    expect(responseFor(messages, 1)?.body).toMatchObject({ bytesWritten: 4, verified: false, data: AA3BB });
+  });
+
+  it('write without verify does not read back', async () => {
+    const backend = memoryBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'write', sessionGeneration: 2, address: '0x20000010', data: AA4, verify: false,
+    }));
+
+    expect(responseFor(messages, 1)?.body).toMatchObject({ bytesWritten: 4, verified: false });
+    expect((backend as any).calls).toEqual(['writeMemory']);
+  });
+
+  it('a write backend failure carries the frozen MemoryWriteFailed code', async () => {
+    const backend = memoryBackend({
+      writeMemory: () => ({ ok: false, errorCode: 'MemoryWriteFailed', error: 'write rejected' }),
+    });
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'write', sessionGeneration: 2, address: '0x20000010', data: 'qqqq',
+    }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: false,
+      body: { errorCode: 'MemoryWriteFailed', message: 'write rejected' },
+    });
+  });
+
+  it('rejects a memory request while not connected as SessionStarting', async () => {
+    const session = connectedJlinkSession(memoryBackend() as unknown as OzoneBackend);
+    (session as any).phase = 'idle';
+    const messages = collect(session);
+
+    await (session as any).handleRequest(memoryRequest(1, {
+      kind: 'read', sessionGeneration: 2, address: '0x20000010', count: 4,
+    }));
+
+    expect(responseFor(messages, 1)).toMatchObject({ success: false, body: { errorCode: 'SessionStarting' } });
+  });
+});
+
+describe('automation memory request validation', () => {
+  it('accepts the frozen memory request shapes', () => {
+    expect(parseAutomationMemoryRequest({ kind: 'read', sessionGeneration: 1, address: '0x20000010', count: 4 }))
+      .toMatchObject({ ok: true, request: { kind: 'read', address: '0x20000010', count: 4 } });
+    expect(parseAutomationMemoryRequest({ kind: 'write', sessionGeneration: 1, address: '0x20000010', data: 'qqqq', verify: false }))
+      .toMatchObject({ ok: true, request: { kind: 'write', verify: false } });
+  });
+
+  it('rejects invalid memory request shapes', () => {
+    expect(parseAutomationMemoryRequest({ kind: 'moon', sessionGeneration: 1, address: '0x1' })).toMatchObject({ ok: false });
+    expect(parseAutomationMemoryRequest({ kind: 'read', sessionGeneration: 1, address: '20000010', count: 4 }))
+      .toMatchObject({ ok: false, errorCode: 'InvalidAddress' });
+    expect(parseAutomationMemoryRequest({ kind: 'read', sessionGeneration: 1, address: '0x20000010', count: 0 })).toMatchObject({ ok: false });
+    expect(parseAutomationMemoryRequest({ kind: 'read', sessionGeneration: 1, address: '0x20000010', count: 1048577 })).toMatchObject({ ok: false });
+    expect(parseAutomationMemoryRequest({ kind: 'write', sessionGeneration: 1, address: '0x20000010' })).toMatchObject({ ok: false });
   });
 });
 

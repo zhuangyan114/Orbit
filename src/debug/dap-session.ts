@@ -37,6 +37,10 @@ import {
   AutomationExpressionWriteOutcome,
   AutomationSymbol,
   parseAutomationExpressionRequest,
+  AUTOMATION_MEMORY_COMMAND,
+  AutomationMemoryRequest,
+  AutomationMemoryResult,
+  parseAutomationMemoryRequest,
 } from './dap-automation-protocol';
 
 export interface DebugProtocolMessage {
@@ -1632,6 +1636,8 @@ export class DapSession extends EventEmitter {
           return this.handleAutomationRuntime(msg);
         case AUTOMATION_EXPRESSION_COMMAND:
           return this.handleAutomationExpression(msg);
+        case AUTOMATION_MEMORY_COMMAND:
+          return this.handleAutomationMemory(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
     }
@@ -3384,6 +3390,162 @@ export class DapSession extends EventEmitter {
     this.sendResponse(msg, {
       symbol,
       exact: raw.exact ?? false,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  // --- byte-oriented memory access (plan Task 9) ----------------------------
+  // `read` reuses the standard DAP readMemory handler (base64 byte contract +
+  // the same read gate/control-cancel behavior as MemoryView). `write` runs
+  // under the step lock + target-write barrier (control work) and optionally
+  // verifies by reading back through the same selected owner.
+
+  private async handleAutomationMemory(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationMemoryRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationMemoryFailure(msg, parsed.errorCode, parsed.message, this.automationTargetState(), startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationMemoryFailure(msg, errorCode, `session phase ${this.phase} cannot access memory`, this.automationTargetState(), startedAt);
+      return;
+    }
+    if (request.kind === 'read') {
+      await this.handleAutomationMemoryRead(msg, request, startedAt);
+      return;
+    }
+    await this.handleAutomationMemoryWrite(msg, request, startedAt);
+  }
+
+  private sendAutomationMemoryFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    targetState: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationMemoryResult = {
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  private parseAutomationAddress(address: string): number {
+    return Number.parseInt(address.replace(/^0x/i, ''), 16) >>> 0;
+  }
+
+  private async handleAutomationMemoryRead(
+    msg: DebugProtocolMessage,
+    request: AutomationMemoryRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const address = this.parseAutomationAddress(request.address);
+    // Reuse the exact DAP readMemory handler so running/halted behavior, the
+    // read gate, and control cancellation match MemoryView byte-for-byte.
+    const captured = await this.runAutomationRead(msg, 'readMemory', {
+      memoryReference: request.address,
+      count: request.count,
+    });
+    if (!captured.success) {
+      const code = this.memoryReadFailureCode(captured);
+      this.sendAutomationMemoryFailure(msg, code, captured.message ?? 'memory read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const body = (captured.body ?? {}) as { data?: string; unreadableBytes?: number };
+    const dataBase64 = typeof body.data === 'string' ? body.data : '';
+    const bytesRead = dataBase64.length > 0 ? Buffer.from(dataBase64, 'base64').length : 0;
+    this.sendResponse(msg, {
+      address: this.formatMemoryReference(address),
+      requestedBytes: request.count ?? 0,
+      bytesRead,
+      unreadableBytes: typeof body.unreadableBytes === 'number'
+        ? body.unreadableBytes
+        : Math.max(0, (request.count ?? 0) - bytesRead),
+      data: dataBase64,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  private memoryReadFailureCode(captured: { body?: any; message?: string }): string {
+    const code = typeof captured.body?.errorCode === 'string' ? captured.body.errorCode : '';
+    if (code === 'TargetReadCancelled' || code === 'TargetReadUnavailable') return 'TargetReadCancelled';
+    if (code === 'MemoryReadFailed' || code === 'MalformedResponse') return 'MemoryReadFailed';
+    // The readMemory handler replies 'Target is running' when the read gate is
+    // not acquired (control in progress); surface the frozen retryable code.
+    if (!code && /target is running/i.test(captured.message ?? '')) return 'TargetReadCancelled';
+    return code || 'InternalError';
+  }
+
+  private async handleAutomationMemoryWrite(
+    msg: DebugProtocolMessage,
+    request: AutomationMemoryRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const address = this.parseAutomationAddress(request.address);
+    let data: number[];
+    try {
+      data = Array.from(Buffer.from(request.data ?? '', 'base64'));
+    } catch {
+      this.sendAutomationMemoryFailure(msg, 'InvalidRequest', 'invalid base64 memory payload', this.automationTargetState(), startedAt);
+      return;
+    }
+    if (data.length === 0) {
+      this.sendAutomationMemoryFailure(msg, 'InvalidRequest', 'memory write data decodes to zero bytes', this.automationTargetState(), startedAt);
+      return;
+    }
+
+    const outcome = await this.withStepLock(async () => {
+      if (!(await this.beginTargetWrite())) {
+        return { ok: false as const, errorCode: 'TargetBusy', error: 'Target busy' };
+      }
+      try {
+        this.flushDataSampling();
+        const writeResult = await this.backend.execute({ cmd: 'writeMemory', address, data });
+        if (!writeResult.ok) {
+          return { ok: false as const, errorCode: writeResult.errorCode ?? 'MemoryWriteFailed', error: writeResult.error };
+        }
+        if (request.verify === false) {
+          return { ok: true as const, bytesWritten: data.length, verified: false };
+        }
+        const readResult = await this.backend.execute({ cmd: 'readMemory', address, size: data.length });
+        if (!readResult.ok) {
+          return {
+            ok: false as const,
+            errorCode: 'MemoryWriteFailed',
+            error: `verify read failed: ${readResult.errorCode ?? 'MemoryReadFailed'}: ${readResult.error}`,
+          };
+        }
+        const block = readResult.data as MemoryBlock;
+        const readBack = Array.from(block.data ?? []);
+        const verified = readBack.length === data.length && readBack.every((byte, index) => byte === data[index]);
+        return {
+          ok: true as const,
+          bytesWritten: data.length,
+          verified,
+          verifyData: Buffer.from(readBack).toString('base64'),
+        };
+      } finally {
+        this.endTargetWrite();
+      }
+    });
+
+    if (!outcome.ok) {
+      this.sendAutomationMemoryFailure(msg, outcome.errorCode, outcome.error, this.automationTargetState(), startedAt);
+      return;
+    }
+    this.sendResponse(msg, {
+      address: this.formatMemoryReference(address),
+      bytesWritten: outcome.bytesWritten,
+      verified: outcome.verified,
+      ...(outcome.verifyData !== undefined ? { data: outcome.verifyData } : {}),
       targetState: this.automationTargetState(),
       elapsedMs: Date.now() - startedAt,
     });

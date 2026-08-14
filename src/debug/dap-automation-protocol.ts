@@ -664,3 +664,108 @@ export function parseAutomationExpressionRequest(args: unknown): AutomationExpre
 
   return { ok: true, request };
 }
+
+// --- memory snapshot (plan Task 9) ------------------------------------------
+// `orbitMemorySnapshot` reuses the standard DAP readMemory/writeMemory base64
+// byte contract and read gates. `write` is control work: the adapter runs it
+// under the step lock + target-write barrier and verifies by reading back
+// through the same selected owner when `verify` is set. No `uint32[]` memory
+// semantics are introduced anywhere on this path.
+
+export const AUTOMATION_MEMORY_COMMAND = 'orbitMemorySnapshot';
+
+export type AutomationMemoryKind = 'read' | 'write';
+
+export interface AutomationMemoryRequest {
+  kind: AutomationMemoryKind;
+  sessionGeneration: number;
+  /** Frozen Address: 0x-prefixed hex; the adapter parses it to a 32-bit int. */
+  address: string;
+  /** read: byte count (1..1048576, the frozen count bound). */
+  count?: number;
+  allowPartial?: boolean;
+  /** write: base64 payload. */
+  data?: string;
+  /** write: whether to read back and compare (frozen default true). */
+  verify?: boolean;
+}
+
+/** Outcome of `orbitMemorySnapshot`: a read block, a write report, or a failure. */
+export interface AutomationMemoryResult {
+  /** 0x-prefixed hex address actually read/written. */
+  address?: string;
+  requestedBytes?: number;
+  bytesRead?: number;
+  unreadableBytes?: number;
+  /** Base64 read payload (read) or read-back payload (write verify). */
+  data?: string;
+  /** write: bytes actually written. */
+  bytesWritten?: number;
+  verified?: boolean;
+  errorCode?: string;
+  message?: string;
+  targetState?: string;
+  elapsedMs?: number;
+}
+
+export type AutomationMemoryParseResult =
+  | { ok: true; request: AutomationMemoryRequest }
+  | { ok: false; errorCode: string; message: string };
+
+const MEMORY_KINDS: readonly AutomationMemoryKind[] = ['read', 'write'];
+
+const MAX_MEMORY_BYTES = 1048576;
+
+/**
+ * Validates the wire arguments of `orbitMemorySnapshot`. Never throws; every
+ * rejection carries a machine-readable errorCode the MemoryService maps to the
+ * frozen automation error codes. Address must be 0x-prefixed hex; count obeys
+ * the frozen 1 MiB bound; write data is a non-empty base64 string.
+ */
+export function parseAutomationMemoryRequest(args: unknown): AutomationMemoryParseResult {
+  if (!isRecord(args)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'automation memory requires request arguments' };
+  }
+  if (!isOneOf(args.kind, MEMORY_KINDS)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: `unknown automation memory kind ${String(args.kind)}` };
+  }
+  if (!isPositiveInt(args.sessionGeneration)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'sessionGeneration must be a positive integer' };
+  }
+  if (typeof args.address !== 'string' || !/^0x[0-9A-Fa-f]+$/.test(args.address)) {
+    return { ok: false, errorCode: 'InvalidAddress', message: 'address must be a 0x-prefixed hex string' };
+  }
+  const request: AutomationMemoryRequest = {
+    kind: args.kind,
+    sessionGeneration: args.sessionGeneration,
+    address: args.address,
+  };
+
+  if (args.kind === 'read') {
+    if (!isPositiveInt(args.count) || args.count > MAX_MEMORY_BYTES) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'count must be an integer between 1 and 1048576' };
+    }
+    request.count = args.count;
+    if (args.allowPartial !== undefined) {
+      if (typeof args.allowPartial !== 'boolean') {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'allowPartial must be a boolean' };
+      }
+      request.allowPartial = args.allowPartial;
+    }
+  }
+
+  if (args.kind === 'write') {
+    if (typeof args.data !== 'string' || args.data.length === 0) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'write requires a non-empty base64 data string' };
+    }
+    request.data = args.data;
+    if (args.verify !== undefined) {
+      if (typeof args.verify !== 'boolean') {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'verify must be a boolean' };
+      }
+      request.verify = args.verify;
+    }
+  }
+
+  return { ok: true, request };
+}

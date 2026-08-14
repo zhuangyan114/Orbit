@@ -733,6 +733,92 @@ export interface ExperimentReport {
   elapsedMs: number;
 }
 
+// --- RTT and diagnostics DTOs (OpenRPC, plan Task 11). Frozen shapes returned
+// --- by orbit.rtt.* and orbit.diagnostics.snapshot. Byte payloads are Base64;
+// --- addresses and exact integers are strings; diagnostics never carry tokens,
+// --- Authorization headers, raw memory data or user variable values.
+
+/** OpenRPC RttState (RttSnapshot.state). */
+export type RttState =
+  | 'stopped'
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'unavailable'
+  | 'error';
+
+/** OpenRPC RttSnapshot (data of orbit.rtt.status / start / stop / read). */
+export interface RttSnapshot {
+  state: RttState;
+  owner?: OwnerKind;
+  bufferIndex: number;
+  pollIntervalMs: number;
+  targetName?: string;
+  ansi: boolean;
+  bytesAvailable: number;
+  droppedBytes: number;
+}
+
+/** OpenRPC RttReadData (data of orbit.rtt.read). */
+export interface RttReadData {
+  snapshot: RttSnapshot;
+  /** Base64-encoded bytes (`contentEncoding: base64`, `x-orbit-bytes`). */
+  data: string;
+  bytesRead: number;
+  nextCursor?: string | null;
+}
+
+/** OpenRPC DiagnosticsApi (DiagnosticsSnapshot.api). */
+export interface DiagnosticsApi {
+  version: string;
+  connections: number;
+  sseConnections: number;
+  registryGeneration: number;
+}
+
+/** OpenRPC DiagnosticsDap (DiagnosticsSnapshot.dap). */
+export interface DiagnosticsDap {
+  sessionId?: string;
+  sessionGeneration?: number;
+  phase: string;
+  pendingRequests: number;
+}
+
+/** OpenRPC DiagnosticsOwner (DiagnosticsSnapshot.owner). */
+export interface DiagnosticsOwner {
+  kind?: OwnerKind;
+  transport?: string;
+  connected: boolean;
+  helperPid?: number;
+}
+
+/** OpenRPC DiagnosticsScheduler (DiagnosticsSnapshot.scheduler). */
+export interface DiagnosticsScheduler {
+  control: number;
+  watch: number;
+  timeline: number;
+  background: number;
+}
+
+/** OpenRPC DiagnosticsSampling (DiagnosticsSnapshot.sampling). */
+export interface DiagnosticsSampling {
+  activeRecordings: number;
+  retainedFrames: number;
+  retainedBytes: number;
+  droppedFrames: number;
+}
+
+/** OpenRPC DiagnosticsSnapshot (data of orbit.diagnostics.snapshot). */
+export interface DiagnosticsSnapshot {
+  api: DiagnosticsApi;
+  dap: DiagnosticsDap;
+  owner: DiagnosticsOwner;
+  scheduler: DiagnosticsScheduler;
+  sampling: DiagnosticsSampling;
+  /** Frozen const false: the snapshot must never contain the bearer token. */
+  tokenIncluded: false;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

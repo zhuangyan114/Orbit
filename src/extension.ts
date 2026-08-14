@@ -16,7 +16,7 @@ import { RuntimeRouter } from './plugin-api/runtime-router';
 import { ViewStateService } from './plugin-api/view-state-service';
 import { RecordingService } from './plugin-api/recording-service';
 import { FastSampleSink } from './plugin-api/fast-sample-sink';
-import { AUTOMATION_CONTROL_EVENT } from './debug/dap-automation-protocol';
+import { AUTOMATION_CONTROL_EVENT, AUTOMATION_LIFECYCLE_EVENT } from './debug/dap-automation-protocol';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
@@ -272,6 +272,35 @@ export async function activate(context: vscode.ExtensionContext) {
               patch.pc = null;
             }
             sessionRegistry.update(event.session, patch);
+          }
+        } else if (isOrbitDebugSessionType(event.session.type) && event.event === AUTOMATION_LIFECYCLE_EVENT) {
+          // Structured lifecycle event from the DAP adapter (plan Task 11).
+          // Resolve the exact session identity and generation, then publish the
+          // public target.* event; a stale event from a replaced session is
+          // dropped because its record's session object no longer matches.
+          const type = event.body?.type;
+          if (typeof type === 'string') {
+            const snapshot = sessionRegistry.getSessionSnapshot(event.session.id);
+            if (snapshot) {
+              try {
+                const exact = sessionRegistry.requireExact({
+                  sessionId: snapshot.sessionId,
+                  sessionGeneration: snapshot.sessionGeneration,
+                });
+                if (exact === event.session && eventHub) {
+                  const data: Record<string, unknown> = {};
+                  if (event.body?.reason !== undefined) data.reason = event.body.reason;
+                  if (event.body?.threadId !== undefined) data.threadId = event.body.threadId;
+                  eventHub.publish(type, {
+                    sessionId: snapshot.sessionId,
+                    sessionGeneration: snapshot.sessionGeneration,
+                    data,
+                  });
+                }
+              } catch {
+                // Stale generation/terminated session: drop the event.
+              }
+            }
           }
         }
       }),

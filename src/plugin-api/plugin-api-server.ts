@@ -50,7 +50,10 @@ import { RuntimeService } from './runtime-service';
 import { MemoryService } from './memory-service';
 import { ViewStateService } from './view-state-service';
 import { RecordingService } from './recording-service';
-import { EventHub } from './event-hub';
+import { RttService } from './rtt-service';
+import { DiagnosticsService } from './diagnostics-service';
+import { AutomationEvent, EventHub } from './event-hub';
+import { MAX_SSE_CONNECTIONS, SseConnection } from './sse-stream';
 import {
   AutomationControlRequest,
   AutomationControlResult,
@@ -362,6 +365,38 @@ interface ExperimentRunWireParams {
   continueOnError?: boolean;
 }
 
+interface RttStatusWireParams {
+  context: TargetRequestContext;
+  bufferIndex?: number;
+}
+
+interface RttStartWireParams {
+  context: TargetMutationContext;
+  bufferIndex?: number;
+  pollIntervalMs?: number;
+  targetName?: string;
+  ansi?: boolean;
+}
+
+interface RttStopWireParams {
+  context: TargetMutationContext;
+  bufferIndex?: number;
+}
+
+interface RttReadWireParams {
+  context: TargetRequestContext;
+  bufferIndex?: number;
+  cursor?: string;
+  maxBytes?: number;
+}
+
+interface DiagnosticsSnapshotWireParams {
+  context: ConnectionContext;
+  sessionId?: string;
+  includeLogs?: boolean;
+  includePerformance?: boolean;
+}
+
 export interface PluginApiServerOptions {
   /** Injected for tests; defaults to an Extension-Host-backed registry. */
   registry?: InstanceRegistry;
@@ -381,6 +416,10 @@ export interface PluginApiServerOptions {
   viewStateService?: ViewStateService;
   /** Unified automation recording service (plan Task 10). */
   recordingService?: RecordingService;
+  /** RTT status/start/stop/read service (plan Task 11). */
+  rttService?: RttService;
+  /** Redacted diagnostics snapshot service (plan Task 11). */
+  diagnosticsService?: DiagnosticsService;
   /** High-rate sampler (UI Timeline channel) for recording frames (plan Task 10). */
   fastSampleSink?: import('./fast-sample-sink').FastSampleSink;
   /** Expressions (UI Timeline) that must keep sampling while recordings run. */
@@ -439,6 +478,9 @@ export class PluginApiServer implements vscode.Disposable {
   private memoryService: MemoryService;
   private viewState: ViewStateService;
   private recording: RecordingService;
+  private rtt: RttService;
+  private diagnostics: DiagnosticsService;
+  private readonly sseConnections = new Set<SseConnection>();
   private startedAtMs = 0;
 
   constructor(
@@ -486,6 +528,21 @@ export class PluginApiServer implements vscode.Disposable {
         runtime: this.runtime,
         eventHub: this.options.eventHub,
         sampleSink: this.options.fastSampleSink,
+      });
+    this.rtt =
+      this.options.rttService ??
+      new RttService({
+        registry: sessionRegistry ?? new SessionRegistry(),
+        eventHub: this.options.eventHub,
+      });
+    this.diagnostics =
+      this.options.diagnosticsService ??
+      new DiagnosticsService({
+        registry: sessionRegistry ?? new SessionRegistry(),
+        version: API_VERSION,
+        getConnections: () => this.handshake ? Array.from(this.handshake.connections()).length : 0,
+        getSseConnections: () => this.sseConnections.size,
+        getSamplingStats: () => this.recording.stats(),
       });
     this.experiment = new ExperimentService(this.runtime, this.recorder, this.recording, this.memoryService);
     if (this.options.handshakeFactory) {
@@ -565,6 +622,8 @@ export class PluginApiServer implements vscode.Disposable {
   }
 
   dispose() {
+    for (const connection of this.sseConnections) connection.close();
+    this.sseConnections.clear();
     this.recorder.dispose();
     this.recording.dispose();
     this.viewState.dispose();
@@ -1046,6 +1105,45 @@ export class PluginApiServer implements vscode.Disposable {
         ),
       })),
     );
+    // --- plan Task 11: RTT and redacted diagnostics -------------------------
+    dispatcher.register(
+      buildMethodDefinition('orbit.rtt.status', async (params: RttStatusWireParams) => ({
+        data: await this.rtt.status(this.sessionRef(params.context), {
+          bufferIndex: params.bufferIndex,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.rtt.start', async (params: RttStartWireParams) => ({
+        data: await this.rtt.start(this.sessionRef(params.context), {
+          bufferIndex: params.bufferIndex,
+          pollIntervalMs: params.pollIntervalMs,
+          targetName: params.targetName,
+          ansi: params.ansi,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.rtt.stop', async (params: RttStopWireParams) => ({
+        data: await this.rtt.stop(this.sessionRef(params.context), {
+          bufferIndex: params.bufferIndex,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.rtt.read', async (params: RttReadWireParams) => ({
+        data: await this.rtt.read(this.sessionRef(params.context), {
+          bufferIndex: params.bufferIndex,
+          cursor: params.cursor,
+          maxBytes: params.maxBytes,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.diagnostics.snapshot', async (params: DiagnosticsSnapshotWireParams) => ({
+        data: await this.diagnostics.snapshot(params.sessionId),
+      })),
+    );
   }
 
   private sessionRef(context: TargetRequestContext): SessionRef {
@@ -1187,8 +1285,7 @@ export class PluginApiServer implements vscode.Disposable {
     }
 
     if (req.method === 'GET' && req.url === '/v1/events') {
-      // SSE transport lands in Task 11.
-      this.writeJson(res, 501, { ok: false, error: 'SSE event stream is not implemented yet' });
+      this.handleEvents(req, res);
       return;
     }
 
@@ -1236,6 +1333,94 @@ export class PluginApiServer implements vscode.Disposable {
     } catch {
       this.writeJson(res, 503, { ok: false, status: 'starting' });
     }
+  }
+
+  /** `GET /v1/events`: SSE transport (plan §2.5, Task 11). */
+  private handleEvents(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (!this.isAuthorized(req)) {
+      this.writeJson(res, 401, { ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const connectionId = this.headerValue(req.headers['x-orbit-connection-id']);
+    if (!connectionId) {
+      this.writeJson(res, 400, { ok: false, error: 'X-Orbit-Connection-Id header is required' });
+      return;
+    }
+    try {
+      this.handshake!.authorize(connectionId, 'read');
+    } catch {
+      this.writeJson(res, 401, { ok: false, error: 'ConnectionExpired' });
+      return;
+    }
+    if (this.sseConnections.size >= MAX_SSE_CONNECTIONS) {
+      this.writeJson(res, 429, { ok: false, error: 'SSE connection limit reached' });
+      return;
+    }
+
+    const eventHub = this.options.eventHub;
+    if (!eventHub) {
+      this.writeJson(res, 503, { ok: false, error: 'Event stream unavailable' });
+      return;
+    }
+
+    const filter = this.readEventTypeFilter(req);
+    const lastEventId = this.headerValue(req.headers['last-event-id']);
+    let initial: AutomationEvent[] = [];
+    const replay = eventHub.eventsAfter(lastEventId);
+    if (replay.reset) {
+      const reset = this.buildResetEvent(replay.latestEventId);
+      if (reset) initial.push(reset);
+      initial = initial.concat(eventHub.eventsAfter(undefined).events);
+    } else {
+      initial = replay.events;
+    }
+
+    const connection = new SseConnection({
+      res,
+      filter,
+      replay: initial,
+      buildResetEvent: () => this.buildResetEvent(eventHub.latestEventId()),
+      subscribe: listener => eventHub.subscribe(listener),
+    });
+    this.sseConnections.add(connection);
+    connection.start();
+    // Remove from the live set the moment the socket closes (disconnect cleanup).
+    res.on('close', () => this.sseConnections.delete(connection));
+  }
+
+  /** Reads the repeated `X-Orbit-Event-Type` filter header (empty = no filter). */
+  private readEventTypeFilter(req: http.IncomingMessage): ReadonlySet<string> | undefined {
+    const raw = req.headers['x-orbit-event-type'];
+    const values = Array.isArray(raw) ? raw : (typeof raw === 'string' ? [raw] : []);
+    const filtered = values.filter(value => value.trim().length > 0);
+    return filtered.length > 0 ? new Set(filtered) : undefined;
+  }
+
+  private headerValue(value: string | string[] | undefined): string | undefined {
+    const raw = Array.isArray(value) ? value[0] : value;
+    return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : undefined;
+  }
+
+  /** Builds the synthetic `events.reset` event from redacted snapshots (§2.5). */
+  private buildResetEvent(latestEventId?: string): AutomationEvent | undefined {
+    const eventHub = this.options.eventHub;
+    if (!eventHub) return undefined;
+    const id = latestEventId ?? eventHub.latestEventId();
+    return {
+      eventId: id ?? '0000000000000000',
+      instanceId: this.getInstanceId(),
+      projectId: this.getProjectId(),
+      timestamp: String(Date.now()),
+      type: 'events.reset',
+      data: {
+        latestEventId: id,
+        sessions: this.options.sessionRegistry?.snapshot({ includeTerminated: false }) ?? [],
+        breakpointCount: this.breakpointService.countSourceBreakpoints(),
+        watch: this.viewState.watchExpressionList,
+        timeline: this.viewState.timelineSnapshot(false).expressions,
+        recording: this.recording.stats(),
+      },
+    };
   }
 
   private async handleV1Rpc(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

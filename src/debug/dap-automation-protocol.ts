@@ -15,6 +15,15 @@
 export const AUTOMATION_CONTROL_COMMAND = 'orbitAutomationControl';
 export const AUTOMATION_CONTROL_EVENT = 'orbitAutomationControl';
 
+/**
+ * DAP custom event sent alongside standard stopped/continued/terminated events
+ * (plan Task 11). The Extension Host validates the exact session identity and
+ * generation against the SessionRegistry before publishing the corresponding
+ * public `target.*` event; the adapter does not need to know its own
+ * sessionGeneration because the registry resolves it from the session object.
+ */
+export const AUTOMATION_LIFECYCLE_EVENT = 'orbitAutomationLifecycle';
+
 /** Internal custom request the Extension Host uses to pull the DAP-side verified snapshot (plan Task 6). */
 export const AUTOMATION_BREAKPOINTS_COMMAND = 'orbitBreakpointsSnapshot';
 
@@ -768,4 +777,186 @@ export function parseAutomationMemoryRequest(args: unknown): AutomationMemoryPar
   }
 
   return { ok: true, request };
+}
+
+// --- RTT snapshot (plan Task 11) --------------------------------------------
+// `orbitRttSnapshot` drives status/start/stop/read through the selected session
+// owner. RTT is a distinct logical consumer from Watch/Timeline/recording even
+// though it shares the physical owner; reads run at background priority and a
+// control request pauses them for its complete critical section.
+
+export const AUTOMATION_RTT_COMMAND = 'orbitRttSnapshot';
+
+export type AutomationRttKind = 'status' | 'start' | 'stop' | 'read';
+
+export interface AutomationRttRequest {
+  kind: AutomationRttKind;
+  sessionGeneration: number;
+  /** status/start/stop/read: the SEGGER RTT up-buffer index (default 0). */
+  bufferIndex?: number;
+  /** start: poll interval hint (adapter default 50 ms). */
+  pollIntervalMs?: number;
+  /** start: SEGGER RTT target name (best-effort; not enforced by this adapter). */
+  targetName?: string;
+  /** start: whether to preserve ANSI escape sequences in read output. */
+  ansi?: boolean;
+  /** read: maximum bytes to return (adapter default 65536). */
+  maxBytes?: number;
+}
+
+/** Adapter-internal RTT snapshot (mirrors the frozen public RttSnapshot). */
+export interface AutomationRttSnapshot {
+  state: 'stopped' | 'starting' | 'running' | 'stopping' | 'unavailable' | 'error';
+  owner: 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
+  bufferIndex: number;
+  pollIntervalMs: number;
+  targetName?: string;
+  ansi: boolean;
+  bytesAvailable: number;
+  droppedBytes: number;
+}
+
+/** Outcome of `orbitRttSnapshot`: a snapshot plus an optional read payload. */
+export interface AutomationRttResult {
+  snapshot?: AutomationRttSnapshot;
+  /** read: Base64 bytes. */
+  data?: string;
+  bytesRead?: number;
+  errorCode?: string;
+  message?: string;
+  targetState?: string;
+  elapsedMs?: number;
+}
+
+export type AutomationRttParseResult =
+  | { ok: true; request: AutomationRttRequest }
+  | { ok: false; errorCode: string; message: string };
+
+const RTT_KINDS: readonly AutomationRttKind[] = ['status', 'start', 'stop', 'read'];
+
+/**
+ * Validates the wire arguments of `orbitRttSnapshot`. Never throws; every
+ * rejection carries a machine-readable errorCode the RttService maps to the
+ * frozen automation error codes.
+ */
+export function parseAutomationRttRequest(args: unknown): AutomationRttParseResult {
+  if (!isRecord(args)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'automation RTT requires request arguments' };
+  }
+  if (!isOneOf(args.kind, RTT_KINDS)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: `unknown automation RTT kind ${String(args.kind)}` };
+  }
+  if (!isPositiveInt(args.sessionGeneration)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'sessionGeneration must be a positive integer' };
+  }
+  const request: AutomationRttRequest = {
+    kind: args.kind,
+    sessionGeneration: args.sessionGeneration,
+  };
+
+  if (args.bufferIndex !== undefined) {
+    if (typeof args.bufferIndex !== 'number' || !Number.isInteger(args.bufferIndex) || args.bufferIndex < 0) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'bufferIndex must be a non-negative integer' };
+    }
+    request.bufferIndex = args.bufferIndex;
+  }
+  if (args.kind === 'start') {
+    if (args.pollIntervalMs !== undefined) {
+      if (!isPositiveInt(args.pollIntervalMs)) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'pollIntervalMs must be a positive integer' };
+      }
+      request.pollIntervalMs = args.pollIntervalMs;
+    }
+    if (args.targetName !== undefined) {
+      if (typeof args.targetName !== 'string' || args.targetName.trim().length === 0) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'targetName must be a non-empty string' };
+      }
+      request.targetName = args.targetName.trim();
+    }
+    if (args.ansi !== undefined) {
+      if (typeof args.ansi !== 'boolean') {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'ansi must be a boolean' };
+      }
+      request.ansi = args.ansi;
+    }
+  }
+  if (args.kind === 'read' && args.maxBytes !== undefined) {
+    if (!isPositiveInt(args.maxBytes) || args.maxBytes > 1048576) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'maxBytes must be an integer between 1 and 1048576' };
+    }
+    request.maxBytes = args.maxBytes;
+  }
+
+  return { ok: true, request };
+}
+
+// --- diagnostics snapshot (plan Task 11) -------------------------------------
+// `orbitDiagnosticsSnapshot` returns only counts, states, elapsed times and
+// error codes: never the bearer token, Authorization, raw memory data or user
+// variable values. The Extension Host merges this adapter-side view with its
+// own API/connection/sampling counters.
+
+export const AUTOMATION_DIAGNOSTICS_COMMAND = 'orbitDiagnosticsSnapshot';
+
+export interface AutomationDiagnosticsRequest {
+  sessionGeneration: number;
+}
+
+/** Adapter-side scheduler queue counts (mirrors the frozen public DTO). */
+export interface AutomationSchedulerSnapshot {
+  control: number;
+  watch: number;
+  timeline: number;
+  background: number;
+}
+
+/** Outcome of `orbitDiagnosticsSnapshot`. */
+export interface AutomationDiagnosticsResult {
+  sessionGeneration?: number;
+  phase: string;
+  targetState: string;
+  ownerKind: string;
+  transport?: string;
+  connected: boolean;
+  pendingRequests: number;
+  scheduler: AutomationSchedulerSnapshot;
+  errorCode?: string;
+  message?: string;
+  elapsedMs?: number;
+}
+
+const ZERO_SCHEDULER: AutomationSchedulerSnapshot = {
+  control: 0,
+  watch: 0,
+  timeline: 0,
+  background: 0,
+};
+
+/**
+ * Validates the wire arguments of `orbitDiagnosticsSnapshot`. Never throws.
+ */
+export function parseAutomationDiagnosticsRequest(args: unknown):
+  | { ok: true; request: AutomationDiagnosticsRequest }
+  | { ok: false; errorCode: string; message: string } {
+  if (!isRecord(args)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'automation diagnostics requires request arguments' };
+  }
+  if (!isPositiveInt(args.sessionGeneration)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'sessionGeneration must be a positive integer' };
+  }
+  return { ok: true, request: { sessionGeneration: args.sessionGeneration } };
+}
+
+/** Normalizes an owner scheduler snapshot onto the frozen four-priority shape. */
+export function normalizeSchedulerSnapshot(snapshot: unknown): AutomationSchedulerSnapshot {
+  if (!isRecord(snapshot)) return ZERO_SCHEDULER;
+  const queued = isRecord(snapshot.queued) ? snapshot.queued : {};
+  const asCount = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  return {
+    control: asCount(queued.control),
+    watch: asCount(queued.watch),
+    timeline: asCount(queued.timeline),
+    background: asCount(queued.background),
+  };
 }

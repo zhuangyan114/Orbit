@@ -94,6 +94,7 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
   flash?(elfPath: string, device: string, options?: CmsisDapFlashOptions): Promise<CppJLinkResult<CmsisDapFlashResult>>;
   getPerformanceDiagnostics?(): Record<string, unknown>;
+  getSchedulerSnapshot?(): Record<string, unknown>;
   dispose(graceful?: boolean): Promise<void>;
 }
 
@@ -209,6 +210,13 @@ export class SessionTargetSelector {
       helperRpcElapsedMs: null,
       helperProcessingMs: null,
       cmsisDap: null,
+    };
+  }
+  getSchedulerSnapshot(): Record<string, unknown> {
+    return this.owner?.getSchedulerSnapshot?.() || {
+      running: false,
+      pausedPriorities: [],
+      queued: { control: 0, watch: 0, timeline: 0, background: 0 },
     };
   }
   async writeMemory(address: number, bytes: Uint8Array) {

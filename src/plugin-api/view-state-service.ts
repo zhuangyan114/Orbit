@@ -279,6 +279,11 @@ export class ViewStateService implements vscode.Disposable {
     return this.timeline.map(entry => ({ ...entry }));
   }
 
+  /** Watch expressions (no values) for the `events.reset` snapshot (Task 11). */
+  get watchExpressionList(): string[] {
+    return [...this.watchExpressions];
+  }
+
   dispose(): void {
     this.stopSampling();
   }

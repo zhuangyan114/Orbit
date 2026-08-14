@@ -296,7 +296,8 @@ export class OzoneBackend {
         && command.cmd !== 'resolveSymbol'
         && command.cmd !== 'searchSymbols'
         && command.cmd !== 'prepareFastDataSampling'
-        && command.cmd !== 'getPerformanceDiagnostics') {
+        && command.cmd !== 'getPerformanceDiagnostics'
+        && command.cmd !== 'getSchedulerSnapshot') {
         return { ok: false, error: 'Target access is owned by the active ozone DAP session' };
       }
       switch (command.cmd) {
@@ -439,6 +440,15 @@ case 'readVariableRuntime':
                 helperProcessingMs: null,
                 cmsisDap: null,
               }),
+            },
+          };
+        case 'getSchedulerSnapshot':
+          return {
+            ok: true,
+            data: this.sessionTarget?.getSchedulerSnapshot?.() || {
+              running: false,
+              pausedPriorities: [],
+              queued: { control: 0, watch: 0, timeline: 0, background: 0 },
             },
           };
         case 'writeMemory':

@@ -65,11 +65,14 @@ export interface EventReplay {
   latestEventId: string | undefined;
 }
 
+export type EventHubListener = (event: AutomationEvent) => void;
+
 export class EventHub {
   private readonly ring: AutomationEvent[] = [];
   private ringBytes = 0;
   private sequence = 0n;
   private disposed = false;
+  private readonly listeners = new Set<EventHubListener>();
 
   constructor(private readonly options: EventHubOptions) {}
 
@@ -104,7 +107,38 @@ export class EventHub {
     this.ring.push(event);
     this.ringBytes += bytes;
     this.evictOverBudget();
+
+    // Deliver to live subscribers (SSE connections) after the ring append, so
+    // a subscriber can safely call eventsAfter() with the same event id. A
+    // listener that throws must not break other listeners or the publisher.
+    for (const listener of Array.from(this.listeners)) {
+      try {
+        listener(event);
+      } catch {
+        // A faulty subscriber is isolated; the ring is already durable.
+      }
+    }
     return event;
+  }
+
+  /**
+   * Subscribes to newly published events and returns an idempotent unsubscribe
+   * function. Live delivery is best-effort: the ring remains the durable source
+   * of truth, so a dropped live event is still recoverable via replay.
+   */
+  subscribe(listener: EventHubListener): () => void {
+    this.listeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Number of live subscribers (diagnostics/SSE connection accounting). */
+  subscriberCount(): number {
+    return this.listeners.size;
   }
 
   /**

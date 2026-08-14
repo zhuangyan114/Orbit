@@ -193,6 +193,19 @@ export class RecordingService implements vscode.Disposable {
     void this.sampleSink?.dispose();
   }
 
+  /** Whole-instance sampling counters for `orbit.diagnostics.snapshot` (Task 11). */
+  stats(): { activeRecordings: number; retainedFrames: number; retainedBytes: number; droppedFrames: number } {
+    let activeRecordings = 0;
+    let retainedFrames = 0;
+    let retainedBytes = 0;
+    for (const entry of this.recordings.values()) {
+      if (!entry.stopped) activeRecordings += 1;
+      retainedFrames += entry.frames.length;
+      retainedBytes += entry.recording.bytesRetained;
+    }
+    return { activeRecordings, retainedFrames, retainedBytes, droppedFrames: 0 };
+  }
+
   // --- high-rate fast-path sampling (plan Task 10) ---------------------------
 
   /**

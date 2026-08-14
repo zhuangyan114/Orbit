@@ -566,21 +566,24 @@ describe('DapSession CMSIS-DAP control routing', () => {
         });
       }
 
+      // Each stop now also emits the sanitized `orbitAutomationLifecycle`
+      // companion event (plan Task 11), so the wire alternates
+      // stopped -> lifecycle -> stackTrace response.
       expect(dapLog).toHaveBeenCalledWith(
         '[protocol] event seq=1 event=stopped stopGeneration=1 reason=breakpoint threadId=1 allThreadsStopped=true',
       );
       expect(dapLog).toHaveBeenCalledWith(
-        `[protocol] response seq=2 requestSeq=41 command=stackTrace success=true stopGeneration=1`
+        `[protocol] response seq=3 requestSeq=41 command=stackTrace success=true stopGeneration=1`
           + ` frameCount=1 frame0Id=1 pc=0x8003FB0 source=${sourcePath}:293`,
       );
       expect(dapLog).toHaveBeenCalledWith(
-        '[protocol] event seq=3 event=stopped stopGeneration=2 reason=breakpoint threadId=1 allThreadsStopped=true',
+        '[protocol] event seq=4 event=stopped stopGeneration=2 reason=breakpoint threadId=1 allThreadsStopped=true',
       );
       expect(dapLog).toHaveBeenCalledWith(
-        `[protocol] response seq=4 requestSeq=42 command=stackTrace success=true stopGeneration=2`
+        `[protocol] response seq=6 requestSeq=42 command=stackTrace success=true stopGeneration=2`
           + ` frameCount=1 frame0Id=1 pc=0x8003FB0 source=${sourcePath}:293`,
       );
-      expect(messages.map(message => message.seq)).toEqual([1, 2, 3, 4]);
+      expect(messages.map(message => message.seq)).toEqual([1, 2, 3, 4, 5, 6]);
     } finally {
       (session as any).stopPolling();
       dapLog.mockRestore();

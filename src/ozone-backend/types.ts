@@ -198,6 +198,7 @@ export type OzoneCommand =
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[]; priority?: 'watch' | 'timeline' }
   | { cmd: 'getPerformanceDiagnostics' }
+  | { cmd: 'getSchedulerSnapshot' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
   | { cmd: 'startRtt'; controlBlockAddress?: number }
   | { cmd: 'stopRtt' }

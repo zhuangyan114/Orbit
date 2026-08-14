@@ -41,6 +41,17 @@ import {
   AutomationMemoryRequest,
   AutomationMemoryResult,
   parseAutomationMemoryRequest,
+  AUTOMATION_LIFECYCLE_EVENT,
+  AUTOMATION_RTT_COMMAND,
+  AutomationRttRequest,
+  AutomationRttResult,
+  AutomationRttSnapshot,
+  parseAutomationRttRequest,
+  AUTOMATION_DIAGNOSTICS_COMMAND,
+  AutomationDiagnosticsRequest,
+  AutomationDiagnosticsResult,
+  parseAutomationDiagnosticsRequest,
+  normalizeSchedulerSnapshot,
 } from './dap-automation-protocol';
 
 export interface DebugProtocolMessage {
@@ -158,6 +169,14 @@ export class DapSession extends EventEmitter {
   private rttControlBlockSource: 'elf-symbol' | 'config' = 'elf-symbol';
   private dapStepProfileSeq = 0;
   private rttStripAnsi = true;
+  // Automation RTT is a distinct logical consumer from the UI RTT Log (plan
+  // Task 11). It shares the physical owner but tracks its own start/read state
+  // so an API `start`/`stop`/`read` never races the terminal polling loop.
+  private automationRttStarted = false;
+  private automationRttBufferIndex = 0;
+  private automationRttPollIntervalMs = 50;
+  private automationRttAnsi = true;
+  private automationRttTargetName: string | undefined;
   private _rtos = '';
   private rttLogTarget: 'terminal' | 'debugConsole' | 'both' = 'terminal';
   private rttDecoder = new StringDecoder('utf8');
@@ -913,6 +932,22 @@ export class DapSession extends EventEmitter {
       );
     }
     this.emit('send', message);
+    // Companion sanitized lifecycle event for the Automation API (plan Task 11):
+    // only states/reasons, no memory or variable values. The Extension Host
+    // resolves the exact session identity and generation before publishing.
+    this.emitAutomationLifecycle(event, body);
+  }
+
+  private emitAutomationLifecycle(event: string, body?: any) {
+    let type: string | undefined;
+    if (event === 'stopped') type = 'target.stopped';
+    else if (event === 'continued') type = 'target.running';
+    else if (event === 'terminated' && typeof body?.reason === 'string') type = 'target.connectionLost';
+    if (!type) return;
+    const payload: Record<string, unknown> = { type };
+    if (body?.reason !== undefined) payload.reason = body.reason;
+    if (body?.threadId !== undefined) payload.threadId = body.threadId;
+    this.sendEvent(AUTOMATION_LIFECYCLE_EVENT, payload);
   }
 
   private resetVariableHandles() {
@@ -1638,6 +1673,10 @@ export class DapSession extends EventEmitter {
           return this.handleAutomationExpression(msg);
         case AUTOMATION_MEMORY_COMMAND:
           return this.handleAutomationMemory(msg);
+        case AUTOMATION_RTT_COMMAND:
+          return this.handleAutomationRtt(msg);
+        case AUTOMATION_DIAGNOSTICS_COMMAND:
+          return this.handleAutomationDiagnostics(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
     }
@@ -3554,6 +3593,230 @@ export class DapSession extends EventEmitter {
       verified: outcome.verified,
       ...(outcome.verifyData !== undefined ? { data: outcome.verifyData } : {}),
       targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  // --- RTT snapshot bridge (plan Task 11) ------------------------------------
+  // `session.customRequest('orbitRttSnapshot', ...)` drives status/start/stop/
+  // read through the selected session owner. RTT remains a distinct logical
+  // consumer from the UI RTT Log and Timeline; reads run at background priority
+  // and are paused for a control request's critical section by the scheduler.
+
+  private async handleAutomationRtt(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationRttRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationRttFailure(msg, parsed.errorCode, parsed.message, startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationRttFailure(msg, errorCode, `session phase ${this.phase} cannot drive RTT`, startedAt);
+      return;
+    }
+    switch (request.kind) {
+      case 'status':
+        await this.handleAutomationRttStatus(msg, request, startedAt);
+        return;
+      case 'start':
+        await this.handleAutomationRttStart(msg, request, startedAt);
+        return;
+      case 'stop':
+        await this.handleAutomationRttStop(msg, request, startedAt);
+        return;
+      case 'read':
+        await this.handleAutomationRttRead(msg, request, startedAt);
+        return;
+    }
+  }
+
+  private sendAutomationRttFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationRttResult = {
+      errorCode,
+      message,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  private async automationRttOwnerKind(): Promise<AutomationRttSnapshot['owner']> {
+    return this.currentOwnerKind();
+  }
+
+  private automationRttState(): AutomationRttSnapshot['state'] {
+    if (!this.rttAvailable) return 'unavailable';
+    return this.automationRttStarted ? 'running' : 'stopped';
+  }
+
+  private async buildAutomationRttSnapshot(
+    bufferIndex: number,
+  ): Promise<AutomationRttSnapshot> {
+    return {
+      state: this.automationRttState(),
+      owner: await this.automationRttOwnerKind(),
+      bufferIndex,
+      pollIntervalMs: this.automationRttPollIntervalMs,
+      ...(this.automationRttTargetName !== undefined ? { targetName: this.automationRttTargetName } : {}),
+      ansi: this.automationRttAnsi,
+      bytesAvailable: 0,
+      droppedBytes: 0,
+    };
+  }
+
+  private async handleAutomationRttStatus(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const snapshot = await this.buildAutomationRttSnapshot(request.bufferIndex ?? this.automationRttBufferIndex);
+    this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRttStart(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (!this.rttAvailable) {
+      this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT is unavailable (no control block resolved)', startedAt);
+      return;
+    }
+    const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
+    this.automationRttBufferIndex = bufferIndex;
+    this.automationRttPollIntervalMs = request.pollIntervalMs ?? this.automationRttPollIntervalMs;
+    this.automationRttAnsi = request.ansi ?? this.automationRttAnsi;
+    if (request.targetName !== undefined) this.automationRttTargetName = request.targetName;
+    const result = await this.backend.execute({ cmd: 'startRtt', controlBlockAddress: this.rttControlBlockAddress });
+    if (!result.ok) {
+      this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
+      return;
+    }
+    this.automationRttStarted = true;
+    const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
+    this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRttStop(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
+    const result = await this.backend.execute({ cmd: 'stopRtt' });
+    this.automationRttStarted = false;
+    if (!result.ok) {
+      this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
+      return;
+    }
+    const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
+    this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRttRead(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (!this.rttAvailable) {
+      this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT is unavailable (no control block resolved)', startedAt);
+      return;
+    }
+    const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
+    const size = Math.max(1, Math.min(request.maxBytes ?? this.rttReadSize, 1048576));
+    const result = await this.backend.execute({
+      cmd: 'readRtt',
+      bufferIndex,
+      size,
+      signal: undefined,
+    });
+    if (!result.ok) {
+      this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
+      return;
+    }
+    const bytes = (result.data as any)?.bytes;
+    const buffer = Array.isArray(bytes)
+      ? Buffer.from(bytes)
+      : bytes instanceof Uint8Array
+        ? Buffer.from(bytes)
+        : Buffer.alloc(0);
+    const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
+    this.sendResponse(msg, {
+      snapshot,
+      data: buffer.toString('base64'),
+      bytesRead: buffer.length,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  // --- diagnostics snapshot bridge (plan Task 11) ----------------------------
+  // `session.customRequest('orbitDiagnosticsSnapshot', ...)` returns only
+  // counts, states, elapsed times and error codes. No token, Authorization,
+  // raw memory data or user variable values are ever included.
+
+  private async handleAutomationDiagnostics(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationDiagnosticsRequest(msg.arguments);
+    if (!parsed.ok) {
+      const result: AutomationDiagnosticsResult = {
+        phase: this.phase,
+        targetState: this.automationTargetState(),
+        ownerKind: 'unknown',
+        connected: false,
+        pendingRequests: 0,
+        scheduler: normalizeSchedulerSnapshot(undefined),
+        errorCode: parsed.errorCode,
+        message: parsed.message,
+        elapsedMs: Date.now() - startedAt,
+      };
+      this.sendResponse(msg, result, false, `${parsed.errorCode}: ${parsed.message}`);
+      return;
+    }
+    let scheduler = normalizeSchedulerSnapshot(undefined);
+    let ownerKind = 'unknown';
+    let transport: string | undefined;
+    let connected = false;
+    try {
+      const perf = await this.backend.execute({ cmd: 'getPerformanceDiagnostics' });
+      if (perf.ok && perf.data && typeof perf.data === 'object') {
+        const owner = String((perf.data as { owner?: unknown }).owner ?? '');
+        if (owner.includes('cmsis-dap')) ownerKind = 'cmsis-dap';
+        else if (owner.includes('jlink-native')) ownerKind = 'jlink-native';
+        else if (owner.includes('legacy')) ownerKind = 'jlink-legacy';
+      }
+    } catch {
+      // Best-effort owner reporting; the probe remains the fallback authority.
+    }
+    try {
+      const sched = await this.backend.execute({ cmd: 'getSchedulerSnapshot' });
+      if (sched.ok) scheduler = normalizeSchedulerSnapshot(sched.data);
+    } catch {
+      // Scheduler snapshot is best-effort; zero counts remain the fallback.
+    }
+    if (ownerKind === 'unknown') {
+      ownerKind = this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-legacy';
+    }
+    if (ownerKind === 'cmsis-dap') transport = 'winusb';
+    else if (ownerKind === 'jlink-native') transport = 'native';
+    else if (ownerKind === 'jlink-legacy') transport = 'legacy';
+    connected = this.phase === 'connected';
+    this.sendResponse(msg, {
+      sessionGeneration: parsed.request.sessionGeneration,
+      phase: this.phase,
+      targetState: this.automationTargetState(),
+      ownerKind,
+      ...(transport !== undefined ? { transport } : {}),
+      connected,
+      pendingRequests: 0,
+      scheduler,
       elapsedMs: Date.now() - startedAt,
     });
   }

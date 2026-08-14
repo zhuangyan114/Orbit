@@ -26,6 +26,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Reconstructs a structured DAP memory failure from a `customRequest`
+ * rejection. VS Code rejects a `success: false` response as `Error(message)`
+ * and does not reliably attach the response body, so the leading
+ * `ErrorCode:` prefix is the fallback when `.body` is absent.
+ */
+function memoryFailureFromRejection(error: unknown): AutomationMemoryResult | undefined {
+  const record = (error && typeof error === 'object') ? error as Record<string, unknown> : {};
+  const body = record.body && typeof record.body === 'object' ? record.body as Record<string, unknown> : undefined;
+  if (body && typeof body.errorCode === 'string') {
+    return {
+      errorCode: body.errorCode,
+      message: typeof body.message === 'string' ? body.message : undefined,
+      targetState: typeof body.targetState === 'string' ? body.targetState : undefined,
+    };
+  }
+  const message = typeof record.message === 'string' ? record.message : '';
+  const prefix = /^([A-Za-z][A-Za-z0-9]*):\s*(.*)$/.exec(message.trim());
+  if (prefix) {
+    return { errorCode: prefix[1], message: prefix[2] || message };
+  }
+  return undefined;
+}
+
 export interface MemoryServiceOptions {
   registry: SessionRegistry;
   /** Pulls one byte-oriented memory operation from an exact active session. */
@@ -56,11 +80,12 @@ export class MemoryService {
           const response: unknown = await session.customRequest(AUTOMATION_MEMORY_COMMAND, request);
           return (isRecord(response) ? response : {}) as AutomationMemoryResult;
         } catch (error) {
-          // A DAP `success: false` response rejects `customRequest` and attaches
-          // the structured body as `.body`; surface it so the caller can map its
-          // errorCode. A transport error without a body is rethrown.
-          const body = (error as { body?: unknown } | undefined)?.body;
-          if (isRecord(body)) return body as AutomationMemoryResult;
+          // A DAP `success: false` response rejects `customRequest`; surface the
+          // structured errorCode (from the attached body or the message prefix)
+          // so the caller maps it to the frozen automation codes. A transport
+          // error without a recoverable errorCode is rethrown.
+          const structured = memoryFailureFromRejection(error);
+          if (structured) return structured;
           throw error;
         }
       },

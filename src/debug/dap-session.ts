@@ -3447,12 +3447,23 @@ export class DapSession extends EventEmitter {
     startedAt: number,
   ): Promise<void> {
     const address = this.parseAutomationAddress(request.address);
-    // Reuse the exact DAP readMemory handler so running/halted behavior, the
-    // read gate, and control cancellation match MemoryView byte-for-byte.
-    const captured = await this.runAutomationRead(msg, 'readMemory', {
-      memoryReference: request.address,
-      count: request.count,
-    });
+    // The backend halts -> reads -> resumes while the target is running; pause
+    // the run-state poll loop so that brief halt is not mistaken for a real
+    // stop (which would fire a spurious stopped event and block low-priority
+    // reads for 150ms). Polling resumes afterwards when the target was running.
+    const wasRunning = this.targetRunning;
+    this.stopPolling();
+    let captured: { body?: any; success: boolean; message?: string };
+    try {
+      // Reuse the exact DAP readMemory handler so running/halted behavior, the
+      // read gate, and control cancellation match MemoryView byte-for-byte.
+      captured = await this.runAutomationRead(msg, 'readMemory', {
+        memoryReference: request.address,
+        count: request.count,
+      });
+    } finally {
+      if (wasRunning) this.startPolling();
+    }
     if (!captured.success) {
       const code = this.memoryReadFailureCode(captured);
       this.sendAutomationMemoryFailure(msg, code, captured.message ?? 'memory read failed', this.automationTargetState(), startedAt);
@@ -3502,10 +3513,15 @@ export class DapSession extends EventEmitter {
       return;
     }
 
+    const wasRunning = this.targetRunning;
     const outcome = await this.withStepLock(async () => {
       if (!(await this.beginTargetWrite())) {
         return { ok: false as const, errorCode: 'TargetBusy', error: 'Target busy' };
       }
+      // Control work: pause the run-state poll loop so the write's internal
+      // halt -> write -> resume is not mistaken for a real stop (see the read
+      // handler for the same guard).
+      this.stopPolling();
       try {
         this.flushDataSampling();
         const writeResult = await this.backend.execute({ cmd: 'writeMemory', address, data });
@@ -3537,6 +3553,7 @@ export class DapSession extends EventEmitter {
       }
     });
 
+    if (wasRunning) this.startPolling();
     if (!outcome.ok) {
       this.sendAutomationMemoryFailure(msg, outcome.errorCode, outcome.error, this.automationTargetState(), startedAt);
       return;

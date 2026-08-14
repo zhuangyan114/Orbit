@@ -100,6 +100,22 @@ describe('MemoryService read', () => {
     await expect(ctx.service.read({ sessionId: 'sess-1', sessionGeneration: 99 }, { address: '0x20000010', count: 4 }))
       .rejects.toMatchObject({ errorCode: 'SessionChanged' });
   });
+
+  it('maps a bodiless DAP rejection to the frozen error via the message prefix', async () => {
+    // VS Code's customRequest rejects a `success: false` response as a plain
+    // Error(message) without attaching the body; the default seam must recover
+    // the errorCode from the leading `ErrorCode:` prefix.
+    const registry = new SessionRegistry();
+    const session = {
+      id: 'sess-1', type: 'orbit', name: 'test',
+      customRequest: async () => { throw new Error('TargetReadCancelled: Target is running'); },
+    };
+    const service = new MemoryService({ registry });
+    registry.onStarted(session as never);
+    const ref = registry.currentRef()!;
+    await expect(service.read(ref, { address: '0x20000010', count: 4 }))
+      .rejects.toMatchObject({ errorCode: 'TargetReadCancelled', retryable: true });
+  });
 });
 
 describe('MemoryService write', () => {

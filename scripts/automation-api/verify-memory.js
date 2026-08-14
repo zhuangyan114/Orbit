@@ -163,6 +163,25 @@ async function main() {
   const restoredValue = base64ToU32(afterRestore.data?.data);
   record('memory.read confirms the restore', restoredValue === original, { original: `0x${original.toString(16).toUpperCase()}`, restored: restoredValue !== null ? `0x${restoredValue.toString(16).toUpperCase()}` : null });
 
+  // 8b) hold the RUNNING state so the operator can watch the VS Code UI
+  // (toolbar must stay "running", watch keeps refreshing, timeline keeps
+  // loading). A light running-state read every 2s keeps the fixed path
+  // exercised so any spurious stop would surface here.
+  const holdMs = Number(process.env.ORBIT_HOLD_MS ?? 10000);
+  record(`holding running for ${holdMs}ms — observe toolbar/watch/timeline`, holdMs > 0);
+  const holdDeadline = Date.now() + holdMs;
+  let holdReads = 0;
+  let holdValueStable = true;
+  while (Date.now() < holdDeadline) {
+    await new Promise(r => setTimeout(r, 2000));
+    const holdRead = await rpc('orbit.memory.read', { context: targetCtx, address: ramAddr, count: 4 });
+    holdReads += 1;
+    const holdValue = base64ToU32(holdRead.data?.data);
+    if (holdRead.data?.bytesRead !== 4 || holdValue !== original) holdValueStable = false;
+    console.log(`      hold running read #${holdReads} value=${holdValue !== null ? `0x${holdValue.toString(16).toUpperCase()}` : 'null'} bytes=${holdRead.data?.bytesRead}`);
+  }
+  record('hold completed with running reads', holdReads > 0 && holdValueStable, { holdReads, valueStable: holdValueStable });
+
   // 9) halt to a clean state
   const pause = await rpc('orbit.target.pause', { context: { ...targetCtx, idempotencyKey: 'hw-mem-pause' } });
   record('target.pause halts to a clean state', pause.data?.state === 'halted', { state: pause.data?.state, pc: pause.data?.pc });

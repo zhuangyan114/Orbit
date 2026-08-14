@@ -10,15 +10,23 @@ export interface JsonRpcSuccess {
   id?: string | number;
   ok: true;
   data: unknown;
+  deprecation: LegacyDeprecationMetadata;
 }
 
 export interface JsonRpcFailure {
   id?: string | number;
   ok: false;
   error: string;
+  outcomeUnknown?: true;
+  deprecation: LegacyDeprecationMetadata;
 }
 
 export type JsonRpcResponse = JsonRpcSuccess | JsonRpcFailure;
+
+export interface LegacyDeprecationMetadata {
+  deprecated: true;
+  replacement: '/v1/rpc';
+}
 
 export interface SignalSpec {
   alias: string;

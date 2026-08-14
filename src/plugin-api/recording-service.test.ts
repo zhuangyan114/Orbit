@@ -206,5 +206,29 @@ describe('RecordingService high-rate fast-path (shared Timeline channel)', () =>
     await new Promise<void>(resolve => setTimeout(resolve, 1));
     expect(capture.removed).toBe('recording');
     service.dispose();
+    expect(sink.dispose).not.toHaveBeenCalled();
+  });
+
+  it('detaches the recording consumer on dispose without disposing the shared sink', async () => {
+    const registry = new SessionRegistry();
+    registry.onStarted({ id: 'sess-dispose', type: 'orbit', name: 'test' } as never);
+    const sink = {
+      addConsumer: vi.fn(),
+      removeConsumer: vi.fn(),
+      dispose: vi.fn(async () => undefined),
+    } as unknown as FastSampleSink;
+    const service = new RecordingService({
+      registry,
+      runtime: { readSignals: vi.fn() } as unknown as RuntimeRouter,
+      sampleSink: sink,
+    });
+    await service.start(registry.currentRef()!, {
+      name: 'active', channels: [chan('active')], intervalMs: 0,
+    });
+
+    service.dispose();
+
+    expect(sink.removeConsumer).toHaveBeenCalledWith('recording');
+    expect(sink.dispose).not.toHaveBeenCalled();
   });
 });

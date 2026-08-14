@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { randomBytes, randomUUID } from 'crypto';
+import { TextDecoder } from 'util';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { findElfFiles } from '../ozone-backend/flasher';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
@@ -12,13 +13,6 @@ import {
   ApiEndpointInfo,
   JsonRpcRequest,
   JsonRpcResponse,
-  ReadManyParams,
-  RecordClearParams,
-  RecordGetParams,
-  RecordStartParams,
-  RecordStopParams,
-  SignalSpec,
-  WriteManyParams,
 } from './types';
 import {
   AUTOMATION_SCOPES,
@@ -54,6 +48,8 @@ import { RttService } from './rtt-service';
 import { DiagnosticsService } from './diagnostics-service';
 import { AutomationEvent, EventHub } from './event-hub';
 import { MAX_SSE_CONNECTIONS, SseConnection } from './sse-stream';
+import { getMethodCatalogEntry } from './schemas';
+import { LEGACY_API_DEPRECATION, LegacyApiAdapter } from './legacy-api-adapter';
 import {
   AutomationControlRequest,
   AutomationControlResult,
@@ -65,6 +61,27 @@ const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
 const LEGACY_ENDPOINT_FILE = 'plugin-api-endpoint.json';
 const API_VERSION = '1.0';
+const DEFAULT_BODY_TIMEOUT_MS = 10_000;
+const DEFAULT_LEGACY_HANDLER_TIMEOUT_MS = 10_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+class HttpRequestError extends Error {
+  constructor(readonly statusCode: number, message: string) {
+    super(message);
+    this.name = 'HttpRequestError';
+  }
+}
+
+class LegacyHandlerTimeoutError extends Error {
+  constructor(readonly outcomeUnknown: boolean, timeoutMs: number) {
+    super(`Legacy RPC handler timed out after ${timeoutMs} ms`);
+    this.name = 'LegacyHandlerTimeoutError';
+  }
+}
+
+interface ActiveRead {
+  promise: Promise<unknown>;
+}
 
 interface InstanceDescribeParams {
   context: BootstrapContext;
@@ -433,6 +450,12 @@ export interface PluginApiServerOptions {
   sharedSampleExpressions?: () => string[];
   /** Bounded event ring Task 11's SSE stream consumes (plan §2.5). */
   eventHub?: EventHub;
+  /** Maximum wall-clock time allowed to receive an HTTP request body. */
+  bodyTimeoutMs?: number;
+  /** Maximum wall-clock time allowed for one legacy `/rpc` handler. */
+  legacyHandlerTimeoutMs?: number;
+  /** Maximum time shutdown waits for already-running read-only requests. */
+  shutdownTimeoutMs?: number;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -487,8 +510,13 @@ export class PluginApiServer implements vscode.Disposable {
   private recording: RecordingService;
   private rtt: RttService;
   private diagnostics: DiagnosticsService;
+  private legacy: LegacyApiAdapter;
   private readonly sseConnections = new Set<SseConnection>();
+  private readonly activeRequestIds = new Set<string>();
+  private readonly activeReads = new Set<ActiveRead>();
   private startedAtMs = 0;
+  private shuttingDown = false;
+  private disposePromise: Promise<void> | null = null;
 
   constructor(
     private context: vscode.ExtensionContext,
@@ -552,6 +580,7 @@ export class PluginApiServer implements vscode.Disposable {
         getSamplingStats: () => this.recording.stats(),
       });
     this.experiment = new ExperimentService(this.runtime, this.recorder, this.recording, this.memoryService);
+    this.legacy = new LegacyApiAdapter(this.runtime, this.recorder, this.experiment);
     if (this.options.handshakeFactory) {
       this.handshake = this.options.handshakeFactory(this.registry);
     }
@@ -559,9 +588,18 @@ export class PluginApiServer implements vscode.Disposable {
 
   async start(): Promise<ApiEndpointInfo> {
     if (this.server) return this.endpointInfo();
+    if (this.shuttingDown) throw new Error('Plugin API server is disposed');
 
     this.server = http.createServer((req, res) => {
-      void this.handleRequest(req, res);
+      void this.handleRequest(req, res).catch(error => {
+        if (!res.headersSent && !res.destroyed) {
+          const message = (error as Error)?.message ?? 'Internal error';
+          const payload = req.method === 'POST' && req.url === '/rpc'
+            ? this.legacyFailure(message)
+            : { ok: false, error: message };
+          this.writeJson(res, 500, payload);
+        }
+      });
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -591,6 +629,7 @@ export class PluginApiServer implements vscode.Disposable {
       this.server = null;
       throw error;
     }
+    this.options.eventHub?.reset();
     if (!this.handshake) {
       this.handshake = new HandshakeService({
         instanceId: () => this.registry.getInstanceId(),
@@ -628,19 +667,45 @@ export class PluginApiServer implements vscode.Disposable {
     return this.registry.getProjectId();
   }
 
-  dispose() {
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposePromise = this.shutdown();
+    return this.disposePromise;
+  }
+
+  private async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    const server = this.server;
+    this.server = null;
+    if (server) server.close();
+
     for (const connection of this.sseConnections) connection.close();
     this.sseConnections.clear();
     this.recorder.dispose();
     this.recording.dispose();
     this.viewState.dispose();
+
+    const reads = [...this.activeReads].map(active => active.promise);
+    if (reads.length > 0) {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(reads),
+          new Promise<void>(resolve => {
+            timer = setTimeout(resolve, this.options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
     this.dispatcher?.dispose();
     this.dispatcher = null;
-    void this.registry.dispose();
-    if (this.server) {
-      this.server.close();
-      this.server = null;
-    }
+    this.handshake?.closeAll();
+    server?.closeAllConnections?.();
+    await this.registry.dispose();
   }
 
   private buildRegistry(): InstanceRegistry {
@@ -668,11 +733,11 @@ export class PluginApiServer implements vscode.Disposable {
 
   private readAllowedScopes(): AutomationScope[] {
     const configured = getOrbitConfiguration().get<unknown>('automation.allowedScopes', ['read']);
-    const scopes = (Array.isArray(configured) ? configured : []).filter(
+    if (!Array.isArray(configured)) return ['read'];
+    return configured.filter(
       (scope): scope is AutomationScope =>
         typeof scope === 'string' && (AUTOMATION_SCOPES as readonly string[]).includes(scope),
     );
-    return scopes.length > 0 ? scopes : ['read'];
   }
 
   private registerV1Methods(): void {
@@ -1287,11 +1352,15 @@ export class PluginApiServer implements vscode.Disposable {
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    this.setCorsHeaders(res);
-
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
+    const isLegacyRpc = req.method === 'POST' && req.url === '/rpc';
+    if (this.shuttingDown) {
+      this.writeJson(
+        res,
+        503,
+        isLegacyRpc
+          ? this.legacyFailure('Automation API is shutting down')
+          : { ok: false, error: 'Automation API is shutting down' },
+      );
       return;
     }
 
@@ -1316,7 +1385,7 @@ export class PluginApiServer implements vscode.Disposable {
     }
 
     if (!this.isAuthorized(req)) {
-      this.writeJson(res, 401, { ok: false, error: 'Unauthorized' });
+      this.writeJson(res, 401, this.legacyFailure('Unauthorized'));
       return;
     }
 
@@ -1326,7 +1395,8 @@ export class PluginApiServer implements vscode.Disposable {
       const response = await this.handleRpc(request);
       this.writeJson(res, 200, response);
     } catch (err: any) {
-      this.writeJson(res, 400, { ok: false, error: err?.message || String(err) });
+      const statusCode = err instanceof HttpRequestError ? err.statusCode : 400;
+      this.writeJson(res, statusCode, this.legacyFailure(err?.message || String(err)));
     }
   }
 
@@ -1462,11 +1532,30 @@ export class PluginApiServer implements vscode.Disposable {
         this.writeJson(res, 503, { ok: false, error: 'Automation API is starting' });
         return;
       }
-      const response = await this.dispatcher.dispatch(request, req.headers.authorization);
+      const method = this.requestMethod(request);
+      const mutation = method ? (getMethodCatalogEntry(method)?.mutation ?? false) : false;
+      let response;
+      try {
+        response = await this.runRequest(
+          this.requestId(request),
+          mutation,
+          () => this.dispatcher!.dispatch(request, req.headers.authorization),
+        );
+      } catch (error) {
+        const automationError = error instanceof AutomationError
+          ? error
+          : new AutomationError('InternalError', (error as Error)?.message, false);
+        response = {
+          jsonrpc: '2.0' as const,
+          id: this.requestId(request) ?? null,
+          error: automationError.toJsonRpcErrorObject(),
+        };
+      }
       if ('result' in response) this.touchConnection(request);
       this.writeJson(res, 200, response);
     } catch (err: any) {
-      this.writeJson(res, 400, { ok: false, error: err?.message || String(err) });
+      const statusCode = err instanceof HttpRequestError ? err.statusCode : 400;
+      this.writeJson(res, statusCode, { ok: false, error: err?.message || String(err) });
     }
   }
 
@@ -1482,45 +1571,34 @@ export class PluginApiServer implements vscode.Disposable {
       if (!request || typeof request.method !== 'string') {
         throw new Error('RPC method is required');
       }
-
-      const data = await this.dispatch(request.method, request.params);
-      return { id: request.id, ok: true, data };
+      const mutation = this.legacy.isMutation(request.method);
+      const data = await this.runLegacyRequest(
+        request.id,
+        mutation,
+        () => this.legacy.dispatch(request.method, request.params),
+      );
+      return this.legacySuccess(request.id, data);
     } catch (err: any) {
-      return { id: request?.id, ok: false, error: err?.message || String(err) };
+      return this.legacyFailure(
+        err?.message || String(err),
+        request?.id,
+        err instanceof LegacyHandlerTimeoutError && err.outcomeUnknown,
+      );
     }
   }
 
-  private async dispatch(method: string, params: unknown): Promise<unknown> {
-    switch (method) {
-      case 'ozone.status':
-        return { targetState: await this.runtime.getTargetState() };
-      case 'ozone.target.getState':
-        return { state: await this.runtime.getTargetState() };
-      case 'ozone.expr.readMany':
-        return { results: await this.runtime.readSignals(this.readManySignals(params as ReadManyParams)) };
-      case 'ozone.expr.writeMany':
-        return { results: await this.runtime.writeMany((params as WriteManyParams)?.writes || []) };
-      case 'ozone.record.start':
-        return this.recorder.start(params as RecordStartParams);
-      case 'ozone.record.stop':
-        return this.recorder.stop(params as RecordStopParams);
-      case 'ozone.record.get':
-        return this.recorder.get((params as RecordGetParams).recordingId);
-      case 'ozone.record.clear':
-        return this.recorder.clear((params as RecordClearParams) || {});
-      case 'ozone.experiment.run':
-        return this.experiment.run(params as any);
-      default:
-        throw new Error(`Unsupported method: ${method}`);
-    }
+  private legacySuccess(id: string | number | undefined, data: unknown): JsonRpcResponse {
+    return { id, ok: true, data, deprecation: LEGACY_API_DEPRECATION };
   }
 
-  private readManySignals(params: ReadManyParams): SignalSpec[] {
-    if (Array.isArray(params?.signals)) return params.signals;
-    if (Array.isArray(params?.expressions)) {
-      return params.expressions.map(expression => ({ alias: expression, expression }));
-    }
-    throw new Error('readMany requires signals or expressions');
+  private legacyFailure(error: string, id?: string | number, outcomeUnknown = false): JsonRpcResponse {
+    return {
+      id,
+      ok: false,
+      error,
+      ...(outcomeUnknown ? { outcomeUnknown: true as const } : {}),
+      deprecation: LEGACY_API_DEPRECATION,
+    };
   }
 
   private isAuthorized(req: http.IncomingMessage): boolean {
@@ -1528,22 +1606,159 @@ export class PluginApiServer implements vscode.Disposable {
     return header === `Bearer ${this.token}`;
   }
 
+  private requestMethod(request: unknown): string | undefined {
+    if (!request || typeof request !== 'object') return undefined;
+    const method = (request as { method?: unknown }).method;
+    return typeof method === 'string' ? method : undefined;
+  }
+
+  private requestId(request: unknown): string | number | undefined {
+    if (!request || typeof request !== 'object') return undefined;
+    const id = (request as { id?: unknown }).id;
+    return typeof id === 'string' || typeof id === 'number' ? id : undefined;
+  }
+
+  private async runRequest<T>(
+    id: string | number | undefined,
+    mutation: boolean,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    if (this.shuttingDown) {
+      throw new AutomationError('InternalError', 'Automation API is shutting down', false);
+    }
+    const requestKey = id === undefined ? undefined : `${typeof id}:${String(id)}`;
+    if (requestKey && this.activeRequestIds.has(requestKey)) {
+      throw new AutomationError('InvalidRequest', `request id ${String(id)} is already in flight`, false);
+    }
+    if (requestKey) this.activeRequestIds.add(requestKey);
+
+    const promise = Promise.resolve().then(run);
+    const active = { promise };
+    if (!mutation) this.activeReads.add(active);
+    try {
+      return await promise;
+    } finally {
+      if (!mutation) this.activeReads.delete(active);
+      if (requestKey) this.activeRequestIds.delete(requestKey);
+    }
+  }
+
+  private async runLegacyRequest<T>(
+    id: string | number | undefined,
+    mutation: boolean,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    if (this.shuttingDown) {
+      throw new AutomationError('InternalError', 'Automation API is shutting down', false);
+    }
+    const requestKey = id === undefined ? undefined : `${typeof id}:${String(id)}`;
+    if (requestKey && this.activeRequestIds.has(requestKey)) {
+      throw new AutomationError('InvalidRequest', `request id ${String(id)} is already in flight`, false);
+    }
+    if (requestKey) this.activeRequestIds.add(requestKey);
+
+    const handlerPromise = Promise.resolve().then(run);
+    if (!mutation) {
+      const drainPromise = new Promise<void>(resolve => {
+        const settled = () => setImmediate(resolve);
+        void handlerPromise.then(settled, settled);
+      });
+      const active = { promise: drainPromise };
+      this.activeReads.add(active);
+      void drainPromise.then(() => this.activeReads.delete(active));
+    }
+    const releaseRequestId = () => {
+      if (requestKey) this.activeRequestIds.delete(requestKey);
+    };
+    void handlerPromise.then(releaseRequestId, releaseRequestId);
+
+    return this.runLegacyHandler(handlerPromise, mutation);
+  }
+
+  private async runLegacyHandler<T>(handlerPromise: Promise<T>, mutation: boolean): Promise<T> {
+    const timeoutMs = this.options.legacyHandlerTimeoutMs ?? DEFAULT_LEGACY_HANDLER_TIMEOUT_MS;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new LegacyHandlerTimeoutError(mutation, timeoutMs)),
+          timeoutMs,
+        );
+        timer.unref?.();
+        void handlerPromise.then(resolve, reject);
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private readBody(req: http.IncomingMessage): Promise<string> {
+    const rawLength = req.headers['content-length'];
+    if (Array.isArray(rawLength)) {
+      req.resume();
+      return Promise.reject(new HttpRequestError(400, 'Invalid Content-Length'));
+    }
+    if (rawLength !== undefined) {
+      const contentLength = Number(rawLength);
+      if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+        req.resume();
+        return Promise.reject(new HttpRequestError(400, 'Invalid Content-Length'));
+      }
+      if (contentLength > MAX_BODY_BYTES) {
+        req.resume();
+        return Promise.reject(new HttpRequestError(413, 'Request body too large'));
+      }
+    }
+
     return new Promise((resolve, reject) => {
-      let body = '';
+      const chunks: Buffer[] = [];
       let length = 0;
-      req.setEncoding('utf8');
-      req.on('data', chunk => {
-        length += Buffer.byteLength(chunk);
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('aborted', onAborted);
+        req.off('error', onError);
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        req.resume();
+        reject(error);
+      };
+      const onData = (chunk: Buffer | string) => {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        length += bytes.length;
         if (length > MAX_BODY_BYTES) {
-          reject(new Error('Request body too large'));
-          req.destroy();
+          fail(new HttpRequestError(413, 'Request body too large'));
           return;
         }
-        body += chunk;
-      });
-      req.on('end', () => resolve(body));
-      req.on('error', reject);
+        chunks.push(bytes);
+      };
+      const onEnd = () => {
+        if (settled) return;
+        try {
+          const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+          settled = true;
+          cleanup();
+          resolve(body);
+        } catch {
+          fail(new HttpRequestError(400, 'Request body is not valid UTF-8'));
+        }
+      };
+      const onAborted = () => fail(new HttpRequestError(400, 'Request body upload aborted'));
+      const onError = (error: Error) => fail(error);
+      const timer = setTimeout(
+        () => fail(new HttpRequestError(408, 'Request body upload timed out')),
+        this.options.bodyTimeoutMs ?? DEFAULT_BODY_TIMEOUT_MS,
+      );
+      timer.unref?.();
+      req.on('data', onData);
+      req.on('end', onEnd);
+      req.on('aborted', onAborted);
+      req.on('error', onError);
     });
   }
 
@@ -1569,9 +1784,4 @@ export class PluginApiServer implements vscode.Disposable {
     res.end(body);
   }
 
-  private setCorsHeaders(res: http.ServerResponse) {
-    res.setHeader('access-control-allow-origin', 'http://127.0.0.1');
-    res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
-    res.setHeader('access-control-allow-headers', 'authorization,content-type');
-  }
 }

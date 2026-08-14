@@ -177,6 +177,14 @@ export class EventHub {
     return this.ring.some(event => event.eventId === eventId);
   }
 
+  /** Clears instance-local replay state while preserving live subscribers. */
+  reset(): void {
+    if (this.disposed) return;
+    this.ring.length = 0;
+    this.ringBytes = 0;
+    this.sequence = 0n;
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;

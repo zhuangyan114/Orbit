@@ -385,6 +385,33 @@
           "default": true,
           "description": "读取 SEGGER RTT 输出，并将其显示在 VS Code 调试控制台中"
         },
+        "orbit.automation.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the loopback Orbit Automation API for this VS Code window."
+        },
+        "orbit.automation.allowedScopes": {
+          "type": "array",
+          "default": [
+            "read"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "read",
+              "session.control",
+              "breakpoints.write",
+              "view.write",
+              "record",
+              "rtt.control",
+              "variables.write",
+              "memory.write",
+              "flash"
+            ]
+          },
+          "uniqueItems": true,
+          "description": "Maximum scopes the Automation API may grant during a handshake."
+        },
         "orbit.logging.enabled": {
           "type": "boolean",
           "default": true,

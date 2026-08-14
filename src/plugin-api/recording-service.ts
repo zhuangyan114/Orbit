@@ -190,7 +190,7 @@ export class RecordingService implements vscode.Disposable {
   dispose(): void {
     for (const active of this.recordings.values()) this.stopActive(active);
     this.recordings.clear();
-    void this.sampleSink?.dispose();
+    this.syncSampleSink();
   }
 
   /** Whole-instance sampling counters for `orbit.diagnostics.snapshot` (Task 11). */

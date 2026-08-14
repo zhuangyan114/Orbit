@@ -7,6 +7,7 @@ import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
+import { AutomationApiLifecycle } from './plugin-api/automation-api-lifecycle';
 import { EventHub } from './plugin-api/event-hub';
 import { SessionRegistry, SessionUpdatePatch } from './plugin-api/session-registry';
 import { SessionService } from './plugin-api/session-service';
@@ -17,7 +18,7 @@ import { ViewStateService } from './plugin-api/view-state-service';
 import { RecordingService } from './plugin-api/recording-service';
 import { FastSampleSink } from './plugin-api/fast-sample-sink';
 import { AUTOMATION_CONTROL_EVENT, AUTOMATION_LIFECYCLE_EVENT } from './debug/dap-automation-protocol';
-import { configureLogger } from './utils/logger';
+import { configureLogger, log } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
 import { createRtosViewsRefreshHandler } from './debug/rtos-views-tracker';
@@ -31,13 +32,14 @@ let timelineProvider: TimelineWebviewProvider;
 let watchPollTimer: NodeJS.Timeout | null = null;
 let watchPollGeneration = 0;
 let activeWatchSession: vscode.DebugSession | null = null;
-let pluginApiServer: PluginApiServer;
+let automationApiLifecycle: AutomationApiLifecycle<PluginApiServer> | undefined;
 let eventHub: EventHub;
 let sessionRegistry: SessionRegistry;
 /** Shared runtime router + view/recording services for the Automation API. */
 let apiRuntime: RuntimeRouter;
 let apiViewState: ViewStateService;
 let apiRecording: RecordingService;
+let apiFastSampleSink: FastSampleSink;
 let rttLogTerminal: vscode.Terminal | null = null;
 let rttLogPty: RttLogTerminal | null = null;
 
@@ -167,8 +169,8 @@ export async function activate(context: vscode.ExtensionContext) {
     // identity from the API server so events published after startup carry the
     // real instanceId/projectId.
     eventHub = new EventHub({
-      instanceId: () => pluginApiServer?.getInstanceId() ?? '',
-      projectId: () => pluginApiServer?.getProjectId() ?? '',
+      instanceId: () => automationApiLifecycle?.getActive()?.getInstanceId() ?? '',
+      projectId: () => automationApiLifecycle?.getActive()?.getProjectId() ?? '',
     });
     sessionRegistry = new SessionRegistry({ eventHub });
     apiRuntime = new RuntimeRouter(
@@ -182,6 +184,7 @@ export async function activate(context: vscode.ExtensionContext) {
       // adapter sampler while these expressions exist (plan Task 10).
       persistentExpressions: () => dataSamplingManager?.expressionList ?? [],
     });
+    apiFastSampleSink = fastSampleSink;
     apiViewState = new ViewStateService({ registry: sessionRegistry, runtime: apiRuntime, store: context.workspaceState, eventHub, sampleSink: fastSampleSink });
     apiRecording = new RecordingService({
       registry: sessionRegistry,
@@ -196,19 +199,43 @@ export async function activate(context: vscode.ExtensionContext) {
     const breakpointService = new BreakpointService({ registry: sessionRegistry });
     const runtimeService = new RuntimeService({ registry: sessionRegistry });
 
-    pluginApiServer = new PluginApiServer(context, backend, {
-      sessionRegistry,
-      sessionService,
-      breakpointService,
-      runtimeService,
-      viewStateService: apiViewState,
-      recordingService: apiRecording,
-      fastSampleSink,
-      eventHub,
-    });
-    const apiEndpoint = await pluginApiServer.start();
-    context.subscriptions.push(pluginApiServer);
-      console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);
+    automationApiLifecycle = new AutomationApiLifecycle(
+      () => new PluginApiServer(context, backend, {
+        sessionRegistry,
+        sessionService,
+        breakpointService,
+        runtimeService,
+        viewStateService: apiViewState,
+        recordingService: apiRecording,
+        fastSampleSink,
+        eventHub,
+      }),
+      () => eventHub.reset(),
+    );
+    const setAutomationEnabled = async (enabled: boolean) => {
+      await automationApiLifecycle!.setEnabled(enabled);
+      const activeServer = automationApiLifecycle!.getActive();
+      if (activeServer) {
+        const endpoint = activeServer.getEndpointInfo();
+        log.dap(`[automation-api] started host=${endpoint.host} port=${endpoint.port}`);
+      } else {
+        log.dap('[automation-api] disabled');
+      }
+    };
+    try {
+      await setAutomationEnabled(getOrbitConfiguration().get<boolean>('automation.enabled', false));
+    } catch (error) {
+      log.dap(`[automation-api] initial start failed error=${(error as Error)?.message ?? String(error)}`);
+    }
+    context.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration(event => {
+        if (!event.affectsConfiguration('orbit.automation.enabled')) return;
+        void setAutomationEnabled(getOrbitConfiguration().get<boolean>('automation.enabled', false)).catch(error => {
+          log.dap(`[automation-api] configuration transition failed error=${(error as Error)?.message ?? String(error)}`);
+        });
+      }),
+      { dispose: () => { void automationApiLifecycle?.setEnabled(false); } },
+    );
 
     // Adopt a session that was already running when this Extension Host
     // activated; its start event fired before the registry existed.
@@ -359,7 +386,7 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand('ozone.enableMcuDebugViews', enableMcuDebugViewsIntegration),
 
       vscode.commands.registerCommand('ozone.api.getEndpoint', () => {
-        return pluginApiServer?.getEndpointInfo();
+        return automationApiLifecycle?.getActive()?.getEndpointInfo();
       }),
 
       vscode.commands.registerCommand('ozone.addToDataSampling', async (item) => {
@@ -584,11 +611,12 @@ async function enableMcuDebugViewsIntegration() {
   }
 }
 
-export function deactivate() {
+export async function deactivate() {
   stopWatchPolling();
+  await automationApiLifecycle?.setEnabled(false);
   rttLogTerminal?.dispose();
   dataSamplingManager?.dispose();
+  await apiFastSampleSink?.dispose();
   sessionRegistry?.dispose();
   eventHub?.dispose();
-  pluginApiServer?.dispose();
 }

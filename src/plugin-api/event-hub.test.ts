@@ -153,6 +153,22 @@ describe('EventHub bounded ring', () => {
     expect(event.eventId).toBe('0000000000000001');
   });
 
+  it('resets retained events and sequence without detaching live subscribers', () => {
+    const { hub } = makeHub();
+    const received: AutomationEvent[] = [];
+    hub.subscribe(event => received.push(event));
+    hub.publish('session.started', { sessionId: 'old' });
+
+    hub.reset();
+
+    expect(hub.eventCount()).toBe(0);
+    expect(hub.latestEventId()).toBeUndefined();
+    expect(hub.subscriberCount()).toBe(1);
+    const event = hub.publish('session.started', { sessionId: 'new' });
+    expect(event.eventId).toBe('0000000000000001');
+    expect(received.map(item => item.sessionId)).toEqual(['old', 'new']);
+  });
+
   it('stays within the frozen production budgets', () => {
     const { hub } = makeHub();
     expect(MAX_RING_EVENTS).toBe(1000);

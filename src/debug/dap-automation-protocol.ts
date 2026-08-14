@@ -18,6 +18,9 @@ export const AUTOMATION_CONTROL_EVENT = 'orbitAutomationControl';
 /** Internal custom request the Extension Host uses to pull the DAP-side verified snapshot (plan Task 6). */
 export const AUTOMATION_BREAKPOINTS_COMMAND = 'orbitBreakpointsSnapshot';
 
+/** Internal custom request the Extension Host uses to read runtime state (plan Task 7). */
+export const AUTOMATION_RUNTIME_COMMAND = 'orbitRuntimeSnapshot';
+
 export type AutomationControlAction =
   | 'pause' | 'continue' | 'reset' | 'restart'
   | 'stepOver' | 'stepInto' | 'stepOut' | 'stepInstruction'
@@ -269,4 +272,163 @@ export interface AutomationBreakpointCapabilities {
 export interface AutomationBreakpointsResult {
   breakpoints: AutomationBreakpointSnapshot[];
   capabilities: AutomationBreakpointCapabilities;
+}
+
+// --- runtime snapshot (plan Task 7) ----------------------------------------
+// `orbitRuntimeSnapshot` reuses the standard DAP threads/stackTrace/scopes/
+// variables data models and adds a dedicated registers core. The Extension Host
+// maps these adapter-internal shapes onto the frozen public DTOs, so this
+// module stays `vscode`-free.
+
+export type AutomationRuntimeKind =
+  | 'threads'
+  | 'stackTrace'
+  | 'scopes'
+  | 'variables'
+  | 'registers';
+
+export type AutomationRegisterGroup = 'core' | 'floating' | 'system';
+
+export interface AutomationRuntimeRequest {
+  kind: AutomationRuntimeKind;
+  sessionGeneration: number;
+  /** stackTrace: the thread whose frames are requested. */
+  threadId?: number;
+  startFrame?: number;
+  levels?: number;
+  /** scopes: the stack frame whose scopes are requested. */
+  frameId?: number;
+  /** variables: the variablesReference to expand (adapter-internal integer). */
+  variablesReference?: number;
+  /** registers: restrict to the requested groups (core is the only populated group). */
+  groups?: AutomationRegisterGroup[];
+}
+
+/** Adapter-internal thread shape (mirrors the frozen public Thread DTO). */
+export interface AutomationThread {
+  threadId: number;
+  name: string;
+  state: string;
+  stopped: boolean;
+}
+
+/** Adapter-internal stack frame shape (mirrors the frozen public StackFrame DTO). */
+export interface AutomationStackFrame {
+  frameId: number;
+  name: string;
+  source?: { path: string; line: number };
+  instructionPointerReference: string;
+}
+
+/** Adapter-internal scope shape (mirrors the frozen public Scope DTO). */
+export interface AutomationScope {
+  name: string;
+  variablesReference: number;
+  expensive: boolean;
+}
+
+/** Adapter-internal variable shape (mirrors the frozen public Variable DTO). */
+export interface AutomationVariable {
+  name: string;
+  value: string;
+  type?: string;
+  variablesReference: number;
+  evaluateName?: string;
+  memoryReference?: string;
+}
+
+/** Adapter-internal register shape (mirrors the frozen public Register DTO). */
+export interface AutomationRegister {
+  name: string;
+  /** Exact value as a 0x-prefixed hex string. */
+  value: string;
+  group: AutomationRegisterGroup;
+  bits: number;
+  memoryReference?: string;
+}
+
+/** Outcome of `orbitRuntimeSnapshot`: one kind-specific payload or a failure. */
+export interface AutomationRuntimeResult {
+  threads?: AutomationThread[];
+  stackFrames?: AutomationStackFrame[];
+  scopes?: AutomationScope[];
+  variables?: AutomationVariable[];
+  registers?: AutomationRegister[];
+  errorCode?: string;
+  message?: string;
+  targetState?: string;
+  elapsedMs?: number;
+}
+
+export type AutomationRuntimeParseResult =
+  | { ok: true; request: AutomationRuntimeRequest }
+  | { ok: false; errorCode: string; message: string };
+
+const RUNTIME_KINDS: readonly AutomationRuntimeKind[] = [
+  'threads', 'stackTrace', 'scopes', 'variables', 'registers',
+];
+
+const REGISTER_GROUPS: readonly AutomationRegisterGroup[] = ['core', 'floating', 'system'];
+
+/**
+ * Validates the wire arguments of `orbitRuntimeSnapshot`. Never throws; every
+ * rejection carries a machine-readable errorCode the RuntimeService maps to the
+ * frozen automation error codes.
+ */
+export function parseAutomationRuntimeRequest(args: unknown): AutomationRuntimeParseResult {
+  if (!isRecord(args)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'automation runtime requires request arguments' };
+  }
+  if (!isOneOf(args.kind, RUNTIME_KINDS)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: `unknown automation runtime kind ${String(args.kind)}` };
+  }
+  if (!isPositiveInt(args.sessionGeneration)) {
+    return { ok: false, errorCode: 'InvalidRequest', message: 'sessionGeneration must be a positive integer' };
+  }
+  const request: AutomationRuntimeRequest = {
+    kind: args.kind,
+    sessionGeneration: args.sessionGeneration,
+  };
+
+  if (args.kind === 'stackTrace') {
+    if (!isPositiveInt(args.threadId)) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'stackTrace requires a positive integer threadId' };
+    }
+    request.threadId = args.threadId;
+    if (args.startFrame !== undefined) {
+      if (typeof args.startFrame !== 'number' || !Number.isInteger(args.startFrame) || args.startFrame < 0) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'startFrame must be a non-negative integer' };
+      }
+      request.startFrame = args.startFrame;
+    }
+    if (args.levels !== undefined) {
+      if (typeof args.levels !== 'number' || !Number.isInteger(args.levels) || args.levels < 1) {
+        return { ok: false, errorCode: 'InvalidRequest', message: 'levels must be a positive integer' };
+      }
+      request.levels = args.levels;
+    }
+  }
+  if (args.kind === 'scopes') {
+    if (!isPositiveInt(args.frameId)) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'scopes requires a positive integer frameId' };
+    }
+    request.frameId = args.frameId;
+  }
+  if (args.kind === 'variables') {
+    // A leaf variable carries variablesReference 0; expanding it is a valid
+    // empty read, so 0 is accepted (any other non-integer is rejected).
+    if (typeof args.variablesReference !== 'number'
+      || !Number.isInteger(args.variablesReference)
+      || args.variablesReference < 0) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'variables requires a non-negative integer variablesReference' };
+    }
+    request.variablesReference = args.variablesReference;
+  }
+  if (args.kind === 'registers' && args.groups !== undefined) {
+    if (!Array.isArray(args.groups) || args.groups.some(group => !isOneOf(group, REGISTER_GROUPS))) {
+      return { ok: false, errorCode: 'InvalidRequest', message: 'groups must be a subset of core/floating/system' };
+    }
+    request.groups = [...args.groups];
+  }
+  return { ok: true, request };
 }

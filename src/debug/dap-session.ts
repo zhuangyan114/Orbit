@@ -23,6 +23,13 @@ import {
   standardCommandForAction,
   AUTOMATION_BREAKPOINTS_COMMAND,
   AutomationBreakpointSnapshot,
+  AUTOMATION_RUNTIME_COMMAND,
+  AutomationRuntimeRequest,
+  AutomationRuntimeResult,
+  AutomationStackFrame,
+  AutomationRegister,
+  AutomationVariable,
+  parseAutomationRuntimeRequest,
 } from './dap-automation-protocol';
 
 export interface DebugProtocolMessage {
@@ -1614,6 +1621,8 @@ export class DapSession extends EventEmitter {
           return this.handleAutomationControl(msg);
         case AUTOMATION_BREAKPOINTS_COMMAND:
           return this.handleAutomationBreakpoints(msg);
+        case AUTOMATION_RUNTIME_COMMAND:
+          return this.handleAutomationRuntime(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
     }
@@ -2946,6 +2955,256 @@ export class DapSession extends EventEmitter {
       breakpoints,
       capabilities: { conditional: false, hitConditional: false, logPoints: false },
     });
+  }
+
+  // --- runtime snapshot bridge (plan Task 7) --------------------------------
+  // `session.customRequest('orbitRuntimeSnapshot', ...)` reuses the standard DAP
+  // threads/stackTrace/scopes/variables handlers through the same capture
+  // mechanism as automation control, plus a dedicated registers core. The
+  // adapter reports the target state and any read-gate failure as a structured
+  // errorCode; running targets never fabricate stopped-state data.
+
+  private async handleAutomationRuntime(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationRuntimeRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationRuntimeFailure(msg, parsed.errorCode, parsed.message, this.automationTargetState(), startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationRuntimeFailure(msg, errorCode, `session phase ${this.phase} cannot read runtime state`, this.automationTargetState(), startedAt);
+      return;
+    }
+    switch (request.kind) {
+      case 'threads':
+        await this.handleAutomationThreads(msg, request, startedAt);
+        return;
+      case 'stackTrace':
+        await this.handleAutomationStackTrace(msg, request, startedAt);
+        return;
+      case 'scopes':
+        await this.handleAutomationScopes(msg, request, startedAt);
+        return;
+      case 'variables':
+        await this.handleAutomationVariables(msg, request, startedAt);
+        return;
+      case 'registers':
+        await this.handleAutomationRegisters(msg, request, startedAt);
+        return;
+    }
+  }
+
+  private automationTargetState(): string {
+    return this.targetRunning ? 'Running' : 'Halted';
+  }
+
+  private sendAutomationRuntimeFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    targetState: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationRuntimeResult = {
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  /**
+   * Runs one standard DAP read handler through the capture mechanism and
+   * returns its first recorded response, so automation runtime reads share the
+   * exact handlers (and read gates) of the UI path.
+   */
+  private async runAutomationRead(
+    msg: DebugProtocolMessage,
+    command: string,
+    args: Record<string, unknown>,
+  ): Promise<{ body?: any; success: boolean; message?: string }> {
+    const synthetic: DebugProtocolMessage = {
+      type: 'request',
+      seq: msg.seq,
+      command,
+      arguments: args,
+    };
+    const capture: AutomationCapture = { synthetic, recorded: false, success: false };
+    this.automationCapture = capture;
+    try {
+      await this.dispatchRequest(synthetic);
+    } catch (error) {
+      if (!capture.recorded) {
+        capture.recorded = true;
+        capture.success = false;
+        capture.message = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      this.automationCapture = null;
+    }
+    return { body: capture.body, success: capture.success, message: capture.message };
+  }
+
+  private async handleAutomationThreads(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const captured = await this.runAutomationRead(msg, 'threads', {});
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, 'InternalError', captured.message ?? 'threads read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const stopped = !this.targetRunning;
+    const state = this.targetRunning ? 'running' : 'halted';
+    const threads = (captured.body?.threads ?? []).map((thread: any) => ({
+      threadId: thread.id,
+      name: thread.name,
+      state,
+      stopped,
+    }));
+    this.sendResponse(msg, { threads, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationStackTrace(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading the call stack', 'Running', startedAt);
+      return;
+    }
+    const captured = await this.runAutomationRead(msg, 'stackTrace', { threadId: request.threadId });
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, this.readFailureCode(captured), captured.message ?? 'stack trace read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const stackFrames: AutomationStackFrame[] = (captured.body?.stackFrames ?? []).map((frame: any) => {
+      const result: AutomationStackFrame = {
+        frameId: frame.id,
+        name: frame.name,
+        instructionPointerReference: frame.instructionPointerReference ?? '0x0',
+      };
+      if (typeof frame.source?.path === 'string' && frame.source.path.length > 0 && frame.line > 0) {
+        result.source = { path: frame.source.path, line: frame.line };
+      }
+      return result;
+    });
+    this.sendResponse(msg, { stackFrames, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationScopes(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading scopes', 'Running', startedAt);
+      return;
+    }
+    const captured = await this.runAutomationRead(msg, 'scopes', { frameId: request.frameId });
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, 'InternalError', captured.message ?? 'scopes read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const scopes = (captured.body?.scopes ?? []).map((scope: any) => ({
+      name: scope.name,
+      variablesReference: scope.variablesReference ?? 0,
+      expensive: scope.expensive ?? false,
+    }));
+    this.sendResponse(msg, { scopes, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationVariables(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading variables', 'Running', startedAt);
+      return;
+    }
+    const captured = await this.runAutomationRead(msg, 'variables', { variablesReference: request.variablesReference });
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, this.readFailureCode(captured), captured.message ?? 'variables read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const variables: AutomationVariable[] = (captured.body?.variables ?? []).map((variable: any) => {
+      const result: AutomationVariable = {
+        name: variable.name,
+        value: variable.value ?? '',
+        variablesReference: variable.variablesReference ?? 0,
+      };
+      if (typeof variable.type === 'string' && variable.type.length > 0) result.type = variable.type;
+      if (typeof variable.evaluateName === 'string' && variable.evaluateName.length > 0) result.evaluateName = variable.evaluateName;
+      if (typeof variable.memoryReference === 'string' && variable.memoryReference.length > 0) result.memoryReference = variable.memoryReference;
+      return result;
+    });
+    this.sendResponse(msg, { variables, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRegisters(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading registers', 'Running', startedAt);
+      return;
+    }
+    const readEpoch = this.readCancelEpoch;
+    if (!(await this.beginTargetReadWhenAvailable('foreground', 1200))) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetReadCancelled', 'could not acquire the stopped-target read gate for registers', this.automationTargetState(), startedAt);
+      return;
+    }
+    const controller = new AbortController();
+    try {
+      if (readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating()) {
+        this.sendAutomationRuntimeFailure(msg, 'TargetReadCancelled', 'registers read was cancelled before dispatch', this.automationTargetState(), startedAt);
+        return;
+      }
+      this.activeStoppedReadAbortController = controller;
+      const regResult = await this.backend.execute({ cmd: 'getRegisters', signal: controller.signal });
+      const stale = controller.signal.aborted || readEpoch !== this.readCancelEpoch
+        || this.controlInProgress || this.isSessionTerminating();
+      if (stale) {
+        this.sendAutomationRuntimeFailure(msg, 'TargetReadCancelled', 'registers read was cancelled', this.automationTargetState(), startedAt);
+        return;
+      }
+      if (!regResult.ok) {
+        this.sendAutomationRuntimeFailure(msg, regResult.errorCode ?? 'TargetReadUnavailable', regResult.error, regResult.targetState ?? this.automationTargetState(), startedAt);
+        return;
+      }
+      const requestedGroups = new Set<string>(request.groups ?? ['core']);
+      const registers: AutomationRegister[] = [];
+      for (const register of (regResult.data as any[] | undefined) ?? []) {
+        // REG_INDEXES only exposes the 32-bit core integer/control registers,
+        // so every reported register belongs to the core group in this build.
+        const group: AutomationRegister['group'] = 'core';
+        if (!requestedGroups.has(group)) continue;
+        registers.push({
+          name: register.name,
+          value: typeof register.hex === 'string' ? register.hex : `0x${(Number(register.value) >>> 0).toString(16)}`,
+          group,
+          bits: 32,
+          memoryReference: this.formatMemoryReference(register.value),
+        });
+      }
+      this.sendResponse(msg, { registers, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+    } finally {
+      if (this.activeStoppedReadAbortController === controller) {
+        this.activeStoppedReadAbortController = null;
+      }
+      this.endTargetRead();
+    }
+  }
+
+  private readFailureCode(captured: { message?: string }): string {
+    return extractErrorCodePrefix(captured.message ?? '') ?? 'InternalError';
   }
 
   private async handleAutomationControl(msg: DebugProtocolMessage) {

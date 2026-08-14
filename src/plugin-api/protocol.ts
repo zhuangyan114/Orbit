@@ -430,6 +430,61 @@ export interface BreakpointMutationData {
   nextCursor?: string | null;
 }
 
+// --- Runtime DTOs (OpenRPC, plan Task 7). Frozen shapes returned by the
+// --- orbit.runtime.* methods. `variablesReference` is a UInt64 string on the
+// --- wire (the adapter-internal integer is stringified by RuntimeService).
+
+/** OpenRPC Thread (items of orbit.runtime.threads). */
+export interface RuntimeThread {
+  threadId: number;
+  name: string;
+  state: string;
+  stopped: boolean;
+}
+
+/** OpenRPC StackFrame (items of orbit.runtime.stackTrace). */
+export interface RuntimeStackFrame {
+  frameId: number;
+  name: string;
+  source?: SourceLocation;
+  instructionPointerReference: string;
+}
+
+/** OpenRPC Scope (items of orbit.runtime.scopes). */
+export interface RuntimeScope {
+  name: string;
+  /** UInt64 string of the adapter-internal variablesReference. */
+  variablesReference: string;
+  expensive: boolean;
+}
+
+/** OpenRPC Variable (items of orbit.runtime.variables). */
+export interface RuntimeVariable {
+  name: string;
+  value: string;
+  type?: string;
+  /** UInt64 string of the adapter-internal variablesReference (0 for a leaf). */
+  variablesReference: string;
+  evaluateName?: string;
+  memoryReference?: string;
+}
+
+/** OpenRPC Register (items of orbit.runtime.registers). */
+export interface RuntimeRegister {
+  name: string;
+  /** UInt64 exact value (0x-prefixed hex for this adapter). */
+  value: string;
+  group: 'core' | 'floating' | 'system';
+  bits: number;
+  memoryReference?: string;
+}
+
+/** Generic runtime list data envelope (data of every orbit.runtime.* method). */
+export interface RuntimeListData<T> {
+  items: T[];
+  nextCursor?: string | null;
+}
+
 /** OpenRPC HandshakeData (data of orbit.handshake). `session` is added by Task 3. */
 export interface HandshakeData {
   connectionId: string;

@@ -46,11 +46,13 @@ import { WorkspaceFolderInfo } from './protocol';
 import { SessionRegistry, SessionUpdatePatch } from './session-registry';
 import { SessionService, listOrbitLaunchConfigurations } from './session-service';
 import { BreakpointService } from './breakpoint-service';
+import { RuntimeService } from './runtime-service';
 import {
   AutomationControlRequest,
   AutomationControlResult,
+  AutomationRegisterGroup,
 } from '../debug/dap-automation-protocol';
-import { ControlOutcome, FlashReport, SessionRef } from './protocol';
+import { ControlOutcome, FlashReport, SessionRef, TargetRequestContext } from './protocol';
 
 const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -186,6 +188,43 @@ interface BreakpointsReplaceWireParams {
   waitForVerificationMs?: number;
 }
 
+interface RuntimeThreadsWireParams {
+  context: TargetRequestContext;
+  cursor?: string;
+  limit?: number;
+}
+
+interface RuntimeStackTraceWireParams {
+  context: TargetRequestContext;
+  threadId: number;
+  startFrame?: number;
+  levels?: number;
+  cursor?: string;
+}
+
+interface RuntimeScopesWireParams {
+  context: TargetRequestContext;
+  frameId: number;
+  cursor?: string;
+  limit?: number;
+}
+
+interface RuntimeVariablesWireParams {
+  context: TargetRequestContext;
+  variablesReference: string;
+  filter?: 'named' | 'indexed';
+  start?: number;
+  count?: number;
+  cursor?: string;
+}
+
+interface RuntimeRegistersWireParams {
+  context: TargetRequestContext;
+  groups?: AutomationRegisterGroup[];
+  cursor?: string;
+  limit?: number;
+}
+
 export interface PluginApiServerOptions {
   /** Injected for tests; defaults to an Extension-Host-backed registry. */
   registry?: InstanceRegistry;
@@ -197,6 +236,8 @@ export interface PluginApiServerOptions {
   sessionService?: SessionService;
   /** Unified VS Code breakpoint service (plan Task 6). */
   breakpointService?: BreakpointService;
+  /** Runtime inspection service (plan Task 7). */
+  runtimeService?: RuntimeService;
 }
 
 /** Snapshot of the VS Code workspace used for projectId hashing (plan §2.1). */
@@ -245,6 +286,7 @@ export class PluginApiServer implements vscode.Disposable {
   private dispatcher: RpcDispatcher | null = null;
   private sessionService: SessionService;
   private breakpointService: BreakpointService;
+  private runtimeService: RuntimeService;
   private startedAtMs = 0;
 
   constructor(
@@ -271,6 +313,9 @@ export class PluginApiServer implements vscode.Disposable {
     this.breakpointService =
       this.options.breakpointService ??
       new BreakpointService({ registry: sessionRegistry ?? new SessionRegistry() });
+    this.runtimeService =
+      this.options.runtimeService ??
+      new RuntimeService({ registry: sessionRegistry ?? new SessionRegistry() });
     if (this.options.handshakeFactory) {
       this.handshake = this.options.handshakeFactory(this.registry);
     }
@@ -590,6 +635,58 @@ export class PluginApiServer implements vscode.Disposable {
         ),
       })),
     );
+    // --- plan Task 7: runtime inspection through the exact DAP session ---
+    dispatcher.register(
+      buildMethodDefinition('orbit.runtime.threads', async (params: RuntimeThreadsWireParams) => ({
+        data: await this.runtimeService.threads(this.sessionRef(params.context), {
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.runtime.stackTrace', async (params: RuntimeStackTraceWireParams) => ({
+        data: await this.runtimeService.stackTrace(this.sessionRef(params.context), {
+          threadId: params.threadId,
+          startFrame: params.startFrame,
+          levels: params.levels,
+          cursor: params.cursor,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.runtime.scopes', async (params: RuntimeScopesWireParams) => ({
+        data: await this.runtimeService.scopes(this.sessionRef(params.context), {
+          frameId: params.frameId,
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.runtime.variables', async (params: RuntimeVariablesWireParams) => ({
+        data: await this.runtimeService.variables(this.sessionRef(params.context), {
+          variablesReference: params.variablesReference,
+          filter: params.filter,
+          start: params.start,
+          count: params.count,
+          cursor: params.cursor,
+        }),
+      })),
+    );
+    dispatcher.register(
+      buildMethodDefinition('orbit.runtime.registers', async (params: RuntimeRegistersWireParams) => ({
+        data: await this.runtimeService.registers(this.sessionRef(params.context), {
+          groups: params.groups,
+          cursor: params.cursor,
+          limit: params.limit,
+        }),
+      })),
+    );
+  }
+
+  private sessionRef(context: TargetRequestContext): SessionRef {
+    return { sessionId: context.sessionId, sessionGeneration: context.sessionGeneration };
   }
 
   /**

@@ -5,6 +5,8 @@ import {
   parseAutomationControlRequest,
   standardCommandForAction,
   AUTOMATION_BREAKPOINTS_COMMAND,
+  AUTOMATION_RUNTIME_COMMAND,
+  parseAutomationRuntimeRequest,
 } from './dap-automation-protocol';
 
 function automationRequest(seq: number, args: Record<string, unknown>): DebugProtocolMessage {
@@ -548,5 +550,187 @@ describe('DapSession automation breakpoints snapshot', () => {
     });
 
     expect(responseFor(messages, 1)?.body?.breakpoints).toEqual([]);
+  });
+});
+
+function runtimeRequest(seq: number, args: Record<string, unknown>): DebugProtocolMessage {
+  return { type: 'request', seq, command: AUTOMATION_RUNTIME_COMMAND, arguments: args };
+}
+
+/** Read-only backend for runtime snapshots: call stack, locals and registers. */
+function runtimeBackend(overrides: Record<string, unknown> = {}): { execute: (command: any) => Promise<any>; calls: string[] } {
+  const calls: string[] = [];
+  const backend = {
+    calls,
+    execute: async (command: { cmd: string } & Record<string, unknown>) => {
+      calls.push(command.cmd);
+      if (overrides[command.cmd]) return (overrides[command.cmd] as () => unknown)();
+      if (command.cmd === 'getCallStack') {
+        return {
+          ok: true,
+          data: [{ id: 1, function: 'StartTask02', file: 'c:\\ws\\freertos.c', line: 402, address: 0x08004E2E }],
+        };
+      }
+      if (command.cmd === 'getLocals') {
+        return { ok: true, data: [{ name: 'aww', value: '0.5', type: 'float' }] };
+      }
+      if (command.cmd === 'getRegisters') {
+        return {
+          ok: true,
+          data: [
+            { name: 'PC', value: 0x08000480, hex: '0x08000480' },
+            { name: 'R0', value: 1, hex: '0x00000001' },
+          ],
+        };
+      }
+      return { ok: true, data: {} };
+    },
+  };
+  return backend;
+}
+
+describe('DapSession automation runtime snapshot', () => {
+  it('threads reuses the standard handler and reports the halted thread', async () => {
+    const session = connectedJlinkSession(runtimeBackend() as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'threads', sessionGeneration: 2 }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: true,
+      command: AUTOMATION_RUNTIME_COMMAND,
+      body: {
+        threads: [{ threadId: 1, name: expect.any(String), state: 'halted', stopped: true }],
+        targetState: 'Halted',
+      },
+    });
+  });
+
+  it('stackTrace reuses handleStackTrace and reports frames with addresses', async () => {
+    const backend = runtimeBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'stackTrace', sessionGeneration: 2, threadId: 1 }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: true,
+      body: {
+        stackFrames: [{
+          frameId: 1,
+          name: 'StartTask02',
+          source: { path: 'c:\\ws\\freertos.c', line: 402 },
+          instructionPointerReference: '0x8004E2E',
+        }],
+      },
+    });
+    expect((backend as any).calls).toContain('getCallStack');
+  });
+
+  it('scopes reuses the standard handler (Local + Registers)', async () => {
+    const session = connectedJlinkSession(runtimeBackend() as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'scopes', sessionGeneration: 2, frameId: 1 }));
+
+    expect(responseFor(messages, 1)?.body).toMatchObject({
+      scopes: [
+        { name: 'Local', variablesReference: 1, expensive: false },
+        { name: 'Registers', variablesReference: 2, expensive: false },
+      ],
+    });
+  });
+
+  it('variables reference 1 reuses handleVariables and returns locals', async () => {
+    const backend = runtimeBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'variables', sessionGeneration: 2, variablesReference: 1 }));
+
+    expect(responseFor(messages, 1)?.body).toMatchObject({
+      variables: [{ name: 'aww', value: '0.5', type: 'float', variablesReference: 0 }],
+    });
+    expect((backend as any).calls).toContain('getLocals');
+  });
+
+  it('variables reference 2 reuses handleVariables and returns registers as variables', async () => {
+    const session = connectedJlinkSession(runtimeBackend() as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'variables', sessionGeneration: 2, variablesReference: 2 }));
+
+    expect(responseFor(messages, 1)?.body?.variables).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'PC', value: '0x08000480', type: 'uint32', variablesReference: 0 }),
+    ]));
+  });
+
+  it('registers runs a dedicated core and reports group/bits/value/memoryReference', async () => {
+    const backend = runtimeBackend();
+    const session = connectedJlinkSession(backend as unknown as OzoneBackend);
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'registers', sessionGeneration: 2 }));
+
+    expect(responseFor(messages, 1)?.body).toMatchObject({
+      registers: [
+        { name: 'PC', value: '0x08000480', group: 'core', bits: 32, memoryReference: '0x8000480' },
+        { name: 'R0', value: '0x00000001', group: 'core', bits: 32, memoryReference: '0x1' },
+      ],
+    });
+    expect((backend as any).calls).toContain('getRegisters');
+  });
+
+  it('reports TargetRunning instead of fabricating stopped-state data', async () => {
+    const session = connectedJlinkSession(runtimeBackend() as unknown as OzoneBackend);
+    (session as any).targetRunning = true;
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'stackTrace', sessionGeneration: 2, threadId: 1 }));
+
+    expect(responseFor(messages, 1)).toMatchObject({
+      success: false,
+      body: { errorCode: 'TargetRunning', targetState: 'Running' },
+    });
+  });
+
+  it('rejects a runtime request while not connected as SessionStarting', async () => {
+    const session = connectedJlinkSession(runtimeBackend() as unknown as OzoneBackend);
+    (session as any).phase = 'idle';
+    const messages = collect(session);
+
+    await (session as any).handleRequest(runtimeRequest(1, { kind: 'threads', sessionGeneration: 2 }));
+
+    expect(responseFor(messages, 1)).toMatchObject({ success: false, body: { errorCode: 'SessionStarting' } });
+  });
+});
+
+describe('automation runtime request validation', () => {
+  it('accepts the frozen runtime request shapes', () => {
+    expect(parseAutomationRuntimeRequest({ kind: 'threads', sessionGeneration: 1 }))
+      .toMatchObject({ ok: true, request: { kind: 'threads' } });
+    expect(parseAutomationRuntimeRequest({ kind: 'stackTrace', sessionGeneration: 1, threadId: 2, startFrame: 1, levels: 5 }))
+      .toMatchObject({ ok: true, request: { kind: 'stackTrace', threadId: 2, startFrame: 1, levels: 5 } });
+    expect(parseAutomationRuntimeRequest({ kind: 'scopes', sessionGeneration: 1, frameId: 3 }))
+      .toMatchObject({ ok: true, request: { kind: 'scopes', frameId: 3 } });
+    expect(parseAutomationRuntimeRequest({ kind: 'variables', sessionGeneration: 1, variablesReference: 2 }))
+      .toMatchObject({ ok: true, request: { kind: 'variables', variablesReference: 2 } });
+    expect(parseAutomationRuntimeRequest({ kind: 'variables', sessionGeneration: 1, variablesReference: 0 }))
+      .toMatchObject({ ok: true, request: { kind: 'variables', variablesReference: 0 } });
+    expect(parseAutomationRuntimeRequest({ kind: 'registers', sessionGeneration: 1, groups: ['core'] }))
+      .toMatchObject({ ok: true, request: { kind: 'registers', groups: ['core'] } });
+  });
+
+  it('rejects invalid frozen runtime request shapes with InvalidRequest', () => {
+    expect(parseAutomationRuntimeRequest({ kind: 'moon', sessionGeneration: 1 })).toMatchObject({ ok: false });
+    expect(parseAutomationRuntimeRequest({ kind: 'threads', sessionGeneration: 0 })).toMatchObject({ ok: false });
+    expect(parseAutomationRuntimeRequest({ kind: 'stackTrace', sessionGeneration: 1 }))
+      .toMatchObject({ ok: false, message: expect.stringContaining('threadId') });
+    expect(parseAutomationRuntimeRequest({ kind: 'scopes', sessionGeneration: 1 }))
+      .toMatchObject({ ok: false, message: expect.stringContaining('frameId') });
+    expect(parseAutomationRuntimeRequest({ kind: 'variables', sessionGeneration: 1 }))
+      .toMatchObject({ ok: false, message: expect.stringContaining('variablesReference') });
+    expect(parseAutomationRuntimeRequest({ kind: 'registers', sessionGeneration: 1, groups: ['fpu'] }))
+      .toMatchObject({ ok: false });
   });
 });

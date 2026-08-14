@@ -11,6 +11,7 @@ import { EventHub } from './plugin-api/event-hub';
 import { SessionRegistry, SessionUpdatePatch } from './plugin-api/session-registry';
 import { SessionService } from './plugin-api/session-service';
 import { BreakpointService } from './plugin-api/breakpoint-service';
+import { RuntimeService } from './plugin-api/runtime-service';
 import { AUTOMATION_CONTROL_EVENT } from './debug/dap-automation-protocol';
 import { configureLogger } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
@@ -164,8 +165,9 @@ export async function activate(context: vscode.ExtensionContext) {
     sessionRegistry = new SessionRegistry({ eventHub });
     const sessionService = new SessionService({ registry: sessionRegistry });
     const breakpointService = new BreakpointService({ registry: sessionRegistry });
+    const runtimeService = new RuntimeService({ registry: sessionRegistry });
 
-    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry, sessionService, breakpointService });
+    pluginApiServer = new PluginApiServer(context, backend, { sessionRegistry, sessionService, breakpointService, runtimeService });
     const apiEndpoint = await pluginApiServer.start();
     context.subscriptions.push(pluginApiServer);
       console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);

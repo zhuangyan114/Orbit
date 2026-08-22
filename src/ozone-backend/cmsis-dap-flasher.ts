@@ -28,27 +28,58 @@ export interface FlashSector {
   size: number;
 }
 
+/** A contiguous target RAM window an ELF PT_LOAD segment may occupy. */
+export interface RamRegion {
+  /** Stable label used in error messages, e.g. 'SRAM' or 'AXI SRAM'. */
+  readonly name?: string;
+  readonly address: number;
+  readonly size: number;
+}
+
+/** Read-only identity/capacity registers verified before any erase/program. */
+export interface FlashPreflightDefinition {
+  /** DBGMCU_IDCODE register address (F4: 0xE0042000, H7: DBGMCU base). */
+  readonly idcodeAddress: number;
+  /** Expected DEV_ID, the low 12 bits of DBGMCU_IDCODE. */
+  readonly deviceId: number;
+  /** 16-bit Flash size register address reporting capacity in KiB. */
+  readonly flashSizeRegisterAddress: number;
+  /** Capacity the size register must report; must equal flashSize / 1024. */
+  readonly expectedFlashSizeKiB: number;
+}
+
 export interface FlashTargetDefinition {
   readonly name: string;
-  readonly deviceId: number;
+  /** Uppercase aliases that resolve to this target, e.g. STM32F407VE. */
+  readonly aliases: readonly string[];
   readonly dpIdcode: number;
   readonly flashBase: number;
   readonly flashSize: number;
-  readonly sramBase: number;
-  readonly sramSize: number;
   readonly sectors: readonly FlashSector[];
+  /** Every RAM window ELF segments may target; the loader uses one region. */
+  readonly ramRegions: readonly RamRegion[];
+  /** Index into ramRegions hosting the algorithm, page buffer, and stack. */
+  readonly loaderRamIndex: number;
+  readonly preflight: FlashPreflightDefinition;
+  /**
+   * Flash Algorithm reference: a built-in algorithm name (see
+   * BUILTIN_FLASH_ALGORITHMS) or a user algorithm image/manifest path.
+   * CmsisDapFlashOptions.algorithmPath still overrides this per session.
+   */
+  readonly algorithm: string;
+  /** Per-operation timeouts scaled to the target's sector/page timing. */
+  readonly eraseTimeoutMs: number;
+  readonly programTimeoutMs: number;
 }
 
 export const STM32F407VET6: FlashTargetDefinition = Object.freeze({
   name: 'STM32F407VET6',
-  deviceId: 0x413,
+  // STM32F407VE is the common density/package prefix used by project files;
+  // it is accepted only as the unqualified name of this exact 512 KiB target.
+  aliases: ['STM32F407VE'],
   dpIdcode: 0x2BA01477,
   flashBase: 0x08000000,
   flashSize: 512 * 1024,
-  // The normal SRAM window used by the loader. CCM RAM is deliberately not
-  // selected because it is not accessible by every debug/loader path.
-  sramBase: 0x20000000,
-  sramSize: 128 * 1024,
   sectors: [
     { number: 0, address: 0x08000000, size: 0x4000 },
     { number: 1, address: 0x08004000, size: 0x4000 },
@@ -59,7 +90,130 @@ export const STM32F407VET6: FlashTargetDefinition = Object.freeze({
     { number: 6, address: 0x08040000, size: 0x20000 },
     { number: 7, address: 0x08060000, size: 0x20000 },
   ],
+  ramRegions: [
+    // The normal SRAM window used by the loader. CCM RAM is deliberately not
+    // modeled because it is not accessible by every debug/loader path.
+    { name: 'SRAM', address: 0x20000000, size: 128 * 1024 },
+  ],
+  loaderRamIndex: 0,
+  preflight: {
+    idcodeAddress: 0xE0042000,
+    deviceId: 0x413,
+    flashSizeRegisterAddress: 0x1FFF7A22,
+    expectedFlashSizeKiB: 512,
+  },
+  algorithm: 'stm32f407',
+  eraseTimeoutMs: 5000,
+  programTimeoutMs: 5000,
 });
+
+const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6];
+
+/** All registered flash targets, in registration order. */
+export function listFlashTargets(): readonly FlashTargetDefinition[] {
+  return FLASH_TARGETS;
+}
+
+export function normalizeFlashTargetDeviceName(device: string): string {
+  return device.trim().toUpperCase();
+}
+
+/**
+ * Structural invariants every registry entry must satisfy so a malformed
+ * target fails with InvalidConfiguration instead of misbehaving mid-flash.
+ */
+export function validateFlashTargetDefinition(target: FlashTargetDefinition): void {
+  if (typeof target.name !== 'string' || target.name === '' || target.name.trim().toUpperCase() !== target.name) {
+    fail(`Flash target name must be a non-empty uppercase string: ${JSON.stringify(target.name)}`);
+  }
+  if (!Number.isSafeInteger(target.flashBase) || target.flashBase < 0
+    || !Number.isSafeInteger(target.flashSize) || target.flashSize <= 0 || target.flashSize % 1024 !== 0) {
+    fail(`Flash target ${target.name} has an invalid Flash window`);
+  }
+  const aliasNames = new Set<string>([target.name]);
+  for (const alias of target.aliases) {
+    const normalized = normalizeFlashTargetDeviceName(alias);
+    if (normalized === '' || normalized !== alias) {
+      fail(`Flash target ${target.name} alias must be non-empty and uppercase: ${JSON.stringify(alias)}`);
+    }
+    if (aliasNames.has(normalized)) {
+      fail(`Flash target ${target.name} has a duplicate alias: ${alias}`);
+    }
+    aliasNames.add(normalized);
+  }
+  if (target.sectors.length === 0) fail(`Flash target ${target.name} has no sectors`);
+  let sectorEnd = target.flashBase;
+  target.sectors.forEach((sector, index) => {
+    if (!Number.isSafeInteger(sector.address) || !Number.isSafeInteger(sector.size) || sector.size <= 0) {
+      fail(`Flash target ${target.name} sector ${sector.number} is malformed`);
+    }
+    if (sector.number !== index) {
+      fail(`Flash target ${target.name} sector numbers must be dense and ordered`);
+    }
+    if (sector.address !== sectorEnd) {
+      fail(`Flash target ${target.name} sectors must tile its Flash window without gaps`);
+    }
+    sectorEnd += sector.size;
+  });
+  if (sectorEnd !== target.flashBase + target.flashSize) {
+    fail(`Flash target ${target.name} sectors do not cover its Flash size`);
+  }
+  if (target.ramRegions.length === 0) fail(`Flash target ${target.name} has no RAM regions`);
+  const sortedRegions = [...target.ramRegions].sort((a, b) => a.address - b.address);
+  for (const region of sortedRegions) {
+    if (!Number.isSafeInteger(region.address) || !Number.isSafeInteger(region.size)
+      || region.address < 0 || region.size <= 0 || region.address + region.size > 0x100000000) {
+      fail(`Flash target ${target.name} RAM region ${region.name ?? '(unnamed)'} is malformed`);
+    }
+  }
+  for (let index = 1; index < sortedRegions.length; index += 1) {
+    const previous = sortedRegions[index - 1]!;
+    const region = sortedRegions[index]!;
+    if (region.address < previous.address + previous.size) {
+      fail(`Flash target ${target.name} RAM regions overlap at 0x${region.address.toString(16)}`);
+    }
+  }
+  if (!Number.isInteger(target.loaderRamIndex)
+    || target.loaderRamIndex < 0 || target.loaderRamIndex >= target.ramRegions.length) {
+    fail(`Flash target ${target.name} loaderRamIndex is outside its RAM regions`);
+  }
+  const preflight = target.preflight;
+  if (!Number.isSafeInteger(preflight.idcodeAddress) || preflight.idcodeAddress < 0
+    || !Number.isSafeInteger(preflight.flashSizeRegisterAddress) || preflight.flashSizeRegisterAddress < 0
+    || !Number.isInteger(preflight.deviceId) || preflight.deviceId < 0 || preflight.deviceId > 0xFFF) {
+    fail(`Flash target ${target.name} preflight register model is invalid`);
+  }
+  if (preflight.expectedFlashSizeKiB !== target.flashSize / 1024) {
+    fail(`Flash target ${target.name} preflight capacity does not match its Flash size`);
+  }
+  if (!Number.isSafeInteger(target.eraseTimeoutMs) || target.eraseTimeoutMs <= 0
+    || !Number.isSafeInteger(target.programTimeoutMs) || target.programTimeoutMs <= 0) {
+    fail(`Flash target ${target.name} Flash Algorithm timeouts are invalid`);
+  }
+  if (typeof target.algorithm !== 'string' || target.algorithm.trim() === '') {
+    fail(`Flash target ${target.name} has no Flash Algorithm reference`);
+  }
+}
+
+/**
+ * Resolves a device name to its registered FlashTargetDefinition, including
+ * the alias mechanism (STM32F407VE → STM32F407VET6). An unregistered device
+ * throws a structured TargetMismatch listing the supported targets.
+ */
+export function resolveFlashTarget(device: string): FlashTargetDefinition {
+  const normalized = normalizeFlashTargetDeviceName(device);
+  const target = FLASH_TARGETS.find(entry => entry.name === normalized || entry.aliases.includes(normalized));
+  if (!target) {
+    const supported = FLASH_TARGETS.flatMap(entry => [entry.name, ...entry.aliases]).join(', ');
+    throw new CmsisDapFlashError(
+      'TargetMismatch',
+      `CMSIS-DAP DAP-02A target is not registered: ${device} (supported: ${supported})`,
+      { device, supportedTargets: FLASH_TARGETS.map(entry => entry.name) },
+    );
+  }
+  validateFlashTargetDefinition(target);
+  return target;
+}
 
 export interface Elf32LoadSegment {
   /** Runtime address described by ELF p_vaddr. */
@@ -167,31 +321,35 @@ function isInRange(address: number, size: number, base: number, capacity: number
   return address >= base && size >= 0 && address + size <= base + capacity;
 }
 
+function findRamRegion(target: FlashTargetDefinition, address: number, size: number): RamRegion | undefined {
+  return target.ramRegions.find(region => isInRange(address, size, region.address, region.size));
+}
+
 function validateSegmentTarget(segment: Elf32LoadSegment, target: FlashTargetDefinition): void {
   if (segment.memorySize === 0) return;
   if (isInRange(segment.address, segment.memorySize, target.flashBase, target.flashSize)) return;
-  if (isInRange(segment.address, segment.memorySize, target.sramBase, target.sramSize)) return;
+  if (findRamRegion(target, segment.address, segment.memorySize)) return;
   throw new CmsisDapFlashError(
     'TargetMismatch',
-    `ELF PT_LOAD at 0x${segment.address.toString(16)} is outside STM32F407VET6 Flash and SRAM`,
-    { address: segment.address, size: segment.memorySize },
+    `ELF PT_LOAD at 0x${segment.address.toString(16)} is outside ${target.name} Flash and RAM regions`,
+    { address: segment.address, size: segment.memorySize, target: target.name },
   );
 }
 
 export function calculateEraseSectors(
   segments: readonly Elf32LoadSegment[],
-  target: FlashTargetDefinition = STM32F407VET6,
+  target: FlashTargetDefinition,
 ): FlashSector[] {
   const selected = new Map<number, FlashSector>();
   for (const segment of segments) {
     validateSegmentTarget(segment, target);
     if (segment.fileSize === 0) continue;
     if (!isInRange(segment.loadAddress, segment.fileSize, target.flashBase, target.flashSize)) {
-      if (isInRange(segment.loadAddress, segment.fileSize, target.sramBase, target.sramSize)) continue;
+      if (findRamRegion(target, segment.loadAddress, segment.fileSize)) continue;
       throw new CmsisDapFlashError(
         'TargetMismatch',
-        `ELF load bytes at 0x${segment.loadAddress.toString(16)} are outside STM32F407VET6 Flash and SRAM`,
-        { address: segment.loadAddress, size: segment.fileSize },
+        `ELF load bytes at 0x${segment.loadAddress.toString(16)} are outside ${target.name} Flash and RAM regions`,
+        { address: segment.loadAddress, size: segment.fileSize, target: target.name },
       );
     }
     const end = segment.loadAddress + segment.fileSize;
@@ -200,11 +358,6 @@ export function calculateEraseSectors(
     }
   }
   return [...selected.values()].sort((a, b) => a.number - b.number);
-}
-
-export interface RamRegion {
-  address: number;
-  size: number;
 }
 
 export interface FlashRamLayout {
@@ -227,11 +380,16 @@ export function planFlashRamLayout(
   if (!Number.isInteger(algorithmSize) || algorithmSize <= 0) fail('Flash Algorithm is empty');
   if (!Number.isInteger(pageBufferSize) || pageBufferSize <= 0) fail('Flash Algorithm page buffer is empty');
   if (!Number.isInteger(stackSize) || stackSize < 0x100 || stackSize % 8 !== 0) fail('Flash Algorithm stack size is invalid');
-  const algorithmAddress = target.sramBase;
+  const loaderRegion = target.ramRegions[target.loaderRamIndex];
+  if (!loaderRegion) {
+    fail(`Flash target ${target.name} has no loader RAM region at index ${target.loaderRamIndex}`);
+  }
+  const algorithmAddress = loaderRegion.address;
   const pageBufferAddress = alignUp(algorithmAddress + algorithmSize, 4);
-  const stackAddress = target.sramBase + target.sramSize - stackSize;
-  if (pageBufferAddress + pageBufferSize > stackAddress || stackAddress < target.sramBase) {
-    fail('Flash Algorithm regions do not fit inside target SRAM');
+  const stackAddress = loaderRegion.address + loaderRegion.size - stackSize;
+  if (pageBufferAddress + pageBufferSize > stackAddress || stackAddress < loaderRegion.address) {
+    fail(`Flash Algorithm regions do not fit inside ${target.name} ${loaderRegion.name ?? 'loader RAM'} `
+      + `(0x${loaderRegion.address.toString(16)}+0x${loaderRegion.size.toString(16)})`);
   }
   return {
     algorithm: { address: algorithmAddress, size: algorithmSize },
@@ -262,7 +420,12 @@ export interface FlashAlgorithmImage {
   path: string;
 }
 
-const BUILTIN_ENTRIES: FlashAlgorithmEntries = {
+/**
+ * Entry offsets shared by the built-in algorithms and the conservative
+ * default for user binaries: Init/UnInit/EraseSector/ProgramPage/Verify/BKPT
+ * at fixed 0x100 strides with a `00 BE` Thumb BKPT sentinel.
+ */
+const DEFAULT_ALGORITHM_ENTRIES: FlashAlgorithmEntries = {
   init: 0x000,
   uninit: 0x100,
   eraseSector: 0x200,
@@ -271,8 +434,36 @@ const BUILTIN_ENTRIES: FlashAlgorithmEntries = {
   bkpt: 0x500,
 };
 
-export function defaultFlashAlgorithmPath(): string {
-  const relative = path.join('out', 'native', 'win32-x64', 'orbit-stm32f407-flash-algorithm.bin');
+export interface BuiltinFlashAlgorithmMetadata {
+  /** File name shipped under out/native/win32-x64/. */
+  readonly fileName: string;
+  readonly entries: FlashAlgorithmEntries;
+  /** CMSIS-Pack static_base for R9; zero means the image has no static data. */
+  readonly staticBase: number;
+  readonly pageSize: number;
+  /** Whether ProgramPage leaves the uploaded bytes unchanged for Verify. */
+  readonly preservesPageBuffer: boolean;
+}
+
+/** Built-in RAM Flash Algorithms referenced by FlashTargetDefinition.algorithm. */
+const BUILTIN_FLASH_ALGORITHMS: ReadonlyMap<string, BuiltinFlashAlgorithmMetadata> = new Map([
+  [
+    'stm32f407',
+    Object.freeze({
+      fileName: 'orbit-stm32f407-flash-algorithm.bin',
+      entries: DEFAULT_ALGORITHM_ENTRIES,
+      staticBase: 0,
+      // The built-in algorithm accepts up to 64 KiB per ProgramPage. A 16 KiB
+      // buffer matches STM32F4's smallest erase sector and avoids paying the
+      // CMSIS-DAP register/RAM-upload overhead once per 1 KiB slice.
+      pageSize: 0x4000,
+      preservesPageBuffer: true,
+    } satisfies BuiltinFlashAlgorithmMetadata),
+  ],
+]);
+
+function builtinFlashAlgorithmPath(fileName: string): string {
+  const relative = path.join('out', 'native', 'win32-x64', fileName);
   const candidates = [
     path.resolve(__dirname, '..', relative),
     path.resolve(__dirname, '..', '..', relative),
@@ -281,27 +472,35 @@ export function defaultFlashAlgorithmPath(): string {
   return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
 }
 
-export function loadFlashAlgorithm(explicitPath?: string): FlashAlgorithmImage {
-  const candidate = explicitPath || defaultFlashAlgorithmPath();
-  if (!fs.existsSync(candidate)) {
+/** Registered built-in Flash Algorithms and their metadata contract. */
+export function listBuiltinFlashAlgorithms(): ReadonlyMap<string, BuiltinFlashAlgorithmMetadata> {
+  return BUILTIN_FLASH_ALGORITHMS;
+}
+
+export function loadFlashAlgorithm(target: FlashTargetDefinition, explicitPath?: string): FlashAlgorithmImage {
+  const reference = explicitPath || target.algorithm;
+  // An explicit user path never resolves to a built-in image; a target's
+  // algorithm reference does when it names a registered built-in algorithm.
+  const builtin = explicitPath ? undefined : BUILTIN_FLASH_ALGORITHMS.get(reference);
+  if (!builtin && !explicitPath && !/[\\/]/.test(reference) && path.extname(reference) === '') {
+    // The reference is a bare algorithm name, so an unknown one is a registry
+    // gap rather than a missing file.
     throw new CmsisDapFlashError(
       'FlashAlgorithmUnavailable',
-      `CMSIS-Pack/RAM Flash Algorithm is unavailable: ${candidate}`,
-      { path: candidate },
+      `Flash target ${target.name} references unknown built-in Flash Algorithm '${reference}'`,
+      { target: target.name, algorithm: reference },
     );
   }
-  let binaryPath = candidate;
-  let entries = BUILTIN_ENTRIES;
-  let staticBase = 0;
-  // The built-in algorithm accepts up to 64 KiB per ProgramPage. A 16 KiB
-  // buffer matches STM32F4's smallest erase sector and avoids paying the
-  // CMSIS-DAP register/RAM-upload overhead once per 1 KiB slice. User
+  let binaryPath = builtin ? builtinFlashAlgorithmPath(builtin.fileName) : reference;
+  let entries: FlashAlgorithmEntries = builtin ? builtin.entries : DEFAULT_ALGORITHM_ENTRIES;
+  let staticBase = builtin ? builtin.staticBase : 0;
+  // Built-in images declare their page contract through metadata. User
   // supplied images retain the conservative 1 KiB default unless their
   // manifest declares a different page size.
-  let pageSize = explicitPath ? 1024 : 0x4000;
-  let preservesPageBuffer = !explicitPath;
-  let source: FlashAlgorithmImage['source'] = explicitPath ? 'user-provided' : 'built-in';
-  if (candidate.toLowerCase().endsWith('.json')) {
+  let pageSize = builtin ? builtin.pageSize : 1024;
+  let preservesPageBuffer = builtin ? builtin.preservesPageBuffer : false;
+  let source: FlashAlgorithmImage['source'] = builtin ? 'built-in' : 'user-provided';
+  if (!builtin && reference.toLowerCase().endsWith('.json')) {
     let manifest: {
       binary?: string;
       entries?: Partial<FlashAlgorithmEntries> & { verify?: number | null };
@@ -310,12 +509,12 @@ export function loadFlashAlgorithm(explicitPath?: string): FlashAlgorithmImage {
       preservesPageBuffer?: boolean;
     };
     try {
-      manifest = JSON.parse(fs.readFileSync(candidate, 'utf8')) as typeof manifest;
+      manifest = JSON.parse(fs.readFileSync(reference, 'utf8')) as typeof manifest;
     } catch (error) {
       throw new CmsisDapFlashError('FlashAlgorithmUnavailable', `Flash Algorithm manifest is invalid: ${String(error)}`);
     }
     if (!manifest.binary) throw new CmsisDapFlashError('FlashAlgorithmUnavailable', 'Flash Algorithm manifest has no binary');
-    binaryPath = path.resolve(path.dirname(candidate), manifest.binary);
+    binaryPath = path.resolve(path.dirname(reference), manifest.binary);
     const manifestEntries = manifest.entries || {};
     const requiredEntries: Array<keyof FlashAlgorithmEntries> = [
       'init', 'uninit', 'eraseSector', 'programPage', 'bkpt',
@@ -364,13 +563,14 @@ export function loadFlashAlgorithm(explicitPath?: string): FlashAlgorithmImage {
   return { code, entries, staticBase, pageSize, preservesPageBuffer, source, path: binaryPath };
 }
 
-export function validateTargetDeviceName(device: string, target: FlashTargetDefinition = STM32F407VET6): void {
-  const normalized = device.trim().toUpperCase();
-  // STM32F407VE is the common density/package prefix used by project files;
-  // it is accepted only as the unqualified name of this exact 512 KiB target.
-  const isV407VeAlias = target.name === STM32F407VET6.name && normalized === 'STM32F407VE';
-  if (normalized !== target.name && !isV407VeAlias) {
-    throw new CmsisDapFlashError('TargetMismatch', `CMSIS-DAP DAP-02A only supports ${target.name}, received ${device}`);
+export function validateTargetDeviceName(device: string, target: FlashTargetDefinition): void {
+  const normalized = normalizeFlashTargetDeviceName(device);
+  if (normalized !== target.name && !target.aliases.includes(normalized)) {
+    throw new CmsisDapFlashError(
+      'TargetMismatch',
+      `CMSIS-DAP DAP-02A only supports ${target.name}, received ${device}`,
+      { device, target: target.name },
+    );
   }
 }
 
@@ -517,12 +717,15 @@ function ensureNotAborted(signal?: AbortSignal): void {
   }
 }
 
+/** Fallback timeout for algorithm operations without a per-target field. */
+const DEFAULT_FLASH_ALGORITHM_TIMEOUT_MS = 5000;
+
 export async function flashCmsisDapElf(
   transport: CmsisDapFlashTransport,
   elfPath: string,
   device: string,
   options: CmsisDapFlashOptions = {},
-  target: FlashTargetDefinition = STM32F407VET6,
+  target: FlashTargetDefinition,
 ): Promise<CmsisDapFlashResult> {
   const reports: FlashOperationReport[] = [];
   let erasedSectors: FlashSector[] = [];
@@ -562,7 +765,7 @@ export async function flashCmsisDapElf(
     if (erasedSectors.length === 0) throw new CmsisDapFlashError('InvalidConfiguration', 'ELF has no Flash PT_LOAD bytes');
     const flashSegments = segments.filter(segment => segment.fileSize > 0 && segment.loadAddress >= target.flashBase
       && segment.loadAddress + segment.fileSize <= target.flashBase + target.flashSize);
-    const algorithm = loadFlashAlgorithm(options.algorithmPath);
+    const algorithm = loadFlashAlgorithm(target, options.algorithmPath);
     const pageSize = options.pageSize || algorithm.pageSize;
     const pageBufferSize = options.pageBufferSize || pageSize;
     if (pageBufferSize < pageSize) {
@@ -572,7 +775,15 @@ export async function flashCmsisDapElf(
       );
     }
     const layout = planFlashRamLayout(target, algorithm.code.length, pageBufferSize, options.stackSize);
-    const timeoutMs = options.timeoutMs ?? 5000;
+    // Per-target defaults keep slow sectors (e.g. future 128 KiB H7 sectors)
+    // from being reported as timeouts; options.timeoutMs still overrides
+    // every operation for compatibility.
+    const operationTimeoutMs = (operation: FlashAlgorithmOperation): number => {
+      if (options.timeoutMs !== undefined) return options.timeoutMs;
+      if (operation === 'eraseSector') return target.eraseTimeoutMs;
+      if (operation === 'programPage' || operation === 'verify') return target.programTimeoutMs;
+      return DEFAULT_FLASH_ALGORITHM_TIMEOUT_MS;
+    };
     const clockHz = options.clockHz ?? 4000000;
     const verify = options.verify !== false;
     let skipUninit = false;
@@ -584,21 +795,21 @@ export async function flashCmsisDapElf(
         `SW-DP IDCODE mismatch: expected 0x${target.dpIdcode.toString(16)}, got 0x${(dp.value >>> 0).toString(16)}`,
         { expected: target.dpIdcode, actual: dp.value >>> 0 });
     }
-    const idcode = await transport.readMemory(0xE0042000, 4);
+    const idcode = await transport.readMemory(target.preflight.idcodeAddress, 4);
     if (!idcode.ok || !idcode.bytes) throwReadFailure('DBGMCU_IDCODE preflight', idcode);
     const deviceIdcode = readLe32(asBytes(idcode.bytes));
-    if ((deviceIdcode & 0xFFF) !== target.deviceId) {
+    if ((deviceIdcode & 0xFFF) !== target.preflight.deviceId) {
       throw new CmsisDapFlashError('TargetMismatch',
-        `DBGMCU_IDCODE mismatch: expected device ID 0x${target.deviceId.toString(16)}, got 0x${(deviceIdcode & 0xFFF).toString(16)}`,
-        { expected: target.deviceId, actual: deviceIdcode });
+        `DBGMCU_IDCODE mismatch: expected device ID 0x${target.preflight.deviceId.toString(16)}, got 0x${(deviceIdcode & 0xFFF).toString(16)}`,
+        { expected: target.preflight.deviceId, actual: deviceIdcode });
     }
-    const flashSize = await transport.readMemory(0x1FFF7A22, 2);
+    const flashSize = await transport.readMemory(target.preflight.flashSizeRegisterAddress, 2);
     if (!flashSize.ok || !flashSize.bytes) throwReadFailure('Flash size preflight', flashSize);
     const flashSizeKiB = readLe16(asBytes(flashSize.bytes));
-    if (flashSizeKiB !== target.flashSize / 1024) {
+    if (flashSizeKiB !== target.preflight.expectedFlashSizeKiB) {
       throw new CmsisDapFlashError('TargetMismatch',
-        `Flash capacity mismatch: expected ${target.flashSize / 1024} KiB, got ${flashSizeKiB} KiB`,
-        { expectedKiB: target.flashSize / 1024, actualKiB: flashSizeKiB });
+        `Flash capacity mismatch: expected ${target.preflight.expectedFlashSizeKiB} KiB, got ${flashSizeKiB} KiB`,
+        { expectedKiB: target.preflight.expectedFlashSizeKiB, actualKiB: flashSizeKiB });
     }
 
     const run = async (
@@ -624,7 +835,7 @@ export async function flashCmsisDapElf(
         data: Array.from(data),
         clockHz,
         staticBase: algorithm.staticBase,
-        timeoutMs,
+        timeoutMs: operationTimeoutMs(operation),
         reusePageBuffer,
       };
       let result: CmsisDapFlashRpcResult;

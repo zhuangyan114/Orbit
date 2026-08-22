@@ -791,6 +791,34 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(createLegacy).not.toHaveBeenCalled();
   });
 
+  it('resolves flash devices through the registry before touching the helper', async () => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    expect((await channel.connect({
+      device: 'STM32F407VET6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    })).ok).toBe(true);
+
+    const mismatch = await channel.flash('image.elf', 'STM32H723VGT6');
+    expect(mismatch).toMatchObject({
+      ok: false,
+      errorCode: 'TargetMismatch',
+      diagnostics: { ownerKind: 'cmsis-dap', supportedTargets: ['STM32F407VET6'] },
+    });
+    expect(mismatch.message).toContain('STM32H723VGT6');
+    expect(helper.withControlCriticalSection).not.toHaveBeenCalled();
+
+    // A registered alias passes registry resolution and proceeds into the
+    // flash flow, which then fails on the missing ELF file.
+    const alias = await channel.flash('does-not-exist.elf', 'stm32f407ve');
+    expect(alias.ok).toBe(false);
+    expect(alias.errorCode).toBe('InvalidConfiguration');
+    expect(alias.message).toContain('does-not-exist.elf');
+    expect(helper.withControlCriticalSection).toHaveBeenCalled();
+  });
+
   it('routes CMSIS-DAP WinUSB through the same single helper owner', async () => {
     const helper = fakeCmsisDapHelper();
     const cmsisDap = new CmsisDapTargetChannel({ helperClient: helper });

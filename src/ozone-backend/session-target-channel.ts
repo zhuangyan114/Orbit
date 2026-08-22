@@ -32,11 +32,14 @@ import {
   findDefaultHelperPath,
 } from './cmsis-dap-helper-channel';
 import {
+  CmsisDapFlashError,
   CmsisDapFlashOptions,
   CmsisDapFlashResult,
-  flashCmsisDapElf,
   FlashAlgorithmRunRequest,
   FlashAlgorithmRunData,
+  FlashTargetDefinition,
+  flashCmsisDapElf,
+  resolveFlashTarget,
 } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
 import { NativeSchedulerCancelledError } from './native-scheduler';
@@ -650,6 +653,21 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   async flash(elfPath: string, device: string, options: CmsisDapFlashOptions = {}) {
     if (this.state !== 'connected') return this.invalidState<CmsisDapFlashResult>('flash');
+    // Resolve the device through the flash target registry before entering
+    // the control critical section so an unregistered device fails fast with
+    // a structured TargetMismatch instead of touching the target.
+    let target: FlashTargetDefinition;
+    try {
+      target = resolveFlashTarget(device);
+    } catch (error) {
+      if (!(error instanceof CmsisDapFlashError)) throw error;
+      log.dll(`[cmsis-dap] flash target resolution failed device=${device} owner=cmsis-dap `
+        + `errorCode=${error.code}`);
+      return failure<CmsisDapFlashResult>(error.message, error.code, {
+        ownerKind: 'cmsis-dap',
+        ...error.diagnostics,
+      });
+    }
     const result = await this.helper.withControlCriticalSection(async (controlRequest: CmsisDapControlRequest) =>
       flashCmsisDapElf({
         readDp: async reg => {
@@ -685,7 +703,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
             + `size=${report.size} elapsedMs=${report.elapsedMs} ok=${report.ok} `
             + `errorCode=${report.errorCode || ''}`);
         },
-      }));
+      }, target));
     const elapsedMs = result.reports.reduce((total, item) => total + item.elapsedMs, 0);
     if (!result.success) {
       return {

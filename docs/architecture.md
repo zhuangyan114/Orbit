@@ -5,12 +5,13 @@
 ```mermaid
 flowchart TD
     VSCode["VS Code 调试 UI\nWatch / Timeline / 外部 Viewer"]
-    MCP["MCP client"]
+    MCP["MCP / Node / Python client"]
 
     subgraph Host["VS Code Extension Host"]
         Ext["extension.ts\n命令、Webview、会话生命周期"]
-        Router["RuntimeRouter\n活动 Orbit session 身份检查"]
-        Api["Plugin API\n127.0.0.1 + Bearer token"]
+        Router["RuntimeRouter\n精确 sessionId/generation"]
+        Api["Automation API v1\n127.0.0.1 /v1/rpc + /v1/events"]
+        Registry["InstanceRegistry + SessionRegistry"]
         Watch["Watch provider / webview"]
         Timeline["DataSamplingManager / Timeline"]
     end
@@ -41,7 +42,8 @@ flowchart TD
 
     VSCode --> Entry
     VSCode --> Ext
-    MCP --> Api --> Router
+    MCP --> Api --> Registry
+    Registry --> Router
     Ext --> Watch
     Ext --> Timeline
     Watch -->|"customRequest"| Session
@@ -62,7 +64,7 @@ flowchart TD
 
 | 边界 | 入口 | 职责 |
 |---|---|---|
-| Extension Host | `src/extension.ts` | Watch/Timeline UI、Plugin API、活动 session identity/generation、DAP custom request 路由 |
+| Extension Host | `src/extension.ts` | Watch/Timeline UI、Automation API v1（默认关闭）、活动 session identity/generation、DAP custom request 路由 |
 | DAP Adapter | `src/debugadapter.ts`、`src/debug/dap-session.ts` | DAP 协议、目标控制、变量/内存、RTT、采样、停止/终止事件；不导入 `vscode` |
 | J-Link helper | `native/jlink-helper/src/main.cpp` | 在独立进程加载 `JLink_x64.dll`，提供 J-Link 控制、内存、断点、源码步进和 RTT |
 | CMSIS-DAP helper | `native/cmsis-dap-helper/src/main.cpp` | 枚举 HID/WinUSB、CMSIS-DAP framing、SWD/DP/AP、Cortex-M 控制、内存、FPB、Flash Algorithm 和内存型 RTT |
@@ -96,10 +98,21 @@ control > watch > timeline > background
 1. **Watch / evaluate**: Webview 或 VS Code DAP request -> `DapSession` -> `OzoneBackend` -> 当前 owner。运行态 realtime path 不额外查询 target state。
 2. **Timeline**: `DataSamplingManager` -> 活动 session `dataSample` -> scheduler timeline work -> `ozoneDataSamples`；结果发布前检查 session identity 和 generation。
 3. **RTT**: J-Link owner 使用 DLL RTT API；CMSIS-DAP owner通过目标内存读取 SEGGER RTT control block 和 ring buffer。两者都属于当前 owner，轮询为 background work。
-4. **Viewer / MCP**: Viewer 使用标准 DAP `variables`、`memoryReference`、`readMemory`、`writeMemory` 和 SVD metadata；MCP 通过 loopback Plugin API 到 `RuntimeRouter`，活动 session 存在时不得回退 Extension Host backend。
+4. **Viewer / Automation API / MCP**: Viewer 使用标准 DAP `variables`、`memoryReference`、`readMemory`、`writeMemory` 和 SVD metadata。Automation API v1 只监听 `127.0.0.1`，按 `instanceId`/`projectId`/`sessionId`/`sessionGeneration` 绑定可见 Orbit session；MCP、Node CLI 和 Python 客户端都走同一 `/v1/rpc` 与 `/v1/events`。活动 DAP session 存在时不得回退 Extension Host backend，也不得创建第二个 target owner。
+
+## Automation API v1
+
+- 开关：`orbit.automation.enabled`（默认 `false`）。关闭后不启动 endpoint，不影响标准调试。
+- 权限：`orbit.automation.allowedScopes` 默认仅 `read`；mutation scope 需工作区确认。
+- 发现：用户范围 registry pointer + 每窗口 endpoint 文件；相同 `projectId` 的多窗口必须显式 `instanceId`。
+- 兼容：一个发布周期保留旧 `POST /rpc`（`ozone.*`）映射到新 service，并带 deprecation；不得跳过 handshake/generation。
+- 验收分层：自动化 / Mock / 真实硬件分开报告。1.1.0 已通过 J-Link native 与 CMSIS-DAP HID v1（无 flash）；未授权的 J-Link legacy 与显式 Flash 标为 `out-of-scope`，不得写成通过。见 [硬件验收](api/orbit-automation-hardware-acceptance.md)。
 
 ## 相关文档
 
+- [Automation API v1](api/orbit-automation-api.md)
+- [验收矩阵](api/orbit-automation-acceptance-matrix.md)
+- [硬件验收](api/orbit-automation-hardware-acceptance.md)
 - [DAP/owner 验证矩阵](debug-engine-refactor/validation-matrix.md)
 - [Native scheduler 设计](debug-engine-refactor/native-scheduler-design.md)
 - [实时变量保护](debug-engine-refactor/realtime-variable-protection.md)

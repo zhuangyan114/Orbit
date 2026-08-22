@@ -15,18 +15,18 @@
   <a href="https://github.com/zhuangyan114/Orbit/releases">Orbit Releases</a>
 </p>
 
-> 本 README 是 Orbit 正式版 1.1.0 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
+> 本 README 是 Orbit 正式版 1.1.1 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
 
 ## Orbit 是什么
 
-Orbit 是一个运行在 VS Code 中的嵌入式调试前端。它以 Debug Adapter Protocol（DAP）承接 VS Code 的调试请求，通过 J-Link DLL 或原生 CMSIS-DAP v1 HID / (v2 WinUSB helper 暂未实现) 访问 STM32 / ARM Cortex-M 目标，并在同一目标所有权模型下提供：
+Orbit 是一个运行在 VS Code 中的嵌入式调试前端。它以 Debug Adapter Protocol（DAP）承接 VS Code 的调试请求，通过 J-Link DLL 或原生 CMSIS-DAP helper（真机验收为 v1 HID；v2 WinUSB 有代码/Mock，本版未做真机）访问 STM32 / ARM Cortex-M 目标，并在同一目标所有权模型下提供：
 
 - 源码级启动、暂停、继续、单步、复位和断点；
 - 可展开的 Watch 表达式、运行时数值写入和变化高亮；
 - Timeline 实时采样、缩放、悬停读数和短期历史保留；
 - SEGGER RTT 输出、ANSI 处理和 P-RTLog tokenized 帧解码；
 - 通过标准 DAP memory / variables 能力接入外部 Memory View、Peripheral Viewer 和 RTOS Views；
-- 面向脚本和 AI 工具的本机 Plugin API 与 MCP 适配器。
+- 面向脚本和 AI 工具的本机 Automation API v1（Node / Python / MCP 共用同一协议）。
 
 Orbit 的目标不是复制一个完整 IDE，而是把“程序停在哪里、变量现在是多少、波形怎样变化、日志从哪里来、实验是否可重复”连接到同一套调试会话中。
 
@@ -36,7 +36,7 @@ Orbit 的目标不是复制一个完整 IDE，而是把“程序停在哪里、�
 
 Orbit 暴露 `orbit` DAP 调试器类型，使用 ELF/AXF 载入符号、行号和 DWARF 类型信息；旧配置中的 `ozone` 类型仍作为兼容别名保留。标准 DAP 的 `evaluate`、可展开 `variablesReference`、结构体/数组/指针子节点、`memoryReference`、读写内存和 RTOS capability 会保留给 VS Code 及外部视图使用。
 
-`probe: "jlink"`（默认）选择 J-Link；`probe: "cmsis-dap"` 选择 CMSIS-DAP/DAPLink。CMSIS-DAP 的 `auto` transport 优先 v2 WinUSB 并兼容 v1 HID，烧录、调试、Watch、Timeline、RTT 和 Viewer 始终复用同一个 helper owner。
+`probe: "jlink"`（默认）选择 J-Link；`probe: "cmsis-dap"` 选择 CMSIS-DAP/DAPLink。`cmsisDapTransport: "auto"` 优先 v2 WinUSB 并兼容 v1 HID。
 
 ### 运行时查看变量
 
@@ -55,13 +55,15 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 
 ### 自动化与 AI 接入
 
-Extension Host 激活时启动仅监听 `127.0.0.1` 的 Plugin API，并写出带随机 Bearer Token 的 endpoint 文件。独立的 MCP server 通过 stdio 暴露状态、批量读写、录波和通用实验工具；目标访问仍由 Orbit 的活动调试会话负责。
+工作区打开 `orbit.automation.enabled` 后，每个 VS Code 窗口在 `127.0.0.1` 上发布独立的 Automation API v1（`/v1/rpc`、`/v1/events`）。客户端按 `projectId`/`instanceId` 握手，再绑定精确的 `sessionId`/`sessionGeneration`。Node CLI、Python 标准和 MCP 都走同一协议，不会另开第二条目标连接。默认只授 `read`；写入、控制、Flash 需要额外 scope。真实硬件验收与 Mock 分层记录，见 [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)。
 
 
 ## 文档与发布
 
 - [全套工具链教程](Releases/docs/全套工具链教程.md)：面向第一次从 Keil5 等集成 IDE 转到 VS Code 的用户，从零安装和配置 ARM GCC、CMake、CMake Tools、J-Link 与 Orbit，并完成第一次编译和调试。
-- [用户文档](Releases/docs/user-guide.md)：面向已经具备基本 VS Code/嵌入式开发环境的用户，作为 Orbit 的正式参考手册，覆盖安装要求、`launch.json`、Watch、Timeline、RTT、P-RTLog、RTOS Views、Memory View、Peripheral Viewer、Native/Legacy、MCP、FAQ 和已知限制。
+- [用户文档](Releases/docs/user-guide.md)：面向已经具备基本 VS Code/嵌入式开发环境的用户，作为 Orbit 的正式参考手册，覆盖安装要求、`launch.json`、Watch、Timeline、RTT、P-RTLog、RTOS Views、Memory View、Peripheral Viewer、Native/Legacy、Automation API、MCP、FAQ 和已知限制。
+- [Automation API v1](docs/api/orbit-automation-api.md)：本机 JSON-RPC / SSE 协议、握手、generation fence 和客户端快速开始。
+- [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)：自动化 / Mock / 真实硬件分层状态。1.1.1 已通过 J-Link native 与 CMSIS-DAP HID v1（均无 flash）；J-Link legacy 与显式 Flash 不在本版范围。
 
 两份教程互相补充，并不是重复内容：
 
@@ -79,12 +81,16 @@ Extension Host 激活时启动仅监听 `127.0.0.1` 的 Plugin API，并写出�
 - 增加了对 DAP-Link-V1 的支持
 - 大幅优化了Timeline的采样效率和显示逻辑
 - 修复了许多bug,优化了调试体验
-- 目前 CMSIS-DAP 链路仅支持STM32F407VET6,后续会尽快支持F103C8T6,F407IGH6,H723VGT6
+- 目前 CMSIS-DAP 链路仅支持STM32F407VET6
+
+## 1.1.1 更新日志
+
+- 开放调试API，支持python，nodejs调用，AI可直接调用MCP调试
 
 ## 预告
 
-- 不久后将开放本插件所有API接口,可以实现Python脚本全自动调试,或者让AI通过命令行执行调试
 - 会尽快支持 CMSIS-DAP-V2 
+- CMSIS-DAP链路后续会尽快支持F103C8T6,F407IGH6,H723VGT6
 
 ## 许可证
 

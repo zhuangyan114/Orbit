@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import { BoundedMetric } from '../utils/bounded-metric';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
@@ -6,11 +7,60 @@ import {
   DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock,
   OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
 } from '../ozone-backend/types';
+import { parseElf32LoadSegments } from '../ozone-backend/cmsis-dap-flasher';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
 import { normalizeDapLaunchConfig } from './dap-launch-config';
 import { parseConstantExpression } from '../utils/constant-expression';
+import {
+  AUTOMATION_CONTROL_COMMAND,
+  AUTOMATION_CONTROL_EVENT,
+  AutomationControlRequest,
+  AutomationControlResult,
+  AutomationFlashReport,
+  parseAutomationControlRequest,
+  standardCommandForAction,
+  AUTOMATION_BREAKPOINTS_COMMAND,
+  AutomationBreakpointSnapshot,
+  AUTOMATION_RUNTIME_COMMAND,
+  AutomationRuntimeRequest,
+  AutomationRuntimeResult,
+  AutomationStackFrame,
+  AutomationRegister,
+  AutomationVariable,
+  parseAutomationRuntimeRequest,
+  AUTOMATION_EXPRESSION_COMMAND,
+  AutomationExpressionRequest,
+  AutomationExpressionResult,
+  AutomationExpressionValue,
+  AutomationExpressionWriteOutcome,
+  AutomationSymbol,
+  parseAutomationExpressionRequest,
+  AUTOMATION_MEMORY_COMMAND,
+  AutomationMemoryRequest,
+  AutomationMemoryResult,
+  parseAutomationMemoryRequest,
+  AUTOMATION_LIFECYCLE_EVENT,
+  AUTOMATION_RTT_COMMAND,
+  AutomationRttRequest,
+  AutomationRttResult,
+  AutomationRttSnapshot,
+  parseAutomationRttRequest,
+  AUTOMATION_DIAGNOSTICS_COMMAND,
+  AutomationDiagnosticsRequest,
+  AutomationDiagnosticsResult,
+  parseAutomationDiagnosticsRequest,
+  normalizeSchedulerSnapshot,
+  AUTOMATION_RTT_LOG_COMMAND,
+  AutomationRttLogEntry,
+  AutomationRttLogRequest,
+  AutomationRttLogResult,
+  parseAutomationRttLogRequest,
+} from './dap-automation-protocol';
+
+/** Bound on the decoded RTT Log line ring exposed through `orbit.rttlog.read`. */
+const MAX_RTT_LOG_LINES = 2000;
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -41,6 +91,12 @@ const targetReadPriorityRank: Record<TargetReadPriority, number> = {
 
 function normalizeTargetReadPriority(priority: TargetReadRequestPriority): TargetReadPriority {
   return priority === 'low' ? 'background' : priority;
+}
+
+/** Parses a leading `ErrorCode: ...` prefix from a DAP failure message. */
+function extractErrorCodePrefix(message: string): string | null {
+  const match = /^([A-Za-z][A-Za-z0-9]*):/.exec(String(message ?? '').trim());
+  return match ? match[1] : null;
 }
 
 interface TargetReadWaiter {
@@ -80,6 +136,20 @@ interface DapVariableHandle {
   stopGeneration: number;
 }
 
+/**
+ * In-flight automation control capture. The synthetic standard request runs
+ * through the same handlers as UI control; `sendResponse` records the first
+ * response the handler produces instead of emitting it, and the automation
+ * entry point translates it into the structured outcome.
+ */
+interface AutomationCapture {
+  synthetic: DebugProtocolMessage;
+  recorded: boolean;
+  body?: any;
+  success: boolean;
+  message?: string;
+}
+
 function createTargetReadMetricSet(): TargetReadMetricSet {
   return {
     queueWaitMs: new BoundedMetric(8_192),
@@ -107,6 +177,19 @@ export class DapSession extends EventEmitter {
   private rttControlBlockSource: 'elf-symbol' | 'config' = 'elf-symbol';
   private dapStepProfileSeq = 0;
   private rttStripAnsi = true;
+  // Automation RTT is a distinct logical consumer from the UI RTT Log (plan
+  // Task 11). It shares the physical owner but tracks its own start/read state
+  // so an API `start`/`stop`/`read` never races the terminal polling loop.
+  private automationRttStarted = false;
+  private automationRttBufferIndex = 0;
+  private automationRttPollIntervalMs = 50;
+  private automationRttAnsi = true;
+  private automationRttTargetName: string | undefined;
+  // Decoded terminal-log line ring (plan Task 11 extension, `orbit.rttlog.read`).
+  // Each finalized RTT Log line is retained here with its producing decoder kind
+  // so the API can distinguish P-RTLog-decoded logs from raw RTT text.
+  private rttLogEntries: AutomationRttLogEntry[] = [];
+  private rttLogSequence = 0;
   private _rtos = '';
   private rttLogTarget: 'terminal' | 'debugConsole' | 'both' = 'terminal';
   private rttDecoder = new StringDecoder('utf8');
@@ -156,7 +239,10 @@ export class DapSession extends EventEmitter {
   private activeMemoryReadAbortController: AbortController | null = null;
 
   private breakpoints = new Map<string, number>();
+  /** Resolved instruction address per `${path}:${line}` key, for the automation snapshot. */
+  private breakpointAddresses = new Map<string, number>();
   private stepLock: Promise<void> = Promise.resolve();
+  private automationCapture: AutomationCapture | null = null;
 
   private _elfPath = '';
   private _device = '';
@@ -790,6 +876,19 @@ export class DapSession extends EventEmitter {
   }
 
   private sendResponse(msg: DebugProtocolMessage, body?: any, success = true, message?: string) {
+    const capture = this.automationCapture;
+    if (capture && capture.synthetic === msg) {
+      // Automation requests run the same handlers; the handler's first
+      // response is recorded and translated into the structured outcome
+      // instead of being emitted as a raw standard DAP response.
+      if (!capture.recorded) {
+        capture.recorded = true;
+        capture.body = body;
+        capture.success = success;
+        capture.message = message;
+      }
+      return;
+    }
     const response = {
       type: 'response', seq: this.seq++,
       request_seq: msg.seq, success, command: msg.command || '', body, message,
@@ -846,6 +945,22 @@ export class DapSession extends EventEmitter {
       );
     }
     this.emit('send', message);
+    // Companion sanitized lifecycle event for the Automation API (plan Task 11):
+    // only states/reasons, no memory or variable values. The Extension Host
+    // resolves the exact session identity and generation before publishing.
+    this.emitAutomationLifecycle(event, body);
+  }
+
+  private emitAutomationLifecycle(event: string, body?: any) {
+    let type: string | undefined;
+    if (event === 'stopped') type = 'target.stopped';
+    else if (event === 'continued') type = 'target.running';
+    else if (event === 'terminated' && typeof body?.reason === 'string') type = 'target.connectionLost';
+    if (!type) return;
+    const payload: Record<string, unknown> = { type };
+    if (body?.reason !== undefined) payload.reason = body.reason;
+    if (body?.threadId !== undefined) payload.threadId = body.threadId;
+    this.sendEvent(AUTOMATION_LIFECYCLE_EVENT, payload);
   }
 
   private resetVariableHandles() {
@@ -1421,8 +1536,22 @@ export class DapSession extends EventEmitter {
     }
     const output = this.rttStripAnsi ? this.stripAnsi(text) : text;
     if (output.length <= 0) return;
+    this.appendRttLogLine(text);
     const category = this.isWarningOrErrorRttLine(text) ? 'stderr' : 'stdout';
     this.emitRttDebugConsoleLine(output, category);
+  }
+
+  /** Retains one finalized RTT Log line for `orbit.rttlog.read` (raw text, ANSI intact). */
+  private appendRttLogLine(text: string): void {
+    const line = text.replace(/[\r\n]+$/, '');
+    this.rttLogSequence += 1;
+    this.rttLogEntries.push({
+      id: String(this.rttLogSequence),
+      timestamp: String(Date.now()),
+      kind: this.pRtLogEnabled ? 'decoded' : 'text',
+      text: line,
+    });
+    while (this.rttLogEntries.length > MAX_RTT_LOG_LINES) this.rttLogEntries.shift();
   }
 
   private isWarningOrErrorRttLine(text: string): boolean {
@@ -1458,7 +1587,19 @@ export class DapSession extends EventEmitter {
         this.sendResponse(msg, undefined, false, 'Debug session is terminating');
         return;
       }
-      switch (msg.command) {
+      await this.dispatchRequest(msg);
+    } catch (err: any) {
+      this.sendResponse(msg, undefined, false, err.message);
+    }
+  }
+
+  /**
+   * Single dispatch table shared by standard DAP requests and automation
+   * control requests (plan Task 5): automation requests run through the same
+   * cases, so the same handler core drives both paths.
+   */
+  private async dispatchRequest(msg: DebugProtocolMessage) {
+    switch (msg.command) {
         case 'initialize':
           return this.sendResponse(msg, {
             supportsConfigurationDoneRequest: true,
@@ -1549,11 +1690,24 @@ export class DapSession extends EventEmitter {
           return this.handleGetTargetState(msg);
         case 'rtosInfo':
           return this.handleRtosInfo(msg);
+        case AUTOMATION_CONTROL_COMMAND:
+          return this.handleAutomationControl(msg);
+        case AUTOMATION_BREAKPOINTS_COMMAND:
+          return this.handleAutomationBreakpoints(msg);
+        case AUTOMATION_RUNTIME_COMMAND:
+          return this.handleAutomationRuntime(msg);
+        case AUTOMATION_EXPRESSION_COMMAND:
+          return this.handleAutomationExpression(msg);
+        case AUTOMATION_MEMORY_COMMAND:
+          return this.handleAutomationMemory(msg);
+        case AUTOMATION_RTT_COMMAND:
+          return this.handleAutomationRtt(msg);
+        case AUTOMATION_RTT_LOG_COMMAND:
+          return this.handleAutomationRttLog(msg);
+        case AUTOMATION_DIAGNOSTICS_COMMAND:
+          return this.handleAutomationDiagnostics(msg);
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
-      }
-    } catch (err: any) {
-      this.sendResponse(msg, undefined, false, err.message);
     }
   }
 
@@ -1916,7 +2070,7 @@ export class DapSession extends EventEmitter {
     this.flashAbortController?.abort('DAP disconnect requested');
     (this.backend as any).cancelFlash?.('DAP disconnect requested');
     try {
-      this.breakpoints.clear();
+      this.forgetAllBreakpoints();
       await this.backend.execute({ cmd: 'disconnect' });
       await this.backend.dispose(true);
       this.backend.configureNativeSteps(false);
@@ -1929,6 +2083,30 @@ export class DapSession extends EventEmitter {
     } finally {
       this.endControl();
     }
+  }
+
+  /**
+   * Records one verified breakpoint entry. `address` is optional because some
+   * legacy owners report only a slot id; both maps stay in sync so the
+   * automation snapshot can expose resolved addresses.
+   */
+  private rememberBreakpoint(key: string, id: number, address?: number): void {
+    this.breakpoints.set(key, id);
+    if (typeof address === 'number' && Number.isFinite(address)) {
+      this.breakpointAddresses.set(key, address);
+    } else {
+      this.breakpointAddresses.delete(key);
+    }
+  }
+
+  private forgetBreakpoint(key: string): void {
+    this.breakpoints.delete(key);
+    this.breakpointAddresses.delete(key);
+  }
+
+  private forgetAllBreakpoints(): void {
+    this.breakpoints.clear();
+    this.breakpointAddresses.clear();
   }
 
   private async handleSetBreakpoints(msg: DebugProtocolMessage) {
@@ -2000,7 +2178,7 @@ export class DapSession extends EventEmitter {
         const referencedByAnotherSource = Array.from(this.breakpoints.entries())
           .some(([key, mappedIndex]) => !key.startsWith(sourcePrefix) && mappedIndex === bpIndex);
         if (referencedByAnotherSource) {
-          for (const key of sourceKeys) this.breakpoints.delete(key);
+          for (const key of sourceKeys) this.forgetBreakpoint(key);
           continue;
         }
         log.dap(`handleSetBreakpoints: clearing old slot index=${bpIndex} source=${filePath}`);
@@ -2015,7 +2193,7 @@ export class DapSession extends EventEmitter {
           sendFailure(clearResult, lines);
           return;
         }
-        for (const key of sourceKeys) this.breakpoints.delete(key);
+        for (const key of sourceKeys) this.forgetBreakpoint(key);
       }
 
       for (let index = 0; index < lines.length; ++index) {
@@ -2043,7 +2221,7 @@ export class DapSession extends EventEmitter {
           sendFailure(result, lines.slice(index + 1));
           return;
         }
-        const data = result.data as { id?: unknown } | undefined;
+        const data = result.data as { id?: unknown; address?: unknown } | undefined;
         if (!data || !Number.isInteger(data.id) || (data.id as number) < 0) {
           const failure = {
             error: 'setBreakpoint returned no valid hardware slot id',
@@ -2055,7 +2233,7 @@ export class DapSession extends EventEmitter {
         }
         const id = data.id as number;
         const key = `${filePath}:${line}`;
-        this.breakpoints.set(key, id);
+        this.rememberBreakpoint(key, id, typeof data.address === 'number' ? data.address : undefined);
         results.push({ verified: true, line, id });
       }
 
@@ -2080,13 +2258,25 @@ export class DapSession extends EventEmitter {
       + ` threadId=${msg.arguments?.threadId ?? 'unknown'}`,
     );
     try {
+      const readEpoch = this.readCancelEpoch;
       if (!(await this.beginTargetReadWhenAvailable('foreground', 700))) {
         this.sendResponse(msg, { stackFrames: [] });
         return;
       }
+      const controller = new AbortController();
       try {
-        const result = await this.backend.execute({ cmd: 'getCallStack' });
-        if (!result.ok) {
+        if (readEpoch !== this.readCancelEpoch || this.controlInProgress) {
+          // A control operation (continue/step) started while this read was
+          // waiting on the gate: the target may be running now, so the queued
+          // register reads must never reach the native owner.
+          log.dap(`stackTrace cancelled before dispatch readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch}`);
+          this.sendResponse(msg, { stackFrames: [] });
+          return;
+        }
+        this.activeStoppedReadAbortController = controller;
+        const result = await this.backend.execute({ cmd: 'getCallStack', signal: controller.signal });
+        if (!result.ok || controller.signal.aborted || readEpoch !== this.readCancelEpoch) {
+          log.dap(`stackTrace discarded stale result readEpoch=${readEpoch} currentEpoch=${this.readCancelEpoch} aborted=${controller.signal.aborted}`);
           this.sendResponse(msg, { stackFrames: [] });
           return;
         }
@@ -2101,6 +2291,9 @@ export class DapSession extends EventEmitter {
         }));
         this.sendResponse(msg, { stackFrames });
       } finally {
+        if (this.activeStoppedReadAbortController === controller) {
+          this.activeStoppedReadAbortController = null;
+        }
         this.endTargetRead();
       }
     } catch (err: any) {
@@ -2328,7 +2521,7 @@ export class DapSession extends EventEmitter {
     }
   }
 
-  private async handleReadMemory(msg: DebugProtocolMessage) {
+  private async handleReadMemory(msg: DebugProtocolMessage, liveAccess = false) {
     const args = msg.arguments || {};
     const address = this.parseMemoryReference(args.memoryReference, args.offset);
     const count = Math.max(0, Math.min(Number(args.count) || 0, 1024 * 1024));
@@ -2352,7 +2545,9 @@ export class DapSession extends EventEmitter {
       this.activeMemoryReadAbortController = controller;
       let result: OzoneCommandResult;
       try {
-        result = await this.backend.execute({ cmd: 'readMemory', address, size: count, signal: controller.signal });
+        result = await this.backend.execute({
+          cmd: 'readMemory', address, size: count, signal: controller.signal, ...(liveAccess ? { liveAccess: true } : {}),
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const cancelled = controller.signal.aborted || readEpoch !== this.readCancelEpoch;
@@ -2798,7 +2993,7 @@ export class DapSession extends EventEmitter {
         }
         if (this._probe !== 'cmsis-dap') {
           await this.backend.execute({ cmd: 'clearAllBreakpoints' });
-          this.breakpoints.clear();
+          this.forgetAllBreakpoints();
         }
 
         if (this._probe !== 'cmsis-dap') {
@@ -2806,7 +3001,7 @@ export class DapSession extends EventEmitter {
             const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
             if (result.ok) {
               const data = result.data as any;
-              this.breakpoints.set(`${bp.file}:${bp.line}`, data.id);
+              this.rememberBreakpoint(`${bp.file}:${bp.line}`, data.id, typeof data.address === 'number' ? data.address : undefined);
             }
           }
         }
@@ -2822,6 +3017,1530 @@ export class DapSession extends EventEmitter {
         this.endControl();
       }
     });
+  }
+
+  // --- automation control bridge (plan Task 5) -----------------------------
+  // `session.customRequest('orbitAutomationControl', ...)` drives the same
+  // handler cores as the standard DAP requests, so the VS Code UI updates
+  // through the standard continued/stopped events while the caller receives a
+  // structured outcome and the Extension Host a sanitized custom event.
+
+  /**
+   * Read-only `orbitBreakpointsSnapshot` (plan Task 6): exposes the adapter's
+   * verified hardware-breakpoint map so the Extension Host can merge the
+   * VS Code requested set with DAP verified/address/slot state. Reading the
+   * in-memory map needs no target access, so no control/read barrier applies.
+   */
+  private handleAutomationBreakpoints(msg: DebugProtocolMessage) {
+    const breakpoints: AutomationBreakpointSnapshot[] = [];
+    for (const [key, slot] of this.breakpoints) {
+      const separator = key.lastIndexOf(':');
+      if (separator <= 0) continue;
+      const path = key.slice(0, separator);
+      const line = Number(key.slice(separator + 1));
+      if (!Number.isInteger(line) || line <= 0) continue;
+      const address = this.breakpointAddresses.get(key);
+      breakpoints.push({
+        path,
+        line,
+        verified: true,
+        slot,
+        ...(typeof address === 'number' ? { address: `0x${(address >>> 0).toString(16)}` } : {}),
+      });
+    }
+    // These mirror the adapter's `initialize` capabilities (all unsupported in
+    // this build): the Extension Host uses them to annotate condition/hit/log
+    // breakpoints that are accepted but not enforced.
+    this.sendResponse(msg, {
+      breakpoints,
+      capabilities: { conditional: false, hitConditional: false, logPoints: false },
+    });
+  }
+
+  // --- runtime snapshot bridge (plan Task 7) --------------------------------
+  // `session.customRequest('orbitRuntimeSnapshot', ...)` reuses the standard DAP
+  // threads/stackTrace/scopes/variables handlers through the same capture
+  // mechanism as automation control, plus a dedicated registers core. The
+  // adapter reports the target state and any read-gate failure as a structured
+  // errorCode; running targets never fabricate stopped-state data.
+
+  private async handleAutomationRuntime(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationRuntimeRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationRuntimeFailure(msg, parsed.errorCode, parsed.message, this.automationTargetState(), startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationRuntimeFailure(msg, errorCode, `session phase ${this.phase} cannot read runtime state`, this.automationTargetState(), startedAt);
+      return;
+    }
+    switch (request.kind) {
+      case 'threads':
+        await this.handleAutomationThreads(msg, request, startedAt);
+        return;
+      case 'stackTrace':
+        await this.handleAutomationStackTrace(msg, request, startedAt);
+        return;
+      case 'scopes':
+        await this.handleAutomationScopes(msg, request, startedAt);
+        return;
+      case 'variables':
+        await this.handleAutomationVariables(msg, request, startedAt);
+        return;
+      case 'registers':
+        await this.handleAutomationRegisters(msg, request, startedAt);
+        return;
+    }
+  }
+
+  private automationTargetState(): string {
+    return this.targetRunning ? 'Running' : 'Halted';
+  }
+
+  private sendAutomationRuntimeFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    targetState: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationRuntimeResult = {
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  /**
+   * Runs one standard DAP read handler through the capture mechanism and
+   * returns its first recorded response, so automation runtime reads share the
+   * exact handlers (and read gates) of the UI path.
+   */
+  private async runAutomationRead(
+    msg: DebugProtocolMessage,
+    command: string,
+    args: Record<string, unknown>,
+    options: { liveMemoryAccess?: boolean } = {},
+  ): Promise<{ body?: any; success: boolean; message?: string }> {
+    const synthetic: DebugProtocolMessage = {
+      type: 'request',
+      seq: msg.seq,
+      command,
+      arguments: args,
+    };
+    const capture: AutomationCapture = { synthetic, recorded: false, success: false };
+    this.automationCapture = capture;
+    try {
+      if (command === 'readMemory' && options.liveMemoryAccess === true) {
+        await this.handleReadMemory(synthetic, true);
+      } else {
+        await this.dispatchRequest(synthetic);
+      }
+    } catch (error) {
+      if (!capture.recorded) {
+        capture.recorded = true;
+        capture.success = false;
+        capture.message = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      this.automationCapture = null;
+    }
+    return { body: capture.body, success: capture.success, message: capture.message };
+  }
+
+  private async handleAutomationThreads(
+    msg: DebugProtocolMessage,
+    _request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const captured = await this.runAutomationRead(msg, 'threads', {});
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, 'InternalError', captured.message ?? 'threads read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const stopped = !this.targetRunning;
+    const state = this.targetRunning ? 'running' : 'halted';
+    const threads = (captured.body?.threads ?? []).map((thread: any) => ({
+      threadId: thread.id,
+      name: thread.name,
+      state,
+      stopped,
+    }));
+    this.sendResponse(msg, { threads, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationStackTrace(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading the call stack', 'Running', startedAt);
+      return;
+    }
+    const captured = await this.runAutomationRead(msg, 'stackTrace', { threadId: request.threadId });
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, this.readFailureCode(captured), captured.message ?? 'stack trace read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const stackFrames: AutomationStackFrame[] = (captured.body?.stackFrames ?? []).map((frame: any) => {
+      const result: AutomationStackFrame = {
+        frameId: frame.id,
+        name: frame.name,
+        instructionPointerReference: frame.instructionPointerReference ?? '0x0',
+      };
+      if (typeof frame.source?.path === 'string' && frame.source.path.length > 0 && frame.line > 0) {
+        result.source = { path: frame.source.path, line: frame.line };
+      }
+      return result;
+    });
+    this.sendResponse(msg, { stackFrames, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationScopes(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading scopes', 'Running', startedAt);
+      return;
+    }
+    const captured = await this.runAutomationRead(msg, 'scopes', { frameId: request.frameId });
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, 'InternalError', captured.message ?? 'scopes read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const scopes = (captured.body?.scopes ?? []).map((scope: any) => ({
+      name: scope.name,
+      variablesReference: scope.variablesReference ?? 0,
+      expensive: scope.expensive ?? false,
+    }));
+    this.sendResponse(msg, { scopes, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationVariables(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading variables', 'Running', startedAt);
+      return;
+    }
+    const captured = await this.runAutomationRead(msg, 'variables', { variablesReference: request.variablesReference });
+    if (!captured.success) {
+      this.sendAutomationRuntimeFailure(msg, this.readFailureCode(captured), captured.message ?? 'variables read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const variables: AutomationVariable[] = (captured.body?.variables ?? []).map((variable: any) => {
+      const result: AutomationVariable = {
+        name: variable.name,
+        value: variable.value ?? '',
+        variablesReference: variable.variablesReference ?? 0,
+      };
+      if (typeof variable.type === 'string' && variable.type.length > 0) result.type = variable.type;
+      if (typeof variable.evaluateName === 'string' && variable.evaluateName.length > 0) result.evaluateName = variable.evaluateName;
+      if (typeof variable.memoryReference === 'string' && variable.memoryReference.length > 0) result.memoryReference = variable.memoryReference;
+      return result;
+    });
+    this.sendResponse(msg, { variables, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRegisters(
+    msg: DebugProtocolMessage,
+    request: AutomationRuntimeRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (this.targetRunning) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetRunning', 'target is running; halt before reading registers', 'Running', startedAt);
+      return;
+    }
+    const readEpoch = this.readCancelEpoch;
+    if (!(await this.beginTargetReadWhenAvailable('foreground', 1200))) {
+      this.sendAutomationRuntimeFailure(msg, 'TargetReadCancelled', 'could not acquire the stopped-target read gate for registers', this.automationTargetState(), startedAt);
+      return;
+    }
+    const controller = new AbortController();
+    try {
+      if (readEpoch !== this.readCancelEpoch || this.controlInProgress || this.isSessionTerminating()) {
+        this.sendAutomationRuntimeFailure(msg, 'TargetReadCancelled', 'registers read was cancelled before dispatch', this.automationTargetState(), startedAt);
+        return;
+      }
+      this.activeStoppedReadAbortController = controller;
+      const regResult = await this.backend.execute({ cmd: 'getRegisters', signal: controller.signal });
+      const stale = controller.signal.aborted || readEpoch !== this.readCancelEpoch
+        || this.controlInProgress || this.isSessionTerminating();
+      if (stale) {
+        this.sendAutomationRuntimeFailure(msg, 'TargetReadCancelled', 'registers read was cancelled', this.automationTargetState(), startedAt);
+        return;
+      }
+      if (!regResult.ok) {
+        this.sendAutomationRuntimeFailure(msg, regResult.errorCode ?? 'TargetReadUnavailable', regResult.error, regResult.targetState ?? this.automationTargetState(), startedAt);
+        return;
+      }
+      const requestedGroups = new Set<string>(request.groups ?? ['core']);
+      const registers: AutomationRegister[] = [];
+      for (const register of (regResult.data as any[] | undefined) ?? []) {
+        // REG_INDEXES only exposes the 32-bit core integer/control registers,
+        // so every reported register belongs to the core group in this build.
+        const group: AutomationRegister['group'] = 'core';
+        if (!requestedGroups.has(group)) continue;
+        registers.push({
+          name: register.name,
+          // `hex` keeps the exact 8-digit value; `memoryReference` reuses the
+          // existing formatMemoryReference (no leading-zero padding) so it stays
+          // consistent with the standard variables/Registers view.
+          value: typeof register.hex === 'string' ? register.hex : `0x${(Number(register.value) >>> 0).toString(16)}`,
+          group,
+          bits: 32,
+          memoryReference: this.formatMemoryReference(register.value),
+        });
+      }
+      this.sendResponse(msg, { registers, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+    } finally {
+      if (this.activeStoppedReadAbortController === controller) {
+        this.activeStoppedReadAbortController = null;
+      }
+      this.endTargetRead();
+    }
+  }
+
+  private readFailureCode(captured: { message?: string }): string {
+    return extractErrorCodePrefix(captured.message ?? '') ?? 'InternalError';
+  }
+
+  // --- expression & symbol bridge (plan Task 8) ------------------------------
+  // `session.customRequest('orbitExpressionSnapshot', ...)` reuses the standard
+  // DAP evaluate/watch-read/setWatchValue cores and the loaded ELF symbol cache
+  // so automation expressions and symbol discovery share the exact handlers
+  // (and read gates) of the UI path. Reads map `readWatchExpressions` results
+  // onto the frozen ExpressionValue shape; writes go through the same
+  // `withStepLock` + target-write barrier as `setWatchValue`.
+
+  private async handleAutomationExpression(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationExpressionRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationExpressionFailure(msg, parsed.errorCode, parsed.message, this.automationTargetState(), startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationExpressionFailure(msg, errorCode, `session phase ${this.phase} cannot evaluate expressions`, this.automationTargetState(), startedAt);
+      return;
+    }
+    switch (request.kind) {
+      case 'evaluate':
+        await this.handleAutomationEvaluate(msg, request, startedAt);
+        return;
+      case 'readMany':
+        await this.handleAutomationReadMany(msg, request, startedAt);
+        return;
+      case 'writeMany':
+        await this.handleAutomationWriteMany(msg, request, startedAt);
+        return;
+      case 'inspect':
+        await this.handleAutomationInspect(msg, request, startedAt);
+        return;
+      case 'symbolSearch':
+        await this.handleAutomationSymbolSearch(msg, request, startedAt);
+        return;
+      case 'symbolResolve':
+        await this.handleAutomationSymbolResolve(msg, request, startedAt);
+        return;
+    }
+  }
+
+  private sendAutomationExpressionFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    targetState: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationExpressionResult = {
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  /** One expression read through the shared stopped/realtime watch-read core. */
+  private async handleAutomationEvaluate(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const results = await this.readWatchExpressions([request.expression!], false);
+    const value = this.mapWatchValueToAutomationRoot(results[0]);
+    this.sendResponse(msg, { value, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationReadMany(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const results = await this.readWatchExpressions(request.expressions!, request.forceRealtime ?? false);
+    const values = results.map(value => this.mapWatchValueToAutomationValue(value));
+    this.sendResponse(msg, { values, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationWriteMany(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const writes: AutomationExpressionWriteOutcome[] = [];
+    for (const write of request.writes ?? []) {
+      const result = await this.writeWatchValueCore(write.expression, write.value);
+      writes.push(result.ok
+        ? { expression: write.expression, written: true }
+        : {
+            expression: write.expression,
+            written: false,
+            error: { errorCode: result.errorCode ?? 'InternalError', message: result.error },
+          });
+    }
+    this.sendResponse(msg, { writes, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationInspect(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const results = await this.readWatchExpressions([request.expression!], false);
+    const rootWatch = results[0];
+    const value = this.mapWatchValueToAutomationRoot(rootWatch);
+    const inspectItems: AutomationVariable[] = [];
+    if (value.available && (request.depth ?? 2) > 0 && rootWatch.children) {
+      const maxChildren = request.maxChildren ?? 100;
+      for (const child of rootWatch.children.slice(0, maxChildren)) {
+        inspectItems.push(this.automationVariableFromWatch(child));
+      }
+    }
+    this.sendResponse(msg, { value, inspectItems, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationSymbolSearch(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const result = await this.backend.execute({ cmd: 'searchSymbols', query: request.query!, maxResults: 2000 });
+    if (!result.ok) {
+      const errorCode = result.errorCode === 'SymbolsUnavailable' ? 'CapabilityUnavailable' : (result.errorCode ?? 'InternalError');
+      this.sendAutomationExpressionFailure(msg, errorCode, result.error, this.automationTargetState(), startedAt);
+      return;
+    }
+    const symbols: AutomationSymbol[] = ((result.data as any[]) ?? []).map((symbol: any) => ({
+      name: symbol.name,
+      address: symbol.address,
+      size: symbol.size ?? 0,
+      typeChar: symbol.type ?? '?',
+    }));
+    this.sendResponse(msg, { symbols, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationSymbolResolve(
+    msg: DebugProtocolMessage,
+    request: AutomationExpressionRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const result = request.expression !== undefined
+      ? await this.backend.execute({ cmd: 'resolveSymbol', name: request.expression })
+      : await this.backend.execute({ cmd: 'resolveSymbol', address: Number.parseInt(request.address!.replace(/^0x/i, ''), 16) });
+    if (!result.ok) {
+      const errorCode = result.errorCode === 'SymbolsUnavailable'
+        ? 'CapabilityUnavailable'
+        : result.errorCode === 'SymbolNotFound'
+          ? 'InvalidRequest'
+          : (result.errorCode ?? 'InternalError');
+      this.sendAutomationExpressionFailure(msg, errorCode, result.error, this.automationTargetState(), startedAt);
+      return;
+    }
+    const raw = result.data as any;
+    const symbol: AutomationSymbol = {
+      name: raw.name,
+      address: raw.address,
+      size: raw.size ?? 0,
+      typeChar: raw.type ?? '?',
+      exact: raw.exact ?? false,
+    };
+    this.sendResponse(msg, {
+      symbol,
+      exact: raw.exact ?? false,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  // --- byte-oriented memory access (plan Task 9) ----------------------------
+  // `read` reuses the standard DAP readMemory handler (base64 byte contract +
+  // the same read gate/control-cancel behavior as MemoryView). `write` runs
+  // under the step lock + target-write barrier (control work) and optionally
+  // verifies by reading back through the same selected owner.
+
+  private async handleAutomationMemory(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationMemoryRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationMemoryFailure(msg, parsed.errorCode, parsed.message, this.automationTargetState(), startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationMemoryFailure(msg, errorCode, `session phase ${this.phase} cannot access memory`, this.automationTargetState(), startedAt);
+      return;
+    }
+    if (request.kind === 'read') {
+      await this.handleAutomationMemoryRead(msg, request, startedAt);
+      return;
+    }
+    await this.handleAutomationMemoryWrite(msg, request, startedAt);
+  }
+
+  private sendAutomationMemoryFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    targetState: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationMemoryResult = {
+      errorCode,
+      message,
+      targetState,
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  private parseAutomationAddress(address: string): number {
+    return Number.parseInt(address.replace(/^0x/i, ''), 16) >>> 0;
+  }
+
+  private async handleAutomationMemoryRead(
+    msg: DebugProtocolMessage,
+    request: AutomationMemoryRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const address = this.parseAutomationAddress(request.address);
+    // Reuse the DAP read gate, but keep the Automation API operation live so
+    // the target and Timeline continue running throughout the memory access.
+    const captured = await this.runAutomationRead(msg, 'readMemory', {
+      memoryReference: request.address,
+      count: request.count,
+    }, { liveMemoryAccess: true });
+    if (!captured.success) {
+      const code = this.memoryReadFailureCode(captured);
+      this.sendAutomationMemoryFailure(msg, code, captured.message ?? 'memory read failed', this.automationTargetState(), startedAt);
+      return;
+    }
+    const body = (captured.body ?? {}) as { data?: string; unreadableBytes?: number };
+    const dataBase64 = typeof body.data === 'string' ? body.data : '';
+    const bytesRead = dataBase64.length > 0 ? Buffer.from(dataBase64, 'base64').length : 0;
+    this.sendResponse(msg, {
+      address: this.formatMemoryReference(address),
+      requestedBytes: request.count ?? 0,
+      bytesRead,
+      unreadableBytes: typeof body.unreadableBytes === 'number'
+        ? body.unreadableBytes
+        : Math.max(0, (request.count ?? 0) - bytesRead),
+      data: dataBase64,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  private memoryReadFailureCode(captured: { body?: any; message?: string }): string {
+    const code = typeof captured.body?.errorCode === 'string' ? captured.body.errorCode : '';
+    if (code === 'TargetReadCancelled' || code === 'TargetReadUnavailable') return 'TargetReadCancelled';
+    if (code === 'MemoryReadFailed' || code === 'MalformedResponse') return 'MemoryReadFailed';
+    // The readMemory handler replies 'Target is running' when the read gate is
+    // not acquired (control in progress); surface the frozen retryable code.
+    if (!code && /target is running/i.test(captured.message ?? '')) return 'TargetReadCancelled';
+    return code || 'InternalError';
+  }
+
+  private async handleAutomationMemoryWrite(
+    msg: DebugProtocolMessage,
+    request: AutomationMemoryRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const address = this.parseAutomationAddress(request.address);
+    let data: number[];
+    try {
+      data = Array.from(Buffer.from(request.data ?? '', 'base64'));
+    } catch {
+      this.sendAutomationMemoryFailure(msg, 'InvalidRequest', 'invalid base64 memory payload', this.automationTargetState(), startedAt);
+      return;
+    }
+    if (data.length === 0) {
+      this.sendAutomationMemoryFailure(msg, 'InvalidRequest', 'memory write data decodes to zero bytes', this.automationTargetState(), startedAt);
+      return;
+    }
+
+    const outcome = await this.withStepLock(async () => {
+      if (!(await this.beginTargetWrite())) {
+        return { ok: false as const, errorCode: 'TargetBusy', error: 'Target busy' };
+      }
+      try {
+        this.flushDataSampling();
+        const writeResult = await this.backend.execute({ cmd: 'writeMemory', address, data, liveAccess: true });
+        if (!writeResult.ok) {
+          return { ok: false as const, errorCode: writeResult.errorCode ?? 'MemoryWriteFailed', error: writeResult.error };
+        }
+        if (request.verify === false) {
+          return { ok: true as const, bytesWritten: data.length, verified: false };
+        }
+        const readResult = await this.backend.execute({ cmd: 'readMemory', address, size: data.length, liveAccess: true });
+        if (!readResult.ok) {
+          return {
+            ok: false as const,
+            errorCode: 'MemoryWriteFailed',
+            error: `verify read failed: ${readResult.errorCode ?? 'MemoryReadFailed'}: ${readResult.error}`,
+          };
+        }
+        const block = readResult.data as MemoryBlock;
+        const readBack = Array.from(block.data ?? []);
+        const verified = readBack.length === data.length && readBack.every((byte, index) => byte === data[index]);
+        return {
+          ok: true as const,
+          bytesWritten: data.length,
+          verified,
+          verifyData: Buffer.from(readBack).toString('base64'),
+        };
+      } finally {
+        this.endTargetWrite();
+      }
+    });
+
+    if (!outcome.ok) {
+      this.sendAutomationMemoryFailure(msg, outcome.errorCode, outcome.error, this.automationTargetState(), startedAt);
+      return;
+    }
+    this.sendResponse(msg, {
+      address: this.formatMemoryReference(address),
+      bytesWritten: outcome.bytesWritten,
+      verified: outcome.verified,
+      ...(outcome.verifyData !== undefined ? { data: outcome.verifyData } : {}),
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  // --- RTT snapshot bridge (plan Task 11) ------------------------------------
+  // `session.customRequest('orbitRttSnapshot', ...)` drives status/start/stop/
+  // read through the selected session owner. RTT remains a distinct logical
+  // consumer from the UI RTT Log and Timeline; reads run at background priority
+  // and are paused for a control request's critical section by the scheduler.
+
+  private async handleAutomationRtt(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationRttRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationRttFailure(msg, parsed.errorCode, parsed.message, startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationRttFailure(msg, errorCode, `session phase ${this.phase} cannot drive RTT`, startedAt);
+      return;
+    }
+    switch (request.kind) {
+      case 'status':
+        await this.handleAutomationRttStatus(msg, request, startedAt);
+        return;
+      case 'start':
+        await this.handleAutomationRttStart(msg, request, startedAt);
+        return;
+      case 'stop':
+        await this.handleAutomationRttStop(msg, request, startedAt);
+        return;
+      case 'read':
+        await this.handleAutomationRttRead(msg, request, startedAt);
+        return;
+    }
+  }
+
+  private sendAutomationRttFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationRttResult = {
+      errorCode,
+      message,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  private async automationRttOwnerKind(): Promise<AutomationRttSnapshot['owner']> {
+    return this.currentOwnerKind();
+  }
+
+  private automationRttState(): AutomationRttSnapshot['state'] {
+    if (!this.rttAvailable) return 'unavailable';
+    return this.automationRttStarted ? 'running' : 'stopped';
+  }
+
+  /** Resolves `_SEGGER_RTT` on demand when the launch did not (RTT Log disabled). */
+  private async ensureRttControlBlockAddress(): Promise<boolean> {
+    if (this.rttControlBlockAddress !== undefined) return true;
+    const symbolResult = await this.backend.execute({ cmd: 'resolveSymbol', name: '_SEGGER_RTT' });
+    const address = symbolResult.ok && Number.isInteger((symbolResult.data as any)?.address)
+      ? Number((symbolResult.data as any).address)
+      : undefined;
+    if (address === undefined || address <= 0 || address > 0xFFFFFFFF) return false;
+    this.rttControlBlockAddress = address;
+    this.rttControlBlockSource = 'elf-symbol';
+    log.dap(`[rtt] control block address=0x${address.toString(16)} source=elf-symbol (automation)`);
+    return true;
+  }
+
+  private async buildAutomationRttSnapshot(
+    bufferIndex: number,
+  ): Promise<AutomationRttSnapshot> {
+    return {
+      state: this.automationRttState(),
+      owner: await this.automationRttOwnerKind(),
+      bufferIndex,
+      pollIntervalMs: this.automationRttPollIntervalMs,
+      ...(this.automationRttTargetName !== undefined ? { targetName: this.automationRttTargetName } : {}),
+      ansi: this.automationRttAnsi,
+      bytesAvailable: 0,
+      droppedBytes: 0,
+    };
+  }
+
+  private async handleAutomationRttStatus(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const snapshot = await this.buildAutomationRttSnapshot(request.bufferIndex ?? this.automationRttBufferIndex);
+    this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRttStart(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (!this.rttAvailable) {
+      this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT is unavailable (no control block resolved)', startedAt);
+      return;
+    }
+    // The launch only resolves `_SEGGER_RTT` when the RTT Log is enabled; an
+    // automation start must resolve it on demand so `startRtt` never receives
+    // an undefined control-block address.
+    if (this.rttControlBlockAddress === undefined && !(await this.ensureRttControlBlockAddress())) {
+      this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT control block could not be resolved', startedAt);
+      return;
+    }
+    const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
+    this.automationRttBufferIndex = bufferIndex;
+    this.automationRttPollIntervalMs = request.pollIntervalMs ?? this.automationRttPollIntervalMs;
+    this.automationRttAnsi = request.ansi ?? this.automationRttAnsi;
+    if (request.targetName !== undefined) this.automationRttTargetName = request.targetName;
+    const result = await this.backend.execute({ cmd: 'startRtt', controlBlockAddress: this.rttControlBlockAddress });
+    if (!result.ok) {
+      this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
+      return;
+    }
+    this.automationRttStarted = true;
+    const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
+    this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRttStop(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
+    const result = await this.backend.execute({ cmd: 'stopRtt' });
+    this.automationRttStarted = false;
+    if (!result.ok) {
+      this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
+      return;
+    }
+    const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
+    this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
+  }
+
+  private async handleAutomationRttRead(
+    msg: DebugProtocolMessage,
+    request: AutomationRttRequest,
+    startedAt: number,
+  ): Promise<void> {
+    if (!this.rttAvailable) {
+      this.sendAutomationRttFailure(msg, 'CapabilityUnavailable', 'RTT is unavailable (no control block resolved)', startedAt);
+      return;
+    }
+    const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
+    const size = Math.max(1, Math.min(request.maxBytes ?? this.rttReadSize, 1048576));
+    const result = await this.backend.execute({
+      cmd: 'readRtt',
+      bufferIndex,
+      size,
+      signal: undefined,
+    });
+    if (!result.ok) {
+      this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
+      return;
+    }
+    const bytes = (result.data as any)?.bytes;
+    const buffer = Array.isArray(bytes)
+      ? Buffer.from(bytes)
+      : bytes instanceof Uint8Array
+        ? Buffer.from(bytes)
+        : Buffer.alloc(0);
+    const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
+    this.sendResponse(msg, {
+      snapshot,
+      data: buffer.toString('base64'),
+      bytesRead: buffer.length,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  // --- RTT log snapshot bridge (plan Task 11 extension) ----------------------
+  // `session.customRequest('orbitRttLogSnapshot', ...)` returns the decoded
+  // terminal log lines the RTT Log path already produces. It carries only the
+  // line text and its producing decoder kind; the Extension Host strips ANSI.
+
+  private handleAutomationRttLog(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationRttLogRequest(msg.arguments);
+    if (!parsed.ok) {
+      this.sendAutomationRttLogFailure(msg, parsed.errorCode, parsed.message, startedAt);
+      return;
+    }
+    const request = parsed.request;
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      this.sendAutomationRttLogFailure(msg, errorCode, `session phase ${this.phase} cannot read the RTT log`, startedAt);
+      return;
+    }
+    const entries = this.rttLogEntries;
+    let window: AutomationRttLogEntry[];
+    if (request.cursor !== undefined) {
+      const cursorNum = Number(request.cursor);
+      const after = entries.filter(entry => Number(entry.id) > cursorNum);
+      if (after.length === 0 && entries.length > 0) {
+        // No new lines: an evicted cursor predating the ring resets to the tail.
+        const oldest = Number(entries[0].id);
+        window = cursorNum < oldest ? entries.slice(-request.count) : [];
+      } else {
+        window = after.slice(0, request.count);
+      }
+    } else {
+      window = entries.slice(-request.count);
+    }
+    const result: AutomationRttLogResult = {
+      entries: window,
+      retained: entries.length,
+      nextCursor: window.length > 0 ? window[window.length - 1].id : null,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result);
+  }
+
+  private sendAutomationRttLogFailure(
+    msg: DebugProtocolMessage,
+    errorCode: string,
+    message: string,
+    startedAt: number,
+  ): void {
+    const result: AutomationRttLogResult = {
+      entries: [],
+      retained: 0,
+      errorCode,
+      message,
+      targetState: this.automationTargetState(),
+      elapsedMs: Date.now() - startedAt,
+    };
+    this.sendResponse(msg, result, false, `${errorCode}: ${message}`);
+  }
+
+  // --- diagnostics snapshot bridge (plan Task 11) ----------------------------
+  // `session.customRequest('orbitDiagnosticsSnapshot', ...)` returns only
+  // counts, states, elapsed times and error codes. No token, Authorization,
+  // raw memory data or user variable values are ever included.
+
+  private async handleAutomationDiagnostics(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationDiagnosticsRequest(msg.arguments);
+    if (!parsed.ok) {
+      const result: AutomationDiagnosticsResult = {
+        phase: this.phase,
+        targetState: this.automationTargetState(),
+        ownerKind: 'unknown',
+        connected: false,
+        pendingRequests: 0,
+        scheduler: normalizeSchedulerSnapshot(undefined),
+        errorCode: parsed.errorCode,
+        message: parsed.message,
+        elapsedMs: Date.now() - startedAt,
+      };
+      this.sendResponse(msg, result, false, `${parsed.errorCode}: ${parsed.message}`);
+      return;
+    }
+    let scheduler = normalizeSchedulerSnapshot(undefined);
+    let ownerKind = 'unknown';
+    let transport: string | undefined;
+    let connected = false;
+    try {
+      const perf = await this.backend.execute({ cmd: 'getPerformanceDiagnostics' });
+      if (perf.ok && perf.data && typeof perf.data === 'object') {
+        const owner = String((perf.data as { owner?: unknown }).owner ?? '');
+        if (owner.includes('cmsis-dap')) ownerKind = 'cmsis-dap';
+        else if (owner.includes('jlink-native')) ownerKind = 'jlink-native';
+        else if (owner.includes('legacy')) ownerKind = 'jlink-legacy';
+      }
+    } catch {
+      // Best-effort owner reporting; the probe remains the fallback authority.
+    }
+    try {
+      const sched = await this.backend.execute({ cmd: 'getSchedulerSnapshot' });
+      if (sched.ok) scheduler = normalizeSchedulerSnapshot(sched.data);
+    } catch {
+      // Scheduler snapshot is best-effort; zero counts remain the fallback.
+    }
+    if (ownerKind === 'unknown') {
+      ownerKind = this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-legacy';
+    }
+    if (ownerKind === 'cmsis-dap') transport = 'winusb';
+    else if (ownerKind === 'jlink-native') transport = 'native';
+    else if (ownerKind === 'jlink-legacy') transport = 'legacy';
+    connected = this.phase === 'connected';
+    this.sendResponse(msg, {
+      sessionGeneration: parsed.request.sessionGeneration,
+      phase: this.phase,
+      targetState: this.automationTargetState(),
+      ownerKind,
+      ...(transport !== undefined ? { transport } : {}),
+      connected,
+      pendingRequests: 0,
+      scheduler,
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  /** Maps a shared watch-read value onto the frozen ExpressionValue shape. */
+  private mapWatchValueToAutomationValue(watch: WatchValue): AutomationExpressionValue {
+    if (watch.error && watch.error !== 'running') {
+      return {
+        expression: watch.expression,
+        value: watch.display || watch.hex || String(watch.value),
+        variablesReference: 0,
+        available: false,
+        stale: false,
+        error: { errorCode: watch.errorCode ?? 'InternalError', message: watch.error },
+      };
+    }
+    if (watch.error === 'running') {
+      return {
+        expression: watch.expression,
+        value: '',
+        variablesReference: 0,
+        available: false,
+        stale: true,
+        error: { errorCode: 'TargetRunning', message: 'target is running' },
+      };
+    }
+    return {
+      expression: watch.expression,
+      value: watch.display || watch.hex || String(watch.value),
+      type: watch.typeName,
+      variablesReference: 0,
+      memoryReference: this.memoryReferenceForWatch(watch),
+      available: true,
+      stale: false,
+    };
+  }
+
+  /** As above, but allocates a DAP variablesReference for expandable values. */
+  private mapWatchValueToAutomationRoot(watch: WatchValue): AutomationExpressionValue {
+    const mapped = this.mapWatchValueToAutomationValue(watch);
+    if (mapped.available) mapped.variablesReference = this.allocateVariableHandle(watch);
+    return mapped;
+  }
+
+  /** Maps an already-expanded child onto the frozen Variable shape. */
+  private automationVariableFromWatch(watch: WatchValue): AutomationVariable {
+    const dap = this.toDapVariable(watch);
+    const result: AutomationVariable = {
+      name: dap.name,
+      value: dap.value,
+      variablesReference: dap.variablesReference,
+    };
+    if (dap.type !== undefined) result.type = dap.type;
+    if (dap.evaluateName !== undefined) result.evaluateName = dap.evaluateName;
+    if (dap.memoryReference !== undefined) result.memoryReference = dap.memoryReference;
+    return result;
+  }
+
+  private async handleAutomationControl(msg: DebugProtocolMessage) {
+    const startedAt = Date.now();
+    const parsed = parseAutomationControlRequest(msg.arguments);
+    if (!parsed.ok) {
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: parsed.errorCode,
+        message: parsed.message,
+      };
+      this.sendResponse(msg, result, false, `${parsed.errorCode}: ${parsed.message}`);
+      this.sendAutomationEvent({
+        action: typeof msg.arguments?.action === 'string' ? msg.arguments.action : 'unknown',
+        ok: false,
+        state: 'unknown',
+        errorCode: parsed.errorCode,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return;
+    }
+    const request = parsed.request;
+    const eventBase = {
+      action: request.action,
+      sessionGeneration: request.sessionGeneration,
+      elapsedMs: Date.now() - startedAt,
+    };
+    if (this.automationCapture) {
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: 'TargetBusy',
+        message: 'another automation control is in progress',
+      };
+      this.sendResponse(msg, result, false, 'TargetBusy: another automation control is in progress');
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode: 'TargetBusy' });
+      return;
+    }
+    if (this.phase !== 'connected') {
+      const errorCode = this.isSessionTerminating() ? 'SessionTerminating' : 'SessionStarting';
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode,
+        message: `session phase ${this.phase} cannot run automation control`,
+      };
+      this.sendResponse(msg, result, false, `${errorCode}: session phase ${this.phase} cannot run automation control`);
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode });
+      return;
+    }
+
+    const standard = standardCommandForAction(request);
+    if (standard === null) {
+      // reset / flash have dedicated automation cores; instruction-granularity
+      // stepOut has no selected-owner capability (no standard mapping either).
+      if (request.action === 'reset') {
+        await this.handleAutomationReset(msg, request, startedAt);
+        return;
+      }
+      if (request.action === 'flash') {
+        await this.handleAutomationFlash(msg, request, startedAt);
+        return;
+      }
+      const result: AutomationControlResult = {
+        state: 'unknown',
+        errorCode: 'CapabilityUnavailable',
+        message: `${request.action} is not available on the selected owner`,
+      };
+      this.sendResponse(msg, result, false, `CapabilityUnavailable: ${request.action} is not available on the selected owner`);
+      this.sendAutomationEvent({ ...eventBase, ok: false, state: 'unknown', errorCode: 'CapabilityUnavailable' });
+      return;
+    }
+
+    // The synthetic standard request exercises exactly the same dispatch
+    // cases as a UI request; `sendResponse` records the handler's first
+    // response instead of emitting it.
+    const synthetic: DebugProtocolMessage = {
+      type: 'request',
+      seq: msg.seq,
+      command: standard.command,
+      arguments: standard.arguments,
+    };
+    const capture: AutomationCapture = { synthetic, recorded: false, success: false };
+    this.automationCapture = capture;
+    try {
+      await this.dispatchRequest(synthetic);
+    } catch (error) {
+      if (!capture.recorded) {
+        capture.recorded = true;
+        capture.success = false;
+        capture.message = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      this.automationCapture = null;
+    }
+    await this.completeAutomation(msg, request, capture, startedAt);
+  }
+
+  private async handleAutomationReset(
+    msg: DebugProtocolMessage,
+    request: AutomationControlRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const mode = request.mode ?? 'halt';
+    const capture: AutomationCapture = { synthetic: msg, recorded: false, success: false };
+    await this.withStepLock(async () => {
+      this.beginControl();
+      this.stopPolling();
+      this.setTargetRunning(false);
+      try {
+        const resetResult = await this.backend.execute({ cmd: 'reset' });
+        if (!resetResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(resetResult), resetResult.error);
+          return;
+        }
+        if (mode === 'run') {
+          const runResult = await this.backend.execute({ cmd: 'run' });
+          if (!runResult.ok) {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(runResult), runResult.error);
+            return;
+          }
+          if (this._probe === 'cmsis-dap') {
+            const stateResult = await this.queryTargetState('automation-reset-run-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Running) {
+              this.recordAutomationFailure(capture, this.stateConfirmFailureBody('reset-run', stateResult), stateResult.ok
+                ? `TargetStateInvalid: reset-run returned ${stateResult.data}`
+                : stateResult.error);
+              return;
+            }
+          }
+          this.setTargetRunning(true);
+          this.advanceReadCancelEpoch();
+          this.lastHaltReason = 'entry';
+          this.recordAutomationSuccess(capture);
+          this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+          this.startPolling();
+          return;
+        }
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (!haltResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(haltResult), haltResult.error);
+          return;
+        }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('automation-reset-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.recordAutomationFailure(capture, this.stateConfirmFailureBody('reset-halt', stateResult), stateResult.ok
+              ? `TargetStateInvalid: reset-halt returned ${stateResult.data}`
+              : stateResult.error);
+            return;
+          }
+        }
+        this.markStoppedForUi();
+        this.lastHaltReason = 'entry';
+        this.recordAutomationSuccess(capture);
+        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+      } finally {
+        this.endControl();
+      }
+    });
+    await this.completeAutomation(msg, request, capture, startedAt);
+  }
+
+  private async handleAutomationFlash(
+    msg: DebugProtocolMessage,
+    request: AutomationControlRequest,
+    startedAt: number,
+  ): Promise<void> {
+    const elfPath = request.elfPath!;
+    const resetAfter = request.resetAfter ?? 'halt';
+    const capture: AutomationCapture = { synthetic: msg, recorded: false, success: false };
+    let flashReport: AutomationFlashReport | undefined;
+    await this.withStepLock(async () => {
+      this.beginControl();
+      // Mirror handleRestart: a re-flash invalidates the RTT control-block
+      // state, so background RTT polling is paused for the whole critical
+      // section and restored afterwards.
+      this.stopRttLogPolling();
+      this.stopPolling();
+      this.setTargetRunning(false);
+      try {
+        if (this._probe === 'cmsis-dap') {
+          const haltResult = await this.backend.execute({ cmd: 'halt' });
+          if (!haltResult.ok) {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(haltResult), haltResult.error);
+            return;
+          }
+          const stateResult = await this.queryTargetState('automation-flash-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.recordAutomationFailure(capture, this.stateConfirmFailureBody('flash-pre-halt', stateResult), stateResult.ok
+              ? `TargetStateInvalid: flash pre-halt returned ${stateResult.data}`
+              : stateResult.error);
+            return;
+          }
+        }
+        this.sendEvent('output', { category: 'console', output: `Automation flash: ${elfPath}...\n` });
+        // The flash executes only through the session's selected owner; the
+        // explicit action always programs (never the launch skip path). The
+        // per-request timeout aborts the owner operation, and `verify: false`
+        // is honored by owners that can skip verification (CMSIS-DAP); owners
+        // that always verify (J-Link) still do, and the report reflects that.
+        const flashTimeoutMs = request.timeoutMs ?? 180000;
+        const flashController = new AbortController();
+        const flashTimer = setTimeout(
+          () => flashController.abort(`automation flash timed out after ${flashTimeoutMs}ms`),
+          flashTimeoutMs,
+        );
+        let flashResult: OzoneCommandResult = { ok: false, error: 'automation flash produced no result' };
+        try {
+          flashResult = await this.backend.execute({
+            cmd: 'flash',
+            elfPath,
+            device: this._device,
+            interface: this._interface as 'SWD' | 'JTAG',
+            speedKHz: this._speedKHz,
+            probe: this._probe,
+            flashBeforeDebug: true,
+            verify: request.verify ?? true,
+            signal: flashController.signal,
+            ...(this._cmsisDapFlashAlgorithmPath
+              ? { cmsisDapFlashAlgorithmPath: this._cmsisDapFlashAlgorithmPath }
+              : {}),
+          });
+        } finally {
+          clearTimeout(flashTimer);
+        }
+        if (!flashResult.ok) {
+          this.sendEvent('output', { category: 'stderr', output: `Automation flash failed: ${flashResult.error}\n` });
+          if (this._probe === 'cmsis-dap') {
+            // Reconcile the post-failure target state exactly like
+            // handleRestart: a halt re-syncs the UI and a running target
+            // resumes polling instead of leaving the session stuck "halted".
+            const stateResult = await this.queryTargetState('automation-flash-failure-recovery');
+            const failure: OzoneCommandResult = stateResult.ok
+              ? {
+                  ...flashResult,
+                  targetState: stateResult.data === TargetState.Halted
+                    ? 'halted'
+                    : stateResult.data === TargetState.Running
+                      ? 'running'
+                      : String(stateResult.data),
+                }
+              : flashResult;
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(failure), failure.error);
+            if (stateResult.ok && stateResult.data === TargetState.Halted) {
+              this.markStoppedForUi();
+              this.lastHaltReason = 'pause';
+              if (this.rttLogEnabled) this.startRttLogPolling();
+              this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
+            } else if (stateResult.ok && stateResult.data === TargetState.Running) {
+              this.setTargetRunning(true);
+              this.startPolling();
+            }
+          } else {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(flashResult), flashResult.error);
+          }
+          return;
+        }
+        this.sendEvent('output', { category: 'console', output: 'Automation flash: flash successful\n' });
+        flashReport = await this.buildFlashReport(elfPath, flashResult.data, request, startedAt);
+
+        if (resetAfter === 'none') {
+          const stateResult = await this.queryTargetState('automation-flash-state');
+          if (stateResult.ok && stateResult.data === TargetState.Halted) {
+            this.markStoppedForUi();
+            this.lastHaltReason = 'entry';
+            if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
+            this.recordAutomationSuccess(capture);
+            this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+          } else if (stateResult.ok && stateResult.data === TargetState.Running) {
+            this.setTargetRunning(true);
+            this.advanceReadCancelEpoch();
+            if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
+            this.recordAutomationSuccess(capture);
+            this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+            this.startPolling();
+          } else {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(stateResult), stateResult.ok
+              ? `TargetStateInvalid: flash state ${stateResult.data}`
+              : stateResult.error);
+          }
+          return;
+        }
+
+        const resetResult = await this.backend.execute({ cmd: 'reset' });
+        if (!resetResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(resetResult), resetResult.error);
+          return;
+        }
+        if (resetAfter === 'run') {
+          const runResult = await this.backend.execute({ cmd: 'run' });
+          if (!runResult.ok) {
+            this.recordAutomationFailure(capture, this.failureBodyFromResult(runResult), runResult.error);
+            return;
+          }
+          if (this._probe === 'cmsis-dap') {
+            const stateResult = await this.queryTargetState('automation-flash-run-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Running) {
+              this.recordAutomationFailure(capture, this.stateConfirmFailureBody('flash-run', stateResult), stateResult.ok
+                ? `TargetStateInvalid: flash-run returned ${stateResult.data}`
+                : stateResult.error);
+              return;
+            }
+          }
+          this.setTargetRunning(true);
+          this.advanceReadCancelEpoch();
+          if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
+          this.recordAutomationSuccess(capture);
+          this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+          this.startPolling();
+          return;
+        }
+        const haltResult = await this.backend.execute({ cmd: 'halt' });
+        if (!haltResult.ok) {
+          this.recordAutomationFailure(capture, this.failureBodyFromResult(haltResult), haltResult.error);
+          return;
+        }
+        if (this._probe === 'cmsis-dap') {
+          const stateResult = await this.queryTargetState('automation-flash-halt-confirm');
+          if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+            this.recordAutomationFailure(capture, this.stateConfirmFailureBody('flash-halt', stateResult), stateResult.ok
+              ? `TargetStateInvalid: flash-halt returned ${stateResult.data}`
+              : stateResult.error);
+            return;
+          }
+        }
+        await new Promise<void>(r => setTimeout(r, 200));
+        this.markStoppedForUi();
+        this.lastHaltReason = 'entry';
+        if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
+        this.recordAutomationSuccess(capture);
+        this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
+      } finally {
+        this.endControl();
+      }
+    });
+    await this.completeAutomation(msg, request, capture, startedAt, flashReport ? { flash: flashReport } : undefined);
+  }
+
+  private recordAutomationSuccess(capture: AutomationCapture, body?: any) {
+    if (capture.recorded) return;
+    capture.recorded = true;
+    capture.success = true;
+    capture.body = body;
+  }
+
+  private recordAutomationFailure(capture: AutomationCapture, body: any, message?: string) {
+    if (capture.recorded) return;
+    capture.recorded = true;
+    capture.success = false;
+    capture.body = body;
+    capture.message = message;
+  }
+
+  private failureBodyFromResult(result: OzoneCommandResult): Record<string, unknown> {
+    if (!('error' in result) || !result.error) {
+      return { message: 'target control failed' };
+    }
+    const body: Record<string, unknown> = { message: result.error };
+    if (result.errorCode) body.errorCode = result.errorCode;
+    if (result.targetState) body.targetState = result.targetState;
+    if (result.diagnostics) body.diagnostics = result.diagnostics;
+    return body;
+  }
+
+  private stateConfirmFailureBody(operation: string, result: OzoneCommandResult): Record<string, unknown> {
+    return {
+      errorCode: 'TargetStateInvalid',
+      message: `TargetStateInvalid: ${operation} returned ${result.ok ? result.data : result.error}`,
+    };
+  }
+
+  /**
+   * Maps a DAP handler failure onto a frozen automation error code. A
+   * structured `body.errorCode` always wins; otherwise known DAP messages
+   * (e.g. the step-lock "Target busy") map to their frozen code before
+   * falling back to a leading `Code:` prefix or InternalError.
+   */
+  private normalizeAutomationErrorCode(body: Record<string, unknown>, message: string): string {
+    if (typeof body.errorCode === 'string' && body.errorCode.length > 0) return body.errorCode;
+    if (/target busy/i.test(message)) return 'TargetBusy';
+    return extractErrorCodePrefix(message) ?? 'InternalError';
+  }
+
+  private async completeAutomation(
+    msg: DebugProtocolMessage,
+    request: AutomationControlRequest,
+    capture: AutomationCapture,
+    startedAt: number,
+    extra?: { flash?: AutomationFlashReport },
+  ): Promise<void> {
+    const elapsedMs = Date.now() - startedAt;
+    const eventBase = {
+      action: request.action,
+      sessionGeneration: request.sessionGeneration,
+      elapsedMs,
+    };
+    if (!capture.recorded) {
+      capture.recorded = true;
+      capture.success = false;
+      capture.message = 'control handler produced no response';
+    }
+    if (capture.success) {
+      // The handler completed; the target state the core settled in drives
+      // the outcome (halted stop reasons come from the same lastHaltReason
+      // the UI events used).
+      const state: AutomationControlResult['state'] = this.targetRunning ? 'running' : 'halted';
+      const stopReason = state === 'halted' ? this.lastHaltReason : undefined;
+      const pc = state === 'halted' ? await this.readCurrentPc() : undefined;
+      const result: AutomationControlResult = {
+        state,
+        ...(stopReason ? { stopReason } : {}),
+        ...(pc ? { pc } : {}),
+        diagnostics: { action: request.action, elapsedMs, sessionGeneration: request.sessionGeneration },
+        ...(extra?.flash ? { flash: extra.flash } : {}),
+      };
+      this.sendResponse(msg, result);
+      this.sendAutomationEvent({
+        ...eventBase,
+        ok: true,
+        state,
+        ...(stopReason ? { stopReason } : {}),
+        ...(pc ? { pc } : {}),
+        ...(extra?.flash ? {
+          flash: {
+            elfPath: extra.flash.elfPath,
+            owner: extra.flash.owner,
+            bytesProgrammed: extra.flash.bytesProgrammed,
+            verified: extra.flash.verified,
+            segments: extra.flash.segments,
+          },
+        } : {}),
+      });
+      return;
+    }
+
+    const body = capture.body && typeof capture.body === 'object' ? capture.body : {};
+    const fallbackMessage = capture.message ?? 'automation control failed';
+    const errorCode = this.normalizeAutomationErrorCode(body, fallbackMessage);
+    const failureMessage = typeof body.message === 'string' && body.message.length > 0
+      ? body.message
+      : fallbackMessage;
+    const result: AutomationControlResult = {
+      state: 'unknown',
+      errorCode,
+      message: failureMessage,
+      ...(typeof body.targetState === 'string' ? { targetState: body.targetState } : {}),
+      diagnostics: {
+        action: request.action,
+        elapsedMs,
+        sessionGeneration: request.sessionGeneration,
+        ...(body.diagnostics && typeof body.diagnostics === 'object' ? body.diagnostics : {}),
+      },
+    };
+    const responseMessage = failureMessage.startsWith(`${errorCode}:`) || failureMessage === errorCode
+      ? failureMessage
+      : `${errorCode}: ${failureMessage}`;
+    this.sendResponse(msg, result, false, responseMessage);
+    this.sendAutomationEvent({
+      ...eventBase,
+      ok: false,
+      state: 'unknown',
+      errorCode,
+    });
+  }
+
+  private sendAutomationEvent(payload: Record<string, unknown>) {
+    // Sanitized event for the Extension Host: states, counts, error codes and
+    // elapsed times only — no diagnostics details, memory or variable values.
+    this.sendEvent(AUTOMATION_CONTROL_EVENT, payload);
+  }
+
+  private async readCurrentPc(): Promise<string | undefined> {
+    try {
+      const result = await this.backend.execute({ cmd: 'readRegister', name: 'PC' });
+      if (result.ok && result.data && typeof result.data === 'object') {
+        const value = (result.data as { value?: unknown }).value;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          return `0x${(value >>> 0).toString(16)}`;
+        }
+      }
+    } catch (error) {
+      log.dap(`automation readCurrentPc failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return undefined;
+  }
+
+  private async currentOwnerKind(): Promise<AutomationFlashReport['owner']> {
+    try {
+      const result = await this.backend.execute({ cmd: 'getPerformanceDiagnostics' });
+      if (result.ok && result.data && typeof result.data === 'object') {
+        const owner = String((result.data as { owner?: unknown }).owner ?? '');
+        if (owner.includes('cmsis-dap')) return 'cmsis-dap';
+        if (owner.includes('jlink-native')) return 'jlink-native';
+        if (owner.includes('legacy')) return 'jlink-legacy';
+      }
+    } catch (_) {
+      // Owner reporting is best-effort; the probe is the fallback authority.
+    }
+    return this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-legacy';
+  }
+
+  private async buildFlashReport(
+    elfPath: string,
+    flashData: unknown,
+    request: AutomationControlRequest,
+    startedAt: number,
+  ): Promise<AutomationFlashReport> {
+    const diagnostics: Record<string, unknown> = { verifyRequested: request.verify ?? true };
+    const segments: AutomationFlashReport['segments'] = [];
+    let bytesProgrammed = 0;
+    try {
+      const bytes = await fs.promises.readFile(elfPath);
+      const parsed = parseElf32LoadSegments(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+      for (const segment of parsed) {
+        if (segment.fileSize <= 0) continue;
+        segments.push({
+          startAddress: `0x${(segment.loadAddress >>> 0).toString(16)}`,
+          endAddress: `0x${((segment.loadAddress + segment.fileSize) >>> 0).toString(16)}`,
+          bytes: segment.fileSize,
+        });
+        bytesProgrammed += segment.fileSize;
+      }
+    } catch (error) {
+      diagnostics.elfSegmentParseError = error instanceof Error ? error.message : String(error);
+    }
+    let verified = false;
+    if (flashData && typeof flashData === 'object') {
+      const data = flashData as { reports?: Array<{ operation?: string; ok?: boolean }>; message?: string };
+      if (Array.isArray(data.reports)) {
+        verified = data.reports.some(report => report.operation === 'verify' && report.ok === true);
+      } else if (typeof data.message === 'string' && /verified|verif/i.test(data.message)) {
+        verified = true;
+      }
+    }
+    const owner = await this.currentOwnerKind();
+    return {
+      elfPath,
+      owner,
+      bytesProgrammed,
+      verified,
+      segments,
+      elapsedMs: Date.now() - startedAt,
+      diagnostics,
+    };
   }
 
   private async handleEvaluate(msg: DebugProtocolMessage) {
@@ -3211,10 +4930,25 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, { ok: false, error: 'Invalid watch value request' });
       return;
     }
-    await this.withStepLock(async () => {
+    const result = await this.writeWatchValueCore(expression, value, address, typeName);
+    this.sendResponse(msg, result);
+  }
+
+  /**
+   * Shared write core used by the standard DAP `setWatchValue` request and the
+   * automation `writeMany` handler. The whole write runs under the step lock
+   * and the target-write barrier so automation writes are control work, never
+   * a bypass of the read/control handoff.
+   */
+  private async writeWatchValueCore(
+    expression: string,
+    value: number,
+    address?: number,
+    typeName?: string,
+  ): Promise<OzoneCommandResult> {
+    return this.withStepLock(async () => {
       if (!(await this.beginTargetWrite())) {
-        this.sendResponse(msg, { ok: false, error: 'Target busy' });
-        return;
+        return { ok: false, error: 'Target busy', errorCode: 'TargetBusy' };
       }
       try {
         // Preserve timestamp order: publish samples captured before the write before acknowledging it.
@@ -3224,7 +4958,7 @@ export class DapSession extends EventEmitter {
           this.runtimeWatchCache.delete(expression);
           this.runtimeWatchCacheTime.delete(expression);
         }
-        this.sendResponse(msg, result);
+        return result;
       } finally {
         this.endTargetWrite();
       }

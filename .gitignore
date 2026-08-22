@@ -12,3 +12,6 @@ artifacts/
 .DS_Store
 Thumbs.db
 *.log
+__pycache__/
+*.py[cod]
+.zcode/

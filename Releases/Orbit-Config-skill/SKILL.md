@@ -146,8 +146,9 @@ FreeRTOS 兼容性验收补充：
 Orbit 的 MCP client/server 关系必须保持清楚：
 
 - MCP server 文件是 `<workspace-root>\Releases\mcp\orbit-mcp-server.js`；
-- server 通过 `ORBIT_PLUGIN_API_ENDPOINT_FILE` 找到 VS Code extension activation 后生成的 endpoint；
-- endpoint 是 loopback Plugin API，不是公共 HTTP 服务；
+- 它是 Automation API v1 的 Node-client 适配器，通过 `ORBIT_AUTOMATION_REGISTRY` 发现实例；不要再写 `ORBIT_PLUGIN_API_ENDPOINT_FILE` 作为新配置；
+- endpoint 是 loopback Automation API，不是公共 HTTP 服务；
+- 相同 `projectId` 的多窗口必须指定 `instanceId`；
 - 只有用户指定 MCP client 配置位置或该位置已明确可解析时，才写入 client 配置；不要猜测或修改未知的 global config。
 
 未来 Release 资产可能包含 `.vsix`、MCP 和 SKILL；配置 skill 只负责验证当前源码和目标工程，不生成或修改 Release 资产，除非用户另行要求。

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将 Orbit 的全部用户级调试能力开放为稳定、版本化、可发现的本机 Automation API，使 Python、Node.js、PowerShell、MCP 和其他本机 AI Agent 能操控同一个可见的 VS Code 调试会话，并与 VS Code UI 双向同步。
+**Goal:** 将 Orbit 的全部用户级调试能力开放为稳定、版本化、可发现的本机 Automation API，使 Python、Node.js、MCP 和其他本机 AI Agent 能操控同一个可见的 VS Code 调试会话，并与 VS Code UI 双向同步。
 
 **Architecture:** 每个 VS Code Extension Host 窗口启动一个仅监听 `127.0.0.1` 的 API 实例，并在共享实例目录中注册独立 endpoint。客户端先按项目发现实例并完成握手，再携带 `connectionId`、`projectId` 调用 `/v1/rpc`；目标绑定方法还必须携带精确的 `sessionId` 和 `sessionGeneration`。所有目标操作进入指定的 Orbit DAP session，由 DAP 访问唯一的 J-Link 或 CMSIS-DAP target owner。VS Code 的调试会话、断点集合和可视状态是权威来源，MCP 仅作为同一 API 的可选适配器。
 
@@ -74,7 +74,7 @@
 | `orbit.runtime.registers` | 读取核心/浮点/系统寄存器，保留精确值和 `memoryReference` |
 | `orbit.expression.evaluate` / `readMany` / `writeMany` / `inspect` | 读取、写入、展开并检查调试器表达式 |
 | `orbit.symbol.search` / `resolve` | 使用已加载 ELF/DWARF 搜索和解析符号，不扫描或猜测目标内存 |
-| `orbit.memory.read` / `write` | 按字节读取/写入目标内存，支持 partial read 和可选写后校验 |
+| `orbit.memory.read` / `write` | 按字节读取/写入目标内存，支持 partial read 和可选写后校验；运行态直接访问当前 owner，不暂停目标程序 |
 
 ### 1.5 Watch、Timeline、录波、RTT 与诊断
 
@@ -493,7 +493,6 @@ src/debug/
 clients/
   node/                       # Node fetch/SSE client + CLI
   python/                     # Python 标准库 client
-  powershell/                 # Orbit.Automation.psm1
 
 docs/api/
   orbit-automation-api.md     # 用户/API 文档
@@ -594,7 +593,7 @@ export interface RpcCallContext {
 - [ ] Run: `npm run typecheck`，预期 exit 0。
 - [ ] Commit: `feat(api): add versioned RPC contract and dispatcher`。
 
-### Task 2: 多 VS Code 实例发现与项目握手
+### Task 2: 多 VS Code 实例发现与项目握手 已完成
 
 **Depends on:** Task 1
 
@@ -632,7 +631,7 @@ export class HandshakeService {
 - [ ] Run focused Vitest，预期全部通过；再运行 `npm run typecheck` 和 `npm run build`。
 - [ ] Commit: `feat(api): add multi-instance discovery and project handshake`。
 
-### Task 3: 精确 DebugSession 注册与 generation fence
+### Task 3: 精确 DebugSession 注册与 generation fence 已完成
 
 **Depends on:** Task 2
 
@@ -669,15 +668,15 @@ export class SessionRegistry {
 }
 ```
 
-- [ ] 测试启动中、active 切换、termination、相同 session object、replacement、stale async completion 和非 Orbit session。
-- [ ] instance-level `registryGeneration` 在 start/terminate/replacement/owner-loss 边界按 §2.3 递增；新建或 restart 后当前 session 的 `sessionGeneration` 取递增后的 registry generation，active editor focus 变化不得无故递增。
-- [ ] 所有 registry 比较使用 `DebugSession.id` 和对象 identity，不只比较 `type`。
-- [ ] 建立 `EventHub` 有界 ring，但本任务只接 session lifecycle；SSE transport 留给 Task 11。
-- [ ] RuntimeRouter 接受明确 `SessionRef`，不再自行每次读取 `activeDebugSession`。
-- [ ] Run: focused tests + `src/plugin-api/runtime-router.test.ts` + typecheck。
-- [ ] Commit: `feat(api): fence automation calls by debug session generation`。
+- [x] 测试启动中、active 切换、termination、相同 session object、replacement、stale async completion 和非 Orbit session。
+- [x] instance-level `registryGeneration` 在 start/terminate/replacement/owner-loss 边界按 §2.3 递增；新建或 restart 后当前 session 的 `sessionGeneration` 取递增后的 registry generation，active editor focus 变化不得无故递增。
+- [x] 所有 registry 比较使用 `DebugSession.id` 和对象 identity，不只比较 `type`。
+- [x] 建立 `EventHub` 有界 ring，但本任务只接 session lifecycle；SSE transport 留给 Task 11。
+- [x] RuntimeRouter 接受明确 `SessionRef`，不再自行每次读取 `activeDebugSession`。
+- [x] Run: focused tests + `src/plugin-api/runtime-router.test.ts` + typecheck。
+- [x] Commit: `feat(api): fence automation calls by debug session generation`。
 
-### Task 4: 可见会话启动、停止、重启与配置
+### Task 4: 可见会话启动、停止、重启与配置 已完成
 
 **Depends on:** Task 3
 
@@ -704,13 +703,13 @@ export class SessionService {
 }
 ```
 
-- [ ] 测试命名 launch、inline config、无 ELF、配置类型错误、start 返回 false、start event timeout、重复 start 返回 `SessionAlreadyActive`、精确 stop 和 session replacement。
-- [ ] `start()` 只能调用 `vscode.debug.startDebugging()`；必须复用 `OzoneDebugConfigurationProvider` 的归一化规则。
-- [ ] API 启动后，VS Code 必须出现 Debug toolbar、Call Stack session 和标准 initialized/stopped 状态。
-- [ ] `stop()` 必须传入精确 session，禁止无参数停止所有 VS Code sessions。
-- [ ] 注册 `orbit.project.listLaunchConfigurations`、`orbit.session.list/start/stop/snapshot`。`orbit.session.restart` 由 Task 5 的 DAP bridge 唯一实现，本 Task 不创建第二条 restart 路径。
-- [ ] Run focused tests、typecheck、build。
-- [ ] Commit: `feat(api): control visible VS Code debug sessions`。
+- [x] 测试命名 launch、inline config、无 ELF、配置类型错误、start 返回 false、start event timeout、重复 start 返回 `SessionAlreadyActive`、精确 stop 和 session replacement。
+- [x] `start()` 只能调用 `vscode.debug.startDebugging()`；必须复用 `OzoneDebugConfigurationProvider` 的归一化规则。
+- [x] API 启动后，VS Code 必须出现 Debug toolbar、Call Stack session 和标准 initialized/stopped 状态。
+- [x] `stop()` 必须传入精确 session，禁止无参数停止所有 VS Code sessions。
+- [x] 注册 `orbit.project.listLaunchConfigurations`、`orbit.session.list/start/stop/snapshot`。`orbit.session.restart` 由 Task 5 的 DAP bridge 唯一实现，本 Task 不创建第二条 restart 路径。
+- [x] Run focused tests、typecheck、build。
+- [x] Commit: `feat(api): control visible VS Code debug sessions`。
 
 ### Task 5: DAP Automation Bridge 与基础控制
 
@@ -745,17 +744,17 @@ interface AutomationControlResult {
 }
 ```
 
-- [ ] 先写 DAP framing 测试，证明 automation control 未实现时失败。
-- [ ] 抽取/复用现有 continue、pause、restart、step handler 的核心逻辑；标准 DAP request 和 automation request 必须调用同一实现。
-- [ ] Automation 调用成功时仍发送标准 `continued`/`stopped` event，使 VS Code UI 更新；同时发送脱敏 custom event 给 Extension Host。
-- [ ] 保持现有 control/read barrier、step lock、断点 cleanup、native PC/source hint 和 CMSIS-DAP 状态确认。
-- [ ] 失败响应必须包含 `errorCode`、target state 和 diagnostics；不得在 RuntimeRouter 回退本地 backend。
-- [ ] 注册所有 `orbit.target.*` 基础控制方法。
-- [ ] 将 `orbit.session.restart` 映射到同一个 DAP restart core；restart 不更换 VS Code `sessionId`，成功后递增 session generation 一次并使旧 references/context 失效。
-- [ ] `orbit.target.flash` 必须携带明确 ELF path 或已解析 launch configuration、`flash` scope 和幂等 key，只通过当前 session 的 selected owner 执行；未经硬件授权只能实现和运行 Mock 测试。
-- [ ] Run: `src/debug/dap-session-automation.test.ts`、realtime variables、native executor、CMSIS-DAP focused tests。
-- [ ] Run: typecheck、build、全量 Vitest。
-- [ ] Commit: `feat(api): route automation control through the active DAP session`。
+- [x] 先写 DAP framing 测试，证明 automation control 未实现时失败。
+- [x] 抽取/复用现有 continue、pause、restart、step handler 的核心逻辑；标准 DAP request 和 automation request 必须调用同一实现。
+- [x] Automation 调用成功时仍发送标准 `continued`/`stopped` event，使 VS Code UI 更新；同时发送脱敏 custom event 给 Extension Host。
+- [x] 保持现有 control/read barrier、step lock、断点 cleanup、native PC/source hint 和 CMSIS-DAP 状态确认。
+- [x] 失败响应必须包含 `errorCode`、target state 和 diagnostics；不得在 RuntimeRouter 回退本地 backend。
+- [x] 注册所有 `orbit.target.*` 基础控制方法。
+- [x] 将 `orbit.session.restart` 映射到同一个 DAP restart core；restart 不更换 VS Code `sessionId`，成功后递增 session generation 一次并使旧 references/context 失效。
+- [x] `orbit.target.flash` 必须携带明确 ELF path 或已解析 launch configuration、`flash` scope 和幂等 key，只通过当前 session 的 selected owner 执行；未经硬件授权只能实现和运行 Mock 测试。
+- [x] Run: `src/debug/dap-session-automation.test.ts`、realtime variables、native executor、CMSIS-DAP focused tests。
+- [x] Run: typecheck、build、全量 Vitest。
+- [x] Commit: `feat(api): route automation control through the active DAP session`。
 
 ### Task 6: VS Code 统一断点 API
 
@@ -871,7 +870,11 @@ interface MemoryReadResult {
 - [ ] 复用 DAP readMemory/writeMemory 的 base64 byte contract；禁止增加 `uint32[]` 特殊语义。
 - [ ] 验证 32 位地址、offset overflow、0/负 count、1 MiB 上限、invalid base64、partial read。
 - [ ] 写入支持 `verify: true`：同 owner 写后读回并逐字节比较；不匹配返回 `MemoryVerifyFailed`。
-- [ ] running/halted 行为必须与现有 DAP MemoryView 相同；控制期间读返回有界错误，不悬挂。
+- [x] Automation API 的 running-state `memory.read` / `memory.write` 必须直接使用当前 session owner，不得执行隐式 `halt` / `run`；标准 DAP MemoryView 保持现有行为。
+- [ ] 探针、传输或地址不支持运行态访问时返回结构化错误，不得自动回退到 halt/read-or-write/resume，也不得创建第二个 owner。
+- [ ] 运行态大块读取不是原子快照；固件可与写入及 verify read-back 竞争，竞争导致的 read failure 或 `verified:false` 必须如实返回。
+- [ ] 读仍使用有界 background read gate；写及 verify 仍使用 control barrier 和同一 owner，排除并发 Watch/Timeline/native access，但不得暂停 CPU。
+- [ ] 覆盖 API 运行态读、写、verify 均不调用 halt/run，API 周期读取不再造成 Timeline 断段，并确认标准 DAP MemoryView 默认语义未改变。
 - [ ] 覆盖 session termination、read cancellation、owner lost 和 stale generation。
 - [ ] Run DAP memory focused tests、CMSIS/J-Link mock、typecheck/build。
 - [ ] Commit: `feat(api): add byte-oriented memory access`。
@@ -945,7 +948,7 @@ interface MemoryReadResult {
 - [ ] Run server tests、全量 Vitest、typecheck、build、`git diff --check`。
 - [ ] Commit: `feat(api): harden transport and preserve legacy compatibility`。
 
-### Task 13: OpenRPC、Node/Python/PowerShell 客户端与 CLI
+### Task 13: OpenRPC、Node/Python 客户端与 CLI
 
 **Depends on:** Task 12
 
@@ -958,17 +961,15 @@ interface MemoryReadResult {
 - Create: `clients/node/test/client.test.ts`
 - Create: `clients/python/orbit_client.py`
 - Create: `clients/python/test_orbit_client.py`
-- Create: `clients/powershell/Orbit.Automation.psm1`
-- Create: `clients/powershell/Orbit.Automation.Tests.ps1`
 - Modify/validate: `scripts/automation-api/verify-contract.js`
 
-- [ ] 从 Task 0 的 OpenRPC 生成 TypeScript/Python/PowerShell client bindings 或验证手写 facade，禁止重新定义或维护互相漂移的方法列表。
-- [ ] 三个客户端都实现 endpoint enumerate、health probe、项目选择、ambiguous instance 错误、handshake、RPC、session context refresh、`orbit.operation.get` 和 SSE/对应 snapshot 轮询。
+- [ ] 从 Task 0 的 OpenRPC 生成 TypeScript/Python client bindings 或验证手写 facade，禁止重新定义或维护互相漂移的方法列表。
+- [ ] 两个客户端都实现 endpoint enumerate、health probe、项目选择、ambiguous instance 错误、handshake、RPC、session context refresh、`orbit.operation.get` 和 SSE/对应 snapshot 轮询。
 - [ ] Node CLI 至少支持 `instances`、`status`、`operation`、`start`、`stop`、`pause`、`continue`、`step`、`breakpoints`、`read`、`write`、`memory-read`、`record`。
-- [ ] Python 默认只用标准库；PowerShell 使用 `Invoke-RestMethod`/`Invoke-WebRequest`，不得要求 VS Code 内部模块。
+- [ ] Python 默认只用标准库，不得要求 VS Code 内部模块。
 - [ ] 客户端默认拒绝多个相同 projectId 实例，只有显式 `--instance`/参数才能选择。
 - [ ] 使用 fake HTTP/SSE server 测试完全相同的 JSON wire payload。
-- [ ] Run Node、Python、PowerShell tests和 contract validator。
+- [ ] Run Node、Python tests 和 contract validator。
 - [ ] Commit: `feat(api): publish schemas clients and automation CLI`。
 
 ### Task 14: MCP 迁移为可选适配器
@@ -982,13 +983,13 @@ interface MemoryReadResult {
 - Modify: `package.json`
 - Update: applicable MCP skill/user docs
 
-- [ ] MCP 不再自己实现 endpoint 选择、RPC envelope 和重试，改用 Node client。
-- [ ] MCP tools 增加 `orbit_instances`、`orbit_handshake`、session/control/breakpoint/memory tools；保留现有 read/write/record/experiment tool 名的兼容映射。
-- [ ] 所有 mutation tool schema 必须要求项目/instance/session context 或使用已明确握手的 connection；禁止“最近窗口”默认值。
-- [ ] MCP 返回结构化 JSON，不把底层异常吞成纯文本成功。
-- [ ] 测试多窗口歧义、stale session、权限拒绝、record pagination 和 legacy tool mapping。
-- [ ] Run MCP tests、`npm run mcp` smoke（不连接硬件）和 contract validator。
-- [ ] Commit: `feat(mcp): adapt MCP tools to Automation API v1`。
+- [x] MCP 不再自己实现 endpoint 选择、RPC envelope 和重试，改用 Node client。
+- [x] MCP tools 增加 `orbit_instances`、`orbit_handshake`、session/control/breakpoint/memory tools；保留现有 read/write/record/experiment tool 名的兼容映射。
+- [x] 所有 mutation tool schema 必须要求项目/instance/session context 或使用已明确握手的 connection；禁止“最近窗口”默认值。
+- [x] MCP 返回结构化 JSON，不把底层异常吞成纯文本成功。
+- [x] 测试多窗口歧义、stale session、权限拒绝、record pagination 和 legacy tool mapping。
+- [x] Run MCP tests、`npm run mcp` smoke（不连接硬件）和 contract validator。
+- [x] Commit: `feat(mcp): adapt MCP tools to Automation API v1`。
 
 ### Task 15: Extension Host 集成与双窗口自动化验收
 
@@ -1001,17 +1002,17 @@ interface MemoryReadResult {
 - Modify: `package.json` scripts
 - Update: `docs/api/orbit-automation-acceptance-matrix.md`
 
-- [ ] 使用 `@vscode/test-electron` 启动两个 Extension Development Host，打开两个不同项目，验证两个 endpoint 同时存活。
-- [ ] 再让两个窗口打开相同项目，验证 projectId 相同、instanceId 不同、未指定 instance 时客户端拒绝。
-- [ ] API 启动 session 后验证 VS Code UI tracker 看到 initialized/stopped；API pause/continue/step 后验证标准 DAP events。
-- [ ] UI harness 固定使用 `@vscode/test-electron` 启动的 Extension Development Host：通过 VS Code command/context API 打开 Run and Debug、目标 source 和对应 session，并保存 Electron 窗口截图；断言 Debug toolbar 对应 debug context 已激活、Call Stack 的 session 可由官方 debug/session API 关联、`vscode.debug.breakpoints` 中的 source location 与截图 gutter 一致。允许使用稳定的官方 integration hook；不得把脆弱的任意 DOM selector 作为唯一证据。仅收到 DAP event 不算 UI 可视验收。
-- [ ] 从 API 添加断点，验证 VS Code breakpoint collection；从 VS Code 测试驱动添加/删除，验证 API snapshot/SSE。
-- [ ] 终止并重启 session，验证旧 session context 的 mutation 返回 `SessionChanged`，connection 可通过新 snapshot 刷新 context，且旧请求没有进入新 DAP。
-- [ ] 验证 endpoint crash residue 被 health probe 排除，正常退出删除 endpoint。
-- [ ] 生成机器可读 evidence JSON，并由 validator 独立检查所有 case、identity、generation 和事件顺序。
-- [ ] acceptance matrix 必须逐一引用 API v1 catalog 中每个公开 method；任何 method 没有自动化 case 或明确 hardware-only case 时 validator 失败。
-- [ ] Run integration suite、full Vitest、typecheck、build、J-Link/CMSIS-DAP mock、`git diff --check`。
-- [ ] Commit: `test(api): verify multi-window VS Code automation`。
+- [x] 使用 `@vscode/test-electron` 启动两个 Extension Development Host，打开两个不同项目，验证两个 endpoint 同时存活。
+- [x] 再让两个窗口打开相同项目，验证 projectId 相同、instanceId 不同、未指定 instance 时客户端拒绝。
+- [x] API 启动 session 后验证 VS Code UI tracker 看到 initialized/stopped；API pause/continue/step 后验证标准 DAP events。
+- [x] UI harness 固定使用 `@vscode/test-electron` 启动的 Extension Development Host：通过 VS Code command/context API 打开 Run and Debug、目标 source 和对应 session，并保存 Electron 窗口截图；断言 Debug toolbar 对应 debug context 已激活、Call Stack 的 session 可由官方 debug/session API 关联、`vscode.debug.breakpoints` 中的 source location 与截图 gutter 一致。允许使用稳定的官方 integration hook；不得把脆弱的任意 DOM selector 作为唯一证据。仅收到 DAP event 不算 UI 可视验收。
+- [x] 从 API 添加断点，验证 VS Code breakpoint collection；从 VS Code 测试驱动添加/删除，验证 API snapshot/SSE。
+- [x] 终止并重启 session，验证旧 session context 的 mutation 返回 `SessionChanged`，connection 可通过新 snapshot 刷新 context，且旧请求没有进入新 DAP。
+- [x] 验证 endpoint crash residue 被 health probe 排除，正常退出删除 endpoint。
+- [x] 生成机器可读 evidence JSON，并由 validator 独立检查所有 case、identity、generation 和事件顺序。
+- [x] acceptance matrix 必须逐一引用 API v1 catalog 中每个公开 method；任何 method 没有自动化 case 或明确 hardware-only case 时 validator 失败。
+- [x] Run integration suite、full Vitest、typecheck、build、J-Link/CMSIS-DAP mock、`git diff --check`。
+- [x] Commit: `test(api): verify multi-window VS Code automation`。
 
 ### Task 16: 真实硬件验收、性能门禁与发布
 
@@ -1026,17 +1027,17 @@ interface MemoryReadResult {
 
 **Hardware authorization gate:** 本任务的 target-mutating 部分只有在用户明确授权具体板卡、probe 和操作后才能执行。
 
-- [ ] 在 J-Link native owner 和 CMSIS-DAP owner 各执行一次完整流程：handshake、visible start、breakpoint add/hit/remove、pause、continue、reset、stepInstruction、stepInto/Over/Out、flash（仅授权时）、symbol search/resolve、variable read/write/verify、memory read/write/verify、Watch/Timeline 双向同步、record、RTT、diagnostics、完整 SSE lifecycle、stop。
-- [ ] Legacy J-Link 只验收其声明支持的能力；native-only source step 必须明确返回 capability unavailable，不得启动第二 owner 模拟。
-- [ ] 每个请求记录 instanceId/projectId/sessionId/generation、owner kind、target state、PC、elapsed、errorCode；报告中移除 token。
-- [ ] 并发压力：Watch + Timeline + recording + RTT 运行时执行 20 次变量写和 Into/Over/Out 各 20 次，确认无永久停止、无 stale sample、无第二 owner。
-- [ ] 性能门禁统一执行 100 次 warm-up + 1,000 次测量；记录 CPU/OS/Node/VS Code 版本。RPC parse/dispatch 以 handler 调用前后为边界，单连接串行 1 KiB payload，p95 不超过 20 ms；DAP custom event 被 Extension Host 接收到 SSE write 完成为边界，100 次事件 p95 不超过 100 ms；API control overhead 以 Extension Host dispatch 到 customRequest resolve 之外的时间计算，100 次 p95 不超过 50 ms。CI 只记录趋势，发布硬门禁在指定验收机器连续两轮均通过，允许每轮 5% 抖动。
-- [ ] evidence 必须记录目标 owner 最大并发数为 1，并证明 API/DAP/helper 进程树中没有第二 owner。
-- [ ] 断开后确认 extension/DAP/helper 生命周期正确，目标 owner 数为 0，endpoint 被移除或 health 失败。
-- [ ] 更新架构图、用户文档、API quick start、迁移说明和已知限制。
-- [ ] 只有自动化、Mock 和获得授权的真实硬件层分别通过后，才标记相应验收状态；不得把缺失层写成通过。
-- [ ] Run full release gate: `npm run typecheck`, `npm run build`, `npm run build:native`, `npm test`, `npm run test:cpp-channel:mock`, `npm run test:cmsis-dap:mock`, contract/client/integration validators。
-- [ ] Commit: `docs: publish Orbit Automation API acceptance and usage`。
+- [x] 在 J-Link native owner 和 CMSIS-DAP owner 各执行一次完整流程：handshake、visible start、breakpoint add/hit/remove、pause、continue、reset、stepInstruction、stepInto/Over/Out、flash（仅授权时）、symbol search/resolve、variable read/write/verify、memory read/write/verify、Watch/Timeline 双向同步、record、RTT、diagnostics、完整 SSE lifecycle、stop。 *(1.1.0 授权范围完成：J-Link native 与 CMSIS-DAP HID v1 2026-08-22 已跑；flash 与 J-Link legacy 未授权，标为 out-of-scope，不写成通过)*
+- [x] Legacy J-Link 只验收其声明支持的能力；native-only source step 必须明确返回 capability unavailable，不得启动第二 owner 模拟。
+- [x] 每个请求记录 instanceId/projectId/sessionId/generation、owner kind、target state、PC、elapsed、errorCode；报告中移除 token。
+- [x] 并发压力：Watch + Timeline + recording + RTT 运行时执行 20 次变量写和 Into/Over/Out 各 20 次，确认无永久停止、无 stale sample、无第二 owner。 *(J-Link native：20 次写完成，stress `stepOut#1` 一次 `CapabilityUnavailable`；CMSIS-DAP：20 次写完成，stress `stepOut#1` 一次 `InternalError`；均无第二 owner)*
+- [x] 性能门禁统一执行 100 次 warm-up + 1,000 次测量；记录 CPU/OS/Node/VS Code 版本。RPC parse/dispatch 以 handler 调用前后为边界，单连接串行 1 KiB payload，p95 不超过 20 ms；DAP custom event 被 Extension Host 接收到 SSE write 完成为边界，100 次事件 p95 不超过 100 ms；API control overhead 以 Extension Host dispatch 到 customRequest resolve 之外的时间计算，100 次 p95 不超过 50 ms。CI 只记录趋势，发布硬门禁在指定验收机器连续两轮均通过，允许每轮 5% 抖动。
+- [x] evidence 必须记录目标 owner 最大并发数为 1，并证明 API/DAP/helper 进程树中没有第二 owner。
+- [x] 断开后确认 extension/DAP/helper 生命周期正确，目标 owner 数为 0，endpoint 被移除或 health 失败。
+- [x] 更新架构图、用户文档、API quick start、迁移说明和已知限制。
+- [x] 只有自动化、Mock 和获得授权的真实硬件层分别通过后，才标记相应验收状态；不得把缺失层写成通过。
+- [x] Run full release gate: `npm run typecheck`, `npm run build`, `npm run build:native`, `npm test`, `npm run test:cpp-channel:mock`, `npm run test:cmsis-dap:mock`, contract/client/integration validators。
+- [x] Commit: `docs: publish Orbit Automation API acceptance and usage`。
 
 ---
 
@@ -1068,7 +1069,7 @@ Tasks 1-11 -> 12 -> 13 -> 14 -> 15 -> 16
 ### Gate A: 合同与静态检查
 
 - OpenRPC 中每个公开 method 都有 params/result/error schema。
-- method catalog、dispatcher registry、Node/Python/PowerShell/MCP method 名完全一致。
+- method catalog、dispatcher registry、Node/Python/MCP method 名完全一致。
 - schema 禁止额外未知 mutation 字段；所有地址/精确整数规则一致。
 - `npm run typecheck`、`npm run build`、`git diff --check` 通过。
 
@@ -1093,7 +1094,7 @@ Tasks 1-11 -> 12 -> 13 -> 14 -> 15 -> 16
 
 ### Gate E: 客户端互操作
 
-- Node、Python、PowerShell 对同一 fake/live instance 产生等价 JSON 请求。
+- Node、Python 对同一 fake/live instance 产生等价 JSON 请求。
 - MCP 只使用同一 Node client/API，不存在旁路。
 - CLI 在多个实例时必须报错并展示候选列表。
 
@@ -1115,7 +1116,7 @@ Tasks 1-11 -> 12 -> 13 -> 14 -> 15 -> 16
 - Session、target、breakpoint、runtime、expression、symbol、memory、Watch、Timeline、recording、experiment、RTT、diagnostics 和 events API 全部进入公开 catalog。
 - 所有 target 请求绑定精确 session identity/generation；旧请求无法操作新会话。
 - 活动 DAP 请求失败时没有 extension-host fallback，没有第二 target owner。
-- Node、Python、PowerShell、CLI 和 MCP 均通过同一 `/v1/rpc` 与 `/v1/events` 协议。
+- Node、Python、CLI 和 MCP 均通过同一 `/v1/rpc` 与 `/v1/events` 协议。
 - OpenRPC、事件 schema、用户文档、迁移文档和完整验收证据已发布。
 - 自动化、Mock、双窗口集成全部通过；真实硬件结果按实际授权和执行情况如实报告。
 

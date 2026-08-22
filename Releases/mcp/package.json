@@ -4,7 +4,7 @@
   "description": "Orbit MCP adapter for target inspection, waveform recording, and experiments",
   "main": "orbit-mcp-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test orbit-mcp-server.test.js"
   },
   "keywords": [],
   "author": "",

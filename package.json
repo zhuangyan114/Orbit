@@ -2,7 +2,7 @@
   "name": "orbit-for-vscode",
   "displayName": "Orbit",
   "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -385,6 +385,33 @@
           "default": true,
           "description": "读取 SEGGER RTT 输出，并将其显示在 VS Code 调试控制台中"
         },
+        "orbit.automation.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the loopback Orbit Automation API for this VS Code window."
+        },
+        "orbit.automation.allowedScopes": {
+          "type": "array",
+          "default": [
+            "read"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "read",
+              "session.control",
+              "breakpoints.write",
+              "view.write",
+              "record",
+              "rtt.control",
+              "variables.write",
+              "memory.write",
+              "flash"
+            ]
+          },
+          "uniqueItems": true,
+          "description": "Maximum scopes the Automation API may grant during a handshake."
+        },
         "orbit.logging.enabled": {
           "type": "boolean",
           "default": true,
@@ -495,7 +522,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "node esbuild.config.js",
+    "build": "node esbuild.config.js && npm run build:automation-client",
+    "build:automation-client": "tsc -p clients/node/tsconfig.json",
     "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
     "test:cpp-channel": "node scripts/cpp-channel-smoke.js",
     "test:cpp-channel:mock": "node scripts/cpp-channel-smoke.js --mock",
@@ -506,6 +534,13 @@
     "lint": "eslint src --ext ts,tsx",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:automation-clients": "vitest run clients/node/test/client.test.ts && python -m unittest clients/python/test_orbit_client.py",
+    "test:automation-contract": "node scripts/automation-api/verify-contract.js",
+    "test:automation-acceptance": "node scripts/automation-api/acceptance-validator.js",
+    "test:automation-integration": "vitest run src/plugin-api/automation-api.integration.test.ts",
+    "test:automation-multi-window": "node scripts/automation-api/verify-multi-window.js",
+    "test:automation-hardware": "node scripts/automation-api/verify-hardware.js --mock",
+    "test:mcp": "node --test Releases/mcp/orbit-mcp-server.test.js",
     "dev": "npm run build && code --extensionDevelopmentPath=."
   },
   "devDependencies": {
@@ -525,6 +560,7 @@
     "koffi": "^3.1.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
+    "zod": "^4.4.3",
     "zustand": "^5.0.0"
   }
 }

@@ -41,7 +41,7 @@
 | 操作系统 | Native helper 的 CMake 配置明确要求 Windows；Native 发布目标为 `win32-x64`。当前产品应按 Windows 环境准备。 |
 | VS Code | `package.json` 声明 `engines.vscode: ^1.90.0`，即 VS Code 1.90.0 以上且仍在 1.x 主版本范围内。 |
 | 目标 | 产品定位为 STM32 / ARM Cortex-M；J-Link 需要 DLL 可识别的 device，CMSIS-DAP 烧录需要匹配目标的 Flash Algorithm。 |
-| 调试器 | 支持 SEGGER J-Link，以及标准 CMSIS-DAP/DAPLink v2 WinUSB 或 v1 HID probe。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
+| 调试器 | 支持 SEGGER J-Link，以及标准 CMSIS-DAP/DAPLink probe（1.1.0 真机为 v1 HID；v2 WinUSB 有代码/Mock）。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
 | 固件文件 | `program` 使用 ELF/AXF。符号、源码行和 DWARF 类型质量取决于文件是否包含相应调试信息。 |
 | 外部视图 | RTOS Views、Memory View、Peripheral Viewer 和 debug tracker 由外部扩展提供，Orbit 不在 `extensionDependencies` 中自动安装它们。 |
 | 源码构建 | 仅在从源码构建 Native helper 时需要 CMake 3.20+，以及 Visual Studio C++ 工具或 x64 MinGW-w64。 |
@@ -101,7 +101,7 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 ### 2.3 CMSIS-DAP / DAPLink
 
-`probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。
+`probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。1.1.0 真机验收覆盖 HID v1；v2 WinUSB 以设备枚举和握手为准，本版未做真机。
 
 CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。`flashBeforeDebug: false` 完全跳过烧录，仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
 
@@ -428,7 +428,7 @@ Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供
 | --- | --- | --- |
 | Native | 独立的 `orbit-jlink-helper.exe`，通过 JSON-lines 与 DAP 侧通信；helper 内加载 J-Link DLL | 拥有 Native source-level step into/over/out、批量内存读取和 NativeScheduler；目标为 Windows x64。 |
 | Legacy | Node 进程中的 `koffi` 直接加载 `JLink_x64.dll` | 保留现有调试和 DAP 兼容路径；Native source-level step API 在该 owner 上不可用。 |
-| CMSIS-DAP | 独立的 `orbit-cmsis-dap-helper.exe`，使用 WinUSB v2 或 HID v1 | 提供 SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm、Watch/Timeline 和内存型 RTT；不加载 J-Link DLL。 |
+| CMSIS-DAP | 独立的 `orbit-cmsis-dap-helper.exe`，HID v1 已真机验收；WinUSB v2 有代码/Mock | 提供 SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm、Watch/Timeline 和内存型 RTT；不加载 J-Link DLL。 |
 
 ### 11.2 owner 选择
 
@@ -456,62 +456,56 @@ control  >  watch  >  timeline  >  background
 
 ## 12. MCP 与 Plugin API
 
-### 12.1 Plugin API
+### 12.1 Automation API v1
 
-Extension Host 激活时启动一个随机端口的本机 HTTP server：
+工作区设置 `orbit.automation.enabled`（默认 `false`）后，每个 Extension Host 在 `127.0.0.1` 启动独立 API：
 
-- host：`127.0.0.1`；
-- `GET /health`：返回 ready 状态；
-- `POST /rpc`：需要 `Authorization: Bearer <token>`；
+- `GET /health`：实例身份、API version、uptime，不含 token；
+- `POST /v1/rpc`：JSON-RPC 2.0，强制 Bearer；
+- `GET /v1/events`：SSE，需 Bearer 与 `X-Orbit-Connection-Id`；
 - 请求体最大 `1 MiB`；
-- endpoint 文件名：`plugin-api-endpoint.json`；
-- 文件写入 VS Code extension global storage；
-- API 停止时随扩展释放。
+- 发现：用户范围 `registries.json` + 每窗口 endpoint 文件；
+- 一个发布周期仍写 legacy `plugin-api-endpoint.json`，内容只标记 `unique`/`ambiguous`，不会替客户端选窗口。
 
-当前 JSON-RPC 方法：
+默认 `orbit.automation.allowedScopes` 仅为 `["read"]`。控制、断点、写入、录波、RTT、Flash 需要对应 scope。目标绑定方法必须带精确 `sessionId`/`sessionGeneration`；mutation 还要 `idempotencyKey`。
 
-| 方法 | 能力 |
-| --- | --- |
-| `ozone.status` | 返回目标状态。 |
-| `ozone.target.getState` | 返回目标状态。 |
-| `ozone.expr.readMany` | 批量读取表达式或带 alias/unit/role 的 signal。 |
-| `ozone.expr.writeMany` | 按表达式写入有限数值，可带 address/typeName 元数据。 |
-| `ozone.record.start` / `stop` / `get` / `clear` | 录制、停止、读取和清理波形。 |
-| `ozone.experiment.run` | 执行 read / write / wait / record 步骤，可配置 baseline 和 min/max safety。 |
+完整方法清单、错误码和 DTO 以 [Automation API v1](../../docs/api/orbit-automation-api.md) 和 OpenRPC 为准。Node / Python 客户端与 MCP 共用该协议。
+
+一个发布周期保留旧 `POST /rpc` 的 `ozone.status` / `ozone.expr.*` / `ozone.record.*` / `ozone.experiment.run`，它们只映射到新 service 并带 deprecation，不能跳过 handshake 或 generation fence。
 
 若活动 `orbit` DAP session（或旧 `ozone` 别名）存在，RuntimeRouter 将读写和目标状态请求发送到该 DAP session；DAP 请求失败会作为该操作的错误返回，不会回退到 Extension Host 的另一条目标连接。
 
 ### 12.2 MCP server
 
-源码 MCP server 是 stdio 进程 `Releases/mcp/orbit-mcp-server.js`，它读取 endpoint 文件，再调用上面的本机 Plugin API。当前注册工具：
+源码 MCP server 是 stdio 进程 `Releases/mcp/orbit-mcp-server.js`，它只作为 Automation API v1 的适配器：通过 Node client 发现 `ORBIT_AUTOMATION_REGISTRY` 中的实例、握手，再调用 `POST /v1/rpc`。`ozone-mcp-server.js` 只是兼容启动器。多个相同 `projectId` 窗口必须指定 `instanceId`，禁止选择最近活动窗口。
 
-- `ozone_status`；
-- `ozone_read_many`；
-- `ozone_write_many`；
-- `ozone_record`；
-- `ozone_experiment_run`。
+v1 工具：`orbit_instances`、`orbit_handshake`、`orbit_session_*`、`orbit_target_*`、`orbit_breakpoints_*`、`orbit_memory_*`，以及 `orbit_record_get` / `orbit_expression_evaluate` / `orbit_diagnostics_snapshot`。
 
-Windows 下未设置环境变量时，endpoint 默认路径为：
+便捷工具名同样映射到同一 v1 方法：
 
-```text
-%APPDATA%\Code\User\globalStorage\orbit-debug.orbit-for-vscode\plugin-api-endpoint.json
-```
+- `orbit_status` → `orbit.session.list`
+- `orbit_read_many` → `orbit.expression.readMany`
+- `orbit_write_many` → `orbit.expression.writeMany`
+- `orbit_record` → `orbit.record.start/get/stop/clear`（分页读取）
+- `orbit_experiment_run` → `orbit.experiment.run`
 
-也可以显式设置：
+工具返回 structured JSON。`errorCode` 失败不得伪装成文本成功。默认 registry 为：
 
 ```text
-OZONE_PLUGIN_API_ENDPOINT_FILE=<endpoint 文件绝对路径>
+%LOCALAPPDATA%\Orbit\automation\registries.json
 ```
+
+`tools/list` 给每个 object `inputSchema` 显式带上 `required` 数组；全可选工具为 `[]`。opencode 对缺失 `required` 的 object schema 会发出 `required: null`（[issue #15540](https://github.com/anomalyco/opencode/issues/15540)，修复 PR 未合并）。严格的 OpenAI 兼容中转在转成 Anthropic 协议时会因此返回 `standard_violation /required: got null, want array`。MCP 侧补空数组即可，不改变工具参数语义。
 
 ### 12.3 MCP 数值、录波和实验边界
 
 | 项目 | 源码限制 |
 | --- | --- |
-| 写入值 | 必须是 finite number；可选 address 必须是 `0..0xFFFFFFFF` 的 32-bit unsigned integer。 |
+| 写入值 | Automation API 的 write value 是字符串；`orbit_write_many` 仍接受 number，适配器会转成字符串。 |
 | 单次录波通道 | 至少 1 个，最多 64 个；alias 不能重复。 |
 | 录波间隔 | 默认 `10 ms`，最终限制到 `5..10000 ms` 并取整数毫秒。 |
 | 录波帧数 | 每个 recording 最多保留 `50000` 帧，超出时丢弃最旧帧。 |
-| 录波时长 | `ExperimentService` 的 record step 最多 `60000 ms`。直接 `ozone_record` 的时长由调用参数提供，MCP wrapper 会等待结束后读取并清理 recording。 |
+| 录波时长 | `orbit_record` 按 `durationMs` 等待后分页读取全部 frames，再 stop/clear；单页默认 100、最大 1,000 frames。 |
 | wait 时长 | `0..60000 ms`，取整数毫秒。 |
 | 实验步骤 | 最多 64 步，类型为 `read`、`write`、`wait`、`record`。 |
 | safety | 对匹配 expression 的写入执行可选 `min` / `max` 检查。 |
@@ -556,9 +550,9 @@ Watch 和 Timeline 都依赖当前 DAP session 的目标状态。Timeline 在目
 
 Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源码固定调用 `TIF_Select(SWD)`。请先使用 Native，并把该行为作为当前版本限制处理。
 
-### Q10：MCP 找不到 endpoint 文件。
+### Q10：MCP 找不到实例或 endpoint。
 
-先启动 VS Code 并激活 Orbit；endpoint 文件只有在 Extension Host 启动 Plugin API 后才会生成。确认 MCP 与 VS Code 使用同一用户配置目录，或设置 `OZONE_PLUGIN_API_ENDPOINT_FILE` 指向实际的 `plugin-api-endpoint.json`。
+先打开工作区并设置 `orbit.automation.enabled: true`，再 Reload Window。客户端读取 `%LOCALAPPDATA%\Orbit\automation\registries.json`（可用 `ORBIT_AUTOMATION_REGISTRY` 覆盖）。多个相同 `projectId` 窗口必须指定 `instanceId`。旧的 `plugin-api-endpoint.json` 在多窗口时是 `ambiguous`，不能用来选窗口。
 
 ### Q11：MCP 读取/写入失败，但 VS Code 中调试已启动。
 
@@ -569,7 +563,7 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 ### 当前实现限制
 
 - Native helper 和当前 J-Link DLL 集成是 Windows 目标；仓库没有把 Linux/macOS 作为当前 Native 运行目标。
-- CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。当前仓库真机验收覆盖 v1 HID，v2 WinUSB 只有代码/Mock/构建证据，具体 probe 固件兼容性仍以设备枚举和握手为准。
+- CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。1.1.0 真机验收覆盖 v1 HID；v2 WinUSB 只有代码/Mock/构建证据，具体 probe 固件兼容性仍以设备枚举和握手为准。
 - `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。
 - `interface` schema 接受 `SWD` 和 `JTAG`，但 Legacy DLL 连接实现当前固定选择 SWD；JTAG 应使用 Native 并单独确认硬件。
 - J-Link 路径使用 6 个槽位索引；CMSIS-DAP 会读取 Cortex-M FPB 容量。任何路径槽位耗尽时新硬件断点都必须返回明确错误。
@@ -580,6 +574,8 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 - RTOS Views、Memory View 和 Peripheral Viewer 不随 Orbit 的源码自动获得全部功能；它们需要外部扩展、正确的 tracking 配置和与当前固件匹配的 ELF/SVD。
 - Orbit 不解析 SVD，也不内置 RTOS kernel 解析器。
 - P-RTLog token 必须在当前 ELF 的 `.pw_tokenizer.entries` 中；`pRtLogRoot` 当前不是 token 搜索路径。
+- Automation API v1 默认关闭。1.1.0 硬件层：J-Link native 与 CMSIS-DAP HID v1 已通过（无 flash）；J-Link legacy 与显式 Flash 不在本版范围，不得与 Mock/自动化结果合并成“全部通过”。
+- J-Link Legacy 不提供 Native source-level `stepInto`/`stepOver`/`stepOut`；这些调用必须返回 `CapabilityUnavailable`，不得启动第二个 owner 来模拟。
 
 ### 当前 DAP capability 中明确未提供的功能
 

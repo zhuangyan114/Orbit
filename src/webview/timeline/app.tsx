@@ -8,10 +8,7 @@ import {
 import { buildTimelineTraceCommands, firstPointAtOrAfter } from './timeline-trace-path';
 import {
   clampTimelineViewportEnd,
-<<<<<<< HEAD
   quantizeTimelineResolution,
-=======
->>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
   TimelineRangeController,
   type TimelineHistoryBounds,
 } from './timeline-range';
@@ -122,7 +119,6 @@ export function TimelineApp() {
     if (!initedRef.current) return;
     const tEnd = tEndRef.current;
     const tStart = tEnd - timePerDivRef.current * H_DIV;
-<<<<<<< HEAD
     const canvasWidth = canvasRef.current?.getBoundingClientRect().width ?? 0;
     const plotWidth = canvasWidth - 24;
     if (plotWidth <= 0) return;
@@ -145,10 +141,6 @@ export function TimelineApp() {
         resolutionKey,
         targetBuckets,
       });
-=======
-    for (const request of rangeControllerRef.current!.requestViewport(tStart, tEnd)) {
-      vscode.postMessage({ command: 'loadRange', ...request });
->>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
     }
   };
 
@@ -235,16 +227,12 @@ export function TimelineApp() {
         }
         case 'rangeSamples': {
           if (msg.historyBounds !== undefined) updateHistoryBounds(msg.historyBounds);
-<<<<<<< HEAD
           if (!rangeControllerRef.current!.completeRequest(
             msg.requestId,
             msg.range ?? null,
             msg.generation,
             msg.resolutionKey,
           )) break;
-=======
-          if (!rangeControllerRef.current!.completeRequest(msg.requestId, msg.range ?? null)) break;
->>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
           sampleBatcherRef.current?.enqueue(msg.snapshots || []);
           requestVisibleRange();
           break;

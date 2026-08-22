@@ -438,6 +438,8 @@ export interface CmsisDapFlashOptions {
   pageSize?: number;
   pageBufferSize?: number;
   stackSize?: number;
+  /** When false, skip the verify algorithm/read-back step after programming. */
+  verify?: boolean;
   onOperation?: (report: FlashOperationReport) => void;
 }
 
@@ -572,6 +574,7 @@ export async function flashCmsisDapElf(
     const layout = planFlashRamLayout(target, algorithm.code.length, pageBufferSize, options.stackSize);
     const timeoutMs = options.timeoutMs ?? 5000;
     const clockHz = options.clockHz ?? 4000000;
+    const verify = options.verify !== false;
     let skipUninit = false;
 
     const dp = await transport.readDp(0);
@@ -692,42 +695,44 @@ export async function flashCmsisDapElf(
           const size = Math.min(pageSize, segment.fileSize - offset);
           const page = segment.bytes.slice(offset, offset + size);
           await run('programPage', segment.loadAddress + offset, size, page);
-          if (algorithm.preservesPageBuffer && algorithm.entries.verify !== undefined) {
+          if (verify && algorithm.preservesPageBuffer && algorithm.entries.verify !== undefined) {
             await run('verify', segment.loadAddress + offset, size, page, true);
           }
         }
       }
-      const verificationAlreadyComplete = algorithm.preservesPageBuffer
-        && algorithm.entries.verify !== undefined;
-      for (const segment of flashSegments) {
-        if (verificationAlreadyComplete) continue;
-        if (algorithm.entries.verify !== undefined) {
-          for (let offset = 0; offset < segment.fileSize; offset += pageSize) {
-            const size = Math.min(pageSize, segment.fileSize - offset);
-            await run(
-              'verify',
-              segment.loadAddress + offset,
-              size,
-              segment.bytes.slice(offset, offset + size),
-            );
+      if (verify) {
+        const verificationAlreadyComplete = algorithm.preservesPageBuffer
+          && algorithm.entries.verify !== undefined;
+        for (const segment of flashSegments) {
+          if (verificationAlreadyComplete) continue;
+          if (algorithm.entries.verify !== undefined) {
+            for (let offset = 0; offset < segment.fileSize; offset += pageSize) {
+              const size = Math.min(pageSize, segment.fileSize - offset);
+              await run(
+                'verify',
+                segment.loadAddress + offset,
+                size,
+                segment.bytes.slice(offset, offset + size),
+              );
+            }
+            continue;
           }
-          continue;
-        }
-        const started = Date.now();
-        const read = await transport.readMemory(segment.loadAddress, segment.fileSize);
-        const actual = asBytes(read.bytes);
-        let mismatch = !read.ok || actual.length !== segment.fileSize;
-        if (!mismatch) {
-          for (let index = 0; index < segment.fileSize; index += 1) {
-            if (actual[index] !== segment.bytes[index]) { mismatch = true; break; }
+          const started = Date.now();
+          const read = await transport.readMemory(segment.loadAddress, segment.fileSize);
+          const actual = asBytes(read.bytes);
+          let mismatch = !read.ok || actual.length !== segment.fileSize;
+          if (!mismatch) {
+            for (let index = 0; index < segment.fileSize; index += 1) {
+              if (actual[index] !== segment.bytes[index]) { mismatch = true; break; }
+            }
           }
+          const elapsedMs = Date.now() - started;
+          if (mismatch) {
+            report({ operation: 'verify', address: segment.loadAddress, size: segment.fileSize, elapsedMs, ok: false, errorCode: 'VerifyFailed', message: 'complete Flash read-back comparison failed' });
+            throw new CmsisDapFlashError('VerifyFailed', `Flash read-back mismatch at 0x${segment.loadAddress.toString(16)}`);
+          }
+          report({ operation: 'verify', address: segment.loadAddress, size: segment.fileSize, elapsedMs, ok: true, message: 'complete Flash read-back comparison passed' });
         }
-        const elapsedMs = Date.now() - started;
-        if (mismatch) {
-          report({ operation: 'verify', address: segment.loadAddress, size: segment.fileSize, elapsedMs, ok: false, errorCode: 'VerifyFailed', message: 'complete Flash read-back comparison failed' });
-          throw new CmsisDapFlashError('VerifyFailed', `Flash read-back mismatch at 0x${segment.loadAddress.toString(16)}`);
-        }
-        report({ operation: 'verify', address: segment.loadAddress, size: segment.fileSize, elapsedMs, ok: true, message: 'complete Flash read-back comparison passed' });
       }
     } catch (error) {
       primaryError = error;

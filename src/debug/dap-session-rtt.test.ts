@@ -107,6 +107,64 @@ describe('DapSession RTT polling lifecycle', () => {
     }
   });
 
+  it('resolves the RTT control block on demand for an automation start when RTT Log is disabled', async () => {
+    const backend = launchBackend({ ok: true, data: { address: 0x20005178, size: 0xa8, type: 'B' } });
+    const session = new DapSession(backend as any);
+    const messages: any[] = [];
+    session.on('send', message => messages.push(message));
+    try {
+      await (session as any).handleLaunch(launchRequest({ rttLogEnabled: false }));
+      // The launch skips RTT resolution when the log is disabled, leaving the
+      // automation start to resolve it so `startRtt` never gets undefined.
+      expect((session as any).rttControlBlockAddress).toBeUndefined();
+      expect((session as any).rttAvailable).toBe(true);
+
+      await (session as any).handleAutomationRtt({
+        type: 'request', seq: 2, command: 'orbitRttSnapshot',
+        arguments: { kind: 'start', sessionGeneration: 1 },
+      });
+
+      expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+        cmd: 'resolveSymbol', name: '_SEGGER_RTT',
+      }));
+      expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+        cmd: 'startRtt', controlBlockAddress: 0x20005178,
+      }));
+      const response = messages.find(m => m.type === 'response' && m.command === 'orbitRttSnapshot');
+      expect(response?.success).toBe(true);
+      expect(response?.body?.snapshot?.state).toBe('running');
+    } finally {
+      (session as any).stopConnectionMonitor();
+      (session as any).stopRttLogPolling();
+    }
+  });
+
+  it('returns CapabilityUnavailable when the automation start cannot resolve the RTT control block', async () => {
+    const backend = launchBackend({
+      ok: false, errorCode: 'SymbolNotFound', error: 'SymbolNotFound: _SEGGER_RTT',
+    });
+    const session = new DapSession(backend as any);
+    const messages: any[] = [];
+    session.on('send', message => messages.push(message));
+    try {
+      await (session as any).handleLaunch(launchRequest({ rttLogEnabled: false }));
+      await (session as any).handleAutomationRtt({
+        type: 'request', seq: 2, command: 'orbitRttSnapshot',
+        arguments: { kind: 'start', sessionGeneration: 1 },
+      });
+      expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+        cmd: 'resolveSymbol', name: '_SEGGER_RTT',
+      }));
+      expect(backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({ cmd: 'startRtt' }));
+      const response = messages.find(m => m.type === 'response' && m.command === 'orbitRttSnapshot');
+      expect(response?.success).toBe(false);
+      expect(response?.body?.errorCode).toBe('CapabilityUnavailable');
+    } finally {
+      (session as any).stopConnectionMonitor();
+      (session as any).stopRttLogPolling();
+    }
+  });
+
   it('continues launch without RTT when the ELF has no RTT control block symbol', async () => {
     const backend = launchBackend({
       ok: false,

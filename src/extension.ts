@@ -7,11 +7,23 @@ import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { findElfFiles } from './ozone-backend/flasher';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
-import { configureLogger } from './utils/logger';
+import { AutomationApiLifecycle } from './plugin-api/automation-api-lifecycle';
+import { EventHub } from './plugin-api/event-hub';
+import { SessionRegistry, SessionUpdatePatch, automationLifecyclePatch } from './plugin-api/session-registry';
+import { SessionService } from './plugin-api/session-service';
+import { BreakpointService } from './plugin-api/breakpoint-service';
+import { RuntimeService } from './plugin-api/runtime-service';
+import { RuntimeRouter } from './plugin-api/runtime-router';
+import { ViewStateService } from './plugin-api/view-state-service';
+import { RecordingService } from './plugin-api/recording-service';
+import { FastSampleSink } from './plugin-api/fast-sample-sink';
+import { AUTOMATION_CONTROL_EVENT, AUTOMATION_LIFECYCLE_EVENT } from './debug/dap-automation-protocol';
+import { configureLogger, log } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
 import { createRtosViewsRefreshHandler } from './debug/rtos-views-tracker';
 import * as fs from 'fs';
+import * as path from 'path';
 
 let backend: OzoneBackend;
 let watchProvider: WatchProvider;
@@ -21,7 +33,14 @@ let timelineProvider: TimelineWebviewProvider;
 let watchPollTimer: NodeJS.Timeout | null = null;
 let watchPollGeneration = 0;
 let activeWatchSession: vscode.DebugSession | null = null;
-let pluginApiServer: PluginApiServer;
+let automationApiLifecycle: AutomationApiLifecycle<PluginApiServer> | undefined;
+let eventHub: EventHub;
+let sessionRegistry: SessionRegistry;
+/** Shared runtime router + view/recording services for the Automation API. */
+let apiRuntime: RuntimeRouter;
+let apiViewState: ViewStateService;
+let apiRecording: RecordingService;
+let apiFastSampleSink: FastSampleSink;
 let rttLogTerminal: vscode.Terminal | null = null;
 let rttLogPty: RttLogTerminal | null = null;
 
@@ -120,7 +139,7 @@ export async function activate(context: vscode.ExtensionContext) {
     watchWebviewProvider = wvp;
     wvp.onExpressionsChanged = (exprs) => {
       wp.setExpressions(exprs);
-      context.workspaceState.update('ozoneWatchExpressions', exprs);
+      apiViewState?.setWatchFromUi(exprs);
     };
     const saved = context.workspaceState.get<string[]>('ozoneWatchExpressions', []);
     if (saved.length > 0) {
@@ -131,7 +150,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const dsm = new DataSamplingManager(b);
     dataSamplingManager = dsm;
     dsm.onExpressionsChanged = (exprs) => {
-      context.workspaceState.update('ozoneDataSamplingExpressions', exprs);
+      apiViewState?.setTimelineFromUi(exprs);
       timelineProvider?.refreshEntries();
     };
     wvp.onSendToTimeline = (exprs) => {
@@ -146,10 +165,112 @@ export async function activate(context: vscode.ExtensionContext) {
     const tl = new TimelineWebviewProvider(context, dsm);
     timelineProvider = tl;
 
-    pluginApiServer = new PluginApiServer(context, backend);
-    const apiEndpoint = await pluginApiServer.start();
-    context.subscriptions.push(pluginApiServer);
-      console.log(`[Orbit] Plugin API listening on ${apiEndpoint.url}`);
+    // Bounded automation event ring and the exact DebugSession registry with
+    // the instance-level generation fence (plan Task 3). The ring pulls its
+    // identity from the API server so events published after startup carry the
+    // real instanceId/projectId.
+    eventHub = new EventHub({
+      instanceId: () => automationApiLifecycle?.getActive()?.getInstanceId() ?? '',
+      projectId: () => automationApiLifecycle?.getActive()?.getProjectId() ?? '',
+    });
+    sessionRegistry = new SessionRegistry({ eventHub });
+    apiRuntime = new RuntimeRouter(
+      backend,
+      sessionRegistry
+        ? { resolveSession: ref => sessionRegistry.requireExact(ref), currentRef: () => sessionRegistry.currentRef() }
+        : undefined,
+    );
+    const fastSampleSink = new FastSampleSink({
+      // Keep the UI Timeline's own sampler alive: the sink never stops the
+      // adapter sampler while these expressions exist (plan Task 10).
+      persistentExpressions: () => dataSamplingManager?.expressionList ?? [],
+    });
+    apiFastSampleSink = fastSampleSink;
+    apiViewState = new ViewStateService({ registry: sessionRegistry, runtime: apiRuntime, store: context.workspaceState, eventHub, sampleSink: fastSampleSink });
+    apiRecording = new RecordingService({
+      registry: sessionRegistry,
+      runtime: apiRuntime,
+      eventHub,
+      sampleSink: fastSampleSink,
+      // Keep the UI Timeline expressions live so the adapter sampler stays
+      // shared with the Timeline while a recording runs (plan Task 10).
+      sharedSampleExpressions: () => dataSamplingManager?.expressionList ?? [],
+    });
+    const sessionService = new SessionService({ registry: sessionRegistry });
+    const breakpointService = new BreakpointService({ registry: sessionRegistry });
+    const runtimeService = new RuntimeService({ registry: sessionRegistry });
+
+    automationApiLifecycle = new AutomationApiLifecycle(
+      () => new PluginApiServer(context, backend, {
+        sessionRegistry,
+        sessionService,
+        breakpointService,
+        runtimeService,
+        viewStateService: apiViewState,
+        recordingService: apiRecording,
+        fastSampleSink,
+        eventHub,
+      }),
+      () => eventHub.reset(),
+    );
+    const setAutomationEnabled = async (enabled: boolean) => {
+      await automationApiLifecycle!.setEnabled(enabled);
+      const activeServer = automationApiLifecycle!.getActive();
+      if (activeServer) {
+        const endpoint = activeServer.getEndpointInfo();
+        log.dap(`[automation-api] started host=${endpoint.host} port=${endpoint.port}`);
+      } else {
+        log.dap('[automation-api] disabled');
+      }
+    };
+    try {
+      await setAutomationEnabled(getOrbitConfiguration().get<boolean>('automation.enabled', false));
+    } catch (error) {
+      log.dap(`[automation-api] initial start failed error=${(error as Error)?.message ?? String(error)}`);
+    }
+    context.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration(event => {
+        if (!event.affectsConfiguration('orbit.automation.enabled')) return;
+        void setAutomationEnabled(getOrbitConfiguration().get<boolean>('automation.enabled', false)).catch(error => {
+          log.dap(`[automation-api] configuration transition failed error=${(error as Error)?.message ?? String(error)}`);
+        });
+      }),
+      { dispose: () => { void automationApiLifecycle?.setEnabled(false); } },
+      vscode.commands.registerCommand('orbit.automation.captureUiEvidence', async (targetPath?: string) => {
+        await vscode.commands.executeCommand('workbench.view.debug');
+        const session = vscode.debug.activeDebugSession;
+        const breakpointLocations = vscode.debug.breakpoints.flatMap(breakpoint => {
+          const location = (breakpoint as vscode.SourceBreakpoint).location;
+          if (!location?.uri?.fsPath || !location.range) return [];
+          return [{
+            path: location.uri.fsPath,
+            line: location.range.start.line + 1,
+            column: location.range.start.character + 1,
+          }];
+        });
+        const evidence = {
+          schemaVersion: 1,
+          debugToolbarActive: Boolean(session && isOrbitDebugSessionType(session.type)),
+          inDebugMode: Boolean(session),
+          callStackSessionId: session?.id,
+          sessionType: session?.type,
+          sessionName: session?.name,
+          breakpoints: breakpointLocations,
+          dapEventOnly: false,
+        };
+        if (typeof targetPath === 'string' && targetPath.length > 0) {
+          await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.promises.writeFile(targetPath, `${JSON.stringify(evidence, null, 2)}\n`);
+        }
+        return evidence;
+      }),
+    );
+
+    // Adopt a session that was already running when this Extension Host
+    // activated; its start event fired before the registry existed.
+    if (initialSession && isOrbitDebugSessionType(initialSession.type)) {
+      sessionRegistry.onStarted(initialSession);
+    }
 
     // Track both the canonical Orbit DAP type and the legacy ozone alias.
     for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
@@ -181,10 +302,7 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
         webviewOptions: { retainContextWhenHidden: true },
       }),
-<<<<<<< HEAD
       vscode.debug.registerDebugConfigurationProvider('orbit', new OzoneDebugConfigurationProvider()),
-=======
->>>>>>> 6d9ed73 (perf(timeline): lazily load retained sample ranges)
       vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
         if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneClearDebugConsole') {
@@ -193,16 +311,83 @@ export async function activate(context: vscode.ExtensionContext) {
           showRttLogTerminal();
         } else if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneRttOutput') {
           writeRttLogTerminal(String(event.body?.text || ''));
+        } else if (isOrbitDebugSessionType(event.session.type) && event.event === AUTOMATION_CONTROL_EVENT) {
+          // Sanitized automation control outcome from the DAP adapter (plan
+          // Task 5): mirror the settled target state into the exact session
+          // record. `update` checks object identity itself, so stale events
+          // from replaced sessions are ignored.
+          const state = event.body?.state;
+          if (state === 'running' || state === 'halted') {
+            const patch: SessionUpdatePatch = { phase: state, targetState: state };
+            if (state === 'halted') {
+              if (typeof event.body?.stopReason === 'string') patch.stopReason = event.body.stopReason;
+              if (typeof event.body?.pc === 'string') patch.pc = event.body.pc;
+            } else {
+              // Running clears any stale halted reason/PC.
+              patch.stopReason = null;
+              patch.pc = null;
+            }
+            sessionRegistry.update(event.session, patch);
+          }
+        } else if (isOrbitDebugSessionType(event.session.type) && event.event === AUTOMATION_LIFECYCLE_EVENT) {
+          // Structured lifecycle event from the DAP adapter (plan Task 11).
+          // Gate on the exact registered session object identity first: a stale
+          // event from a replaced session is dropped because its record's
+          // object no longer matches. `target.stopped`/`target.running` must
+          // still come from an active session; `target.connectionLost` is
+          // expected during termination, so only the object-identity gate
+          // applies and it is published even after the registry transitioned.
+          const type = event.body?.type;
+          if (typeof type === 'string' && eventHub) {
+            const recorded = sessionRegistry.getSessionObject(event.session.id);
+            if (recorded !== event.session) return;
+            const snapshot = sessionRegistry.getSessionSnapshot(event.session.id);
+            if (!snapshot) return;
+            if (type !== 'target.connectionLost') {
+              try {
+                sessionRegistry.requireExact({
+                  sessionId: snapshot.sessionId,
+                  sessionGeneration: snapshot.sessionGeneration,
+                });
+              } catch {
+                return; // stale generation/terminated session: drop the event
+              }
+            }
+            const data: Record<string, unknown> = {};
+            if (event.body?.reason !== undefined) data.reason = event.body.reason;
+            if (event.body?.threadId !== undefined) data.threadId = event.body.threadId;
+            eventHub.publish(type, {
+              sessionId: snapshot.sessionId,
+              sessionGeneration: snapshot.sessionGeneration,
+              data,
+            });
+            // Mirror the actual target state into the registry: breakpoint
+            // hits and other non-API stops must advance the phase instead of
+            // leaving snapshots reporting a stale `running`.
+            const patch = automationLifecyclePatch(type, event.body);
+            if (patch) sessionRegistry.update(event.session, patch);
+          }
         }
       }),
       vscode.debug.onDidStartDebugSession((session) => {
         if (isOrbitDebugSessionType(session.type)) setActiveWatchSession(session);
+        sessionRegistry.onStarted(session);
       }),
       vscode.debug.onDidChangeActiveDebugSession((session) => {
         setActiveWatchSession(session);
+        sessionRegistry.onActiveChanged(session);
       }),
       vscode.debug.onDidTerminateDebugSession((session) => {
         terminateWatchSession(session);
+        sessionRegistry.onTerminated(session);
+      }),
+      vscode.debug.onDidChangeBreakpoints(() => {
+        // VS Code breakpoint set is the single authority (plan Task 6); publish
+        // the derived change so SSE clients (Task 11) re-read breakpoints.list.
+        // Count only source breakpoints — the same set breakpoints.list exposes.
+        eventHub?.publish('breakpoints.changed', {
+          data: { breakpointCount: breakpointService.countSourceBreakpoints() },
+        });
       }),
 
       vscode.commands.registerCommand('ozone.addWatch', async () => {
@@ -235,7 +420,7 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand('ozone.enableMcuDebugViews', enableMcuDebugViewsIntegration),
 
       vscode.commands.registerCommand('ozone.api.getEndpoint', () => {
-        return pluginApiServer?.getEndpointInfo();
+        return automationApiLifecycle?.getActive()?.getEndpointInfo();
       }),
 
       vscode.commands.registerCommand('ozone.addToDataSampling', async (item) => {
@@ -460,9 +645,12 @@ async function enableMcuDebugViewsIntegration() {
   }
 }
 
-export function deactivate() {
+export async function deactivate() {
   stopWatchPolling();
+  await automationApiLifecycle?.setEnabled(false);
   rttLogTerminal?.dispose();
   dataSamplingManager?.dispose();
-  pluginApiServer?.dispose();
+  await apiFastSampleSink?.dispose();
+  sessionRegistry?.dispose();
+  eventHub?.dispose();
 }

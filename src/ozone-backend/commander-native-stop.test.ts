@@ -778,3 +778,41 @@ describe('OzoneBackend native stop routing', () => {
     });
   });
 });
+
+describe('OzoneBackend getCallStack cancellation', () => {
+  it('aborts a cancelled getCallStack before touching registers', async () => {
+    const legacy = legacyJLink(0x08000480, 0x08000400);
+    const backend = new OzoneBackend(undefined as unknown as NativeStepExecutor);
+    (backend as any).jlink = legacy;
+
+    const controller = new AbortController();
+    controller.abort();
+    const result = await backend.execute({ cmd: 'getCallStack', signal: controller.signal });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected ok result');
+    expect(result.data).toEqual([]);
+    expect(legacy.readRegister).not.toHaveBeenCalled();
+  });
+
+  it('aborts a getCallStack cancelled between the PC and LR reads', async () => {
+    const legacy = legacyJLink(0x08000480, 0x08000400);
+    const backend = new OzoneBackend(undefined as unknown as NativeStepExecutor);
+    (backend as any).jlink = legacy;
+
+    // Abort right after the PC read: the LR read must never be issued.
+    const controller = new AbortController();
+    (legacy.readRegister as any).mockImplementation((index: number) => {
+      if (index === 15) controller.abort();
+      return index === 15 ? 0x08000480 : 0x08000400;
+    });
+
+    const result = await backend.execute({ cmd: 'getCallStack', signal: controller.signal });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected ok result');
+    expect(result.data).toEqual([]);
+    const registerIndexes = (legacy.readRegister as any).mock.calls.map((call: number[]) => call[0]);
+    expect(registerIndexes).toEqual([15]); // PC only, no LR (R14) read
+  });
+});

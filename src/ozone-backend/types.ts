@@ -163,9 +163,9 @@ export type OzoneCommand =
   | { cmd: 'getRegisters'; signal?: AbortSignal }
   | { cmd: 'getVariable'; name: string; frame?: number }
   | { cmd: 'getLocals'; frame?: number; signal?: AbortSignal }
-  | { cmd: 'getCallStack' }
-  | { cmd: 'readMemory'; address: number; size: number; signal?: AbortSignal }
-  | { cmd: 'writeMemory'; address: number; data: number[] }
+  | { cmd: 'getCallStack'; signal?: AbortSignal }
+  | { cmd: 'readMemory'; address: number; size: number; signal?: AbortSignal; liveAccess?: boolean }
+  | { cmd: 'writeMemory'; address: number; data: number[]; liveAccess?: boolean }
   | { cmd: 'readRegister'; name: string }
   | { cmd: 'getTargetState' }
   | {
@@ -177,11 +177,14 @@ export type OzoneCommand =
     signal?: AbortSignal;
     probe?: DebugProbe;
     flashBeforeDebug?: boolean;
+    /** Advisory verification request; owners that can skip it honor `false`. */
+    verify?: boolean;
     cmsisDapFlashAlgorithmPath?: string;
   }
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }
-  | { cmd: 'resolveSymbol'; name: string }
+  | { cmd: 'resolveSymbol'; name?: string; address?: number }
+  | { cmd: 'searchSymbols'; query: string; maxResults: number }
   | { cmd: 'clearBreakpointAtAddr'; addr: number }
   | { cmd: 'setBreakpointAtAddr'; addr: number }
   | {
@@ -195,6 +198,7 @@ export type OzoneCommand =
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[]; priority?: 'watch' | 'timeline' }
   | { cmd: 'getPerformanceDiagnostics' }
+  | { cmd: 'getSchedulerSnapshot' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
   | { cmd: 'startRtt'; controlBlockAddress?: number }
   | { cmd: 'stopRtt' }

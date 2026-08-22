@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orbit-debug.dev/schemas/orbit-automation-events.schema.json",
+  "title": "Orbit Automation Event",
+  "description": "One event delivered by the authenticated Orbit Automation API v1 SSE stream.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "pattern": "^[0-9]{16,20}$",
+      "description": "Instance-local monotonically increasing unsigned 64-bit decimal identifier."
+    },
+    "instanceId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "projectId": {
+      "type": "string",
+      "pattern": "^sha256:"
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sessionGeneration": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Epoch milliseconds encoded as a decimal string."
+    },
+    "type": {
+      "type": "string",
+      "pattern": "^[a-z][A-Za-z0-9]*(\\.[A-Za-z0-9]+)+$",
+      "description": "Namespaced event type such as session.started or target.stopped."
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "eventId",
+    "instanceId",
+    "projectId",
+    "timestamp",
+    "type"
+  ]
+}

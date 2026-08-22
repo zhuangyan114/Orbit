@@ -1,0 +1,112 @@
+{
+  "handshake": {
+    "jsonrpc": "2.0",
+    "id": "req-1",
+    "method": "orbit.handshake",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a"
+      },
+      "apiVersion": "1.0",
+      "client": {
+        "name": "fixture-client",
+        "version": "1.0.0"
+      },
+      "expected": {
+        "projectId": "sha256:project-a",
+        "instanceId": "instance-a"
+      },
+      "requestedScopes": [
+        "read"
+      ]
+    }
+  },
+  "sessionSnapshot": {
+    "jsonrpc": "2.0",
+    "id": "req-2",
+    "method": "orbit.session.snapshot",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a",
+        "connectionId": "conn-a"
+      },
+      "sessionId": "session-a",
+      "includeCapabilities": true
+    }
+  },
+  "operationGet": {
+    "jsonrpc": "2.0",
+    "id": "req-3",
+    "method": "orbit.operation.get",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a",
+        "connectionId": "conn-a"
+      },
+      "operationId": "op-a"
+    }
+  },
+  "pollSessionSnapshot": {
+    "jsonrpc": "2.0",
+    "id": "req-4",
+    "method": "orbit.session.snapshot",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a",
+        "connectionId": "conn-a"
+      },
+      "sessionId": "session-a",
+      "includeCapabilities": true
+    }
+  },
+  "recordGetPage1": {
+    "jsonrpc": "2.0",
+    "id": "req-5",
+    "method": "orbit.record.get",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a",
+        "connectionId": "conn-a",
+        "sessionId": "session-a",
+        "sessionGeneration": 7
+      },
+      "recordingId": "record-a"
+    }
+  },
+  "recordGetPage2": {
+    "jsonrpc": "2.0",
+    "id": "req-6",
+    "method": "orbit.record.get",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a",
+        "connectionId": "conn-a",
+        "sessionId": "session-a",
+        "sessionGeneration": 7
+      },
+      "recordingId": "record-a",
+      "cursor": "frame-1"
+    }
+  },
+  "rpcError": {
+    "jsonrpc": "2.0",
+    "id": "req-7",
+    "method": "orbit.expression.evaluate",
+    "params": {
+      "context": {
+        "instanceId": "instance-a",
+        "projectId": "sha256:project-a",
+        "connectionId": "conn-a",
+        "sessionId": "session-a",
+        "sessionGeneration": 7
+      },
+      "expression": "missing_symbol"
+    }
+  }
+}

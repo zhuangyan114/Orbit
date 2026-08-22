@@ -1,0 +1,21 @@
+{
+  "name": "@orbit-debug/automation-client",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js client and CLI for the Orbit Automation API",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "orbit-automation": "dist/cli.js",
+    "orbit-automation-session": "dist/session.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run test/client.test.ts",
+    "test:session": "vitest run test/session.test.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

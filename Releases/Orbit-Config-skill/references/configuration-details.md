@@ -248,13 +248,7 @@ frame 的前 4 bytes 是 little-endian token。decoder 从 active ELF 的 `.pw_t
 
 ## MCP and Plugin API
 
-MCP server：`Releases/mcp/orbit-mcp-server.js`，stdio 进程；它读取 `ORBIT_PLUGIN_API_ENDPOINT_FILE` 指向的 endpoint，再访问 loopback Plugin API。endpoint 通常位于：
-
-```text
-%APPDATA%\Code\User\globalStorage\orbit-debug.orbit-for-vscode\plugin-api-endpoint.json
-```
-
-Plugin API 使用 `127.0.0.1`、随机端口、`/health` GET 和带 Bearer token 的 `/rpc` POST；endpoint 文件在 extension global storage 中生成。当前 MCP tools：`ozone_status`、`ozone_read_many`、`ozone_write_many`、`ozone_record`、`ozone_experiment_run`。
+MCP server：`Releases/mcp/orbit-mcp-server.js`，stdio 进程；它通过 Node automation client 读取 `ORBIT_AUTOMATION_REGISTRY`（Windows 默认 `%LOCALAPPDATA%\Orbit\automation\registries.json`），握手后调用 `POST /v1/rpc`。多个相同 `projectId` 实例必须指定 `instanceId`。当前 tools：`orbit_instances`、`orbit_handshake`、session/control/breakpoint/memory tools，以及 `orbit_status`、`orbit_read_many`、`orbit_write_many`、`orbit_record`、`orbit_experiment_run`。`tools/list` 对全可选工具也发出 `required: []`，避免 opencode 把缺失字段序列化成 `required: null` 后被严格中转拒绝。
 
 如果活动 `orbit` DAP session（或旧 `ozone` 别名）存在，runtime reads/writes/status 通过该 DAP session 路由；DAP 请求失败应返回错误，不回退到另一个 Extension Host target owner。
 

@@ -158,9 +158,11 @@ export class OzoneBackend {
     return result.ok && result.data?.state === 'Halted';
   }
 
-  private async targetReadRegister(index: number): Promise<number | null> {
+  private async targetReadRegister(index: number, signal?: AbortSignal): Promise<number | null> {
     if (!this.sessionTarget) return this.jlink.readRegister(index);
-    const result = await this.sessionTarget.readRegister(index);
+    const result = signal
+      ? await this.sessionTarget.readRegister(index, { signal })
+      : await this.sessionTarget.readRegister(index);
     return result.ok && result.data ? result.data.value : null;
   }
 
@@ -294,8 +296,10 @@ export class OzoneBackend {
         && command.cmd !== 'disconnect'
         && command.cmd !== 'loadSymbols'
         && command.cmd !== 'resolveSymbol'
+        && command.cmd !== 'searchSymbols'
         && command.cmd !== 'prepareFastDataSampling'
-        && command.cmd !== 'getPerformanceDiagnostics') {
+        && command.cmd !== 'getPerformanceDiagnostics'
+        && command.cmd !== 'getSchedulerSnapshot') {
         return { ok: false, error: 'Target access is owned by the active ozone DAP session' };
       }
       switch (command.cmd) {
@@ -349,9 +353,9 @@ export class OzoneBackend {
         case 'getLocals':
           return await this.doGetLocals(command.signal);
         case 'getCallStack':
-          return await this.doGetCallStack();
+          return await this.doGetCallStack(command.signal);
         case 'readMemory':
-          return await this.doReadMemory(command.address, command.size, command.signal);
+          return await this.doReadMemory(command.address, command.size, command.signal, command.liveAccess === true);
         case 'readRegister':
           return await this.doReadRegister(command.name);
         case 'getTargetState': {
@@ -384,7 +388,7 @@ export class OzoneBackend {
         }
         case 'flash':
           return await this.doFlash(command.elfPath, command.device, command.interface, command.speedKHz,
-            command.signal, command.probe, command.flashBeforeDebug, command.cmsisDapFlashAlgorithmPath);
+            command.signal, command.probe, command.flashBeforeDebug, command.cmsisDapFlashAlgorithmPath, command.verify);
 case 'readVariableRuntime':
           return await this.readVariableAtRuntime(command.name);
         case 'clearBreakpointAtAddr':
@@ -440,8 +444,17 @@ case 'readVariableRuntime':
               }),
             },
           };
+        case 'getSchedulerSnapshot':
+          return {
+            ok: true,
+            data: this.sessionTarget?.getSchedulerSnapshot?.() || {
+              running: false,
+              pausedPriorities: [],
+              queued: { control: 0, watch: 0, timeline: 0, background: 0 },
+            },
+          };
         case 'writeMemory':
-          return await this.doWriteMemory(command.address, command.data);
+          return await this.doWriteMemory(command.address, command.data, command.liveAccess === true);
         case 'setWatchValue':
           return await this.doSetWatchValue(command.expression, command.value, command.address, command.typeName);
         case 'startRtt':
@@ -540,18 +553,42 @@ case 'readVariableRuntime':
               error: 'SymbolsUnavailable: no ELF symbols are loaded',
             };
           }
-          const symbol = this.findSymbolByName(command.name);
+          const byName = command.name !== undefined ? this.findSymbolByName(command.name) : undefined;
+          const byAddress = command.address !== undefined ? this.findSymbolByAddress(command.address) : undefined;
+          const symbol = byName ?? byAddress;
           if (!symbol || !Number.isFinite(symbol.address)) {
             return {
               ok: false,
               errorCode: 'SymbolNotFound',
-              error: `SymbolNotFound: ${command.name}`,
+              error: `SymbolNotFound: ${command.name ?? `0x${command.address?.toString(16)}`}`,
             };
           }
-          log.eval(`resolveSymbol name=${command.name} address=0x${symbol.address.toString(16)} source=elf`);
+          const exact = command.name !== undefined
+            ? symbol.name === command.name
+            : (symbol.address >>> 0) === (command.address! >>> 0);
+          log.eval(`resolveSymbol name=${command.name ?? ''} address=${command.address ?? '0x0'} -> ${symbol.name} source=elf exact=${exact}`);
           return {
             ok: true,
-            data: { name: symbol.name, address: symbol.address, size: symbol.size, type: symbol.type },
+            data: { name: symbol.name, address: symbol.address, size: symbol.size, type: symbol.type, exact },
+          };
+        }
+        case 'searchSymbols': {
+          if (!this.elfPath || this.symbols.length === 0) {
+            return {
+              ok: false,
+              errorCode: 'SymbolsUnavailable',
+              error: 'SymbolsUnavailable: no ELF symbols are loaded',
+            };
+          }
+          const query = command.query.toLowerCase();
+          const matches = this.symbols
+            .filter(s => s.name.toLowerCase().includes(query))
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .slice(0, command.maxResults);
+          log.eval(`searchSymbols query=${command.query} matches=${matches.length}`);
+          return {
+            ok: true,
+            data: matches.map(s => ({ name: s.name, address: s.address, size: s.size, type: s.type })),
           };
         }
         default:
@@ -956,7 +993,7 @@ case 'readVariableRuntime':
         log.dap(`getRegisters cancelled before register=${name}`);
         return { ok: true, data: [] };
       }
-      const val = await this.readRegisterValue(idx, name);
+      const val = await this.readRegisterValue(idx, name, signal);
       if (signal?.aborted) {
         log.dap(`getRegisters cancelled after register=${name}`);
         return { ok: true, data: [] };
@@ -1081,7 +1118,8 @@ case 'readVariableRuntime':
     return { ok: true, data: variables };
   }
 
-  private async doGetCallStack(): Promise<OzoneCommandResult> {
+  private async doGetCallStack(signal?: AbortSignal): Promise<OzoneCommandResult> {
+    if (signal?.aborted) return { ok: true, data: [] };
     // Wait for CPU to halt if not already halted
     const nativeOwner = this.nativeStepExecutor?.usingNative === true;
     let isHalted = nativeOwner && this.lastNativeStopInfo ? true : await this.targetIsHalted();
@@ -1089,6 +1127,7 @@ case 'readVariableRuntime':
     if (!isHalted) {
       for (let i = 0; i < 20; i++) {
         await new Promise<void>(r => setTimeout(r, 50));
+        if (signal?.aborted) return { ok: true, data: [] };
         isHalted = nativeOwner && this.lastNativeStopInfo ? true : await this.targetIsHalted();
         if (isHalted) break;
       }
@@ -1097,21 +1136,26 @@ case 'readVariableRuntime':
       return { ok: true, data: [] };
     }
     await new Promise<void>(r => setTimeout(r, 100));
+    if (signal?.aborted) return { ok: true, data: [] };
 
     let pc = nativeOwner && this.lastNativeStopInfo
-      ? await this.readRegisterValue(REG_INDEXES.PC, 'PC')
-      : await this.targetReadRegister(REG_INDEXES.PC);
+      ? await this.readRegisterValue(REG_INDEXES.PC, 'PC', signal)
+      : await this.targetReadRegister(REG_INDEXES.PC, signal);
+    if (signal?.aborted) return { ok: true, data: [] };
     let lr = nativeOwner && this.lastNativeStopInfo
-      ? await this.readRegisterValue(REG_INDEXES.LR, 'LR')
-      : await this.targetReadRegister(REG_INDEXES.LR);
+      ? await this.readRegisterValue(REG_INDEXES.LR, 'LR', signal)
+      : await this.targetReadRegister(REG_INDEXES.LR, signal);
+    if (signal?.aborted) return { ok: true, data: [] };
 
     // Retry LR with DAP as readRegister now auto-fallsback to DAP,
     // but also try once more after a small delay for robustness
     if (pc !== null && lr === null) {
       await new Promise<void>(r => setTimeout(r, 50));
+      if (signal?.aborted) return { ok: true, data: [] };
       lr = nativeOwner && this.lastNativeStopInfo
-        ? await this.readRegisterValue(REG_INDEXES.LR, 'LR')
-        : await this.targetReadRegister(REG_INDEXES.LR);
+        ? await this.readRegisterValue(REG_INDEXES.LR, 'LR', signal)
+        : await this.targetReadRegister(REG_INDEXES.LR, signal);
+      if (signal?.aborted) return { ok: true, data: [] };
     }
 
     const registerSource = nativeOwner && this.lastNativeStopInfo
@@ -1168,7 +1212,7 @@ case 'readVariableRuntime':
     return { ok: true, data: frames };
   }
 
-  private async readRegisterValue(index: number, name: string): Promise<number | null> {
+  private async readRegisterValue(index: number, name: string, signal?: AbortSignal): Promise<number | null> {
     const nativeOwner = this.nativeStepExecutor?.usingNative === true;
     if (nativeOwner && this.nativeStepExecutor?.readRegister) {
       try {
@@ -1187,7 +1231,7 @@ case 'readVariableRuntime':
       log.dap(`readRegister ${name} source=nativeHelper failed`);
       return null;
     }
-    const value = await this.targetReadRegister(index);
+    const value = await this.targetReadRegister(index, signal);
     log.dap(`readRegister ${name} source=${this.targetRegisterSource()} value=${value === null ? 'null' : `0x${value.toString(16)}`}`);
     return value;
   }
@@ -2479,11 +2523,16 @@ case 'readVariableRuntime':
     return null;
   }
 
-  private async doReadMemory(address: number, size: number, signal?: AbortSignal): Promise<OzoneCommandResult> {
+  private async doReadMemory(
+    address: number,
+    size: number,
+    signal?: AbortSignal,
+    liveAccess = false,
+  ): Promise<OzoneCommandResult> {
     if (signal?.aborted) {
       return { ok: false, errorCode: 'TargetReadCancelled', error: 'Target read cancelled', targetState: 'Unknown', elapsedMs: 0 };
     }
-    const wasRunning = !(await this.targetIsHalted());
+    const wasRunning = liveAccess ? false : !(await this.targetIsHalted());
     if (wasRunning) {
       if (signal?.aborted) {
         return { ok: false, errorCode: 'TargetReadCancelled', error: 'Target read cancelled', targetState: 'Running', elapsedMs: 0 };
@@ -2495,9 +2544,11 @@ case 'readVariableRuntime':
 
     const readResult = await this.readMemoryChunked(address, size, signal);
     const resumed = wasRunning && !signal?.aborted ? await this.targetRun() : false;
-    const currentTargetState = wasRunning
-      ? (resumed ? 'Running' : readResult.targetState)
-      : 'Halted';
+    const currentTargetState = liveAccess
+      ? readResult.targetState
+      : wasRunning
+        ? (resumed ? 'Running' : readResult.targetState)
+        : 'Halted';
     if (!readResult.ok) {
       const errorCode = readResult.errorCode || 'MemoryReadFailed';
       log.dap(`readMemory failed owner=${this.targetRegisterSource()} errorCode=${errorCode}`
@@ -2599,12 +2650,19 @@ case 'readVariableRuntime':
     probe: DebugProbe = 'jlink',
     flashBeforeDebug = true,
     algorithmPath?: string,
+    verify?: boolean,
   ): Promise<OzoneCommandResult> {
     if (flashBeforeDebug === false) return { ok: true, data: { skipped: true, reason: 'flashBeforeDebug=false' } };
-    let result: { success: boolean; message: string; elfPath?: string };
+    let result: {
+      success: boolean;
+      message: string;
+      elfPath?: string;
+      reports?: Array<{ operation: string; address: number; size: number; elapsedMs: number; ok: boolean; errorCode?: string; message?: string }>;
+      erasedSectors?: Array<{ number: number; address: number; size: number }>;
+    };
     if (probe === 'cmsis-dap') {
       if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'CMSIS-DAP target owner is unavailable' };
-      const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000 };
+      const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000, verify: verify ?? true };
       const flashResult = 'ownerKind' in this.sessionTarget
         ? await this.sessionTarget.flash(elfPath, device, options)
         : this.sessionTarget.flash
@@ -2624,7 +2682,15 @@ case 'readVariableRuntime':
           diagnostics: flashResult.diagnostics,
         };
       }
-      result = { success: true, message: flashResult.message, elfPath };
+      result = {
+        success: true,
+        message: flashResult.message,
+        elfPath,
+        // Per-operation reports (including verify) stay additive so the
+        // automation flash outcome can report what the owner verified.
+        reports: flashResult.data?.reports,
+        erasedSectors: flashResult.data?.erasedSectors,
+      };
     } else {
       result = await flashElf(elfPath, device, interface_, speedKHz, { signal });
     }
@@ -2860,6 +2926,25 @@ case 'readVariableRuntime':
   private findSymbolByName(name: string): SymbolInfo | undefined {
     return this.symbols.find(s => s.name === name)
       || this.symbols.find(s => s.name.toLowerCase() === name.toLowerCase());
+  }
+
+  /** Resolves a symbol whose exact address matches, or that contains the address. */
+  private findSymbolByAddress(address: number): SymbolInfo | undefined {
+    const normalized = address >>> 0;
+    let exact: SymbolInfo | undefined;
+    for (const sym of this.symbols) {
+      if ((sym.address >>> 0) === normalized) {
+        if (!exact || sym.size < exact.size) exact = sym;
+      }
+    }
+    if (exact) return exact;
+    let container: SymbolInfo | undefined;
+    for (const sym of this.symbols) {
+      if (sym.size > 0 && normalized > (sym.address >>> 0) && normalized < (sym.address >>> 0) + sym.size) {
+        if (!container || sym.size < container.size) container = sym;
+      }
+    }
+    return container;
   }
 
   private isFastScalarType(info: { kind?: string; byteSize?: number } | null): boolean {
@@ -4156,15 +4241,43 @@ case 'readVariableRuntime':
     return result;
   }
 
-  private async doWriteMemory(address: number, data: number[]): Promise<OzoneCommandResult> {
+  private async doWriteMemory(address: number, data: number[], liveAccess = false): Promise<OzoneCommandResult> {
     log.eval(`doWriteMemory: addr=0x${address.toString(16)} len=${data.length}`);
+    const bytes = Uint8Array.from(data.map(b => b & 0xFF));
+    if (liveAccess) {
+      if (this.sessionTarget) {
+        const result = await this.sessionTarget.writeMemory(address, bytes);
+        if (!result.ok || result.data?.bytesWritten !== bytes.length) {
+          const errorCode = result.errorCode || 'MemoryWriteFailed';
+          return {
+            ok: false,
+            errorCode,
+            error: `${errorCode}: ${result.message}`,
+            targetState: result.targetState,
+            elapsedMs: result.elapsedMs,
+            diagnostics: result.diagnostics,
+          };
+        }
+        return { ok: true, data: `Wrote ${data.length} byte(s)` };
+      }
+      const ok = this.jlink.writeMemoryBytes(address, bytes);
+      return ok
+        ? { ok: true, data: `Wrote ${data.length} byte(s)` }
+        : {
+          ok: false,
+          errorCode: 'MemoryWriteFailed',
+          error: 'MemoryWriteFailed: live memory write failed',
+          targetState: this.state,
+        };
+    }
+
     const wasRunning = !(await this.targetIsHalted());
     if (wasRunning) {
       const halted = await this.targetHalt();
       if (!halted) return { ok: false, error: 'halt failed' };
       await new Promise<void>(r => setTimeout(r, 50));
     }
-    const ok = await this.targetWriteMemory(address, Uint8Array.from(data.map(b => b & 0xFF)));
+    const ok = await this.targetWriteMemory(address, bytes);
     if (wasRunning) {
       await this.targetRun();
     }

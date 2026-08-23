@@ -4,6 +4,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
   STM32F407VET6,
+  STM32H723VGT6,
   calculateEraseSectors,
   CmsisDapFlashError,
   FlashTargetDefinition,
@@ -269,7 +270,7 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
       algorithm[0x500] = 0x00;
       algorithm[0x501] = 0xBE;
       fs.writeFileSync(algorithmPath, algorithm);
-      const calls: Array<{ operation: string; address: number; size: number; stackSize: number; staticBase: number; reusePageBuffer: boolean }> = [];
+      const calls: Array<{ operation: string; address: number; size: number; stackSize: number; staticBase: number; reusePageBuffer: boolean; flashStatusAddress?: number; flashControlAddress?: number; ramBase?: number; ramSize?: number }> = [];
       const transport = {
         async readDp(reg: number) {
           return reg === 0
@@ -281,8 +282,8 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
           if (address === 0x1FFF7A22) return { ok: true, bytes: [0x00, 0x02].slice(0, size) };
           return { ok: false, errorCode: 'DapInvalidRequest', message: 'unexpected read' };
         },
-        async runAlgorithm(request: { operation: string; targetAddress: number; size: number; stackSize: number; staticBase: number; reusePageBuffer: boolean }) {
-          calls.push({ operation: request.operation, address: request.targetAddress, size: request.size, stackSize: request.stackSize, staticBase: request.staticBase, reusePageBuffer: request.reusePageBuffer });
+        async runAlgorithm(request: { operation: string; targetAddress: number; size: number; stackSize: number; staticBase: number; reusePageBuffer: boolean; flashStatusAddress?: number; flashControlAddress?: number; ramBase?: number; ramSize?: number }) {
+          calls.push({ operation: request.operation, address: request.targetAddress, size: request.size, stackSize: request.stackSize, staticBase: request.staticBase, reusePageBuffer: request.reusePageBuffer, flashStatusAddress: request.flashStatusAddress, flashControlAddress: request.flashControlAddress, ramBase: request.ramBase, ramSize: request.ramSize });
           return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: 0x20000502, dhcsr: 0x00030003 } };
         },
       };
@@ -300,6 +301,9 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
       expect(calls.filter(call => call.operation === 'verify').map(call => call.size)).toEqual([4, 4]);
       expect(calls.every(call => call.stackSize === 0x1000 && call.staticBase === 0)).toBe(true);
       expect(calls.every(call => call.reusePageBuffer === false)).toBe(true);
+      expect(calls.every(call => call.flashStatusAddress === 0x40023C0C
+        && call.flashControlAddress === 0x40023C10)).toBe(true);
+      expect(calls.every(call => call.ramBase === 0x20000000 && call.ramSize === 128 * 1024)).toBe(true);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -721,44 +725,10 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
   });
 });
 
-// H723-shaped target proving the flash model is device-agnostic before the
-// real registry entry lands with its P2 algorithm. Values follow the 1.1.2
-// plan draft; RM0468 confirmation and hardware acceptance happen in P2/P7,
-// so this entry stays out of the registry and flows use user algorithms.
-const STM32H723_TEST_TARGET: FlashTargetDefinition = Object.freeze({
-  name: 'STM32H723VGT6',
-  aliases: [],
-  dpIdcode: 0x6BA02477,
-  flashBase: 0x08000000,
-  flashSize: 1024 * 1024,
-  sectors: [
-    { number: 0, address: 0x08000000, size: 0x20000 },
-    { number: 1, address: 0x08020000, size: 0x20000 },
-    { number: 2, address: 0x08040000, size: 0x20000 },
-    { number: 3, address: 0x08060000, size: 0x20000 },
-    { number: 4, address: 0x08080000, size: 0x20000 },
-    { number: 5, address: 0x080A0000, size: 0x20000 },
-    { number: 6, address: 0x080C0000, size: 0x20000 },
-    { number: 7, address: 0x080E0000, size: 0x20000 },
-  ],
-  ramRegions: [
-    { name: 'ITCM', address: 0x00000000, size: 64 * 1024 },
-    { name: 'DTCM', address: 0x20000000, size: 128 * 1024 },
-    { name: 'AXI SRAM', address: 0x24000000, size: 320 * 1024 },
-    { name: 'SRAM1-3', address: 0x30000000, size: 272 * 1024 },
-    { name: 'SRAM4', address: 0x38000000, size: 16 * 1024 },
-  ],
-  loaderRamIndex: 2,
-  preflight: {
-    idcodeAddress: 0x5C001000,
-    deviceId: 0x483,
-    flashSizeRegisterAddress: 0x1FF1E880,
-    expectedFlashSizeKiB: 1024,
-  },
-  algorithm: 'stm32h723',
-  eraseTimeoutMs: 30000,
-  programTimeoutMs: 15000,
-});
+// H723 registry entry proving the flash model is device-agnostic. Register
+// facts were verified against ST cmsis-device-h7/stm32h723xx.h and the H7 HAL
+// flash driver; DPIDR and timing defaults stay provisional until P7 hardware
+// acceptance.
 
 describe('CMSIS-DAP flash target registry', () => {
   it('resolves registered names and aliases from normalized device input', () => {
@@ -766,22 +736,27 @@ describe('CMSIS-DAP flash target registry', () => {
     expect(resolveFlashTarget(' stm32f407vet6 ')).toBe(STM32F407VET6);
     expect(resolveFlashTarget('stm32f407ve')).toBe(STM32F407VET6);
     expect(resolveFlashTarget('STM32F407VE')).toBe(STM32F407VET6);
-    expect(listFlashTargets()).toContain(STM32F407VET6);
+    expect(resolveFlashTarget('STM32H723VGT6')).toBe(STM32H723VGT6);
+    expect(resolveFlashTarget(' stm32h723vgt6 ')).toBe(STM32H723VGT6);
+    expect(resolveFlashTarget('stm32h723vg')).toBe(STM32H723VGT6);
+    const targets = listFlashTargets();
+    expect(targets).toContain(STM32F407VET6);
+    expect(targets).toContain(STM32H723VGT6);
   });
 
   it('rejects an unregistered device with a structured TargetMismatch', () => {
     try {
-      resolveFlashTarget('STM32H723VGT6');
+      resolveFlashTarget('STM32F429VGT6');
       expect.unreachable('resolveFlashTarget must throw for an unregistered device');
     } catch (error) {
       const mismatch = error as CmsisDapFlashError;
       expect(mismatch).toBeInstanceOf(CmsisDapFlashError);
       expect(mismatch.code).toBe('TargetMismatch');
-      expect(mismatch.message).toContain('STM32H723VGT6');
+      expect(mismatch.message).toContain('STM32F429VGT6');
       expect(mismatch.message).toContain('STM32F407VET6');
       expect(mismatch.diagnostics).toMatchObject({
-        device: 'STM32H723VGT6',
-        supportedTargets: ['STM32F407VET6'],
+        device: 'STM32F429VGT6',
+        supportedTargets: ['STM32F407VET6', 'STM32H723VGT6'],
       });
     }
   });
@@ -809,6 +784,12 @@ describe('CMSIS-DAP flash target registry', () => {
     expect(() => validateFlashTargetDefinition(variant({
       preflight: { ...STM32F407VET6.preflight, expectedFlashSizeKiB: 256 },
     }))).toThrow(/capacity/);
+    expect(() => validateFlashTargetDefinition(variant({
+      flashDiagnostics: { statusAddress: 0x40023C0C, controlAddress: 0x40023C14 },
+    }))).toThrow(/adjacent aligned words/);
+    expect(() => validateFlashTargetDefinition(variant({
+      flashDiagnostics: { statusAddress: 0x40023C0E, controlAddress: 0x40023C12 },
+    }))).toThrow(/adjacent aligned words/);
   });
 });
 
@@ -832,9 +813,29 @@ describe('built-in flash algorithm metadata', () => {
     expect(STM32F407VET6.algorithm).toBe('stm32f407');
   });
 
+  it('registers the H723 algorithm with its page contract', () => {
+    const algorithms = listBuiltinFlashAlgorithms();
+    expect([...algorithms.keys()]).toContain('stm32h723');
+    const h723 = algorithms.get('stm32h723')!;
+    expect(h723.fileName).toBe('orbit-stm32h723-flash-algorithm.bin');
+    expect(h723.pageSize).toBe(0x10000);
+    expect(h723.preservesPageBuffer).toBe(true);
+    expect(h723.staticBase).toBe(0);
+    expect(h723.entries).toEqual({
+      init: 0x000,
+      uninit: 0x100,
+      eraseSector: 0x200,
+      programPage: 0x300,
+      verify: 0x400,
+      bkpt: 0x500,
+    });
+    expect(STM32H723VGT6.algorithm).toBe('stm32h723');
+  });
+
   it('rejects a target whose built-in algorithm name is not registered', () => {
-    expect(() => loadFlashAlgorithm(STM32H723_TEST_TARGET))
-      .toThrow(/unknown built-in Flash Algorithm 'stm32h723'/);
+    const target: FlashTargetDefinition = { ...STM32H723VGT6, algorithm: 'stm32f429' };
+    expect(() => loadFlashAlgorithm(target))
+      .toThrow(/unknown built-in Flash Algorithm 'stm32f429'/);
   });
 
   it('resolves a user algorithm path stored in the target algorithm field', () => {
@@ -851,7 +852,7 @@ describe('built-in flash algorithm metadata', () => {
         pageSize: 4,
         entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
       }));
-      const target: FlashTargetDefinition = { ...STM32H723_TEST_TARGET, algorithm: manifestPath };
+      const target: FlashTargetDefinition = { ...STM32H723VGT6, algorithm: manifestPath };
       const image = loadFlashAlgorithm(target);
       expect(image.source).toBe('user-provided');
       expect(image.pageSize).toBe(4);
@@ -864,16 +865,16 @@ describe('built-in flash algorithm metadata', () => {
 
 describe('multi-target flash model (H723-shaped)', () => {
   it('validates structurally and computes 8 x 128 KiB erase sectors', () => {
-    expect(() => validateFlashTargetDefinition(STM32H723_TEST_TARGET)).not.toThrow();
+    expect(() => validateFlashTargetDefinition(STM32H723VGT6)).not.toThrow();
     const boundary = parseElf32LoadSegments(makeElf([
       { address: 0x0801FFFC, bytes: [1, 2, 3, 4, 5, 6, 7, 8] },
     ]));
-    expect(calculateEraseSectors(boundary, STM32H723_TEST_TARGET).map(sector => sector.number))
+    expect(calculateEraseSectors(boundary, STM32H723VGT6).map(sector => sector.number))
       .toEqual([0, 1]);
     const lastSector = parseElf32LoadSegments(makeElf([
       { address: 0x080E0000, bytes: [1] },
     ]));
-    const sectors = calculateEraseSectors(lastSector, STM32H723_TEST_TARGET);
+    const sectors = calculateEraseSectors(lastSector, STM32H723VGT6);
     expect(sectors.map(sector => sector.number)).toEqual([7]);
     expect(sectors[0]!.address + sectors[0]!.size).toBe(0x08100000);
   });
@@ -885,16 +886,16 @@ describe('multi-target flash model (H723-shaped)', () => {
       { address: 0x30000000, bytes: [3], memorySize: 16 },
       { address: 0x38000000, bytes: [4], memorySize: 16 },
     ]));
-    expect(calculateEraseSectors(spread, STM32H723_TEST_TARGET)).toEqual([]);
+    expect(calculateEraseSectors(spread, STM32H723VGT6)).toEqual([]);
     const straddling = parseElf32LoadSegments(makeElf([
       { address: 0x20000000, bytes: [1, 2, 3, 4], memorySize: 128 * 1024 + 4 },
     ]));
-    expect(() => calculateEraseSectors(straddling, STM32H723_TEST_TARGET))
+    expect(() => calculateEraseSectors(straddling, STM32H723VGT6))
       .toThrow(/outside STM32H723VGT6 Flash and RAM regions/);
   });
 
   it('places the loader in the AXI SRAM region selected by loaderRamIndex', () => {
-    const layout = planFlashRamLayout(STM32H723_TEST_TARGET, 0x123, 0x800, 0x1000);
+    const layout = planFlashRamLayout(STM32H723VGT6, 0x123, 0x800, 0x1000);
     const axiBase = 0x24000000;
     const axiEnd = axiBase + 320 * 1024;
     expect(layout.algorithm.address).toBe(axiBase);
@@ -903,7 +904,7 @@ describe('multi-target flash model (H723-shaped)', () => {
       expect(region.address).toBeGreaterThanOrEqual(axiBase);
       expect(region.address + region.size).toBeLessThanOrEqual(axiEnd);
     }
-    expect(() => planFlashRamLayout(STM32H723_TEST_TARGET, 320 * 1024, 0x800, 0x1000))
+    expect(() => planFlashRamLayout(STM32H723VGT6, 320 * 1024, 0x800, 0x1000))
       .toThrow(/STM32H723VGT6 AXI SRAM/);
   });
 
@@ -923,29 +924,33 @@ describe('multi-target flash model (H723-shaped)', () => {
         pageSize: 4,
         entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
       }));
-      const calls: Array<{ operation: string; timeoutMs: number; algorithmAddress: number; stackPointer: number }> = [];
+      const calls: Array<{ operation: string; timeoutMs: number; algorithmAddress: number; stackPointer: number; flashStatusAddress?: number; flashControlAddress?: number; ramBase?: number; ramSize?: number }> = [];
       const readAddresses: number[] = [];
       const transport = {
-        async readDp() { return { ok: true, value: STM32H723_TEST_TARGET.dpIdcode }; },
+        async readDp() { return { ok: true, value: STM32H723VGT6.dpIdcode }; },
         async readMemory(address: number, size: number) {
           readAddresses.push(address);
           if (address === 0x5C001000) return { ok: true, bytes: [0x83, 0x04, 0x00, 0x10].slice(0, size) };
           if (address === 0x1FF1E880) return { ok: true, bytes: [0x00, 0x04].slice(0, size) };
           return { ok: false, errorCode: 'DapInvalidRequest', message: `unexpected read at 0x${address.toString(16)}` };
         },
-        async runAlgorithm(request: { operation: string; timeoutMs: number; algorithmAddress: number; stackPointer: number; bkptAddress: number }) {
+        async runAlgorithm(request: { operation: string; timeoutMs: number; algorithmAddress: number; stackPointer: number; bkptAddress: number; flashStatusAddress?: number; flashControlAddress?: number; ramBase?: number; ramSize?: number }) {
           calls.push({
             operation: request.operation,
             timeoutMs: request.timeoutMs,
             algorithmAddress: request.algorithmAddress,
             stackPointer: request.stackPointer,
+            flashStatusAddress: request.flashStatusAddress,
+            flashControlAddress: request.flashControlAddress,
+            ramBase: request.ramBase,
+            ramSize: request.ramSize,
           });
           return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003 } };
         },
       };
       const result = await flashCmsisDapElf(transport, elfPath, 'STM32H723VGT6', {
         algorithmPath: manifestPath,
-      }, STM32H723_TEST_TARGET);
+      }, STM32H723VGT6);
       expect(result.success).toBe(true);
       expect(readAddresses).toEqual(expect.arrayContaining([0x5C001000, 0x1FF1E880]));
       expect(readAddresses).not.toContain(0xE0042000);
@@ -954,6 +959,9 @@ describe('multi-target flash model (H723-shaped)', () => {
       expect(timeouts).toEqual({ init: 5000, eraseSector: 30000, programPage: 15000, verify: 15000, uninit: 5000 });
       expect(calls.every(call => call.algorithmAddress === 0x24000000)).toBe(true);
       expect(calls.every(call => call.stackPointer === 0x24050000)).toBe(true);
+      expect(calls.every(call => call.flashStatusAddress === 0x52002010
+        && call.flashControlAddress === 0x5200200C)).toBe(true);
+      expect(calls.every(call => call.ramBase === 0x24000000 && call.ramSize === 320 * 1024)).toBe(true);
       expect(result.erasedSectors.map(sector => sector.number)).toEqual([0]);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -977,7 +985,7 @@ describe('multi-target flash model (H723-shaped)', () => {
       }));
       const timeouts: number[] = [];
       const transport = {
-        async readDp() { return { ok: true, value: STM32H723_TEST_TARGET.dpIdcode }; },
+        async readDp() { return { ok: true, value: STM32H723VGT6.dpIdcode }; },
         async readMemory(address: number, size: number) {
           if (address === 0x5C001000) return { ok: true, bytes: [0x83, 0x04, 0x00, 0x10].slice(0, size) };
           if (address === 0x1FF1E880) return { ok: true, bytes: [0x00, 0x04].slice(0, size) };
@@ -991,7 +999,7 @@ describe('multi-target flash model (H723-shaped)', () => {
       const result = await flashCmsisDapElf(transport, elfPath, 'STM32H723VGT6', {
         algorithmPath: manifestPath,
         timeoutMs: 1234,
-      }, STM32H723_TEST_TARGET);
+      }, STM32H723VGT6);
       expect(result.success).toBe(true);
       expect(timeouts.length).toBeGreaterThan(0);
       expect(new Set(timeouts)).toEqual(new Set([1234]));
@@ -1017,7 +1025,7 @@ describe('multi-target flash model (H723-shaped)', () => {
       }));
       let eraseCalls = 0;
       const transport = {
-        async readDp() { return { ok: true, value: STM32H723_TEST_TARGET.dpIdcode }; },
+        async readDp() { return { ok: true, value: STM32H723VGT6.dpIdcode }; },
         async readMemory(address: number, size: number) {
           // An F4 DEV_ID on the H7 DBGMCU register must fail the preflight.
           if (address === 0x5C001000) return { ok: true, bytes: [0x13, 0x64, 0x00, 0x10].slice(0, size) };
@@ -1030,7 +1038,7 @@ describe('multi-target flash model (H723-shaped)', () => {
       };
       const result = await flashCmsisDapElf(transport, elfPath, 'STM32H723VGT6', {
         algorithmPath: manifestPath,
-      }, STM32H723_TEST_TARGET);
+      }, STM32H723VGT6);
       expect(result.success).toBe(false);
       expect(result.errorCode).toBe('TargetMismatch');
       expect(result.message).toContain('0x483');

@@ -430,8 +430,8 @@ Result CortexMDebug::executeFlashAlgorithm(const FlashAlgorithmRunRequest& reque
                                            DapTransferDiagnostics& diag,
                                            std::chrono::milliseconds timeout,
                                            CortexMDebugDiagnostics* operationDiagnostics) {
-  constexpr uint32_t kSramBase = 0x20000000u;
-  constexpr uint32_t kSramEnd = 0x20020000u;
+  const uint32_t kSramBase = request.ramBase;
+  const uint32_t kSramEnd = request.ramBase + request.ramSize;
   const auto inSram = [=](uint32_t address, uint32_t size) {
     return address >= kSramBase && size <= kSramEnd - address;
   };

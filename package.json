@@ -529,6 +529,7 @@
     "test:cpp-channel:mock": "node scripts/cpp-channel-smoke.js --mock",
     "test:cmsis-dap:mock": "node scripts/cmsis-dap-smoke.js --mock",
     "test:cmsis-dap:algorithm": "node scripts/cmsis-dap/verify-flash-algorithm.js",
+    "test:cmsis-dap:all": "npm run test:cmsis-dap:mock && npm run test:cmsis-dap:algorithm && npm run test:cpp-channel:mock",
     "watch": "node esbuild.config.js --watch",
     "mcp": "node Releases/mcp/orbit-mcp-server.js",
     "lint": "eslint src --ext ts,tsx",

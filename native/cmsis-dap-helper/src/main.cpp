@@ -1377,6 +1377,30 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
   const auto size = uintField(params, "size");
   const auto staticBase = uintField(params, "staticBase").value_or(0);
   const auto clockHz = uintField(params, "clockHz").value_or(4000000);
+  // Optional target Flash diagnostic registers. Absent fields keep the
+  // STM32F407 defaults so existing sessions observe no protocol change; the
+  // two registers must be adjacent aligned words because both are fetched in
+  // one 2-word block read starting at the lower address.
+  const auto flashStatusAddressOpt = uintField(params, "flashStatusAddress");
+  const auto flashControlAddressOpt = uintField(params, "flashControlAddress");
+  const uint32_t flashStatusAddress =
+      static_cast<uint32_t>(flashStatusAddressOpt.value_or(kStm32F4FlashSr));
+  const uint32_t flashControlAddress =
+      static_cast<uint32_t>(flashControlAddressOpt.value_or(kStm32F4FlashCr));
+  const auto flashDiagParamsValid = (!flashStatusAddressOpt || flashStatusAddressOpt <= 0xFFFFFFFFu)
+      && (!flashControlAddressOpt || flashControlAddressOpt <= 0xFFFFFFFFu)
+      && (flashStatusAddress % 4u) == 0u && (flashControlAddress % 4u) == 0u
+      && (flashStatusAddress > flashControlAddress
+              ? flashStatusAddress - flashControlAddress
+              : flashControlAddress - flashStatusAddress) == 4u;
+  // Optional loader RAM window for the algorithm image, page buffer, and
+  // stack. Absent fields keep the STM32F407 128 KiB SRAM defaults.
+  const auto ramBaseOpt = uintField(params, "ramBase");
+  const auto ramSizeOpt = uintField(params, "ramSize");
+  const auto ramWindowParamsValid = (!ramBaseOpt || (ramBaseOpt <= 0xFFFFFFFFu && *ramBaseOpt % 4u == 0u))
+      && (!ramSizeOpt || *ramSizeOpt > 0u)
+      && (!ramBaseOpt || !ramSizeOpt
+          || (*ramBaseOpt <= 0xFFFFFFFFu - *ramSizeOpt && *ramSizeOpt <= 0x10000000u));
   const JsonValue* reusePageBufferValue = params.get("reusePageBuffer");
   const auto reusePageBuffer = boolField(params, "reusePageBuffer");
   if (!operation || (*operation != "init" && *operation != "uninit" && *operation != "eraseSector" &&
@@ -1385,13 +1409,22 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
       !targetAddress || !size || *algorithmAddress > 0xFFFFFFFFu || *entry > 0xFFFFFFFFu ||
       *bkptAddress > 0xFFFFFFFFu || *stackPointer > 0xFFFFFFFFu || *pageBufferAddress > 0xFFFFFFFFu ||
       stackSize > 0xFFFFFFFFu || staticBase > 0xFFFFFFFFu || *targetAddress > 0xFFFFFFFFu ||
-      *size > 0x10000u || clockHz > 0xFFFFFFFFu ||
+      (*size > 0x10000u && *operation != "eraseSector") ||
+      (*operation == "eraseSector" && *size > 0x100000u) || clockHz > 0xFFFFFFFFu ||
+      !flashDiagParamsValid || !ramWindowParamsValid ||
       (reusePageBufferValue && !reusePageBuffer.has_value()) ||
       ((*operation == "programPage" || *operation == "verify") && data->size() < *size)) {
     return resultJson(false, "flashAlgorithm parameters are invalid", channel.state(), 0, "{}",
                       ErrorCodes::kDapInvalidRequest,
                       "{\"operation\":\"flashAlgorithm\"}");
   }
+
+  // Both diagnostic registers are fetched in a single 2-word block read
+  // starting at the lower address (STM32F4: [SR, CR]; H723: [CR1, SR1]).
+  const uint32_t flashDiagBase =
+      flashStatusAddress < flashControlAddress ? flashStatusAddress : flashControlAddress;
+  const uint32_t flashStatusIndex = (flashStatusAddress - flashDiagBase) / 4u;
+  const uint32_t flashControlIndex = (flashControlAddress - flashDiagBase) / 4u;
 
   CmsisDapProtocol protocol(channel.transport.get());
   protocol.setEffectivePacketSize(channel.packetSize);
@@ -1419,6 +1452,8 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
   request.size = static_cast<uint32_t>(*size);
   request.staticBase = static_cast<uint32_t>(staticBase);
   request.timeoutMs = *timeout;
+  request.ramBase = static_cast<uint32_t>(ramBaseOpt.value_or(0x20000000u));
+  request.ramSize = static_cast<uint32_t>(ramSizeOpt.value_or(0x20000u));
   request.loadAlgorithmCode = !channel.flashAlgorithmLoaded
                               || channel.flashAlgorithmAddress != request.algorithmAddress
                               || channel.flashAlgorithmCode != code.value();
@@ -1451,11 +1486,11 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
     request.r0 = request.targetAddress;
   }
   std::vector<uint32_t> flashRegistersBefore;
-  const Result flashBeforeResult = target.readMemoryBlock(kStm32F4FlashSr, 2, flashRegistersBefore, diag,
+  const Result flashBeforeResult = target.readMemoryBlock(flashDiagBase, 2, flashRegistersBefore, diag,
                                                           std::chrono::milliseconds(*timeout));
   const bool flashRegistersBeforeValid = flashBeforeResult.ok && flashRegistersBefore.size() == 2;
-  const uint32_t flashStatusBefore = flashRegistersBeforeValid ? flashRegistersBefore[0] : 0;
-  const uint32_t flashControlBefore = flashRegistersBeforeValid ? flashRegistersBefore[1] : 0;
+  const uint32_t flashStatusBefore = flashRegistersBeforeValid ? flashRegistersBefore[flashStatusIndex] : 0;
+  const uint32_t flashControlBefore = flashRegistersBeforeValid ? flashRegistersBefore[flashControlIndex] : 0;
   const std::string flashBeforeDiagnostics =
       ",\"flashStatusBeforeValid\":" + std::string(flashRegistersBeforeValid ? "true" : "false") +
       (flashRegistersBeforeValid
@@ -1491,11 +1526,11 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
                                      operationDiagnosticsExtra,
                                      &operationDiagnostics);
   std::vector<uint32_t> flashRegisters;
-  const Result flashRegisterResult = target.readMemoryBlock(kStm32F4FlashSr, 2, flashRegisters, diag,
+  const Result flashRegisterResult = target.readMemoryBlock(flashDiagBase, 2, flashRegisters, diag,
                                                             std::chrono::milliseconds(*timeout));
   const bool flashRegistersValid = flashRegisterResult.ok && flashRegisters.size() == 2;
-  const uint32_t flashStatus = flashRegistersValid ? flashRegisters[0] : 0;
-  const uint32_t flashControl = flashRegistersValid ? flashRegisters[1] : 0;
+  const uint32_t flashStatus = flashRegistersValid ? flashRegisters[flashStatusIndex] : 0;
+  const uint32_t flashControl = flashRegistersValid ? flashRegisters[flashControlIndex] : 0;
   const std::string flashAfterDiagnostics =
       ",\"flashStatusValid\":" + std::string(flashRegistersValid ? "true" : "false") +
       (flashRegistersValid

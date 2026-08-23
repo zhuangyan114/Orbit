@@ -5,6 +5,7 @@ import {
   SessionTargetSelector,
 } from './session-target-channel';
 import { CmsisDapDeviceInfo, CmsisDapHelperClient } from './cmsis-dap-helper-channel';
+import type { FlashAlgorithmRunRequest } from './cmsis-dap-flasher';
 
 const fakeDevice = {
   path: 'MOCK\\1234#5678#MOCK-0001',
@@ -801,13 +802,13 @@ describe('SessionTargetSelector owner lifecycle', () => {
       probe: 'cmsis-dap',
     })).ok).toBe(true);
 
-    const mismatch = await channel.flash('image.elf', 'STM32H723VGT6');
+    const mismatch = await channel.flash('image.elf', 'STM32F429VGT6');
     expect(mismatch).toMatchObject({
       ok: false,
       errorCode: 'TargetMismatch',
-      diagnostics: { ownerKind: 'cmsis-dap', supportedTargets: ['STM32F407VET6'] },
+      diagnostics: { ownerKind: 'cmsis-dap', supportedTargets: ['STM32F407VET6', 'STM32H723VGT6'] },
     });
-    expect(mismatch.message).toContain('STM32H723VGT6');
+    expect(mismatch.message).toContain('STM32F429VGT6');
     expect(helper.withControlCriticalSection).not.toHaveBeenCalled();
 
     // A registered alias passes registry resolution and proceeds into the
@@ -817,6 +818,81 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(alias.errorCode).toBe('InvalidConfiguration');
     expect(alias.message).toContain('does-not-exist.elf');
     expect(helper.withControlCriticalSection).toHaveBeenCalled();
+  });
+
+  it('passes Flash Algorithm diagnostic and RAM window fields through the helper RPC', async () => {
+    const flashRequests: Array<Record<string, unknown>> = [];
+    const helper = fakeCmsisDapHelper({
+      request: vi.fn(async (method: string, params: Record<string, unknown> = {}): Promise<any> => {
+        if (method === 'flashAlgorithm') {
+          flashRequests.push(params);
+          return {
+            ok: true,
+            message: 'algorithm complete',
+            targetState: 'Halted' as const,
+            elapsedMs: 1,
+            data: {
+              returnCode: 0,
+              pc: (params as { bkptAddress: number }).bkptAddress,
+              dhcsr: 0x00030003,
+            },
+          };
+        }
+        return (fakeCmsisDapHelper().request as unknown as (method: string, params: Record<string, unknown>) => Promise<any>)(method, params);
+      }),
+    });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    expect((await channel.connect({
+      device: 'STM32H723VGT6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    })).ok).toBe(true);
+
+    const baseRequest = {
+      operation: 'eraseSector',
+      algorithm: [0xbf, 0xbf],
+      algorithmAddress: 0x24000000,
+      entry: 0x24000200,
+      bkptAddress: 0x24000500,
+      stackPointer: 0x24050000,
+      stackSize: 0x1000,
+      pageBufferAddress: 0x24000600,
+      targetAddress: 0x080E0000,
+      size: 0x20000,
+      data: [] as number[],
+      clockHz: 4000000,
+      staticBase: 0,
+      timeoutMs: 100,
+      reusePageBuffer: false,
+    };
+    const result = await channel.runAlgorithm({
+      ...baseRequest,
+      flashStatusAddress: 0x52002010,
+      flashControlAddress: 0x5200200C,
+      ramBase: 0x24000000,
+      ramSize: 320 * 1024,
+    } as FlashAlgorithmRunRequest);
+    expect(result.ok).toBe(true);
+    expect(flashRequests).toHaveLength(1);
+    expect(flashRequests[0]).toMatchObject({
+      operation: 'eraseSector',
+      targetAddress: 0x080E0000,
+      size: 0x20000,
+      flashStatusAddress: 0x52002010,
+      flashControlAddress: 0x5200200C,
+      ramBase: 0x24000000,
+      ramSize: 320 * 1024,
+    });
+
+    // Requests without the optional fields must reach the helper untouched;
+    // the helper then applies its STM32F4 defaults.
+    const legacy = await channel.runAlgorithm(baseRequest as FlashAlgorithmRunRequest);
+    expect(legacy.ok).toBe(true);
+    expect(flashRequests).toHaveLength(2);
+    const legacyWire = JSON.stringify(flashRequests[1]);
+    expect(legacyWire).not.toContain('flashStatusAddress');
+    expect(legacyWire).not.toContain('ramBase');
   });
 
   it('routes CMSIS-DAP WinUSB through the same single helper owner', async () => {

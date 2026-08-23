@@ -48,6 +48,18 @@ export interface FlashPreflightDefinition {
   readonly expectedFlashSizeKiB: number;
 }
 
+/**
+ * Target Flash controller diagnostic registers read around every flashAlgorithm
+ * operation. The helper reads both words in one block read starting at the
+ * lower address, so the two registers must be adjacent 32-bit words (they are
+ * on every supported target, though the status/control order differs between
+ * families). Omitting this leaves the helper's STM32F4 defaults in place.
+ */
+export interface FlashDiagnosticsDefinition {
+  readonly statusAddress: number;
+  readonly controlAddress: number;
+}
+
 export interface FlashTargetDefinition {
   readonly name: string;
   /** Uppercase aliases that resolve to this target, e.g. STM32F407VE. */
@@ -61,6 +73,11 @@ export interface FlashTargetDefinition {
   /** Index into ramRegions hosting the algorithm, page buffer, and stack. */
   readonly loaderRamIndex: number;
   readonly preflight: FlashPreflightDefinition;
+  /**
+   * Flash controller status/control registers for helper diagnostics. The
+   * helper defaults to the STM32F4 addresses when omitted.
+   */
+  readonly flashDiagnostics?: FlashDiagnosticsDefinition;
   /**
    * Flash Algorithm reference: a built-in algorithm name (see
    * BUILTIN_FLASH_ALGORITHMS) or a user algorithm image/manifest path.
@@ -102,12 +119,73 @@ export const STM32F407VET6: FlashTargetDefinition = Object.freeze({
     flashSizeRegisterAddress: 0x1FFF7A22,
     expectedFlashSizeKiB: 512,
   },
+  flashDiagnostics: {
+    statusAddress: 0x40023C0C,
+    controlAddress: 0x40023C10,
+  },
   algorithm: 'stm32f407',
   eraseTimeoutMs: 5000,
   programTimeoutMs: 5000,
 });
 
-const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6];
+export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
+  name: 'STM32H723VGT6',
+  // STM32H723VG is the density/package prefix used by project files; it is
+  // accepted only as the unqualified name of this exact 1 MiB target.
+  aliases: ['STM32H723VG'],
+  // SW-DP v2 DPIDR expected on the H723; still to be read back on hardware
+  // during P7-1 before it is treated as verified.
+  dpIdcode: 0x6BA02477,
+  flashBase: 0x08000000,
+  flashSize: 1024 * 1024,
+  // 8 uniform 128 KiB sectors (RM0468, single bank).
+  sectors: [
+    { number: 0, address: 0x08000000, size: 0x20000 },
+    { number: 1, address: 0x08020000, size: 0x20000 },
+    { number: 2, address: 0x08040000, size: 0x20000 },
+    { number: 3, address: 0x08060000, size: 0x20000 },
+    { number: 4, address: 0x08080000, size: 0x20000 },
+    { number: 5, address: 0x080A0000, size: 0x20000 },
+    { number: 6, address: 0x080C0000, size: 0x20000 },
+    { number: 7, address: 0x080E0000, size: 0x20000 },
+  ],
+  // RAM map per RM0468/AN5419. DTCM/D2/D3 reachability over the debug AP is
+  // data-permitted here and probed explicitly during P7-2 hardware
+  // acceptance; failures surface through the existing write error paths.
+  ramRegions: [
+    { name: 'ITCM RAM', address: 0x00000000, size: 64 * 1024 },
+    { name: 'DTCM RAM', address: 0x20000000, size: 128 * 1024 },
+    { name: 'AXI SRAM', address: 0x24000000, size: 320 * 1024 },
+    { name: 'SRAM1-3', address: 0x30000000, size: 272 * 1024 },
+    { name: 'SRAM4', address: 0x38000000, size: 16 * 1024 },
+    { name: 'Backup RAM', address: 0x38800000, size: 4 * 1024 },
+  ],
+  // The loader runs from AXI SRAM, matching ecosystem convention and keeping
+  // it clear of DTCM access uncertainty over the debug AP.
+  loaderRamIndex: 2,
+  preflight: {
+    // DBGMCU_IDCODE at the H7 DBGMCU block; DEV_ID 0x483 covers the RM0468
+    // family (H723/H725/H730/H733).
+    idcodeAddress: 0x5C001000,
+    deviceId: 0x483,
+    flashSizeRegisterAddress: 0x1FF1E880,
+    expectedFlashSizeKiB: 1024,
+  },
+  // H723 CR1/SR1 are adjacent words with the opposite order from STM32F4
+  // (CR1 at the lower address); the helper's diagnostic block read starts at
+  // whichever address is lower.
+  flashDiagnostics: {
+    statusAddress: 0x52002010,
+    controlAddress: 0x5200200C,
+  },
+  algorithm: 'stm32h723',
+  // 128 KiB sector erase is an order of magnitude slower than the F4 16 KiB
+  // sectors; both defaults stay generous until real-hardware timing lands.
+  eraseTimeoutMs: 30000,
+  programTimeoutMs: 15000,
+});
+
+const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6, STM32H723VGT6];
 
 /** All registered flash targets, in registration order. */
 export function listFlashTargets(): readonly FlashTargetDefinition[] {
@@ -185,6 +263,15 @@ export function validateFlashTargetDefinition(target: FlashTargetDefinition): vo
   }
   if (preflight.expectedFlashSizeKiB !== target.flashSize / 1024) {
     fail(`Flash target ${target.name} preflight capacity does not match its Flash size`);
+  }
+  if (target.flashDiagnostics !== undefined) {
+    const { statusAddress, controlAddress } = target.flashDiagnostics;
+    if (!Number.isSafeInteger(statusAddress) || !Number.isSafeInteger(controlAddress)
+      || statusAddress < 0 || controlAddress < 0
+      || statusAddress % 4 !== 0 || controlAddress % 4 !== 0
+      || Math.abs(statusAddress - controlAddress) !== 4) {
+      fail(`Flash target ${target.name} flash diagnostics registers must be adjacent aligned words`);
+    }
   }
   if (!Number.isSafeInteger(target.eraseTimeoutMs) || target.eraseTimeoutMs <= 0
     || !Number.isSafeInteger(target.programTimeoutMs) || target.programTimeoutMs <= 0) {
@@ -365,6 +452,8 @@ export interface FlashRamLayout {
   pageBuffer: RamRegion;
   stack: RamRegion;
   stackPointer: number;
+  /** The loader RAM region hosting the algorithm, page buffer, and stack. */
+  region: RamRegion;
 }
 
 function alignUp(value: number, alignment: number): number {
@@ -396,6 +485,7 @@ export function planFlashRamLayout(
     pageBuffer: { address: pageBufferAddress, size: pageBufferSize },
     stack: { address: stackAddress, size: stackSize },
     stackPointer: stackAddress + stackSize,
+    region: loaderRegion,
   };
 }
 
@@ -457,6 +547,19 @@ const BUILTIN_FLASH_ALGORITHMS: ReadonlyMap<string, BuiltinFlashAlgorithmMetadat
       // buffer matches STM32F4's smallest erase sector and avoids paying the
       // CMSIS-DAP register/RAM-upload overhead once per 1 KiB slice.
       pageSize: 0x4000,
+      preservesPageBuffer: true,
+    } satisfies BuiltinFlashAlgorithmMetadata),
+  ],
+  [
+    'stm32h723',
+    Object.freeze({
+      fileName: 'orbit-stm32h723-flash-algorithm.bin',
+      entries: DEFAULT_ALGORITHM_ENTRIES,
+      staticBase: 0,
+      // 64 KiB per ProgramPage, the host-side page cap. Each call is padded
+      // by the algorithm to whole 256-bit flash words; two calls cover one
+      // 128 KiB H723 sector.
+      pageSize: 0x10000,
       preservesPageBuffer: true,
     } satisfies BuiltinFlashAlgorithmMetadata),
   ],
@@ -593,6 +696,20 @@ export interface FlashAlgorithmRunRequest {
   timeoutMs: number;
   /** Reuse only the immediately preceding, helper-validated ProgramPage data. */
   reusePageBuffer: boolean;
+  /**
+   * Flash controller diagnostic registers for this operation. Omitted for
+   * targets without a flashDiagnostics model; the helper then reads its
+   * STM32F4 defaults.
+   */
+  flashStatusAddress?: number;
+  flashControlAddress?: number;
+  /**
+   * Loader RAM window the algorithm image, page buffer, and stack live in.
+   * Omitted for targets without a modeled loader region; the helper then
+   * validates against its STM32F407 128 KiB SRAM defaults.
+   */
+  ramBase?: number;
+  ramSize?: number;
 }
 
 export interface FlashAlgorithmRunData {
@@ -837,6 +954,14 @@ export async function flashCmsisDapElf(
         staticBase: algorithm.staticBase,
         timeoutMs: operationTimeoutMs(operation),
         reusePageBuffer,
+        ...(target.flashDiagnostics
+          ? {
+              flashStatusAddress: target.flashDiagnostics.statusAddress,
+              flashControlAddress: target.flashDiagnostics.controlAddress,
+            }
+          : {}),
+        ramBase: layout.region.address,
+        ramSize: layout.region.size,
       };
       let result: CmsisDapFlashRpcResult;
       try {

@@ -117,6 +117,12 @@ struct FlashAlgorithmRunRequest {
   uint32_t r3 = 0;
   uint32_t staticBase = 0;
   uint32_t timeoutMs = 0;
+  // Target RAM window the algorithm image, page buffer, and stack must live
+  // in. Defaults model the STM32F407 128 KiB SRAM so requests without the
+  // fields keep working; multi-RAM targets (e.g. H723 AXI SRAM) send their
+  // loader region explicitly.
+  uint32_t ramBase = 0x20000000u;
+  uint32_t ramSize = 0x20000u;
   // The helper may keep the validated code image in the target SRAM for the
   // duration of one owner session.
   bool loadAlgorithmCode = true;

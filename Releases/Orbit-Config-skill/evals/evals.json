@@ -4,7 +4,7 @@
     {
       "id": 1,
       "prompt": "请为 STM32F407VET6 工程配置 Orbit。ELF 是 ${workspaceFolder}/build/Debug/app.elf，SVD 是 ${workspaceFolder}/STM32F407VETx.svd，SWD 4000 kHz，FreeRTOS。",
-      "expected_output": "生成四个标准 launch：J-Link/DAPLink 各有烧录和不烧录配置，四项共享已核实的工程字段，默认 DAPLink 不含设备选择器。",
+      "expected_output": "生成四个标准 launch：J-Link/DAPLink 各有烧录和不烧录配置，四项共享已核实的工程字段，默认 DAPLink 不含设备选择器。工程含 FreeRTOS 时同时默认写入全面板 USER CODE（trace/runtime-stat/queue registry），不要只写 rtos 字段。",
       "files": [],
       "assertions": [
         "恰好包含四个标准 Orbit launch name",
@@ -31,6 +31,19 @@
         "生成四个标准 Orbit launch",
         "两项 DAPLink 都包含 C251/F001/LU_2022_8888",
         "两项 J-Link 不包含 CMSIS-DAP 选择器"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "为当前 STM32 CubeMX FreeRTOS 工程配置 Orbit。工程有 FreeRTOSConfig.h，但没开 TRACE/runtime-stat，也没有 vQueueAddToRegistry。",
+      "expected_output": "除四个标准 launch 外，默认在 USER CODE 写入全面板钩子：trace/stack-high/runtime-stat 宏、DWT 时基、rtosViewQueue/Mutex/Semaphore 并 registry；编译后 ELF 含 ulRunTimeCounter 和 xQueueRegistry。",
+      "files": [],
+      "assertions": [
+        "生成四个标准 Orbit launch 且 rtos=FreeRTOS",
+        "FreeRTOSConfig.h USER CODE 含 configUSE_TRACE_FACILITY、configGENERATE_RUN_TIME_STATS、portGET_RUN_TIME_COUNTER_VALUE",
+        "freertos.c 实现 configureTimerForRunTimeStats/getRunTimeCounterValue 或填入已有桩",
+        "创建并 vQueueAddToRegistry rtosViewQueue、rtosViewMutex、rtosViewSemaphore，除非工程已注册同名对象",
+        "未在未授权时 flash"
       ]
     }
   ]

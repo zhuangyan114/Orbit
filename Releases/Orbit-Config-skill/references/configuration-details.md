@@ -201,11 +201,11 @@ Native scheduler 的优先级是 `control > watch > timeline > background`。ste
 
 ## RTOS Views
 
-Orbit 通过 DAP capability 和外部 extension tracker 对接 RTOS Views；Orbit 本身不解析 RTOS kernel。需要三层同时正确：
+Orbit 通过 DAP capability 和外部 extension tracker 对接 RTOS Views；Orbit 本身不解析 RTOS kernel。需要三层同时正确，**配置 skill 默认一次做完**，不要只配 launch：
 
-1. tracker arrays 含 `"orbit"`（兼容时同时保留 `"ozone"`），且对应的 MCU Debug extensions 已安装；
+1. tracker arrays 含 `"orbit"`（兼容时同时保留 `"ozone"`），且对应的 MCU Debug extensions 已安装或已在报告中提示安装；
 2. launch 的 MCU、active ELF、SVD、`rtos` 一致；
-3. firmware 有外部 RTOS View 所需的 symbols、trace 和 runtime-stat hooks。
+3. firmware USER CODE 具备 Tasks + runtime/CPU% + Queue/Mutex/Sem 全面板所需的 symbols、trace、runtime-stat 和 queue registry。
 
 `orbit.rtosViewsAutoRefresh` 默认 `false`；设为 `true` 时，源码会在外部 tracker 报告首次 stack trace 后尝试 focus/refresh RTOS Views。
 
@@ -228,11 +228,75 @@ FreeRTOS 10.x 使用 CMSIS-RTOS v1 wrapper 时，launch 示例为：
 
 外部 RTOS Views 通过以下 DAP 请求展开信息：`initialize` 的 `supportsRTOS` / `rtosName`、`rtosInfo`、`evaluate`、`variables`、`stackTrace` 和 `readMemory`。变量树必须返回可继续请求的 `variablesReference` 与有效 `memoryReference`；`readMemory` 使用 byte-oriented 数据。FreeRTOS 链表、TCB 和 runtime counter 应在停止态取得一致快照，运行态刷新只能走受控 background 读取。
 
-固件侧至少要从同一个 active ELF 中确认 FreeRTOS 内核符号，例如 `uxCurrentNumberOfTasks`、`pxReadyTasksLists`、`xDelayedTaskList1` 和 `pxCurrentTCB`。要显示 Queue/Mux/Sem，还要启用 queue registry，并对目标对象调用 `vQueueAddToRegistry`。名称列若显示 `0x0800...`，通常是 registry 字符串指针尚未被外部视图解引用，不代表对象读取失败。
+固件侧至少要从同一个 active ELF 中确认 FreeRTOS 内核符号，例如 `uxCurrentNumberOfTasks`、`pxReadyTasksLists`、`xDelayedTaskList1` 和 `pxCurrentTCB`（多数为 `static`，靠 DWARF 解析，因此保持 Debug `-g`）。名称列若显示 `0x0800...`，通常是 registry 字符串指针尚未被外部视图解引用，不代表对象读取失败。
 
 `Unable to collect full RTOS information` / `No RTOS detected` 可能是停止态读取被控制操作取消、目标仍在运行或旧 session 缓存了失败结果。确认目标停止后，结束旧调试会话、Reload Window、重新启动 launch，再刷新 RTOS Views；`Busy`、`TargetReadUnavailable` 等瞬态错误应重试，符号缺失才作为永久配置错误报告。
 
-`vet6_led` 的可选验收 fixture 由 `RTT_BENCH_ENABLE=ON` 开启：它创建 `rttBench` RTT 测试任务，并注册一个容量为 4 的 `rtosViewQueue`、一个 `rtosViewMutex` 和一个 `rtosViewSemaphore`。因此该 fixture 的典型快照是 4 个任务、1 个队列和 2 个 MUX/SEM；这些数量不是通用 FreeRTOS 预期。
+### CubeMX 全面板默认补丁
+
+CubeMX 默认 `FreeRTOSConfig.h` 通常不含 trace / stack-high / runtime-stat。配置 skill **默认**写入 USER CODE，而不是只报告缺口。用户明确说不要改固件时才跳过。
+
+在 `FreeRTOSConfig.h` 的 `USER CODE BEGIN Defines` 加入（已存在且为 1 的宏不要重复定义）：
+
+```c
+#define configUSE_TRACE_FACILITY              1
+#define configRECORD_STACK_HIGH_ADDRESS       1
+#define INCLUDE_uxTaskGetStackHighWaterMark   1
+#define INCLUDE_xTaskGetCurrentTaskHandle     1
+#define configGENERATE_RUN_TIME_STATS         1
+#if defined(__ICCARM__) || defined(__CC_ARM) || defined(__GNUC__)
+extern void configureTimerForRunTimeStats(void);
+extern unsigned long getRunTimeCounterValue(void);
+#endif
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS configureTimerForRunTimeStats
+#define portGET_RUN_TIME_COUNTER_VALUE getRunTimeCounterValue
+```
+
+`configQUEUE_REGISTRY_SIZE` 若未定义或为 `0`，在同一 USER CODE 区改为至少 `8`。不要开 `configUSE_STATS_FORMATTING_FUNCTIONS`，RTOS Views 读 TCB 的 `ulRunTimeCounter`，不需要 `vTaskGetRunTimeStats()`。
+
+CubeMX 若已生成空的 `configureTimerForRunTimeStats` / `getRunTimeCounterValue` 桩，填桩，不要再定义一份。否则写在 `freertos.c` 的 `USER CODE BEGIN Application`。默认用 DWT CYCCNT，不占用 HAL tick 定时器（H7 上常见为 TIM23）：
+
+```c
+void configureTimerForRunTimeStats(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->LAR = 0xC5ACCE55; /* Cortex-M7 CoreSight unlock; M3/M4 可保留 */
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+unsigned long getRunTimeCounterValue(void)
+{
+  /* 将计数降到约 1–10 MHz（≥ 10× tick），避免 CYCCNT 在高频 CPU 上数秒溢出 */
+  return DWT->CYCCNT >> 8;
+}
+```
+
+若工程已有更快的空闲 32-bit 定时器并已被 runtime stats 使用，保留现有时基，不要改成 DWT。
+
+### Queue / Mutex / Sem 面板
+
+要显示 Queue/Mux/Sem，必须同时：
+
+1. `configQUEUE_REGISTRY_SIZE > 0`（否则 `xQueueRegistry` 会被 `--gc-sections` 丢掉）；
+2. 对每个要显示的对象调用 `vQueueAddToRegistry(handle, "persistent_name")`，名称用字符串字面量。
+
+应用里没有任何 registry 对象时，默认在 `freertos.c` 对应 USER CODE 创建并注册：
+
+```c
+rtosViewQueueHandle = xQueueCreate(4, sizeof(uint32_t));
+vQueueAddToRegistry(rtosViewQueueHandle, "rtosViewQueue");
+
+rtosViewMutexHandle = xSemaphoreCreateMutex();
+vQueueAddToRegistry(rtosViewMutexHandle, "rtosViewMutex");
+
+rtosViewSemaphoreHandle = xSemaphoreCreateBinary();
+vQueueAddToRegistry(rtosViewSemaphoreHandle, "rtosViewSemaphore");
+```
+
+已有业务 IPC 并已注册则不重复创建。创建后编译，并用 `arm-none-eabi-nm` 确认 ELF 含 `xQueueRegistry`、`vQueueAddToRegistry`、`ulRunTimeCounter`、`ulTotalRunTime`。不要在未授权时 flash。
+
+`vet6_led` 的 `RTT_BENCH_ENABLE=ON` fixture 会额外创建 `rttBench`，并注册同名 `rtosViewQueue` / `rtosViewMutex` / `rtosViewSemaphore`。全面板默认对象与该 fixture 同名时不要重复创建。该 fixture 的 4 任务快照不是所有工程的固定期望；未开 bench 时任务数以工程实际线程 + IDLE 为准。
 
 ## RTT and P-RTLog
 
@@ -267,6 +331,7 @@ Test-Path ".\out\native\win32-x64\orbit-jlink-helper.exe"
 Test-Path ".\out\native\win32-x64\orbit-cmsis-dap-helper.exe"
 cmake --preset debug
 cmake --build --preset debug
+arm-none-eabi-nm build/Debug/*.elf | Select-String "pxCurrentTCB|ulRunTimeCounter|ulTotalRunTime|xQueueRegistry|vQueueAddToRegistry"
 ```
 
 对无注释 JSON：
@@ -280,4 +345,4 @@ JSONC 必须使用 JSONC-aware parser 或 VS Code 检查，不要删除注释来
 
 ## Final report template
 
-最终报告使用以下英文字段名，内容可用中文：`Files changed`、`Launch`、`Probe`、`Transport`、`Device`、`Interface`、`Speed`、`SVD`、`RTOS`、`Owner`、`J-Link DLL/Helper`、`RTT/P-RTLog`、`MCP endpoint`、`Commands run`、`Manual confirmation required`。
+最终报告使用以下英文字段名，内容可用中文：`Files changed`、`Launch`、`Probe`、`Transport`、`Device`、`Interface`、`Speed`、`SVD`、`RTOS`、`RTOS Views full panel`、`Owner`、`J-Link DLL/Helper`、`RTT/P-RTLog`、`MCP endpoint`、`Commands run`、`Manual confirmation required`。`RTOS Views full panel` 必须写明 Tasks / runtime / Queue-Mutex-Sem 是已写入固件还是用户要求跳过。

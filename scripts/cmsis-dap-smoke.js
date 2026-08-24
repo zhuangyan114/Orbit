@@ -1206,6 +1206,16 @@ async function runDap11H723Matrix() {
     const halted = await request('halt', { timeoutMs: 100 });
     check('dap11-h723: halt before algorithm', halted.ok, JSON.stringify(halted));
     if (halted.ok) {
+      const stepped = await request('stepInstruction', { timeoutMs: 100 });
+      check('dap11-h723: instruction step without S_RETIRE_ST',
+        stepped.ok && stepped.data && stepped.data.pcAfter !== stepped.data.pcBefore
+        && stepped.data.instructionRetired === false, JSON.stringify(stepped));
+      const sourceStep = await request('stepOverSourceLine', {
+        lineStart: 0x080001C0, lineEnd: 0x080001C6, timeoutMs: 100, maxInstructionSteps: 8,
+      });
+      check('dap11-h723: source step over without S_RETIRE_ST',
+        sourceStep.ok && sourceStep.data && sourceStep.data.pcAfter !== sourceStep.data.pcBefore
+        && sourceStep.elapsedMs < 100, JSON.stringify(sourceStep));
       const idcode = await request('dpRead', { reg: 0 });
       check('dap11-h723: SW-DP v2 DPIDR', idcode.ok && idcode.data.value === 0x6BA02477,
         JSON.stringify(idcode));
@@ -1278,6 +1288,25 @@ async function runDap11H723Matrix() {
       })());
       check('dap11-h723: non-adjacent diagnostic registers rejected', !invalidDiag.ok
         && invalidDiag.errorCode === 'DapInvalidRequest', JSON.stringify(invalidDiag));
+      const longErase = await request('flashAlgorithm', (() => {
+        const params = h723FlashParams('eraseSector', 0x080A0000, 0x20000);
+        params.timeoutMs = 30000;
+        return params;
+      })());
+      check('dap11-h723: 30s flashAlgorithm timeout accepted', longErase.ok
+        && longErase.data.returnCode === 0, JSON.stringify(longErase));
+      const tooLongErase = await request('flashAlgorithm', (() => {
+        const params = h723FlashParams('eraseSector', 0x08080000, 0x20000);
+        params.timeoutMs = 60001;
+        return params;
+      })());
+      check('dap11-h723: flashAlgorithm timeout above 60s rejected', !tooLongErase.ok
+        && tooLongErase.errorCode === 'DapInvalidRequest'
+        && String(tooLongErase.message).includes('1..60000'), JSON.stringify(tooLongErase));
+      const haltCap = await request('halt', { timeoutMs: 10001 });
+      check('dap11-h723: halt timeout still capped at 10s', !haltCap.ok
+        && haltCap.errorCode === 'DapInvalidRequest'
+        && String(haltCap.message).includes('1..10000'), JSON.stringify(haltCap));
     }
   }
   await closeDevice('dap11-h723');

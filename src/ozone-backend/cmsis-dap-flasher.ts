@@ -1,6 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+/**
+ * Helper ceiling for flashAlgorithm timeoutMs. Halt/step stay at 10 s; only
+ * Flash Algorithm operations may use this longer bound so 128 KiB H7 sector
+ * erase is not rejected as DapInvalidRequest before it even starts.
+ */
+export const FLASH_ALGORITHM_TIMEOUT_MAX_MS = 60_000;
+
 export type CmsisDapFlashErrorCode =
   | 'InvalidConfiguration'
   | 'FlashAlgorithmUnavailable'
@@ -84,6 +91,13 @@ export interface FlashTargetDefinition {
    * CmsisDapFlashOptions.algorithmPath still overrides this per session.
    */
   readonly algorithm: string;
+  /**
+   * Programming granularity in bytes. Adjacent PT_LOAD Flash ranges that share
+   * a flash word must be programmed together; a second write to the same ECC
+   * word on STM32H7 is a bus fault, not a 1-to-0 overlay. Omit or 1 for
+   * per-byte STM32F4 semantics.
+   */
+  readonly flashWordSize?: number;
   /** Per-operation timeouts scaled to the target's sector/page timing. */
   readonly eraseTimeoutMs: number;
   readonly programTimeoutMs: number;
@@ -179,8 +193,12 @@ export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
     controlAddress: 0x5200200C,
   },
   algorithm: 'stm32h723',
+  // 256-bit ECC flash word. Adjacent PT_LOAD ranges that share a 32-byte
+  // row (typical CubeMX .text/.data LMA split) must be programmed once.
+  flashWordSize: 32,
   // 128 KiB sector erase is an order of magnitude slower than the F4 16 KiB
   // sectors; both defaults stay generous until real-hardware timing lands.
+  // Must stay at or below FLASH_ALGORITHM_TIMEOUT_MAX_MS (helper ceiling).
   eraseTimeoutMs: 30000,
   programTimeoutMs: 15000,
 });
@@ -274,11 +292,20 @@ export function validateFlashTargetDefinition(target: FlashTargetDefinition): vo
     }
   }
   if (!Number.isSafeInteger(target.eraseTimeoutMs) || target.eraseTimeoutMs <= 0
-    || !Number.isSafeInteger(target.programTimeoutMs) || target.programTimeoutMs <= 0) {
-    fail(`Flash target ${target.name} Flash Algorithm timeouts are invalid`);
+    || target.eraseTimeoutMs > FLASH_ALGORITHM_TIMEOUT_MAX_MS
+    || !Number.isSafeInteger(target.programTimeoutMs) || target.programTimeoutMs <= 0
+    || target.programTimeoutMs > FLASH_ALGORITHM_TIMEOUT_MAX_MS) {
+    fail(`Flash target ${target.name} Flash Algorithm timeouts must be in 1..${FLASH_ALGORITHM_TIMEOUT_MAX_MS}`);
   }
   if (typeof target.algorithm !== 'string' || target.algorithm.trim() === '') {
     fail(`Flash target ${target.name} has no Flash Algorithm reference`);
+  }
+  if (target.flashWordSize !== undefined
+    && (!Number.isInteger(target.flashWordSize)
+      || target.flashWordSize < 1
+      || (target.flashWordSize & (target.flashWordSize - 1)) !== 0
+      || target.flashWordSize > 0x10000)) {
+    fail(`Flash target ${target.name} flashWordSize must be a power of two in 1..65536`);
   }
 }
 
@@ -408,7 +435,8 @@ function isInRange(address: number, size: number, base: number, capacity: number
   return address >= base && size >= 0 && address + size <= base + capacity;
 }
 
-function findRamRegion(target: FlashTargetDefinition, address: number, size: number): RamRegion | undefined {
+/** Returns the target RAM region that fully contains [address, address+size). */
+export function findRamRegion(target: FlashTargetDefinition, address: number, size: number): RamRegion | undefined {
   return target.ramRegions.find(region => isInRange(address, size, region.address, region.size));
 }
 
@@ -445,6 +473,49 @@ export function calculateEraseSectors(
     }
   }
   return [...selected.values()].sort((a, b) => a.number - b.number);
+}
+
+export interface FlashProgramRange {
+  address: number;
+  bytes: Uint8Array;
+}
+
+/**
+ * Collapses Flash PT_LOAD payloads into programming ranges. Adjacent ranges
+ * that share a flash word (STM32H7 256-bit ECC row) are merged so the
+ * algorithm programs that word once. Gaps inside a merged range are filled
+ * with 0xFF, matching erased Flash. F4 (flashWordSize omitted/1) keeps one
+ * range per PT_LOAD.
+ */
+export function coalesceFlashProgramRanges(
+  segments: readonly Elf32LoadSegment[],
+  target: FlashTargetDefinition,
+): FlashProgramRange[] {
+  const flashWordSize = target.flashWordSize && target.flashWordSize > 1 ? target.flashWordSize : 1;
+  const flashLoads = segments
+    .filter(segment => segment.fileSize > 0
+      && isInRange(segment.loadAddress, segment.fileSize, target.flashBase, target.flashSize))
+    .slice()
+    .sort((a, b) => a.loadAddress - b.loadAddress);
+  const ranges: FlashProgramRange[] = [];
+  for (const segment of flashLoads) {
+    const previous = ranges[ranges.length - 1];
+    const previousWord = previous
+      ? Math.floor((previous.address + previous.bytes.length - 1) / flashWordSize)
+      : -1;
+    const currentWord = Math.floor(segment.loadAddress / flashWordSize);
+    if (!previous || currentWord > previousWord) {
+      ranges.push({ address: segment.loadAddress, bytes: Uint8Array.from(segment.bytes) });
+      continue;
+    }
+    const end = Math.max(previous.address + previous.bytes.length, segment.loadAddress + segment.fileSize);
+    const merged = new Uint8Array(end - previous.address);
+    merged.fill(0xFF);
+    merged.set(previous.bytes, 0);
+    merged.set(segment.bytes, segment.loadAddress - previous.address);
+    previous.bytes = merged;
+  }
+  return ranges;
 }
 
 export interface FlashRamLayout {
@@ -880,8 +951,7 @@ export async function flashCmsisDapElf(
     const segments = parseElf32LoadSegments(elfBytes);
     erasedSectors = calculateEraseSectors(segments, target);
     if (erasedSectors.length === 0) throw new CmsisDapFlashError('InvalidConfiguration', 'ELF has no Flash PT_LOAD bytes');
-    const flashSegments = segments.filter(segment => segment.fileSize > 0 && segment.loadAddress >= target.flashBase
-      && segment.loadAddress + segment.fileSize <= target.flashBase + target.flashSize);
+    const programRanges = coalesceFlashProgramRanges(segments, target);
     const algorithm = loadFlashAlgorithm(target, options.algorithmPath);
     const pageSize = options.pageSize || algorithm.pageSize;
     const pageBufferSize = options.pageBufferSize || pageSize;
@@ -892,6 +962,15 @@ export async function flashCmsisDapElf(
       );
     }
     const layout = planFlashRamLayout(target, algorithm.code.length, pageBufferSize, options.stackSize);
+    if (options.timeoutMs !== undefined
+      && (!Number.isSafeInteger(options.timeoutMs)
+        || options.timeoutMs <= 0
+        || options.timeoutMs > FLASH_ALGORITHM_TIMEOUT_MAX_MS)) {
+      throw new CmsisDapFlashError(
+        'InvalidConfiguration',
+        `Flash Algorithm timeoutMs must be an integer in 1..${FLASH_ALGORITHM_TIMEOUT_MAX_MS}`,
+      );
+    }
     // Per-target defaults keep slow sectors (e.g. future 128 KiB H7 sectors)
     // from being reported as timeouts; options.timeoutMs still overrides
     // every operation for compatibility.
@@ -1026,48 +1105,48 @@ export async function flashCmsisDapElf(
     try {
       await run('init', target.flashBase, 0);
       for (const sector of erasedSectors) await run('eraseSector', sector.address, sector.size);
-      for (const segment of flashSegments) {
-        for (let offset = 0; offset < segment.fileSize; offset += pageSize) {
-          const size = Math.min(pageSize, segment.fileSize - offset);
-          const page = segment.bytes.slice(offset, offset + size);
-          await run('programPage', segment.loadAddress + offset, size, page);
+      for (const range of programRanges) {
+        for (let offset = 0; offset < range.bytes.length; offset += pageSize) {
+          const size = Math.min(pageSize, range.bytes.length - offset);
+          const page = range.bytes.slice(offset, offset + size);
+          await run('programPage', range.address + offset, size, page);
           if (verify && algorithm.preservesPageBuffer && algorithm.entries.verify !== undefined) {
-            await run('verify', segment.loadAddress + offset, size, page, true);
+            await run('verify', range.address + offset, size, page, true);
           }
         }
       }
       if (verify) {
         const verificationAlreadyComplete = algorithm.preservesPageBuffer
           && algorithm.entries.verify !== undefined;
-        for (const segment of flashSegments) {
+        for (const range of programRanges) {
           if (verificationAlreadyComplete) continue;
           if (algorithm.entries.verify !== undefined) {
-            for (let offset = 0; offset < segment.fileSize; offset += pageSize) {
-              const size = Math.min(pageSize, segment.fileSize - offset);
+            for (let offset = 0; offset < range.bytes.length; offset += pageSize) {
+              const size = Math.min(pageSize, range.bytes.length - offset);
               await run(
                 'verify',
-                segment.loadAddress + offset,
+                range.address + offset,
                 size,
-                segment.bytes.slice(offset, offset + size),
+                range.bytes.slice(offset, offset + size),
               );
             }
             continue;
           }
           const started = Date.now();
-          const read = await transport.readMemory(segment.loadAddress, segment.fileSize);
+          const read = await transport.readMemory(range.address, range.bytes.length);
           const actual = asBytes(read.bytes);
-          let mismatch = !read.ok || actual.length !== segment.fileSize;
+          let mismatch = !read.ok || actual.length !== range.bytes.length;
           if (!mismatch) {
-            for (let index = 0; index < segment.fileSize; index += 1) {
-              if (actual[index] !== segment.bytes[index]) { mismatch = true; break; }
+            for (let index = 0; index < range.bytes.length; index += 1) {
+              if (actual[index] !== range.bytes[index]) { mismatch = true; break; }
             }
           }
           const elapsedMs = Date.now() - started;
           if (mismatch) {
-            report({ operation: 'verify', address: segment.loadAddress, size: segment.fileSize, elapsedMs, ok: false, errorCode: 'VerifyFailed', message: 'complete Flash read-back comparison failed' });
-            throw new CmsisDapFlashError('VerifyFailed', `Flash read-back mismatch at 0x${segment.loadAddress.toString(16)}`);
+            report({ operation: 'verify', address: range.address, size: range.bytes.length, elapsedMs, ok: false, errorCode: 'VerifyFailed', message: 'complete Flash read-back comparison failed' });
+            throw new CmsisDapFlashError('VerifyFailed', `Flash read-back mismatch at 0x${range.address.toString(16)}`);
           }
-          report({ operation: 'verify', address: segment.loadAddress, size: segment.fileSize, elapsedMs, ok: true, message: 'complete Flash read-back comparison passed' });
+          report({ operation: 'verify', address: range.address, size: range.bytes.length, elapsedMs, ok: true, message: 'complete Flash read-back comparison passed' });
         }
       }
     } catch (error) {

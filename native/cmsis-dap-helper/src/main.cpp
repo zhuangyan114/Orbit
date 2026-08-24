@@ -1342,10 +1342,25 @@ std::string cortexDiagnosticsJson(const char* operation,
   return json;
 }
 
-std::optional<uint32_t> controlTimeoutMs(const JsonValue& params) {
+// Halt/step/breakpoint control stays bounded at 10 s so a stuck core cannot
+// pin the helper. Flash Algorithm operations (especially 128 KiB H7 sector
+// erase) need a longer ceiling; 60 s covers the STM32H723 defaults of
+// eraseTimeoutMs=30000 / programTimeoutMs=15000 with headroom.
+constexpr uint64_t kControlTimeoutMaxMs = 10000;
+constexpr uint64_t kFlashAlgorithmTimeoutMaxMs = 60000;
+
+std::optional<uint32_t> boundedTimeoutMs(const JsonValue& params, uint64_t maxMs) {
   const uint64_t timeout = uintField(params, "timeoutMs").value_or(1000);
-  if (timeout == 0 || timeout > 10000) return std::nullopt;
+  if (timeout == 0 || timeout > maxMs) return std::nullopt;
   return static_cast<uint32_t>(timeout);
+}
+
+std::optional<uint32_t> controlTimeoutMs(const JsonValue& params) {
+  return boundedTimeoutMs(params, kControlTimeoutMaxMs);
+}
+
+std::optional<uint32_t> flashAlgorithmTimeoutMs(const JsonValue& params) {
+  return boundedTimeoutMs(params, kFlashAlgorithmTimeoutMaxMs);
 }
 
 std::string coreFailure(const Result& result, const char* operation, Channel& channel,
@@ -1362,7 +1377,7 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
     channel.clearFlashAlgorithmState();
     return resultJson(false, readyResult.message, channel.state(), 0, "{}", readyResult.errorCode);
   }
-  const auto timeout = controlTimeoutMs(params);
+  const auto timeout = flashAlgorithmTimeoutMs(params);
   if (!timeout) return invalidControlTimeout("flashAlgorithm", channel);
   const auto operation = stringField(params, "operation");
   const auto code = byteArrayField(params, "algorithm", 128 * 1024);
@@ -1607,7 +1622,11 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
 }
 
 std::string invalidControlTimeout(const char* operation, Channel& channel) {
-  return resultJson(false, "timeoutMs must be an integer in 1..10000",
+  const uint64_t maxMs = std::string(operation) == "flashAlgorithm"
+      ? kFlashAlgorithmTimeoutMaxMs
+      : kControlTimeoutMaxMs;
+  return resultJson(false,
+                    "timeoutMs must be an integer in 1.." + std::to_string(maxMs),
                     channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
                     "{\"operation\":\"" + std::string(operation) + "\",\"field\":\"timeoutMs\"}");
 }
@@ -4290,6 +4309,27 @@ int runSelfTest() {
     expect(result.ok && step.pcBefore == halted.pc && step.pcAfter != step.pcBefore &&
                step.instructionRetired && step.interruptMaskCleared && diag.packets == 9,
            "dap05-known-pc-step-skips-duplicate-pc-read");
+  }
+
+  {
+    // STM32H723 / Cortex-M7 C_STEP can re-halt with a new PC without latching
+    // S_RETIRE_ST. Instruction step must still succeed from the observed PC.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5690", mock), "dap11-h723-step-omit-retire-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics setupDiag;
+    CortexMDebugState halted;
+    expect(debug.halt(halted, setupDiag, std::chrono::milliseconds(100)).ok &&
+               halted.halted && halted.pcValid,
+           "dap11-h723-step-omit-retire-halt");
+    DapTransferDiagnostics diag;
+    CortexMDebugStepResult step;
+    const Result result = debug.stepInstruction(step, diag, std::chrono::milliseconds(100));
+    expect(result.ok && step.halted && step.pcAfter != step.pcBefore &&
+               !step.instructionRetired && step.interruptMaskCleared,
+           "dap11-h723-step-succeeds-without-s-retire-st");
   }
 
   {

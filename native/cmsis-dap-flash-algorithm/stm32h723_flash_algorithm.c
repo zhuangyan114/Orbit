@@ -268,8 +268,26 @@ int Verify(uint32_t adr, uint32_t sz, uint32_t buf) {
   mask_interrupts();
   if (sz == 0u || !in_flash(adr, sz)) return 3;
   const uint8_t *source = (const uint8_t *)buf;
-  for (uint32_t offset = 0u; offset < sz; ++offset) {
-    if (*(volatile const uint8_t *)(adr + offset) != source[offset]) return 3;
+  uint32_t offset = 0u;
+  // H7 ECC Flash faults on byte/halfword instruction fetches and data reads
+  // when ART/I-cache is off (typical of a RAM flash loader). Compare 32-bit
+  // words, then the leftover tail through a word load plus shift.
+  while (offset + 4u <= sz) {
+    uint32_t expected = (uint32_t)source[offset]
+                      | ((uint32_t)source[offset + 1u] << 8)
+                      | ((uint32_t)source[offset + 2u] << 16)
+                      | ((uint32_t)source[offset + 3u] << 24);
+    if (*(volatile const uint32_t *)(adr + offset) != expected) return 3;
+    offset += 4u;
+  }
+  if (offset < sz) {
+    const uint32_t wordAddress = (adr + offset) & ~3u;
+    const uint32_t word = *(volatile const uint32_t *)wordAddress;
+    while (offset < sz) {
+      const uint32_t shift = ((adr + offset) & 3u) * 8u;
+      if (((word >> shift) & 0xFFu) != source[offset]) return 3;
+      offset += 1u;
+    }
   }
   return 0;
 }

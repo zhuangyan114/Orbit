@@ -85,6 +85,12 @@ function verifyH723Source(source) {
     || !flashWord[0].includes('FLASH_WORD_WORDS')) {
     throw new Error('STM32H723 flash word programming must set PG and write all eight 32-bit words of the 256-bit row');
   }
+  const verifyBody = source.match(/int Verify\([\s\S]*?\n}\n\n__attribute__\(\(section\("\.text\.bkpt"/);
+  if (!verifyBody
+    || !verifyBody[0].includes('volatile const uint32_t')
+    || verifyBody[0].includes('volatile const uint8_t')) {
+    throw new Error('STM32H723 Verify must compare Flash through 32-bit loads; byte reads fault on ECC Flash with ART/I-cache off');
+  }
   const cacheInvalidate = source.match(/static void invalidate_target_caches\([\s\S]*?\n}\n\nstatic int sector_number/);
   if (!cacheInvalidate
     || !cacheInvalidate[0].includes('SCB_ICIALLU')

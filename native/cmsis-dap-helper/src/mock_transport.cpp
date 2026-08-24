@@ -149,6 +149,7 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
         h723.flashSize = 1024u * 1024u;
         h723.flashSectorSize = 128u * 1024u;
         h723.flashWordSize = 32u;
+        h723.omitStepRetireSticky = true;
         state_.profile = h723;
         state_.dpIdcode = h723.dpIdcode;
       }
@@ -526,8 +527,10 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
                              (maskInterrupts ? kMockCoreDebugCMaskInts : 0u)
                        : 0;
     if (halt || step || (wasHalted && !debugEnabled)) {
-      state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady |
-                      kMockCoreDebugSRetireSt;
+      state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+      if (!(step && state_.profile.omitStepRetireSticky)) {
+        state_.dhcsr |= kMockCoreDebugSRetireSt;
+      }
     }
     if (step) {
       const uint32_t pc = state_.registers[15];

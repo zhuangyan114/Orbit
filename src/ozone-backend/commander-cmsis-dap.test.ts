@@ -3,6 +3,7 @@ import { OzoneBackend } from './commander';
 import { SessionTargetOwner } from './session-target-channel';
 import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
+import { STM32F407VET6, STM32H723VGT6 } from './cmsis-dap-flasher';
 
 function cmsisOwner(overrides: Partial<SessionTargetOwner> = {}): SessionTargetOwner {
   return {
@@ -400,6 +401,34 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     });
   });
 
+  it('does not throw when a CMSIS-DAP source-step failure returns empty data', async () => {
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x080001C0 },
+      })),
+      stepOverSourceLine: vi.fn(async () => ({
+        ok: false,
+        message: 'Cortex-M instruction step did not retire before the control timeout',
+        errorCode: 'DapControlTimeout',
+        targetState: 'Halted' as const,
+        elapsedMs: 1000,
+        // Helper coreFailure serializes data as {}. Runtime JSON has no pcBefore/pcAfter.
+        data: {} as never,
+        diagnostics: { operation: 'stepOverSourceLine' },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    addSourceLine(backend, 0x080001C0, 0x080001C6);
+
+    await expect(backend.execute({ cmd: 'stepOver' })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'DapControlTimeout',
+      targetState: 'Halted',
+      elapsedMs: 1000,
+    });
+  });
+
   it('preserves structured FPB resource exhaustion', async () => {
     const owner = cmsisOwner({
       setBreakpoint: vi.fn(async () => ({
@@ -482,6 +511,105 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     await expect(backend.execute({
       cmd: 'setWatchValue', expression: 'FLASH_ACR', value: 1,
       address: 0x40023C00, typeName: 'uint32_t',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'InvalidWatchWriteAddress',
+    });
+    expect(writeMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('permits CMSIS-DAP Watch writes inside any STM32H723 RAM region', async () => {
+    const writeMemory = vi.fn(async (address: number, bytes: Uint8Array) => ({
+      ok: true,
+      message: 'memory written',
+      targetState: 'Halted' as const,
+      elapsedMs: 1,
+      data: { address, bytesWritten: bytes.length },
+    }));
+    const owner = cmsisOwner({
+      getState: vi.fn(async () => ({
+        ok: true, message: 'state', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { state: 'Halted' },
+      })),
+      writeMemory,
+      flashTarget: STM32H723VGT6,
+    });
+    const backend = new OzoneBackend(undefined, owner);
+
+    // DTCM, AXI SRAM, and D2 SRAM1-3 are all registry RAM regions; DAP
+    // reachability of DTCM/D2 is deferred to hardware acceptance and any
+    // failure surfaces through the write path itself.
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'dtcmVar', value: 8,
+      address: 0x2001FFFC, typeName: 'uint32_t',
+    })).resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'axiVar', value: 7,
+      address: 0x24000100, typeName: 'uint32_t',
+    })).resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'd2Var', value: 9,
+      address: 0x30000000, typeName: 'uint32_t',
+    })).resolves.toMatchObject({ ok: true });
+    expect(writeMemory).toHaveBeenCalledTimes(3);
+
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'FLASH_CR1', value: 1,
+      address: 0x5200200C, typeName: 'uint32_t',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'InvalidWatchWriteAddress',
+      diagnostics: { ownerKind: 'cmsis-dap', target: 'STM32H723VGT6' },
+    });
+    // The first word past the DTCM end (0x20000000 + 128 KiB) is outside
+    // every region even though the H723 map continues elsewhere.
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'pastDtcm', value: 1,
+      address: 0x20020000, typeName: 'uint32_t',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'InvalidWatchWriteAddress',
+    });
+    expect(writeMemory).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps the STM32F407 Watch-write window unchanged under the registry gate', async () => {
+    const writeMemory = vi.fn(async (address: number, bytes: Uint8Array) => ({
+      ok: true,
+      message: 'memory written',
+      targetState: 'Halted' as const,
+      elapsedMs: 1,
+      data: { address, bytesWritten: bytes.length },
+    }));
+    const owner = cmsisOwner({
+      getState: vi.fn(async () => ({
+        ok: true, message: 'state', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { state: 'Halted' },
+      })),
+      writeMemory,
+      flashTarget: STM32F407VET6,
+    });
+    const backend = new OzoneBackend(undefined, owner);
+
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'counter', value: 42,
+      address: 0x20000004, typeName: 'uint32_t',
+    })).resolves.toMatchObject({ ok: true });
+    expect(writeMemory).toHaveBeenCalledWith(0x20000004, Uint8Array.from([42, 0, 0, 0]));
+
+    // Both the first word past SRAM and CCM RAM stay rejected: the F407
+    // registry entry deliberately models only the 128 KiB SRAM window.
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'pastSram', value: 1,
+      address: 0x20020000, typeName: 'uint32_t',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'InvalidWatchWriteAddress',
+      diagnostics: { target: 'STM32F407VET6' },
+    });
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'ccmVar', value: 1,
+      address: 0x10000000, typeName: 'uint32_t',
     })).resolves.toMatchObject({
       ok: false,
       errorCode: 'InvalidWatchWriteAddress',

@@ -6,7 +6,7 @@ import {
   FastDataSamplePlanItem, FastDataSampleSpec,
 } from './types';
 import { cancelActiveFlashes, flashElf } from './flasher';
-import { CmsisDapFlashOptions } from './cmsis-dap-flasher';
+import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
 import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress } from './jlink-symbols';
@@ -71,6 +71,16 @@ function invalidConfiguration(field: string, allowed: string, value: unknown): O
     errorCode: 'InvalidConfiguration',
     error: `InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`,
   };
+}
+
+function formatHexPc(value: unknown): string {
+  return typeof value === 'number' ? `0x${value.toString(16)}` : 'unknown';
+}
+
+function hasSourceStepPc(
+  data: NativeStepIntoDiagnostics | NativeStepOverDiagnostics | NativeStepOutDiagnostics | undefined,
+): data is NativeStepIntoDiagnostics | NativeStepOverDiagnostics | NativeStepOutDiagnostics {
+  return typeof data?.pcBefore === 'number' && typeof data?.pcAfter === 'number';
 }
 
 export class OzoneBackend {
@@ -1484,13 +1494,15 @@ case 'readVariableRuntime':
     const started = Date.now();
     const result = await run();
     const diagnostics = result.data;
+    const hasPc = hasSourceStepPc(diagnostics);
     log.step(
       `CMSIS-DAP ${kind} owner=cmsis-dap ok=${result.ok}`
       + ` targetState=${result.targetState} elapsedMs=${result.elapsedMs}`
-      + (diagnostics
-        ? ` pc=0x${diagnostics.pcBefore.toString(16)}->0x${diagnostics.pcAfter.toString(16)}`
+      + (hasPc
+        ? ` pc=${formatHexPc(diagnostics.pcBefore)}->${formatHexPc(diagnostics.pcAfter)}`
           + ` class=${diagnostics.classification} cleanup=${diagnostics.cleanupOk}`
-        : ` errorCode=${result.errorCode || 'unknown'} diagnostics=${JSON.stringify(result.diagnostics || {})}`),
+        : ` errorCode=${result.errorCode || 'unknown'} diagnostics=${JSON.stringify(result.diagnostics || {})}`
+          + ` data=${JSON.stringify(diagnostics || {})}`),
     );
     this.stepProfileMark('CMSIS-DAP source state machine', started, `kind=${kind}`);
     if (!result.ok) {
@@ -1503,7 +1515,7 @@ case 'readVariableRuntime':
         elapsedMs: result.elapsedMs,
       };
     }
-    if (result.targetState !== 'Halted' || !diagnostics) {
+    if (result.targetState !== 'Halted' || !hasPc) {
       return {
         ok: false,
         errorCode: result.targetState !== 'Halted' ? 'TargetStateInvalid' : 'MalformedResponse',
@@ -1753,8 +1765,8 @@ case 'readVariableRuntime':
     this.stepProfileMark(
       'native state machine',
       nativeStarted,
-      diagnostics
-        ? `class=${diagnostics.classification} pc=0x${diagnostics.pcBefore.toString(16)}->0x${diagnostics.pcAfter.toString(16)} instructions=${diagnostics.instructions} segments=${JSON.stringify(diagnostics.timings)} cleanup=${diagnostics.cleanupOk}`
+      hasSourceStepPc(diagnostics)
+        ? `class=${diagnostics.classification} pc=${formatHexPc(diagnostics.pcBefore)}->${formatHexPc(diagnostics.pcAfter)} instructions=${diagnostics.instructions} segments=${JSON.stringify(diagnostics.timings)} cleanup=${diagnostics.cleanupOk}`
         : `errorCode=${result.errorCode || 'unknown'} message=${result.message}`,
     );
     if (!result.ok) {
@@ -1792,8 +1804,8 @@ case 'readVariableRuntime':
     this.stepProfileMark(
       'native state machine',
       nativeStarted,
-      diagnostics
-        ? `kind=${kind} class=${diagnostics.classification} pc=0x${diagnostics.pcBefore.toString(16)}->0x${diagnostics.pcAfter.toString(16)} segments=${JSON.stringify(diagnostics.timings)} cleanup=${diagnostics.cleanupOk}`
+      hasSourceStepPc(diagnostics)
+        ? `kind=${kind} class=${diagnostics.classification} pc=${formatHexPc(diagnostics.pcBefore)}->${formatHexPc(diagnostics.pcAfter)} segments=${JSON.stringify(diagnostics.timings)} cleanup=${diagnostics.cleanupOk}`
         : `kind=${kind} errorCode=${result.errorCode || 'unknown'} message=${result.message}`,
     );
     if (kind === 'stepInto' && diagnostics && 'trace' in diagnostics && diagnostics.trace) {
@@ -4312,15 +4324,25 @@ case 'readVariableRuntime':
     const requestedTypeSize = typeName ? this.getBuiltinTypeSize(typeName) : 0;
     const valueType = requestedType || resolvedType;
     const writeSize = Math.max(Math.min(requestedTypeSize || valueType?.byteSize || sym?.size || 4, 8), 1);
-    if (this.isCmsisDapOwner()
-      && (writeAddress < 0x20000000 || writeAddress + writeSize > 0x20020000)) {
-      return {
-        ok: false,
-        error: `CMSIS-DAP Watch writes require an STM32F407 SRAM address: 0x${writeAddress.toString(16)}`,
-        errorCode: 'InvalidWatchWriteAddress',
-        targetState: this.state,
-        diagnostics: { ownerKind: 'cmsis-dap', address: writeAddress, size: writeSize },
-      };
+    if (this.isCmsisDapOwner()) {
+      const flashTarget = this.sessionTarget?.flashTarget;
+      // With a registry entry, any of the target's RAM regions is permitted and
+      // DAP reachability failures surface through the write path itself.
+      // Without one (device missing/unregistered) keep the conservative
+      // STM32F407 SRAM window this gate has always used.
+      const allowed = flashTarget
+        ? findRamRegion(flashTarget, writeAddress, writeSize) !== undefined
+        : writeAddress >= 0x20000000 && writeAddress + writeSize <= 0x20020000;
+      if (!allowed) {
+        const targetName = flashTarget?.name ?? 'STM32F407VET6';
+        return {
+          ok: false,
+          error: `CMSIS-DAP Watch writes require an ${targetName} RAM address: 0x${writeAddress.toString(16)}`,
+          errorCode: 'InvalidWatchWriteAddress',
+          targetState: this.state,
+          diagnostics: { ownerKind: 'cmsis-dap', address: writeAddress, size: writeSize, target: targetName },
+        };
+      }
     }
     const buf = new Uint8Array(writeSize);
     const isFloat = this.isFloatType(valueType) || /^(float|float32_t|fp32|double|float64_t|fp64)$/.test(normalizedTypeName);

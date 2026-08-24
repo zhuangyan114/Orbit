@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### Bug: CMSIS-DAP 调试 H723 单步/逐过程抛 toString 空值
+
+- **日期**: 2026-08-24
+- **问题描述**: 用 DAP-Link 调试 STM32H723 时，单步、逐过程、跳出弹出 `Cannot read properties of undefined (reading 'toString')`；连接、烧录、断点和栈显示仍正常。日志显示唯一 owner 为 `cmsis-dap`，PC 实际从 `0x8003b7a` 前进到 `0x8003b7c`/`0x8003b7e`，但每次源级步进约 1 秒后失败。
+- **根因分析**: CMSIS-DAP helper 把 `C_STEP` 完成条件写成必须同时看到 `S_HALT` 和 `S_RETIRE_ST`。H723/Cortex-M7 上指令已经退休、PC 已变化，但 `S_RETIRE_ST` 可能一直不置位，helper 空等控制超时后返回 `data={}`。`executeCmsisDapSourceStep()` 在记录日志时直接调用 `diagnostics.pcBefore.toString(16)`，把空对象当成完整诊断，于是把 TypeError 抛到 UI。
+- **修改方案**: helper 在核心已 halt 且 PC 已变化时确认步进完成，不再把缺失的 `S_RETIRE_ST` 当成失败；H723 mock `1234:5690` 复现该 DHCSR 行为；TypeScript 源级步进日志在缺少 `pcBefore`/`pcAfter` 时记录结构化错误，不再抛异常。
+- **涉及文件**: `native/cmsis-dap-helper/src/cortex_m_debug.cpp:391` - `executeInstructionStep` PC 回退确认；`native/cmsis-dap-helper/src/mock_transport.h:120`、`mock_transport.cpp:152,531` - H723 省略 `S_RETIRE_ST`；`native/cmsis-dap-helper/src/main.cpp:4332` - helper selftest；`scripts/cmsis-dap-smoke.js:1210` - H723 源级步进 mock；`src/ozone-backend/commander.ts:76,80,1490` - 空诊断日志防护；`src/ozone-backend/commander-cmsis-dap.test.ts:404` - 空 `data` 回归
+- **验证结果**: 用户于 2026-08-24 确认 H723 真机单步、逐过程均迅速响应。focused Vitest 24/24、`tsc --noEmit`、native 构建、CMSIS-DAP mock（含 H723 无 `S_RETIRE_ST` 的指令步进和源级逐过程）均通过。
+
 ### Bug: DAP-09 RTOS View 发布伪造运行计数并缺少动态任务生命周期证据
 
 - **日期**: 2026-08-09

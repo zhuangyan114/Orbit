@@ -7,6 +7,7 @@ import {
   STM32H723VGT6,
   calculateEraseSectors,
   CmsisDapFlashError,
+  coalesceFlashProgramRanges,
   FlashTargetDefinition,
   flashCmsisDapElf,
   listBuiltinFlashAlgorithms,
@@ -790,6 +791,12 @@ describe('CMSIS-DAP flash target registry', () => {
     expect(() => validateFlashTargetDefinition(variant({
       flashDiagnostics: { statusAddress: 0x40023C0E, controlAddress: 0x40023C12 },
     }))).toThrow(/adjacent aligned words/);
+    expect(() => validateFlashTargetDefinition(variant({ eraseTimeoutMs: 60_001 })))
+      .toThrow(/timeouts must be in 1\.\.60000/);
+    expect(() => validateFlashTargetDefinition(variant({ programTimeoutMs: 0 })))
+      .toThrow(/timeouts must be in 1\.\.60000/);
+    expect(() => validateFlashTargetDefinition(variant({ flashWordSize: 24 })))
+      .toThrow(/flashWordSize must be a power of two/);
   });
 });
 
@@ -892,6 +899,70 @@ describe('multi-target flash model (H723-shaped)', () => {
     ]));
     expect(() => calculateEraseSectors(straddling, STM32H723VGT6))
       .toThrow(/outside STM32H723VGT6 Flash and RAM regions/);
+  });
+
+  it('merges adjacent Flash PT_LOAD ranges that share a 32-byte ECC word', () => {
+    const segments = parseElf32LoadSegments(makeElf([
+      { address: 0x08000000, bytes: Array.from({ length: 0x1d98 }, (_, index) => index & 0xFF) },
+      { address: 0x20000000, loadAddress: 0x08001d98, bytes: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00] },
+    ]));
+    const ranges = coalesceFlashProgramRanges(segments, STM32H723VGT6);
+    expect(ranges).toHaveLength(1);
+    expect(ranges[0]!.address).toBe(0x08000000);
+    expect(ranges[0]!.bytes.length).toBe(0x1da8);
+    expect(Array.from(ranges[0]!.bytes.slice(0x1d98, 0x1da8)))
+      .toEqual([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]);
+    expect(STM32H723VGT6.flashWordSize).toBe(32);
+    expect(STM32F407VET6.flashWordSize).toBeUndefined();
+    const f4 = coalesceFlashProgramRanges(segments, STM32F407VET6);
+    expect(f4.map(range => [range.address, range.bytes.length])).toEqual([
+      [0x08000000, 0x1d98],
+      [0x08001d98, 16],
+    ]);
+  });
+
+  it('programs a CubeMX-style .text/.data LMA split as one H723 page', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-h723-ecc-merge-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      const manifestPath = path.join(tempDir, 'algorithm.json');
+      fs.writeFileSync(elfPath, makeElf([
+        { address: 0x08000000, bytes: Array.from({ length: 0x1d98 }, () => 0xAA) },
+        { address: 0x20000000, loadAddress: 0x08001d98, bytes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] },
+      ]));
+      const algorithm = Buffer.alloc(0x600, 0xBF);
+      algorithm[0x500] = 0x00;
+      algorithm[0x501] = 0xBE;
+      fs.writeFileSync(path.join(tempDir, 'algorithm.bin'), algorithm);
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        binary: 'algorithm.bin',
+        pageSize: 0x10000,
+        preservesPageBuffer: true,
+        entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
+      }));
+      const calls: Array<{ operation: string; address: number; size: number }> = [];
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: STM32H723VGT6.dpIdcode }; },
+        async readMemory(address: number, size: number) {
+          if (address === 0x5C001000) return { ok: true, bytes: [0x83, 0x04, 0x00, 0x10].slice(0, size) };
+          if (address === 0x1FF1E880) return { ok: true, bytes: [0x00, 0x04].slice(0, size) };
+          return { ok: false, errorCode: 'DapInvalidRequest', message: 'unexpected read' };
+        },
+        async runAlgorithm(request: { operation: string; targetAddress: number; size: number; bkptAddress: number }) {
+          calls.push({ operation: request.operation, address: request.targetAddress, size: request.size });
+          return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003 } };
+        },
+      }, elfPath, 'STM32H723VGT6', { algorithmPath: manifestPath }, STM32H723VGT6);
+      expect(result.success).toBe(true);
+      expect(calls.filter(call => call.operation === 'programPage')).toEqual([
+        { operation: 'programPage', address: 0x08000000, size: 0x1da8 },
+      ]);
+      expect(calls.filter(call => call.operation === 'verify')).toEqual([
+        { operation: 'verify', address: 0x08000000, size: 0x1da8 },
+      ]);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('places the loader in the AXI SRAM region selected by loaderRamIndex', () => {
@@ -1003,6 +1074,46 @@ describe('multi-target flash model (H723-shaped)', () => {
       expect(result.success).toBe(true);
       expect(timeouts.length).toBeGreaterThan(0);
       expect(new Set(timeouts)).toEqual(new Set([1234]));
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an explicit timeoutMs above the helper flashAlgorithm ceiling', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-h723-timeout-cap-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      const manifestPath = path.join(tempDir, 'algorithm.json');
+      fs.writeFileSync(elfPath, makeElf([{ address: 0x08000000, bytes: [1, 2, 3, 4] }]));
+      const algorithm = Buffer.alloc(0x600, 0xBF);
+      algorithm[0x500] = 0x00;
+      algorithm[0x501] = 0xBE;
+      fs.writeFileSync(path.join(tempDir, 'algorithm.bin'), algorithm);
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        binary: 'algorithm.bin',
+        pageSize: 4,
+        entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
+      }));
+      let algorithmCalls = 0;
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: STM32H723VGT6.dpIdcode }; },
+        async readMemory(address: number, size: number) {
+          if (address === 0x5C001000) return { ok: true, bytes: [0x83, 0x04, 0x00, 0x10].slice(0, size) };
+          if (address === 0x1FF1E880) return { ok: true, bytes: [0x00, 0x04].slice(0, size) };
+          return { ok: false, errorCode: 'DapInvalidRequest', message: 'unexpected read' };
+        },
+        async runAlgorithm() {
+          algorithmCalls += 1;
+          return { ok: true, message: 'unexpected', data: { returnCode: 0, pc: 0x24000500, dhcsr: 0x00030003 } };
+        },
+      }, elfPath, 'STM32H723VGT6', {
+        algorithmPath: manifestPath,
+        timeoutMs: 60_001,
+      }, STM32H723VGT6);
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('InvalidConfiguration');
+      expect(result.message).toContain('1..60000');
+      expect(algorithmCalls).toBe(0);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

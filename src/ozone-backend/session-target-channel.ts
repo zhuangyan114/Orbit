@@ -96,6 +96,12 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   stopRtt(): Promise<CppJLinkResult<any>>;
   readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
   flash?(elfPath: string, device: string, options?: CmsisDapFlashOptions): Promise<CppJLinkResult<CmsisDapFlashResult>>;
+  /**
+   * Registry definition of the session device, resolved at connect. Null when
+   * the device is missing or not registered; consumers must treat null as
+   * "no target knowledge", not as a specific target.
+   */
+  readonly flashTarget?: FlashTargetDefinition | null;
   getPerformanceDiagnostics?(): Record<string, unknown>;
   getSchedulerSnapshot?(): Record<string, unknown>;
   dispose(graceful?: boolean): Promise<void>;
@@ -118,6 +124,7 @@ export class SessionTargetSelector {
 
   get ownerKind(): SessionTargetOwnerKind { return this.owner?.kind || 'none'; }
   get usingNative(): boolean { return this.owner?.usingNative === true; }
+  get flashTarget(): FlashTargetDefinition | null { return this.owner?.flashTarget ?? null; }
 
   async connect(
     config: SessionTargetConnectConfig,
@@ -449,6 +456,12 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private readonly helper: CmsisDapHelperClient;
   private state: 'idle' | 'opened' | 'connected' | 'failed' = 'idle';
   private lastDevice: CmsisDapDeviceInfo | null = null;
+  private flashTargetDef: FlashTargetDefinition | null = null;
+
+  /** Registry definition of the connected device; null when unregistered. */
+  get flashTarget(): FlashTargetDefinition | null {
+    return this.flashTargetDef;
+  }
 
   getPerformanceDiagnostics(): Record<string, unknown> {
     return { owner: this.kind, ...this.helper.getPerformanceSnapshot() };
@@ -553,6 +566,15 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         );
       }
       this.state = 'connected';
+      // Resolve the session device once for data-driven gating (Watch writes).
+      // An unregistered device must not fail connect here; flash() re-resolves
+      // and reports the structured registry error at flash time.
+      try {
+        this.flashTargetDef = config.device ? resolveFlashTarget(config.device) : null;
+      } catch {
+        this.flashTargetDef = null;
+        log.dll(`[cmsis-dap] session device is not in the flash target registry device=${config.device} owner=cmsis-dap`);
+      }
       log.dll(`[cmsis-dap] connected port=${(connected.data as { port?: string })?.port || 'unknown'} owner=cmsis-dap `
         + `fpbRevision=${fpb.data.revision} codeComparators=${fpb.data.codeComparators} fpbSanitized=true`);
       return {
@@ -589,6 +611,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     await this.helper.dispose(true).catch(() => {});
     this.state = 'idle';
     this.lastDevice = null;
+    this.flashTargetDef = null;
     log.dll('[cmsis-dap] disconnected owner=cmsis-dap');
     return { ok: true, message: 'CMSIS-DAP disconnected', targetState: 'Disconnected', elapsedMs: 0, data: {} };
   }

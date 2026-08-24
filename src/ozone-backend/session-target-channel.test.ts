@@ -341,6 +341,41 @@ describe('SessionTargetSelector owner lifecycle', () => {
     }));
   });
 
+  it('exposes the connected device flash target and clears it on disconnect', async () => {
+    const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper() });
+    const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => channel);
+
+    expect(channel.flashTarget).toBeNull();
+    expect(selector.flashTarget).toBeNull();
+
+    const connected = await selector.connect({
+      device: 'STM32H723VGT6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+    expect(connected.ok).toBe(true);
+    expect(channel.flashTarget).toMatchObject({ name: 'STM32H723VGT6' });
+    expect(selector.flashTarget).toMatchObject({ name: 'STM32H723VGT6' });
+
+    await channel.disconnect();
+    expect(channel.flashTarget).toBeNull();
+    expect(selector.flashTarget).toBeNull();
+  });
+
+  it('connects an unregistered device without a flash target entry', async () => {
+    const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper() });
+
+    const connected = await channel.connect({
+      device: 'STM32F429VGT6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+    expect(connected.ok).toBe(true);
+    expect(channel.flashTarget).toBeNull();
+  });
+
   it('preserves an RTT Flags error without replacing the CMSIS-DAP owner or creating J-Link fallback', async () => {
     const base = fakeCmsisDapHelper();
     const request = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {

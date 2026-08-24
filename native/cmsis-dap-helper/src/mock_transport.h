@@ -115,6 +115,9 @@ struct MockTargetProfile {
   // allows programming into fully erased flash words of that byte size
   // (ECC rule: a flash word must never be programmed twice).
   uint32_t flashWordSize = 0;
+  // When true, C_STEP re-halts and advances PC without latching S_RETIRE_ST.
+  // Models STM32H723 / Cortex-M7 hardware observed during source stepping.
+  bool omitStepRetireSticky = false;
 };
 
 // SW-DP / MEM-AP simulation state. Matches the ADIv5 semantics the target
@@ -266,7 +269,7 @@ struct MockFlashAlgorithmRequest {
 //                              (DEV_ID 0x483), Flash size 1 MiB in 8 uniform
 //                              128 KiB sectors, 256-bit ECC flash words
 //                              (no double programming), loader RAM window at
-//                              AXI SRAM 0x24000000
+//                              AXI SRAM 0x24000000. C_STEP omits S_RETIRE_ST.
 class MockCmsisDapTransport : public CmsisDapTransport {
  public:
   MockCmsisDapTransport();

@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### Bug: CMSIS-DAP 调试 H723 入口停下后 RTT/P-RTLog 永久不显示
+
+- **日期**: 2026-08-24
+- **问题描述**: 用 DAP-Link 调试 STM32H723 时，连接、烧录、单步、Watch 正常，但 Orbit RTT Log / P-RTLog 没有输出。日志显示唯一 owner 为 `cmsis-dap`，ELF 已解析 `_SEGGER_RTT=0x2000408c`，`runToEntryPoint` 停在 `main.c:67` 后立刻 `startRtt`，返回 `RttInvalidControlBlock: RTT Control Block magic is not SEGGER RTT`，随后 `action=disabled`；Continue 后固件才会初始化 RTT，日志也不再恢复。
+- **根因分析**: CMSIS-DAP RTT 通过目标内存读控制块，不扫 RAM。入口停在 `SEGGER_RTT_Init()` 之前时，控制块仍是 BSS 零页，缺 `"SEGGER RTT"` magic。Restart 路径已把 `RttInvalidControlBlock` 当瞬态错误按 `orbit.rttPollIntervalMs` 重试，但普通 launch 仍把它当会话级永久不可用并清掉轮询，Continue 无法恢复。
+- **修改方案**: launch 与 Restart 对齐，调用 `startRttLogPolling({ retryInvalidControlBlock: true })`；缺 magic 时保持用户 RTT 启用意图并按轮询间隔重试。非法 ELF 地址、错误 Flags、owner 丢失仍按原规则禁用或终止会话，不创建第二 owner，也不回退 J-Link。
+- **涉及文件**: `src/debug/dap-session.ts:2032` - launch 对缺 magic 做瞬态重试；`src/debug/dap-session-rtt.test.ts:357` - launch 缺 magic 后重试并在固件初始化后 `readRtt` 的回归
+- **验证结果**: 用户于 2026-08-24 确认 H723 真机 P-RTLog 正常显示。focused RTT Vitest 24/24、`tsc --noEmit` 通过。
+
 ### Bug: CMSIS-DAP 调试 H723 单步/逐过程抛 toString 空值
 
 - **日期**: 2026-08-24

@@ -2025,7 +2025,11 @@ export class DapSession extends EventEmitter {
       this.markStoppedForUi();
       this.lastHaltReason = 'entry';
       if (this.rttLogEnabled && this.rttAvailable) {
-        this.startRttLogPolling();
+        // runToEntryPoint / initial halt can stop before SEGGER_RTT_Init()
+        // writes the control-block magic. Treat a missing magic the same way
+        // Restart does: keep the user's RTT intent and retry on the poll
+        // interval instead of disabling the session log permanently.
+        this.startRttLogPolling({ retryInvalidControlBlock: true });
       } else {
         this.stopRttLogPolling(false);
       }

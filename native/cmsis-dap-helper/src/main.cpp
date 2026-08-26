@@ -1367,7 +1367,8 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
                         const std::chrono::steady_clock::time_point& started,
                         uint32_t timeoutMs, const DapTransferDiagnostics& diag,
                         const std::string& extra = "",
-                        const CortexMDebugDiagnostics* algorithm = nullptr);
+                        const CortexMDebugDiagnostics* algorithm = nullptr,
+                        const std::string& dataJson = "{}");
 std::string invalidControlTimeout(const char* operation, Channel& channel);
 
 std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
@@ -1604,7 +1605,8 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
                         const std::chrono::steady_clock::time_point& started,
                         uint32_t timeoutMs, const DapTransferDiagnostics& diag,
                         const std::string& extra,
-                        const CortexMDebugDiagnostics* algorithm) {
+                        const CortexMDebugDiagnostics* algorithm,
+                        const std::string& dataJson) {
   channel.debugPowerReady = false;
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1616,7 +1618,7 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
             << " message=" << result.message
             << " diagnostics=" << cortexDiagnosticsJson(operation, timeoutMs, diag, extra, algorithm)
             << std::endl;
-  return resultJson(false, result.message, channel.state(), elapsedMs, "{}",
+  return resultJson(false, result.message, channel.state(), elapsedMs, dataJson,
                     result.errorCode.empty() ? ErrorCodes::kInternalError : result.errorCode,
                     cortexDiagnosticsJson(operation, timeoutMs, diag, extra, algorithm));
 }
@@ -2290,7 +2292,7 @@ std::string handleSourceStep(const char* operation, const JsonValue& params, Cha
   }
   const std::string stepJson = sourceStepJson(step);
   if (!result.ok) return coreFailure(result, operation, channel, started, *timeout, diagnostics,
-                                     "\"step\":" + stepJson);
+                                     "\"step\":" + stepJson, nullptr, stepJson);
   const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count();
   return resultJson(true, std::string("CMSIS-DAP ") + operation + " completed", "Halted",
@@ -4755,6 +4757,31 @@ int runSelfTest() {
     expect(result.ok && step.classification == "branch" && !step.enteredCall &&
                step.trace.size() == 1 && !step.trace.front().call,
            "dap05-wide-conditional-branch-is-not-call");
+  }
+
+  {
+    // A call return breakpoint that never fires (1234:568C FPB never hits)
+    // must time out with StepTimeout, halt the target, and report the
+    // recovered halt PC so the client can move the UI to the real stop
+    // location instead of leaving the cursor on the timed-out line.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "568C", mock), "dap05-step-timeout-recovery-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics diag;
+    expect(target.initializeDebugPower(diag, std::chrono::milliseconds(100)).ok,
+           "dap05-step-timeout-recovery-debug-power");
+    mock.prepareSourceInstruction(0x080001C2u, {0x00, 0xF0, 0x0D, 0xF8});
+    FpbState fpbState;
+    CmsisDapSourceStepper stepper(&target, &debug, &fpbState);
+    SourceStepResult step;
+    const Result result = stepper.stepOver(0x080001C2u, 0x080001C6u, 4u, step, diag,
+                                           std::chrono::milliseconds(50));
+    expect(!result.ok && result.errorCode == "StepTimeout" &&
+               step.stopReason == "RecoveryHalt" &&
+               step.classification == "recoveredHalt" && step.cleanupOk,
+           "dap05-step-timeout-recovers-halt-and-pc");
   }
 
   {

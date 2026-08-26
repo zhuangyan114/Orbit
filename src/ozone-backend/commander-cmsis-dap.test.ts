@@ -246,6 +246,10 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
 
     expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C6 } });
     expect(owner.stepOverSourceLine).toHaveBeenCalledOnce();
+    expect(owner.stepOverSourceLine).toHaveBeenCalledWith(expect.objectContaining({
+      waitTimeoutMs: 10000,
+      timeoutMs: 10000,
+    }));
     expect(owner.setBreakpoint).not.toHaveBeenCalled();
   });
 
@@ -345,6 +349,10 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
 
     expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C6 } });
     expect(owner.stepOut).toHaveBeenCalledOnce();
+    expect(owner.stepOut).toHaveBeenCalledWith(expect.objectContaining({
+      waitTimeoutMs: 10000,
+      timeoutMs: 10000,
+    }));
     expect(owner.step).not.toHaveBeenCalled();
     expect(owner.setBreakpoint).not.toHaveBeenCalled();
   });
@@ -398,6 +406,47 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       targetState: 'Halted',
       elapsedMs: 1000,
       diagnostics: { cleanupOk: true, restoredSlots: [0, 4] },
+    });
+  });
+
+  it('carries the recovered halt PC when a timed-out stepOver ends in a forced halt', async () => {
+    const owner = cmsisOwner({
+      readRegister: vi.fn(async () => ({
+        ok: true, message: 'pc', targetState: 'Halted' as const, elapsedMs: 1,
+        data: { value: 0x080001C0 },
+      })),
+      stepOverSourceLine: vi.fn(async () => ({
+        ok: false,
+        message: 'target did not halt at the temporary breakpoint before timeout',
+        errorCode: 'StepTimeout',
+        targetState: 'Unknown' as const,
+        elapsedMs: 1000,
+        data: {
+          pcBefore: 0x080001C0,
+          pcAfter: 0x080001E0,
+          classification: 'recoveredHalt',
+          stopReason: 'RecoveryHalt',
+          instructions: 1,
+          cleanupOk: true,
+          timings: { haltMs: 0, readPcMs: 0, decodeMs: 0, executeMs: 0, waitMs: 0, cleanupMs: 0, totalMs: 1000 },
+        },
+      })),
+    });
+    const backend = new OzoneBackend(undefined, owner);
+    addSourceLine(backend, 0x080001C0, 0x080001C6);
+
+    const result = await backend.execute({ cmd: 'stepOver' });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'StepTimeout',
+      targetState: 'Halted',
+      data: {
+        mode: 'cmsis-dap',
+        pcBefore: 0x080001C0,
+        pcAfter: 0x080001E0,
+        stopReason: 'RecoveryHalt',
+      },
     });
   });
 

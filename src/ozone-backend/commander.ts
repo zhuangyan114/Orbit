@@ -1425,7 +1425,11 @@ case 'readVariableRuntime':
       () => this.sessionTarget!.stepOverSourceLine({
         lineStart: range.start,
         lineEnd: range.end,
-        waitTimeoutMs: 1000,
+        // A blocking RTOS call (e.g. osDelay) can suspend the task for many
+        // seconds. The helper reads timeoutMs for the wait and is capped at
+        // 10 s; waitTimeoutMs mirrors it for request-shape consistency.
+        waitTimeoutMs: 10000,
+        timeoutMs: 10000,
         maxInstructionSteps: 128,
         breakpoints: this.snapshotBreakpoints(),
       }),
@@ -1472,7 +1476,8 @@ case 'readVariableRuntime':
     return this.executeCmsisDapSourceStep('stepOut', () => this.sessionTarget!.stepOut({
       functionStart: functionRange.start,
       functionEnd: functionRange.end,
-      waitTimeoutMs: 1000,
+      waitTimeoutMs: 10000,
+      timeoutMs: 10000,
       breakpoints: this.snapshotBreakpoints(),
     }));
   }
@@ -1506,13 +1511,19 @@ case 'readVariableRuntime':
     );
     this.stepProfileMark('CMSIS-DAP source state machine', started, `kind=${kind}`);
     if (!result.ok) {
+      // A timed-out call return breakpoint still ends with a forced halt whose
+      // PC is recorded by the helper. Carry it so the DAP layer can publish the
+      // real stop location instead of leaving the cursor on the timed-out line.
+      const recoveredHalt = hasPc && diagnostics.stopReason === 'RecoveryHalt';
+      if (recoveredHalt) this.state = TargetState.Halted;
       return {
         ok: false,
         errorCode: result.errorCode || 'CmsisDapSourceStepFailed',
         error: `${result.errorCode || 'CmsisDapSourceStepFailed'}: ${result.message}`,
         diagnostics: result.diagnostics,
-        targetState: result.targetState,
+        targetState: recoveredHalt ? 'Halted' : result.targetState,
         elapsedMs: result.elapsedMs,
+        data: hasPc ? { mode: 'cmsis-dap', ...diagnostics } : undefined,
       };
     }
     if (result.targetState !== 'Halted' || !hasPc) {

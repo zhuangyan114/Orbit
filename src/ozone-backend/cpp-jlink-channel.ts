@@ -44,6 +44,7 @@ export interface NativeStepOverRequest {
   lineStart?: number;
   lineEnd?: number;
   waitTimeoutMs?: number;
+  timeoutMs?: number;
   maxInstructionSteps?: number;
   breakpoints?: Record<string, number>;
 }
@@ -55,6 +56,7 @@ export interface NativeStepOverDiagnostics {
   instructions: number;
   temporaryBreakpointCount?: number;
   cleanupOk: boolean;
+  stopReason?: string;
   timings: {
     haltMs: number;
     readPcMs: number;
@@ -72,6 +74,7 @@ export interface NativeStepIntoDiagnostics {
   classification: string;
   instructions: number;
   cleanupOk: true;
+  stopReason?: string;
   timings: NativeStepTimings;
   phase?: 'instruction' | 'sourceLine';
   trace?: Array<{ pc: number; classification: string; call: boolean }>;
@@ -87,6 +90,7 @@ export interface NativeStepOutRequest {
   functionStart: number;
   functionEnd: number;
   waitTimeoutMs?: number;
+  timeoutMs?: number;
   breakpoints?: Record<string, number>;
 }
 
@@ -99,6 +103,7 @@ export interface NativeStepOutDiagnostics {
   classification: 'returnBreakpoint' | 'exceptionReturnBreakpoint' | 'existingReturnBreakpoint' | 'userBreakpoint';
   instructions: 0;
   cleanupOk: boolean;
+  stopReason?: string;
   timings: NativeStepTimings;
 }
 

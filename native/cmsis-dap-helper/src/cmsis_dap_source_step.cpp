@@ -102,7 +102,11 @@ Result CmsisDapSourceStepper::runTo(uint32_t currentPc, uint32_t address,
   if (operation.ok) operation = waitForHalt(stopped, diag, timeout);
   if (!operation.ok) {
     CortexMDebugState recovery;
-    (void)debug_->halt(recovery, diag, timeout);
+    if (debug_->halt(recovery, diag, timeout).ok && recovery.halted && recovery.pcValid) {
+      output.pcAfter = recovery.pc;
+      output.stopReason = "RecoveryHalt";
+      output.classification = "recoveredHalt";
+    }
   }
 
   const Result clear = fpb_.clearTemporary(temporary, diag, timeout);

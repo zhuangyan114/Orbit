@@ -435,6 +435,66 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(messages.indexOf(stopped[0])).toBeGreaterThan(messages.indexOf(response!));
   });
 
+  it('publishes the recovered halt location when a CMSIS-DAP stepOver times out', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'stepOver'
+        ? {
+          ok: false,
+          error: 'StepTimeout: target did not halt at the temporary breakpoint before timeout',
+          errorCode: 'StepTimeout',
+          targetState: 'Halted',
+          data: {
+            mode: 'cmsis-dap',
+            pcBefore: 0x080001C0,
+            pcAfter: 0x080001E0,
+            stopReason: 'RecoveryHalt',
+          },
+        }
+        : { ok: false, error: `unexpected ${command.cmd}` }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleStep(request(1, 'next'), 'stepOver');
+
+    const response = messages.find(message => message.type === 'response');
+    const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+    expect(response).toMatchObject({ success: false, command: 'next' });
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ body: { reason: 'step', threadId: 1, allThreadsStopped: true } });
+    expect(messages.indexOf(stopped[0])).toBeGreaterThan(messages.indexOf(response!));
+    expect(backend.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fabricate a stopped event for a StepTimeout without a recovered halt', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'stepOver'
+        ? {
+          ok: false,
+          error: 'StepTimeout: target did not halt at the temporary breakpoint before timeout',
+          errorCode: 'StepTimeout',
+          targetState: 'Unknown',
+        }
+        : { ok: false, error: `unexpected ${command.cmd}` }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleStep(request(1, 'next'), 'stepOver');
+
+    const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+    expect(stopped).toHaveLength(0);
+    expect(backend.execute).toHaveBeenCalledTimes(1);
+  });
+
   it('emits continued only after CMSIS-DAP confirms Running, never through J-Link', async () => {
     const calls: string[] = [];
     const backend = {

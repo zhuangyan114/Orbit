@@ -2791,6 +2791,23 @@ export class DapSession extends EventEmitter {
               this.sendResponse(msg, undefined, false, result.error);
               responseSent = true;
             }
+            const recovered = result.data as {
+              pcAfter?: number;
+              stopReason?: string;
+            } | undefined;
+            if (this._probe === 'cmsis-dap'
+                && result.errorCode === 'StepTimeout'
+                && result.targetState === 'Halted'
+                && recovered?.stopReason === 'RecoveryHalt'
+                && typeof recovered.pcAfter === 'number') {
+              // The helper forcibly halted the target after the wait timed out.
+              // Publish the recovered stop so the UI moves to the real location
+              // instead of leaving the cursor on the timed-out line.
+              this.lastHaltReason = 'step';
+              this.markStoppedForUi();
+              this.sendEvent('stopped', { reason: 'step', threadId: 1, allThreadsStopped: true });
+              log.dap(`handleStep: ${cmd} StepTimeout recoveredHalt pc=0x${recovered.pcAfter.toString(16)}`);
+            }
             return;
           }
 

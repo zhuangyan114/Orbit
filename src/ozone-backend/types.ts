@@ -217,6 +217,7 @@ export type OzoneCommandResult =
     ok: false;
     error: string;
     errorCode?: string;
+    data?: unknown;
     diagnostics?: Record<string, unknown>;
     targetState?: string;
     elapsedMs?: number;

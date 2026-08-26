@@ -1081,6 +1081,9 @@ async function runDap05CleanupMatrix() {
     && !timedOut.ok && timedOut.errorCode === 'StepTimeout'
     && timedOut.diagnostics.step.cleanupOk === true
     && timedOut.diagnostics.step.temporaryBreakpointCount === 1, JSON.stringify(timedOut));
+  check('dap05-cleanup: timeout reports the recovered halt PC', !timedOut.ok
+    && timedOut.data && timedOut.data.stopReason === 'RecoveryHalt'
+    && typeof timedOut.data.pcAfter === 'number', JSON.stringify(timedOut));
   const duplicate = await request('setBreakpoint', { address: 0x080001C0, timeoutMs: 100 });
   const reusedTemporarySlot = await request('setBreakpoint', {
     address: 0x080001C2, preferredSlot: 1, timeoutMs: 100,

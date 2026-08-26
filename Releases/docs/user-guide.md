@@ -97,13 +97,13 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 它由烧录流程调用。launch 中有 `program` 且 `flashBeforeDebug` 没有设为 `false` 时，Orbit 会调用 JLink Commander，参数包含目标设备、`SWD`/`JTAG` 接口、速度和临时 CommanderScript；烧录默认超时为 30 秒。
 
-没有 `program`，或显式设置 `flashBeforeDebug: false` 时，不会因为 DAP 连接本身而调用 `JLink.exe`。J-Link DLL 仍然是调试连接的必需品。
+没有 `program`，或显式设置 `flashBeforeDebug: false` 时，不会因为 DAP 连接本身而调用 `JLink.exe`。同一会话 Restart 时，若 `flashBeforeDebug: true` 且 ELF 与刚刚烧录的固件相同，也不会再次调用 Commander。J-Link DLL 仍然是调试连接的必需品。
 
 ### 2.3 CMSIS-DAP / DAPLink
 
 `probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。1.1.0 真机验收覆盖 HID v1；v2 WinUSB 以设备枚举和握手为准，本版未做真机。
 
-CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。`flashBeforeDebug: false` 完全跳过烧录，仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
+CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`flashBeforeDebug: false` 完全跳过烧录（包括 Restart），仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
 
 当前 CMSIS-DAP 内置 Flash 目标：
 
@@ -192,7 +192,7 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723：
  | `svdPath` | path | `""` | `svdFile` 的兼容别名；未填写时跟随 `svdFile` 或 `orbit.defaultSvdFile`。 |
 | `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
 | `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
-| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验；`false` 明确跳过所有 Flash 操作。 |
+| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
 | `runToEntryPoint` | string / `false` | `main` | CMSIS-DAP 启动或 Restart 后停靠的符号；`false` 禁用 run-to-entry。 |
 | `rtos` | string | `""` | 传给 DAP capability/外部 RTOS Views 的 RTOS 名称，例如 `FreeRTOS`。 |
 | `rttLogEnabled` | boolean | `true` | 启动后读取 SEGGER RTT。 |

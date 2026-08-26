@@ -301,13 +301,15 @@ async function runScenario(name, flashBeforeDebug, verifyRestart, restartWhileRu
     { count: scenario.flashOperations.length });
     if (restartWhileRunning) {
       const runIndex = scenario.logs.dll.lastIndexOf('control method=run ok=true');
-      const haltIndex = scenario.logs.dll.indexOf('control method=halt ok=true', runIndex + 1);
-      const flashIndex = scenario.logs.dll.indexOf('flash operation=init', haltIndex + 1);
-      const entryIndex = scenario.logs.dll.indexOf('control method=runToAddress ok=true', flashIndex + 1);
-      scenario.restartControlOrder = { runIndex, haltIndex, flashIndex, entryIndex };
-      check(`${name}: running Restart halts before Flash and then reaches main`,
-        runIndex >= 0 && haltIndex > runIndex && flashIndex > haltIndex && entryIndex > flashIndex,
+      const flashAfterRun = scenario.logs.dll.indexOf('flash operation=init', runIndex + 1);
+      const entryIndex = scenario.logs.dll.indexOf('control method=runToAddress ok=true', runIndex + 1);
+      scenario.restartControlOrder = { runIndex, flashAfterRun, entryIndex };
+      check(`${name}: running Restart skips Flash for unchanged firmware and then reaches main`,
+        runIndex >= 0 && flashAfterRun < 0 && entryIndex > runIndex,
       scenario.restartControlOrder);
+      check(`${name}: Restart logs same-firmware skip`,
+        /flash skipped reason=same-firmware/.test(scenario.logs.dap),
+        { dap: scenario.logs.dap.split(/\r?\n/).filter(line => /Restart: flash/.test(line)) });
     }
     check(`${name}: helper exited`, scenario.processesAfter.length === 0,
       { processesAfter: scenario.processesAfter });

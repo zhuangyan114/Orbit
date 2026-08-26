@@ -217,7 +217,7 @@
               },
               "flashBeforeDebug": {
                 "type": "boolean",
-                "description": "Flash and verify the current ELF through the selected J-Link or CMSIS-DAP owner before debugging",
+                "description": "Flash and verify the current ELF through the selected J-Link or CMSIS-DAP owner before debugging. Restart skips reflash when that ELF is unchanged.",
                 "default": true
               },
               "runToEntryPoint": {
@@ -501,7 +501,7 @@
         "orbit.flashBeforeDebug": {
           "type": "boolean",
           "default": true,
-          "description": "启动调试前烧录当前 ELF/AXF 文件"
+          "description": "启动调试前烧录当前 ELF/AXF 文件。同一会话 Restart 时若固件未变则跳过再烧。"
         },
         "orbit.recentSessions": {
           "type": "number",

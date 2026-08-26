@@ -1,5 +1,7 @@
 import { EventEmitter } from 'events';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as path from 'path';
 import { BoundedMetric } from '../utils/bounded-metric';
 import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
@@ -61,6 +63,32 @@ import {
 
 /** Bound on the decoded RTT Log line ring exposed through `orbit.rttlog.read`. */
 const MAX_RTT_LOG_LINES = 2000;
+
+interface FlashedFirmwareIdentity {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+function readFirmwareIdentity(elfPath: string): FlashedFirmwareIdentity | undefined {
+  if (!elfPath) return undefined;
+  try {
+    const resolved = path.resolve(elfPath);
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) return undefined;
+    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(resolved)).digest('hex');
+    return { path: resolved, size: stat.size, sha256 };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameFirmwareIdentity(
+  left: FlashedFirmwareIdentity | undefined,
+  right: FlashedFirmwareIdentity | undefined,
+): boolean {
+  return !!left && !!right && left.size === right.size && left.sha256 === right.sha256;
+}
 
 export interface DebugProtocolMessage {
   type: 'request' | 'response' | 'event';
@@ -252,6 +280,8 @@ export class DapSession extends EventEmitter {
   private _flashEnabled = true;
   private _runToEntryPoint: string | false = false;
   private _cmsisDapFlashAlgorithmPath = '';
+  /** Last ELF this session actually programmed. Restart compares against it. */
+  private _lastFlashedFirmware: FlashedFirmwareIdentity | undefined;
   private dataSamplingActive = false;
   private dataSamplingTimer: NodeJS.Immediate | null = null;
   private dataSamplingSendTimer: NodeJS.Timeout | null = null;
@@ -1872,6 +1902,7 @@ export class DapSession extends EventEmitter {
         if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
         if (this.isSessionTerminating()) return;
         if (flashResult.ok) {
+          this.rememberFlashedFirmware(elfPath);
           this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any).message}\n` });
         } else {
           this.phase = 'idle';
@@ -1930,6 +1961,7 @@ export class DapSession extends EventEmitter {
           await this.failLaunchAfterConnect(msg, flashResult, 'FlashFailed');
           return;
         }
+        this.rememberFlashedFirmware(elfPath);
         this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any)?.message || 'CMSIS-DAP Flash Algorithm completed'}\n` });
       }
       this.phase = 'connected';
@@ -2111,6 +2143,10 @@ export class DapSession extends EventEmitter {
   private forgetAllBreakpoints(): void {
     this.breakpoints.clear();
     this.breakpointAddresses.clear();
+  }
+
+  private rememberFlashedFirmware(elfPath: string, identity?: FlashedFirmwareIdentity): void {
+    this._lastFlashedFirmware = identity ?? readFirmwareIdentity(elfPath);
   }
 
   private async handleSetBreakpoints(msg: DebugProtocolMessage) {
@@ -2912,65 +2948,75 @@ export class DapSession extends EventEmitter {
         }
 
         if (this._elfPath && this._flashEnabled) {
-          if (this._probe === 'cmsis-dap') {
-            const haltResult = await this.backend.execute({ cmd: 'halt' });
-            if (!haltResult.ok) {
-              this.sendCommandFailure(msg, haltResult, 'TargetControlFailed');
-              return;
-            }
-            const stateResult = await this.queryTargetState('restart-flash-halt-confirm');
-            if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
-              const failure: OzoneCommandResult = stateResult.ok
-                ? {
-                  ok: false,
-                  errorCode: 'TargetStateInvalid',
-                  error: `TargetStateInvalid: restart pre-flash halt returned ${stateResult.data}`,
-                  targetState: String(stateResult.data),
-                }
-                : stateResult;
-              this.sendCommandFailure(msg, failure, 'TargetStateReadFailed');
-              return;
-            }
-          }
-          this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
-          const flashResult = await this.backend.execute({
-            cmd: 'flash', elfPath: this._elfPath, device: this._device,
-            interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
-            probe: this._probe,
-            flashBeforeDebug: this._flashEnabled,
-          });
-          if (flashResult.ok) {
-            this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
+          const currentFirmware = readFirmwareIdentity(this._elfPath);
+          if (sameFirmwareIdentity(currentFirmware, this._lastFlashedFirmware)) {
+            log.dap(`Restart: flash skipped reason=same-firmware path=${this._elfPath}`);
+            this.sendEvent('output', {
+              category: 'console',
+              output: `Restart: firmware unchanged, skipping flash (${this._elfPath})\n`,
+            });
           } else {
-            this.sendEvent('output', { category: 'stderr', output: `Restart: flash failed: ${flashResult.error}\n` });
             if (this._probe === 'cmsis-dap') {
-              const stateResult = await this.queryTargetState('restart-flash-failure-recovery');
-              const failure: OzoneCommandResult = stateResult.ok
-                ? {
-                  ...flashResult,
-                  targetState: stateResult.data === TargetState.Halted
-                    ? 'Halted'
-                    : stateResult.data === TargetState.Running
-                      ? 'Running'
-                      : String(stateResult.data),
-                }
-                : flashResult;
-              this.sendCommandFailure(msg, failure, 'FlashFailed');
-              if (stateResult.ok && stateResult.data === TargetState.Halted) {
-                this.markStoppedForUi();
-                this.lastHaltReason = 'pause';
-                if (this.rttLogEnabled) this.startRttLogPolling();
-                this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
-              } else if (stateResult.ok && stateResult.data === TargetState.Running) {
-                this.setTargetRunning(true);
-                this.startPolling();
+              const haltResult = await this.backend.execute({ cmd: 'halt' });
+              if (!haltResult.ok) {
+                this.sendCommandFailure(msg, haltResult, 'TargetControlFailed');
+                return;
               }
-            } else {
-              this.sendResponse(msg, undefined, false, flashResult.error);
+              const stateResult = await this.queryTargetState('restart-flash-halt-confirm');
+              if (!stateResult.ok || stateResult.data !== TargetState.Halted) {
+                const failure: OzoneCommandResult = stateResult.ok
+                  ? {
+                    ok: false,
+                    errorCode: 'TargetStateInvalid',
+                    error: `TargetStateInvalid: restart pre-flash halt returned ${stateResult.data}`,
+                    targetState: String(stateResult.data),
+                  }
+                  : stateResult;
+                this.sendCommandFailure(msg, failure, 'TargetStateReadFailed');
+                return;
+              }
             }
-            return;
+            this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
+            const flashResult = await this.backend.execute({
+              cmd: 'flash', elfPath: this._elfPath, device: this._device,
+              interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
+              probe: this._probe,
+              flashBeforeDebug: this._flashEnabled,
+            });
+            if (flashResult.ok) {
+              this.rememberFlashedFirmware(this._elfPath, currentFirmware);
+              this.sendEvent('output', { category: 'console', output: `Restart: flash successful\n` });
+            } else {
+              this.sendEvent('output', { category: 'stderr', output: `Restart: flash failed: ${flashResult.error}\n` });
+              if (this._probe === 'cmsis-dap') {
+                const stateResult = await this.queryTargetState('restart-flash-failure-recovery');
+                const failure: OzoneCommandResult = stateResult.ok
+                  ? {
+                    ...flashResult,
+                    targetState: stateResult.data === TargetState.Halted
+                      ? 'Halted'
+                      : stateResult.data === TargetState.Running
+                        ? 'Running'
+                        : String(stateResult.data),
+                  }
+                  : flashResult;
+                this.sendCommandFailure(msg, failure, 'FlashFailed');
+                if (stateResult.ok && stateResult.data === TargetState.Halted) {
+                  this.markStoppedForUi();
+                  this.lastHaltReason = 'pause';
+                  if (this.rttLogEnabled) this.startRttLogPolling();
+                  this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
+                } else if (stateResult.ok && stateResult.data === TargetState.Running) {
+                  this.setTargetRunning(true);
+                  this.startPolling();
+                }
+              } else {
+                this.sendResponse(msg, undefined, false, flashResult.error);
+              }
+              return;
+            }
+            await new Promise<void>(r => setTimeout(r, 500));
           }
-          await new Promise<void>(r => setTimeout(r, 500));
         }
         if (this._probe === 'cmsis-dap' && this._runToEntryPoint !== false) {
           const startupResult = await this.backend.execute({
@@ -4259,6 +4305,7 @@ export class DapSession extends EventEmitter {
           return;
         }
         this.sendEvent('output', { category: 'console', output: 'Automation flash: flash successful\n' });
+        this.rememberFlashedFirmware(elfPath);
         flashReport = await this.buildFlashReport(elfPath, flashResult.data, request, startedAt);
 
         if (resetAfter === 'none') {

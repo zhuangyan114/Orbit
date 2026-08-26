@@ -89,6 +89,50 @@ describe('CMSIS-DAP helper control critical section', () => {
     });
   });
 
+  it('forwards optional flashAlgorithm diagnostic fields and omits them when absent', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const written: Array<Record<string, unknown>> = [];
+    (helper as any).child = {
+      stdin: {
+        writable: true,
+        write(line: string) {
+          const request = JSON.parse(line) as Record<string, unknown>;
+          written.push(request);
+          (helper as any).handleLine(JSON.stringify({
+            id: request.id,
+            result: {
+              ok: true,
+              message: 'algorithm complete',
+              targetState: 'Halted',
+              elapsedMs: 1,
+              data: { operation: (request.params as { operation: string }).operation, returnCode: 0 },
+            },
+          }));
+        },
+      },
+    };
+
+    await helper.request('flashAlgorithm', {
+      operation: 'eraseSector',
+      timeoutMs: 100,
+      flashStatusAddress: 0x52002010,
+      flashControlAddress: 0x5200200C,
+    });
+    expect(written[0]).toMatchObject({
+      method: 'flashAlgorithm',
+      params: {
+        operation: 'eraseSector',
+        flashStatusAddress: 0x52002010,
+        flashControlAddress: 0x5200200C,
+      },
+    });
+
+    await helper.request('flashAlgorithm', { operation: 'init', timeoutMs: 100 });
+    const omitted = JSON.stringify(written[1]?.params);
+    expect(omitted).not.toContain('flashStatusAddress');
+    expect(omitted).not.toContain('flashControlAddress');
+  });
+
   it('pauses Watch, Timeline, and background work for the complete scope', async () => {
     const helper = new CmsisDapHelperClient('unused-helper-path');
     let releaseScope!: () => void;

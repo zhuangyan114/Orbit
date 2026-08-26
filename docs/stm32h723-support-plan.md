@@ -27,22 +27,22 @@
 
 RTT 控制块来自 ELF 符号 `_SEGGER_RTT` 或显式配置,不扫固定 RAM 范围,天然器件无关,无需改动。SVD 由用户 `svdFile`/`defaultSvdFile` 提供,仓库不内置,只需文档指路。
 
-## H723 目标参数(初稿,标注项必须核实)
+## H723 目标参数
 
-以下数值在编码前以 RM0468 为准逐一核实,真机到货后再以实际读数确认:
+CMSIS-DAP P7-1～P7-5 已在 STM32H723VGT6 + CMSIS-DAP_LU 上核实。J-Link(P7-6)与长稳/断线(P7-7)暂缓。
 
-| 参数 | 当前判断 | 核实方式 |
+| 参数 | 值 | 状态 |
 | --- | --- | --- |
 | 内核 | Cortex-M7 | — |
-| Flash | 1 MiB @ `0x08000000`,单 bank,8 × 128 KiB 扇区 | RM0468 |
-| 编程粒度 | 256 位(32 字节)flash word,不足需补 `0xFF` | RM0468 |
-| Flash 寄存器基址 | `0x52002000`(CR/SR 偏移与 F4 完全不同) | RM0468 |
-| DBGMCU_IDCODE | 基址 `0x5C001000`,DEV_ID `0x483` | RM0468 + 真机 |
-| Flash 大小寄存器 | H7 家族常见 `0x1FF1E880`(16 位 KiB) | RM0468 + 真机 |
-| SW-DP DPIDR | 预计 `0x6BA02477`(SW-DP v2,与 F4 的 `0x2BA01477` 不同) | 真机 |
-| RAM 区 | ITCM 64K @`0x00000000`;DTCM 128K @`0x20000000`;AXI SRAM(D1)320K @`0x24000000`;SRAM1-3(D2)272K @`0x30000000`;SRAM4(D3)16K @`0x38000000`;Backup 4K @`0x38800000` | RM0468 |
-| Flash loader RAM | AXI SRAM `0x24000000`(与生态惯例一致,避开 DTCM 访问不确定性) | 真机 |
-| 扇区擦除时长 | 128 KiB 扇区远慢于 F4 16 KiB 扇区,默认 `timeoutMs=5000` 可能误报 | RM0468 时序 + 真机实测 |
+| Flash | 1 MiB @ `0x08000000`,单 bank,8 × 128 KiB 扇区 | P7-1/P7-4 真机 |
+| 编程粒度 | 256 位(32 字节)flash word,不足需补 `0xFF` | P7-4/P7-5 真机 |
+| Flash 寄存器基址 | `0x52002000`(CR/SR 偏移与 F4 完全不同) | 算法 + P7-3/P7-4 |
+| DBGMCU_IDCODE | 基址 `0x5C001000`,DEV_ID `0x483`(本板 `0x10016483`) | P7-1 真机 |
+| Flash 大小寄存器 | `0x1FF1E880`,读回 1024 KiB | P7-1 真机 |
+| SW-DP DPIDR | `0x6BA02477`(SW-DP v2) | P7-1 真机 |
+| RAM 区 | ITCM 64K @`0x00000000`;DTCM 128K @`0x20000000`;AXI SRAM(D1)320K @`0x24000000`;SRAM1-3(D2)272K @`0x30000000`;SRAM4(D3)16K @`0x38000000`;Backup 4K @`0x38800000` | RM0468; DTCM/AXI/D2/D3 DAP 可写见 P7-2 |
+| Flash loader RAM | AXI SRAM `0x24000000` | P7-2/P7-3 真机 |
+| 扇区擦除时长 | 末扇区实测约 1.11 s;host 默认仍为 erase 30 s / program 15 s | P7-4 真机 |
 
 ## 工作分解
 
@@ -76,7 +76,7 @@ RTT 控制块来自 ELF 符号 `_SEGGER_RTT` 或显式配置,不扫固定 RAM �
 
 ### P4 Watch 写门禁数据化
 
-`commander.ts doSetWatchValue` 的 CMSIS-DAP 地址检查改为当前 target 的 `ramRegions` 判定;F407 行为不变,H723 允许 DTCM/AXI/D2/D3 各区。DTCM 能否经 DAP 写入在真机确认前,先按"在 region 内即放行,失败由既有写路径报错"处理,并在真机阶段专项验证。
+`commander.ts doSetWatchValue` 的 CMSIS-DAP 地址检查改为当前 target 的 `ramRegions` 判定;F407 行为不变,H723 允许 DTCM/AXI/D2/D3 各区。P7-2 已确认 DTCM/D2/D3 经 DAP 可写回。
 
 ### P5 自动化测试(与 P1–P4 同步开发,不是收尾阶段)
 
@@ -128,23 +128,23 @@ RTT 控制块来自 ELF 符号 `_SEGGER_RTT` 或显式配置,不扫固定 RAM �
 
 ### P6 文档、默认值与发布
 
-1. README 支持列表更新(移除"仅支持 STM32F407VET6"限制的表述,H723 标注真机验收等级)。
-2. `src/debug/dap-launch-config.ts:85` 过时的 F407 未实现文案更新或删除。
-3. SVD 指引:H723 使用 ST 官方 `STM32H723.svd`,经 `svdFile`/`defaultSvdFile` 配置。
-4. 器件默认值(`STM32F407VG` 各处)保持不变,文档说明 H723 需显式设置 `deviceName`。
-5. `package.json` 1.1.1 → 1.1.2,打包 vsix 进 `Releases/`。
+1. README 支持列表更新(移除"仅支持 STM32F407VET6"限制的表述,H723 标注真机验收等级)。**已完成:CMSIS-DAP P7-1～P7-5 真机通过;J-Link 不进 1.1.2 宣称。**
+2. `src/debug/dap-launch-config.ts:85` 过时的 F407 未实现文案更新或删除。**已删除 `cmsisDapFlashUnsupportedMessage`。**
+3. SVD 指引:H723 使用 ST 官方 `STM32H723.svd`,经 `svdFile`/`defaultSvdFile` 配置。**已写入用户文档。**
+4. 器件默认值(`STM32F407VG` 各处)保持不变,文档说明 H723 需显式设置 `deviceName`。**默认值未改。**
+5. `package.json` 1.1.1 → 1.1.2,打包 vsix 进 `Releases/`。**本版发布,J-Link 真机放到后续版本。**
 
 ### P7 硬件分级验收(真机到货后,逐级授权)
 
 每级通过才进入下一级;每级都记录 VID/PID、transport、helper PID、owner、VTref、DPIDR、targetState、raw trace 摘要与错误码:
 
-1. **只读连接与身份核对**:连接、DPIDR、DBGMCU_IDCODE(DEV_ID)、Flash 大小寄存器、RAM 抽样读。此级无目标突变,预计可直接授权。
-2. **RAM stub**:向 AXI SRAM 写入并读回一段数据;DTCM/D2/D3 各做一次定点读写探针,确认 DAP 可达性。
-3. **算法 Init/UnInit**:仅解锁/上锁往返,不擦不写。
-4. **授权测试扇区擦写**:擦除最后一个 128 KiB 扇区(应用不占用),program+verify 一页 32 字节倍数数据,再擦除恢复 `0xFF`。
-5. **真实 ELF 擦写校验**:用 H723 实际工程 ELF 走完整 `flashBeforeDebug: true` 流程,随后进入调试验证断点/Watch/Timeline/RTT。
-6. **J-Link 链路冒烟**:同一块板用 J-Link owner 连接、烧录(DLL 侧算法)、调试,确认器件名透传无需代码改动。
-7. **长稳与断线**:采样中拔线/helper crash 的结构化错误与 session 终止行为。
+1. **只读连接与身份核对**:连接、DPIDR、DBGMCU_IDCODE(DEV_ID)、Flash 大小寄存器、RAM 抽样读。此级无目标突变,预计可直接授权。**2026-08-25 CMSIS-DAP 真机通过。**
+2. **RAM stub**:向 AXI SRAM 写入并读回一段数据;DTCM/D2/D3 各做一次定点读写探针,确认 DAP 可达性。**2026-08-25 CMSIS-DAP 真机通过(AXI/DTCM/D2/D3 均可写回)。**
+3. **算法 Init/UnInit**:仅解锁/上锁往返,不擦不写。**2026-08-25 CMSIS-DAP 真机通过。**
+4. **授权测试扇区擦写**:擦除最后一个 128 KiB 扇区(应用不占用),program+verify 一页 32 字节倍数数据,再擦除恢复 `0xFF`。**2026-08-25 CMSIS-DAP 真机通过(擦除约 1.11 s)。**
+5. **真实 ELF 擦写校验**:用 H723 实际工程 ELF 走完整 `flashBeforeDebug: true` 流程,随后进入调试验证断点/Watch/Timeline/RTT。**2026-08-25 CMSIS-DAP 真机通过(`h7vgt6_test.elf`, owner=`cmsis-dap`,无 J-Link 回退)。**
+6. **J-Link 链路冒烟**:同一块板用 J-Link owner 连接、烧录(DLL 侧算法)、调试,确认器件名透传无需代码改动。**暂缓:当前无 J-Link 会话,不宣称 J-Link 真机通过。**
+7. **长稳与断线**:采样中拔线/helper crash 的结构化错误与 session 终止行为。**暂缓。**
 
 各级对应的自动化脚本见 P5 层 5(脚本执行仍需逐级授权,授权范围单次有效)。
 
@@ -160,11 +160,13 @@ RTT 控制块来自 ELF 符号 `_SEGGER_RTT` 或显式配置,不扫固定 RAM �
 
 | 风险 | 缓解 |
 | --- | --- |
-| 擦除超时误报(128 KiB 扇区慢) | per-target 超时 + 真机实测后再定默认值 |
-| H7 cache 导致 verify 误判(复刻 F4 历史 bug) | P2 显式设计 cache 失效路径,算法断言覆盖 |
-| DTCM/D2 经 DAP 写入不确定 | P7 第 2 级专项探针,先数据放行、失败走既有错误路径 |
-| 参数表初稿有误(标"待核实"项) | 编码前 RM0468 核对,真机第一级只读验证兜底 |
+| 擦除超时误报(128 KiB 扇区慢) | per-target 超时;P7-4 实测末扇区约 1.11 s,30 s 默认仍保留余量 |
+| H7 cache 导致 verify 误判(复刻 F4 历史 bug) | P2 显式设计 cache 失效路径;P7-4/P7-5 Verify 已过 |
+| DTCM/D2 经 DAP 写入不确定 | P7-2 已确认 DTCM/D2/D3 可写回 |
+| 参数表初稿有误(标"待核实"项) | P7-1 已核实 DPIDR/DEV_ID/Flash 容量 |
 | helper 协议变更影响既有 F407 会话 | 新字段可选、缺省保持 F4 常量,双端同步改并回归 cpp-channel mock |
+| J-Link 真机未跑 | P7-6 暂缓,不把 CMSIS-DAP 通过写成 J-Link 通过 |
+| 长稳/断线未跑 | P7-7 暂缓 |
 
 ## 完成定义
 

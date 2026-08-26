@@ -2,7 +2,7 @@
   "name": "orbit-for-vscode",
   "displayName": "Orbit",
   "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {

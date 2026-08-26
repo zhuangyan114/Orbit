@@ -536,9 +536,9 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     });
     const backend = new OzoneBackend(undefined, owner);
 
-    // DTCM, AXI SRAM, and D2 SRAM1-3 are all registry RAM regions; DAP
-    // reachability of DTCM/D2 is deferred to hardware acceptance and any
-    // failure surfaces through the write path itself.
+    // DTCM, AXI SRAM, D2 SRAM1-3, and D3 SRAM4 are all registry RAM regions;
+    // DAP reachability of DTCM/D2/D3 is deferred to hardware acceptance and
+    // any failure surfaces through the write path itself.
     await expect(backend.execute({
       cmd: 'setWatchValue', expression: 'dtcmVar', value: 8,
       address: 0x2001FFFC, typeName: 'uint32_t',
@@ -551,7 +551,11 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       cmd: 'setWatchValue', expression: 'd2Var', value: 9,
       address: 0x30000000, typeName: 'uint32_t',
     })).resolves.toMatchObject({ ok: true });
-    expect(writeMemory).toHaveBeenCalledTimes(3);
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'd3Var', value: 10,
+      address: 0x38000000, typeName: 'uint32_t',
+    })).resolves.toMatchObject({ ok: true });
+    expect(writeMemory).toHaveBeenCalledTimes(4);
 
     await expect(backend.execute({
       cmd: 'setWatchValue', expression: 'FLASH_CR1', value: 1,
@@ -570,7 +574,7 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       ok: false,
       errorCode: 'InvalidWatchWriteAddress',
     });
-    expect(writeMemory).toHaveBeenCalledTimes(3);
+    expect(writeMemory).toHaveBeenCalledTimes(4);
   });
 
   it('keeps the STM32F407 Watch-write window unchanged under the registry gate', async () => {

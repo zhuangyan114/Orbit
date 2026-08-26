@@ -18,6 +18,7 @@ node_modules/**
 !node_modules/koffi/**
 !node_modules/@koromix/**
 out/native/jlink-helper-build/**
+out/native/h723-refs/**
 out/native/win32-x64/test/**
 native/jlink-helper/**
 Releases/Log/**

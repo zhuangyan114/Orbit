@@ -19,10 +19,13 @@ STM32F407 and STM32H723 images are compiled from the original sources in
 | OpenOCD `stm32f2x.c` and STM32 loader sources | OpenOCD `0.12.0`, GPL-2.0-or-later: https://github.com/openocd-org/openocd/tree/v0.12.0/src/flash/nor and https://github.com/openocd-org/openocd/tree/v0.12.0/contrib/loaders/flash/stm32 | GPL code is reference-only and is not copied, translated, linked, or used at runtime. Orbit does not ship OpenOCD or an OpenOCD loader. | Target/sector identification, bounded wait/error handling, and the conceptual RAM-loader lifecycle. |
 | pyOCD FlashAlgo model | pyOCD `0.36.0`, Apache-2.0: https://github.com/pyocd/pyOCD/tree/v0.36.0/pyocd/flash | Apache-2.0 permits reference to the project, but no pyOCD source or algorithm image is bundled. | RAM placement, page-buffer ownership, operation timeout boundaries, and algorithm verify as the preferred path. |
 
-## STM32H723 verified facts (2026-08-23)
+## STM32H723 verified facts (2026-08-25)
 
-Register facts verified against the ST sources above; hardware-acceptance
-items stay open until the P7 acceptance levels run on a real board.
+Register facts verified against the ST sources above. CMSIS-DAP hardware
+acceptance P7-1 through P7-5 ran on STM32H723VGT6 with CMSIS-DAP_LU
+(VID `C251` PID `F001` serial `LU_2022_8888`, HID). Evidence JSON is in
+`outputs/h723-p7/`. J-Link (P7-6) and long-run disconnect (P7-7) are
+deferred until a J-Link session is available.
 
 | Fact | Value | Status |
 | --- | --- | --- |
@@ -34,13 +37,18 @@ items stay open until the P7 acceptance levels run on a real board.
 | Status/error clearing | write-1 to CCR1 mirror bits (not SR) | verified vs HAL driver |
 | Erase sequence | SER + PSIZE + SNB<<8 + START, poll QW, clear SER/SNB | verified vs HAL driver |
 | Program sequence | PG + 8 consecutive 32-bit writes (256-bit flash word) + ISB/DSB, poll QW, clear PG | verified vs HAL driver |
-| Erase PSIZE | 64-bit (PSIZE=0b11), assuming the 2.7-3.6 V range | 待真机确认 |
-| Sector map | 8 x 128 KiB, sector = (addr - 0x08000000) >> 17 | verified vs plan/RM0468, 待真机抽验 |
-| DBGMCU_IDCODE | `0x5C001000`, DEV_ID `0x483` (REV_ID high half) | verified vs header + OpenOCD cfg, 待真机 |
-| Flash size register | `0x1FF1E880`, 16-bit KiB (0xFFFF/0x0000 read as 1 MiB) | verified vs `stm32h723xx.h` |
-| Cache invalidation | Cortex-M7 maintenance registers: ICIALLU (`0xE000EF50`) + DCISW by set/way (`0xE000EF60`); H7 ACR has no ICRST/DCRST bits | verified vs `stm32h723xx.h` ACR definition |
-| SW-DP DPIDR | expected `0x6BA02477` | 待真机 (P7-1) |
-| Sector erase / program timing | defaults erase 30 s / program 15 s | 待真机实测后收敛 |
+| Erase PSIZE | 64-bit (PSIZE=0b11) | verified on hardware P7-4 (last 128 KiB sector erase ~1.11 s) |
+| Sector map | 8 x 128 KiB, sector = (addr - 0x08000000) >> 17 | verified on hardware P7-4 (sector 7 @ `0x080E0000`) |
+| DBGMCU_IDCODE | `0x5C001000`, DEV_ID `0x483` (this board `0x10016483`) | verified on hardware P7-1 |
+| Flash size register | `0x1FF1E880`, 16-bit KiB | verified on hardware P7-1 (1024 KiB) |
+| Cache invalidation | Cortex-M7 maintenance registers: ICIALLU (`0xE000EF50`) + DCISW by set/way (`0xE000EF60`); H7 ACR has no ICRST/DCRST bits | verified vs `stm32h723xx.h` ACR definition; P7-4/P7-5 Verify passed |
+| SW-DP DPIDR | `0x6BA02477` | verified on hardware P7-1 |
+| Sector erase / program timing | last-sector erase ~1.11 s; 32-byte program ~0.27 s; 21844-byte ELF program ~2.5 s. Host defaults remain erase 30 s / program 15 s | measured on hardware P7-4/P7-5 |
+| AXI SRAM DAP write | `0x24000100` write/readback restored | verified on hardware P7-2 |
+| DTCM / D2 / D3 DAP write | DTCM `0x20000100`, SRAM1-3 `0x30000000`, SRAM4 `0x38000000` write/readback restored | verified on hardware P7-2 |
+| CMSIS-DAP ELF flash | `h7vgt6_test.elf` via `flashBeforeDebug: true`, owner=`cmsis-dap`, no J-Link fallback | verified on hardware P7-5 |
+| J-Link owner path | same board, DLL-side flash | deferred (P7-6, no J-Link session) |
+| Long-run / disconnect | sampling unplug / helper crash | deferred (P7-7) |
 
 ## Architecture decision
 

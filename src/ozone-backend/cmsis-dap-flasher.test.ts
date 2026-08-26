@@ -1159,4 +1159,76 @@ describe('multi-target flash model (H723-shaped)', () => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('reports a structured H7 DPIDR mismatch without erasing', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-h723-dpidr-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      const manifestPath = path.join(tempDir, 'algorithm.json');
+      fs.writeFileSync(elfPath, makeElf([{ address: 0x08000000, bytes: [1, 2, 3, 4] }]));
+      const algorithm = Buffer.alloc(0x600, 0xBF);
+      algorithm[0x500] = 0x00;
+      algorithm[0x501] = 0xBE;
+      fs.writeFileSync(path.join(tempDir, 'algorithm.bin'), algorithm);
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        binary: 'algorithm.bin',
+        pageSize: 4,
+        entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
+      }));
+      let eraseCalls = 0;
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: 0x2BA01477 }; },
+        async readMemory() { return { ok: true, bytes: [0x83, 0x04, 0x00, 0x10] }; },
+        async runAlgorithm(request: { operation: string; bkptAddress: number }) {
+          if (request.operation === 'eraseSector') eraseCalls += 1;
+          return { ok: true, message: 'unexpected', data: { returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003 } };
+        },
+      }, elfPath, 'STM32H723VGT6', { algorithmPath: manifestPath }, STM32H723VGT6);
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('TargetMismatch');
+      expect(result.message).toMatch(/SW-DP IDCODE mismatch/i);
+      expect(result.diagnostics).toMatchObject({ expected: 0x6BA02477, actual: 0x2BA01477 });
+      expect(eraseCalls).toBe(0);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a structured H7 Flash capacity mismatch without erasing', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-h723-capacity-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      const manifestPath = path.join(tempDir, 'algorithm.json');
+      fs.writeFileSync(elfPath, makeElf([{ address: 0x08000000, bytes: [1, 2, 3, 4] }]));
+      const algorithm = Buffer.alloc(0x600, 0xBF);
+      algorithm[0x500] = 0x00;
+      algorithm[0x501] = 0xBE;
+      fs.writeFileSync(path.join(tempDir, 'algorithm.bin'), algorithm);
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        binary: 'algorithm.bin',
+        pageSize: 4,
+        entries: { init: 0, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400, bkpt: 0x500 },
+      }));
+      let eraseCalls = 0;
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: STM32H723VGT6.dpIdcode }; },
+        async readMemory(address: number, size: number) {
+          if (address === 0x5C001000) return { ok: true, bytes: [0x83, 0x04, 0x00, 0x10].slice(0, size) };
+          if (address === 0x1FF1E880) return { ok: true, bytes: [0x00, 0x02].slice(0, size) };
+          return { ok: false, errorCode: 'DapInvalidRequest', message: `unexpected read at 0x${address.toString(16)}` };
+        },
+        async runAlgorithm(request: { operation: string; bkptAddress: number }) {
+          if (request.operation === 'eraseSector') eraseCalls += 1;
+          return { ok: true, message: 'unexpected', data: { returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003 } };
+        },
+      }, elfPath, 'STM32H723VGT6', { algorithmPath: manifestPath }, STM32H723VGT6);
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('TargetMismatch');
+      expect(result.message).toMatch(/Flash capacity mismatch/i);
+      expect(result.diagnostics).toMatchObject({ expectedKiB: 1024, actualKiB: 512 });
+      expect(eraseCalls).toBe(0);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });

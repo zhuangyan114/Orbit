@@ -147,8 +147,7 @@ export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
   // STM32H723VG is the density/package prefix used by project files; it is
   // accepted only as the unqualified name of this exact 1 MiB target.
   aliases: ['STM32H723VG'],
-  // SW-DP v2 DPIDR expected on the H723; still to be read back on hardware
-  // during P7-1 before it is treated as verified.
+  // SW-DP v2 DPIDR read back on STM32H723VGT6 hardware during P7-1.
   dpIdcode: 0x6BA02477,
   flashBase: 0x08000000,
   flashSize: 1024 * 1024,
@@ -163,9 +162,9 @@ export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
     { number: 6, address: 0x080C0000, size: 0x20000 },
     { number: 7, address: 0x080E0000, size: 0x20000 },
   ],
-  // RAM map per RM0468/AN5419. DTCM/D2/D3 reachability over the debug AP is
-  // data-permitted here and probed explicitly during P7-2 hardware
-  // acceptance; failures surface through the existing write error paths.
+  // RAM map per RM0468/AN5419. P7-2 confirmed DTCM/D2/D3 are writable over
+  // the debug AP on STM32H723VGT6; keep the existing write-error path if a
+  // later board cannot reach a region.
   ramRegions: [
     { name: 'ITCM RAM', address: 0x00000000, size: 64 * 1024 },
     { name: 'DTCM RAM', address: 0x20000000, size: 128 * 1024 },
@@ -196,9 +195,8 @@ export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
   // 256-bit ECC flash word. Adjacent PT_LOAD ranges that share a 32-byte
   // row (typical CubeMX .text/.data LMA split) must be programmed once.
   flashWordSize: 32,
-  // 128 KiB sector erase is an order of magnitude slower than the F4 16 KiB
-  // sectors; both defaults stay generous until real-hardware timing lands.
-  // Must stay at or below FLASH_ALGORITHM_TIMEOUT_MAX_MS (helper ceiling).
+  // 128 KiB sector erase measured ~1.11 s on P7-4; keep generous host
+  // defaults under FLASH_ALGORITHM_TIMEOUT_MAX_MS (helper ceiling).
   eraseTimeoutMs: 30000,
   programTimeoutMs: 15000,
 });

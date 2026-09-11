@@ -18,7 +18,13 @@ node_modules/**
 !node_modules/koffi/**
 !node_modules/@koromix/**
 out/native/jlink-helper-build/**
+out/native/h723-refs/**
+out/native/cmsis-dap-helper-build/**
+out/native/cmsis-dap-flash-algorithm-build/**
+out/native/cmsis-dap-rtt-tdd/**
+out/native/cmsis-dap-rtt-tdd-red/**
 out/native/win32-x64/test/**
+out/native/*.log
 native/jlink-helper/**
 Releases/Log/**
 Releases/mcp/**

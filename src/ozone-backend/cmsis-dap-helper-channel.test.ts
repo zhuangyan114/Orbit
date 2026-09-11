@@ -89,6 +89,50 @@ describe('CMSIS-DAP helper control critical section', () => {
     });
   });
 
+  it('forwards optional flashAlgorithm diagnostic fields and omits them when absent', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const written: Array<Record<string, unknown>> = [];
+    (helper as any).child = {
+      stdin: {
+        writable: true,
+        write(line: string) {
+          const request = JSON.parse(line) as Record<string, unknown>;
+          written.push(request);
+          (helper as any).handleLine(JSON.stringify({
+            id: request.id,
+            result: {
+              ok: true,
+              message: 'algorithm complete',
+              targetState: 'Halted',
+              elapsedMs: 1,
+              data: { operation: (request.params as { operation: string }).operation, returnCode: 0 },
+            },
+          }));
+        },
+      },
+    };
+
+    await helper.request('flashAlgorithm', {
+      operation: 'eraseSector',
+      timeoutMs: 100,
+      flashStatusAddress: 0x52002010,
+      flashControlAddress: 0x5200200C,
+    });
+    expect(written[0]).toMatchObject({
+      method: 'flashAlgorithm',
+      params: {
+        operation: 'eraseSector',
+        flashStatusAddress: 0x52002010,
+        flashControlAddress: 0x5200200C,
+      },
+    });
+
+    await helper.request('flashAlgorithm', { operation: 'init', timeoutMs: 100 });
+    const omitted = JSON.stringify(written[1]?.params);
+    expect(omitted).not.toContain('flashStatusAddress');
+    expect(omitted).not.toContain('flashControlAddress');
+  });
+
   it('pauses Watch, Timeline, and background work for the complete scope', async () => {
     const helper = new CmsisDapHelperClient('unused-helper-path');
     let releaseScope!: () => void;
@@ -178,6 +222,40 @@ describe('CMSIS-DAP helper control critical section', () => {
     await expect(sourceStep).resolves.toMatchObject({
       ok: true, data: { cleanupOk: true, restoredSlots: [0] },
     });
+  });
+
+  it('routes a stepResumed event frame to the owning request without resolving it', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const resumed: number[] = [];
+    const respond: Array<() => void> = [];
+    (helper as any).child = {
+      stdin: {
+        writable: true,
+        write(line: string) {
+          const request = JSON.parse(line);
+          (helper as any).handleLine(JSON.stringify({
+            type: 'event', event: 'stepResumed', id: request.id,
+          }));
+          // An unrelated event frame must not resolve or disturb the request.
+          (helper as any).handleLine(JSON.stringify({
+            type: 'event', event: 'stepResumed', id: 999,
+          }));
+          respond.push(() => {
+            (helper as any).handleLine(JSON.stringify({
+              id: request.id,
+              result: {
+                ok: true, message: 'step complete', targetState: 'Halted', elapsedMs: 1, data: {},
+              },
+            }));
+          });
+        },
+      },
+    };
+
+    const step = helper.controlRequest('stepOverSourceLine', {}, () => resumed.push(1));
+    expect(resumed).toEqual([1]);
+    respond[0]();
+    await expect(step).resolves.toMatchObject({ ok: true });
   });
 
   it('gives RTT reads background priority so Timeline can run between polls', async () => {

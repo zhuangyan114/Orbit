@@ -1,7 +1,17 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import { DapSession, DebugProtocolMessage } from './dap-session';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { log } from '../utils/logger';
+
+function writeTempFirmware(contents: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-restart-firmware-'));
+  const elfPath = path.join(dir, 'firmware.elf');
+  fs.writeFileSync(elfPath, contents);
+  return elfPath;
+}
 
 function request(seq: number, command: string): DebugProtocolMessage {
   return { type: 'request', seq, command, arguments: {} };
@@ -423,6 +433,124 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(response).toMatchObject({ success: true, command });
     expect(stopped).toHaveLength(1);
     expect(messages.indexOf(stopped[0])).toBeGreaterThan(messages.indexOf(response!));
+  });
+
+  it('publishes the recovered halt location when a CMSIS-DAP stepOver times out', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'stepOver'
+        ? {
+          ok: false,
+          error: 'StepTimeout: target did not halt at the temporary breakpoint before timeout',
+          errorCode: 'StepTimeout',
+          targetState: 'Halted',
+          data: {
+            mode: 'cmsis-dap',
+            pcBefore: 0x080001C0,
+            pcAfter: 0x080001E0,
+            stopReason: 'RecoveryHalt',
+          },
+        }
+        : { ok: false, error: `unexpected ${command.cmd}` }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleStep(request(1, 'next'), 'stepOver');
+
+    const response = messages.find(message => message.type === 'response');
+    const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+    expect(response).toMatchObject({ success: false, command: 'next' });
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ body: { reason: 'step', threadId: 1, allThreadsStopped: true } });
+    expect(messages.indexOf(stopped[0])).toBeGreaterThan(messages.indexOf(response!));
+    expect(backend.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fabricate a stopped event for a StepTimeout without a recovered halt', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'stepOver'
+        ? {
+          ok: false,
+          error: 'StepTimeout: target did not halt at the temporary breakpoint before timeout',
+          errorCode: 'StepTimeout',
+          targetState: 'Unknown',
+        }
+        : { ok: false, error: `unexpected ${command.cmd}` }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleStep(request(1, 'next'), 'stepOver');
+
+    const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+    expect(stopped).toHaveLength(0);
+    expect(backend.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the target as running while a long stepOver waits for the temporary breakpoint', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; onStepResumed?: () => void }) => {
+        if (command.cmd === 'stepOver') {
+          command.onStepResumed?.();
+          return {
+            ok: true,
+            data: { mode: 'cmsis-dap', pcBefore: 0x080001C0, pcAfter: 0x080001C6 },
+          };
+        }
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleStep(request(1, 'next'), 'stepOver');
+
+    const continued = messages.filter(message => message.type === 'event' && message.event === 'continued');
+    const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+    expect(continued).toHaveLength(1);
+    expect(continued[0]).toMatchObject({ body: { threadId: 1, allThreadsContinued: true } });
+    expect(stopped).toHaveLength(1);
+    expect(messages.indexOf(continued[0])).toBeLessThan(messages.indexOf(stopped[0]));
+    // The step ended halted: the session must finish in the halted state.
+    expect((session as any).targetRunning).toBe(false);
+    expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'stepOver',
+      onStepResumed: expect.any(Function),
+    }));
+  });
+
+  it('answers getTargetState from tracked state while a step holds the control gate', async () => {
+    const backend = {
+      execute: vi.fn(async () => ({ ok: false, error: 'must not reach the backend' })),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any).controlInProgress = true;
+    (session as any).targetRunning = true;
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleGetTargetState(request(3, 'getTargetState'));
+    expect(messages.find(message => message.type === 'response'))
+      .toMatchObject({ success: true, body: { state: 'running' } });
+
+    (session as any).targetRunning = false;
+    await (session as any).handleGetTargetState(request(4, 'getTargetState'));
+    expect(messages.find(message => message.request_seq === 4))
+      .toMatchObject({ success: true, body: { state: 'halted' } });
+    expect(backend.execute).not.toHaveBeenCalled();
   });
 
   it('emits continued only after CMSIS-DAP confirms Running, never through J-Link', async () => {
@@ -1850,6 +1978,161 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(response).toMatchObject({ success: true });
     expect(stopped).toHaveLength(1);
     expect(messages.indexOf(stopped[0])).toBeGreaterThan(messages.indexOf(response!));
+  });
+
+  it('skips Restart flash when flashBeforeDebug is true and the ELF matches the last programmed firmware', async () => {
+    const elfPath = writeTempFirmware('same-firmware');
+    try {
+      const calls: string[] = [];
+      const backend = {
+        execute: async (command: { cmd: string }) => {
+          calls.push(command.cmd);
+          if (command.cmd === 'runToEntryPoint') {
+            return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
+          }
+          return { ok: false, error: `unexpected ${command.cmd}` };
+        },
+      } as unknown as OzoneBackend;
+      const session = new DapSession(backend);
+      (session as any)._probe = 'cmsis-dap';
+      (session as any)._elfPath = elfPath;
+      (session as any)._flashEnabled = true;
+      (session as any)._runToEntryPoint = 'main';
+      (session as any).targetConnectionEstablished = true;
+      (session as any).phase = 'connected';
+      (session as any).rttLogEnabled = false;
+      (session as any).rememberFlashedFirmware(elfPath);
+      const messages: DebugProtocolMessage[] = [];
+      session.on('send', message => messages.push(message));
+
+      await (session as any).handleRestart(request(8, 'restart'));
+
+      expect(calls.filter(command => command === 'flash' || command === 'runToEntryPoint'))
+        .toEqual(['runToEntryPoint']);
+      const output = messages.filter(message => message.type === 'event' && message.event === 'output')
+        .map(message => String(message.body?.output || '')).join('');
+      expect(output).toMatch(/firmware unchanged, skipping flash/i);
+      const response = messages.find(message => message.type === 'response' && message.command === 'restart');
+      const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+      expect(response).toMatchObject({ success: true });
+      expect(stopped).toHaveLength(1);
+      expect(stopped[0]).toMatchObject({ body: { reason: 'entry', threadId: 1 } });
+    } finally {
+      fs.rmSync(path.dirname(elfPath), { recursive: true, force: true });
+    }
+  });
+
+  it('records the launched firmware so Restart skips reflash when the ELF is unchanged', async () => {
+    const elfPath = writeTempFirmware('launch-firmware');
+    try {
+      const calls: string[] = [];
+      const backend = {
+        execute: async (command: { cmd: string }) => {
+          calls.push(command.cmd);
+          if (command.cmd === 'connect') return { ok: true, data: { state: 'Connected' } };
+          if (command.cmd === 'flash') return { ok: true, data: { message: 'verified' } };
+          if (command.cmd === 'loadSymbols') return { ok: true, data: 'symbols loaded' };
+          if (command.cmd === 'runToEntryPoint') {
+            return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
+          }
+          return { ok: false, error: `unexpected ${command.cmd}` };
+        },
+        configureNativeSteps: () => {},
+      } as unknown as OzoneBackend;
+      const session = new DapSession(backend);
+      (session as any).rttLogEnabled = false;
+
+      await (session as any).handleLaunch({
+        type: 'request', seq: 20, command: 'launch', arguments: {
+          probe: 'cmsis-dap', program: elfPath, flashBeforeDebug: true, rttLogEnabled: false,
+        },
+      });
+      (session as any).stopConnectionMonitor();
+      expect(calls.filter(command => command === 'flash')).toHaveLength(1);
+
+      calls.length = 0;
+      await (session as any).handleRestart(request(21, 'restart'));
+      expect(calls.filter(command => command === 'flash' || command === 'runToEntryPoint'))
+        .toEqual(['runToEntryPoint']);
+    } finally {
+      fs.rmSync(path.dirname(elfPath), { recursive: true, force: true });
+    }
+  });
+
+  it('reflashes on Restart when flashBeforeDebug is true and the ELF changed since the last program', async () => {
+    const elfPath = writeTempFirmware('firmware-v1');
+    try {
+      const calls: string[] = [];
+      const backend = {
+        execute: async (command: { cmd: string }) => {
+          calls.push(command.cmd);
+          if (command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
+          if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+          if (command.cmd === 'flash') return { ok: true, data: { message: 'verified' } };
+          if (command.cmd === 'runToEntryPoint') {
+            return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
+          }
+          return { ok: false, error: `unexpected ${command.cmd}` };
+        },
+      } as unknown as OzoneBackend;
+      const session = new DapSession(backend);
+      (session as any)._probe = 'cmsis-dap';
+      (session as any)._elfPath = elfPath;
+      (session as any)._flashEnabled = true;
+      (session as any)._runToEntryPoint = 'main';
+      (session as any).targetConnectionEstablished = true;
+      (session as any).phase = 'connected';
+      (session as any).rttLogEnabled = false;
+      (session as any).rememberFlashedFirmware(elfPath);
+      fs.writeFileSync(elfPath, 'firmware-v2');
+      const messages: DebugProtocolMessage[] = [];
+      session.on('send', message => messages.push(message));
+
+      await (session as any).handleRestart(request(9, 'restart'));
+
+      expect(calls.filter(command =>
+        command === 'halt'
+        || command === 'getTargetState'
+        || command === 'flash'
+        || command === 'runToEntryPoint'))
+        .toEqual(['halt', 'getTargetState', 'flash', 'runToEntryPoint']);
+      const response = messages.find(message => message.type === 'response' && message.command === 'restart');
+      expect(response).toMatchObject({ success: true });
+    } finally {
+      fs.rmSync(path.dirname(elfPath), { recursive: true, force: true });
+    }
+  });
+
+  it('never flashes on Restart when flashBeforeDebug is false even if the ELF changed', async () => {
+    const elfPath = writeTempFirmware('firmware-v1');
+    try {
+      const calls: string[] = [];
+      const backend = {
+        execute: async (command: { cmd: string }) => {
+          calls.push(command.cmd);
+          if (command.cmd === 'runToEntryPoint') {
+            return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
+          }
+          return { ok: false, error: `unexpected ${command.cmd}` };
+        },
+      } as unknown as OzoneBackend;
+      const session = new DapSession(backend);
+      (session as any)._probe = 'cmsis-dap';
+      (session as any)._elfPath = elfPath;
+      (session as any)._flashEnabled = false;
+      (session as any)._runToEntryPoint = 'main';
+      (session as any).targetConnectionEstablished = true;
+      (session as any).phase = 'connected';
+      (session as any).rttLogEnabled = false;
+      fs.writeFileSync(elfPath, 'firmware-v2');
+
+      await (session as any).handleRestart(request(10, 'restart'));
+
+      expect(calls.filter(command => command === 'flash' || command === 'runToEntryPoint'))
+        .toEqual(['runToEntryPoint']);
+    } finally {
+      fs.rmSync(path.dirname(elfPath), { recursive: true, force: true });
+    }
   });
 
   it('reports the confirmed halted state after a Restart flash failure without hanging the UI', async () => {

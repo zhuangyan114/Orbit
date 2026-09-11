@@ -100,23 +100,30 @@ function Find-ArmGnuTool {
 }
 
 function Build-FlashAlgorithm {
+  param(
+    [ValidateSet('stm32f407', 'stm32h723')]
+    [string]$Algorithm,
+    [ValidateSet('cortex-m4', 'cortex-m7')]
+    [string]$Cpu
+  )
+
   $armGcc = Find-ArmGnuTool 'arm-none-eabi-gcc.exe'
   $armObjcopy = Find-ArmGnuTool 'arm-none-eabi-objcopy.exe'
   if (-not $armGcc -or -not $armObjcopy) {
-    throw 'arm-none-eabi-gcc.exe and arm-none-eabi-objcopy.exe are required to build the STM32F407 CMSIS-DAP Flash Algorithm.'
+    throw "arm-none-eabi-gcc.exe and arm-none-eabi-objcopy.exe are required to build the $Algorithm CMSIS-DAP Flash Algorithm."
   }
 
   $sourceDir = Join-Path $repoRoot 'native/cmsis-dap-flash-algorithm'
-  $buildDir = Join-Path $repoRoot 'out/native/cmsis-dap-flash-algorithm-build'
-  $objectFile = Join-Path $buildDir 'stm32f407_flash_algorithm.o'
-  $elfFile = Join-Path $buildDir 'stm32f407_flash_algorithm.elf'
-  $mapFile = Join-Path $buildDir 'stm32f407_flash_algorithm.map'
-  $outputFile = Join-Path $outputDir 'orbit-stm32f407-flash-algorithm.bin'
+  $buildDir = Join-Path $repoRoot "out/native/cmsis-dap-flash-algorithm-build"
+  $objectFile = Join-Path $buildDir "${Algorithm}_flash_algorithm.o"
+  $elfFile = Join-Path $buildDir "${Algorithm}_flash_algorithm.elf"
+  $mapFile = Join-Path $buildDir "${Algorithm}_flash_algorithm.map"
+  $outputFile = Join-Path $outputDir "orbit-$Algorithm-flash-algorithm.bin"
   New-Item -ItemType Directory -Force $buildDir | Out-Null
   New-Item -ItemType Directory -Force $outputDir | Out-Null
 
   $commonFlags = @(
-    '-mcpu=cortex-m4',
+    "-mcpu=$Cpu",
     '-mthumb',
     '-mfloat-abi=soft',
     '-ffreestanding',
@@ -132,32 +139,32 @@ function Build-FlashAlgorithm {
     '-Wextra',
     '-Werror',
     '-c',
-    (Join-Path $sourceDir 'stm32f407_flash_algorithm.c'),
+    (Join-Path $sourceDir "${Algorithm}_flash_algorithm.c"),
     '-o',
     $objectFile
   )
   & $armGcc @commonFlags
-  if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm compilation failed with exit code $LASTEXITCODE" }
+  if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm ($Algorithm) compilation failed with exit code $LASTEXITCODE" }
 
   $linkFlags = @(
-    '-mcpu=cortex-m4',
+    "-mcpu=$Cpu",
     '-mthumb',
     '-mfloat-abi=soft',
     '-nostdlib',
     '-Wl,--gc-sections',
     '-Wl,--build-id=none',
     "-Wl,-Map=$mapFile",
-    "-Wl,-T,$(Join-Path $sourceDir 'stm32f407_flash_algorithm.ld')",
+    "-Wl,-T,$(Join-Path $sourceDir "${Algorithm}_flash_algorithm.ld")",
     $objectFile,
     '-o',
     $elfFile
   )
   & $armGcc @linkFlags
-  if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm link failed with exit code $LASTEXITCODE" }
+  if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm ($Algorithm) link failed with exit code $LASTEXITCODE" }
 
   & $armObjcopy '-O' 'binary' '-j' '.text' $elfFile $outputFile
-  if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm binary conversion failed with exit code $LASTEXITCODE" }
-  Write-Host "CMSIS-DAP Flash Algorithm: $outputFile"
+  if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm ($Algorithm) binary conversion failed with exit code $LASTEXITCODE" }
+  Write-Host "CMSIS-DAP Flash Algorithm ($Algorithm): $outputFile"
 }
 
 $projects = @()
@@ -183,5 +190,6 @@ foreach ($entry in $projects) {
 }
 
 if ($Project -eq 'cmsis-dap' -or $Project -eq 'all') {
-  Build-FlashAlgorithm
+  Build-FlashAlgorithm -Algorithm 'stm32f407' -Cpu 'cortex-m4'
+  Build-FlashAlgorithm -Algorithm 'stm32h723' -Cpu 'cortex-m7'
 }

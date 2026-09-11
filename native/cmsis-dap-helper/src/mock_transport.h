@@ -91,6 +91,35 @@ constexpr uint32_t kMockFlashVectorWord1 = 0x080001C1u;
 constexpr uint32_t kMockFlashVectorWord2 = 0x08000421u;
 constexpr uint32_t kMockFlashVectorWord3 = 0x08000461u;
 
+// Simulated target profile. The default models the STM32F407VET6 baseline;
+// the 1234:5690 fixture selects the STM32H723VGT6 profile (uniform 128 KiB
+// sectors, 256-bit ECC flash words). All values are independent mock fixtures
+// maintained here as the protocol oracle; they are not shared with the
+// production target registry.
+struct MockTargetProfile {
+  uint32_t dpIdcode = 0x2BA01477u;       // F407 SW-DP IDCODE (SW-DP v1)
+  uint32_t idcodeAddress = 0xE0042000u;  // DBGMCU_IDCODE register
+  uint32_t idcodeValue = 0x10006413u;    // DEV_ID 0x413, REV_ID 0x1000
+  // Word-sized fixture whose bytes encode the Flash size in KiB at the
+  // offset the preflight reads (F4: high half at +2; H723: low half at +0).
+  uint32_t flashSizeWordAddress = 0x1FFF7A20u;
+  uint32_t flashSizeWordValue = 0x00020000u;
+  uint32_t ramBase = 0x20000000u;
+  uint32_t ramSize = 128u * 1024u;
+  uint32_t flashBase = 0x08000000u;
+  uint32_t flashSize = 512u * 1024u;
+  // 0 keeps the legacy permissive erase window (F4's mixed sectors); a
+  // nonzero value requires erases to cover exactly one aligned sector.
+  uint32_t flashSectorSize = 0;
+  // 0 keeps the legacy per-byte 1->0 programming; a nonzero value only
+  // allows programming into fully erased flash words of that byte size
+  // (ECC rule: a flash word must never be programmed twice).
+  uint32_t flashWordSize = 0;
+  // When true, C_STEP re-halts and advances PC without latching S_RETIRE_ST.
+  // Models STM32H723 / Cortex-M7 hardware observed during source stepping.
+  bool omitStepRetireSticky = false;
+};
+
 // SW-DP / MEM-AP simulation state. Matches the ADIv5 semantics the target
 // layer relies on: DP registers IDCODE/CTRL-STAT/SELECT/RDBUFF, a single
 // MEM-AP with CSW/TAR/DRW, AP read pipelining (a read returns the data
@@ -99,6 +128,7 @@ constexpr uint32_t kMockFlashVectorWord3 = 0x08000461u;
 // shape validation. Unmapped addresses read as zero.
 struct MockSwdState {
   uint32_t dpIdcode = 0x2BA01477u;  // STM32F407VET6 Cortex-M4 SW-DP IDCODE
+  MockTargetProfile profile;        // memory map / flash geometry (F4 default)
   uint32_t dpCtrlStat = 0;
   uint32_t dpSelect = 0;
   uint32_t rdbuff = 0;
@@ -234,6 +264,12 @@ struct MockFlashAlgorithmRequest {
 //                              preempted before its first instruction
 //  - 1234:568F "reset-race" reset passes the startup entry unless its FPB
 //                              comparator was armed before SYSRESETREQ
+//  - 1234:5690 "h723"         STM32H723VGT6 profile: SW-DP v2 IDCODE
+//                              0x6BA02477, DBGMCU_IDCODE at 0x5C001000
+//                              (DEV_ID 0x483), Flash size 1 MiB in 8 uniform
+//                              128 KiB sectors, 256-bit ECC flash words
+//                              (no double programming), loader RAM window at
+//                              AXI SRAM 0x24000000. C_STEP omits S_RETIRE_ST.
 class MockCmsisDapTransport : public CmsisDapTransport {
  public:
   MockCmsisDapTransport();

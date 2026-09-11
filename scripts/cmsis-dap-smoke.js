@@ -60,18 +60,25 @@ const lines = readline.createInterface({ input: child.stdout });
 const pending = new Map();
 let nextId = 1;
 let failures = 0;
+let lastStepEvent = null;
 
 lines.on('line', line => {
-  let response;
+  let frame;
   try {
-    response = JSON.parse(line);
+    frame = JSON.parse(line);
   } catch {
     throw new Error(`helper printed a non-JSON line: ${line}`);
   }
-  const resolve = pending.get(response.id);
+  if (frame.type === 'event') {
+    // Helper event frames (e.g. stepResumed) arrive before the owning
+    // request's response and never resolve the pending request.
+    if (frame.event === 'stepResumed') lastStepEvent = frame;
+    return;
+  }
+  const resolve = pending.get(frame.id);
   if (resolve) {
-    pending.delete(response.id);
-    resolve(response.result);
+    pending.delete(frame.id);
+    resolve(frame.result);
   }
 });
 
@@ -139,7 +146,7 @@ async function runMockMatrix() {
     && hello.data.capabilities.includes('rtt'), JSON.stringify(hello.data.capabilities));
 
   const enumAll = await request('enumDevices', { transport: 'mock' });
-  check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 24,
+  check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 25,
     JSON.stringify(enumAll));
 
   const enumFiltered = await request('enumDevices', { transport: 'mock', vid: '1234', pid: '9999' });
@@ -269,6 +276,23 @@ function flashAlgorithmParams(operation, address, size, data = [], reusePageBuff
     timeoutMs: 500,
     reusePageBuffer,
   };
+}
+
+// Same ABI placed in the H723 loader RAM (AXI SRAM) with the H723 Flash
+// diagnostic registers. Mirrors the STM32H723VGT6 registry entry, but the
+// expected values below are maintained independently as the mock oracle.
+function h723FlashParams(operation, address, size, data = [], reusePageBuffer = false) {
+  const params = flashAlgorithmParams(operation, address, size, data, reusePageBuffer);
+  params.algorithmAddress = 0x24000000;
+  params.entry = 0x24000000 + ({ init: 0x000, uninit: 0x100, eraseSector: 0x200, programPage: 0x300, verify: 0x400 }[operation]);
+  params.bkptAddress = 0x24000500;
+  params.stackPointer = 0x24050000;
+  params.pageBufferAddress = 0x24000600;
+  params.flashStatusAddress = 0x52002010;
+  params.flashControlAddress = 0x5200200C;
+  params.ramBase = 0x24000000;
+  params.ramSize = 320 * 1024;
+  return params;
 }
 
 async function runDap02AMatrix() {
@@ -1057,6 +1081,7 @@ async function runDap05CleanupMatrix() {
   const user = await request('setBreakpoint', {
     address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
   });
+  lastStepEvent = null;
   const timedOut = await request('stepOverSourceLine', {
     lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 10,
   });
@@ -1064,6 +1089,12 @@ async function runDap05CleanupMatrix() {
     && !timedOut.ok && timedOut.errorCode === 'StepTimeout'
     && timedOut.diagnostics.step.cleanupOk === true
     && timedOut.diagnostics.step.temporaryBreakpointCount === 1, JSON.stringify(timedOut));
+  check('dap05-cleanup: timeout reports the recovered halt PC', !timedOut.ok
+    && timedOut.data && timedOut.data.stopReason === 'RecoveryHalt'
+    && typeof timedOut.data.pcAfter === 'number', JSON.stringify(timedOut));
+  check('dap05-cleanup: helper emits stepResumed before waiting for halt', lastStepEvent !== null
+    && lastStepEvent.event === 'stepResumed'
+    && typeof lastStepEvent.id === 'number', JSON.stringify(lastStepEvent));
   const duplicate = await request('setBreakpoint', { address: 0x080001C0, timeoutMs: 100 });
   const reusedTemporarySlot = await request('setBreakpoint', {
     address: 0x080001C2, preferredSlot: 1, timeoutMs: 100,
@@ -1175,12 +1206,133 @@ async function runHardwareHandshake() {
   check('hardware: close', closed.ok, JSON.stringify(closed));
 }
 
+// DAP-11: STM32H723VGT6 mock profile (device 1234:5690). Expected values are
+// independent mock fixtures (see mock_transport.cpp) and never imported from
+// the production target registry: SW-DP v2 DPIDR 0x6BA02477, DBGMCU_IDCODE
+// 0x5C001000 with DEV_ID 0x483, Flash size register 0x1FF1E880 = 1024 KiB,
+// 8 uniform 128 KiB sectors, 256-bit ECC flash words (no double programming),
+// loader RAM at AXI SRAM 0x24000000 (320 KiB).
+async function runDap11H723Matrix() {
+  await openAndInfo('1234', '5690', 'dap11-h723');
+  const connected = await request('connect', { port: 'SWD' });
+  check('dap11-h723: connect', connected.ok, JSON.stringify(connected));
+  if (connected.ok) {
+    const halted = await request('halt', { timeoutMs: 100 });
+    check('dap11-h723: halt before algorithm', halted.ok, JSON.stringify(halted));
+    if (halted.ok) {
+      const stepped = await request('stepInstruction', { timeoutMs: 100 });
+      check('dap11-h723: instruction step without S_RETIRE_ST',
+        stepped.ok && stepped.data && stepped.data.pcAfter !== stepped.data.pcBefore
+        && stepped.data.instructionRetired === false, JSON.stringify(stepped));
+      const sourceStep = await request('stepOverSourceLine', {
+        lineStart: 0x080001C0, lineEnd: 0x080001C6, timeoutMs: 100, maxInstructionSteps: 8,
+      });
+      check('dap11-h723: source step over without S_RETIRE_ST',
+        sourceStep.ok && sourceStep.data && sourceStep.data.pcAfter !== sourceStep.data.pcBefore
+        && sourceStep.elapsedMs < 100, JSON.stringify(sourceStep));
+      const idcode = await request('dpRead', { reg: 0 });
+      check('dap11-h723: SW-DP v2 DPIDR', idcode.ok && idcode.data.value === 0x6BA02477,
+        JSON.stringify(idcode));
+      const dbgmcu = await request('readMemory', { address: 0x5C001000, size: 4 });
+      check('dap11-h723: DBGMCU_IDCODE DEV_ID 0x483', dbgmcu.ok
+        && dbgmcu.data.bytes.join(',') === '131,4,0,16', JSON.stringify(dbgmcu));
+      const flashSize = await request('readMemory', { address: 0x1FF1E880, size: 2 });
+      check('dap11-h723: Flash size register 1024 KiB', flashSize.ok
+        && flashSize.data.bytes.join(',') === '0,4', JSON.stringify(flashSize));
+      const axiProbe = await request('readMemory', { address: 0x24000000, size: 4 });
+      check('dap11-h723: AXI SRAM deterministic fill', axiProbe.ok
+        && bytesMatchPattern(axiProbe.data.bytes, 0x24000000), JSON.stringify(axiProbe));
+
+      const init = await request('flashAlgorithm', h723FlashParams('init', 0x08000000, 0));
+      check('dap11-h723: algorithm init with H723 diagnostic registers', init.ok
+        && init.data.returnCode === 0, JSON.stringify(init));
+      check('dap11-h723: diagnostic registers read as valid', init.ok
+        && init.diagnostics.flashStatusValid === true
+        && init.diagnostics.flashStatusBeforeValid === true, JSON.stringify(init));
+
+      const misaligned = await request('flashAlgorithm', h723FlashParams('eraseSector', 0x08010000, 0x20000));
+      check('dap11-h723: misaligned sector erase rejected', !misaligned.ok
+        && misaligned.errorCode === 'DapAlgorithmError', JSON.stringify(misaligned));
+      const wrongSize = await request('flashAlgorithm', h723FlashParams('eraseSector', 0x080E0000, 0x10000));
+      check('dap11-h723: partial-sector erase rejected', !wrongSize.ok
+        && wrongSize.errorCode === 'DapAlgorithmError', JSON.stringify(wrongSize));
+
+      const erase = await request('flashAlgorithm', h723FlashParams('eraseSector', 0x080E0000, 0x20000));
+      check('dap11-h723: last 128 KiB sector erase', erase.ok
+        && erase.data.returnCode === 0, JSON.stringify(erase));
+
+      const page = Array.from({ length: 64 }, (_, index) => index & 0xFF);
+      const program = await request('flashAlgorithm', h723FlashParams('programPage', 0x080E0000, page.length, page));
+      check('dap11-h723: 256-bit word program', program.ok
+        && program.data.returnCode === 0, JSON.stringify(program));
+      const verify = await request('flashAlgorithm', h723FlashParams('verify', 0x080E0000, page.length, page, true));
+      check('dap11-h723: page buffer reuse verify', verify.ok
+        && verify.data.returnCode === 0, JSON.stringify(verify));
+      const reprogram = await request('flashAlgorithm', h723FlashParams('programPage', 0x080E0000, page.length, page));
+      check('dap11-h723: double program of an ECC word rejected', !reprogram.ok
+        && reprogram.errorCode === 'DapAlgorithmError', JSON.stringify(reprogram));
+      const nextWord = page.map(byte => byte ^ 0x55);
+      const nextWordProgram = await request('flashAlgorithm', h723FlashParams('programPage', 0x080E0040, nextWord.length, nextWord));
+      check('dap11-h723: next erased flash word still programmable', nextWordProgram.ok
+        && nextWordProgram.data.returnCode === 0, JSON.stringify(nextWordProgram));
+
+      const verifyMismatch = await request('flashAlgorithm', h723FlashParams('verify', 0x080E0000, page.length, page.map(byte => byte ^ 0x0F)));
+      check('dap11-h723: verify mismatch is structured', !verifyMismatch.ok
+        && verifyMismatch.errorCode === 'VerifyFailed', JSON.stringify(verifyMismatch));
+
+      const uninit = await request('flashAlgorithm', h723FlashParams('uninit', 0x08000000, 0));
+      check('dap11-h723: algorithm uninit', uninit.ok
+        && uninit.data.returnCode === 0, JSON.stringify(uninit));
+
+      // Default-address compatibility: requests without the diagnostic fields
+      // keep working (the helper falls back to its STM32F4 addresses, which
+      // are simply unmapped on this profile).
+      const legacyErase = await request('flashAlgorithm', (() => {
+        const params = h723FlashParams('eraseSector', 0x080C0000, 0x20000);
+        delete params.flashStatusAddress;
+        delete params.flashControlAddress;
+        return params;
+      })());
+      check('dap11-h723: omitted diagnostic fields keep F4 defaults', legacyErase.ok
+        && legacyErase.data.returnCode === 0, JSON.stringify(legacyErase));
+      const invalidDiag = await request('flashAlgorithm', (() => {
+        const params = h723FlashParams('eraseSector', 0x080C0000, 0x20000);
+        params.flashControlAddress = 0x52002018;
+        return params;
+      })());
+      check('dap11-h723: non-adjacent diagnostic registers rejected', !invalidDiag.ok
+        && invalidDiag.errorCode === 'DapInvalidRequest', JSON.stringify(invalidDiag));
+      const longErase = await request('flashAlgorithm', (() => {
+        const params = h723FlashParams('eraseSector', 0x080A0000, 0x20000);
+        params.timeoutMs = 30000;
+        return params;
+      })());
+      check('dap11-h723: 30s flashAlgorithm timeout accepted', longErase.ok
+        && longErase.data.returnCode === 0, JSON.stringify(longErase));
+      const tooLongErase = await request('flashAlgorithm', (() => {
+        const params = h723FlashParams('eraseSector', 0x08080000, 0x20000);
+        params.timeoutMs = 60001;
+        return params;
+      })());
+      check('dap11-h723: flashAlgorithm timeout above 60s rejected', !tooLongErase.ok
+        && tooLongErase.errorCode === 'DapInvalidRequest'
+        && String(tooLongErase.message).includes('1..60000'), JSON.stringify(tooLongErase));
+      const haltCap = await request('halt', { timeoutMs: 10001 });
+      check('dap11-h723: halt timeout still capped at 10s', !haltCap.ok
+        && haltCap.errorCode === 'DapInvalidRequest'
+        && String(haltCap.message).includes('1..10000'), JSON.stringify(haltCap));
+    }
+  }
+  await closeDevice('dap11-h723');
+}
+
 async function main() {
   try {
     if (useMock) {
     await runMockMatrix();
     await runDap03Matrix();
     await runDap02AMatrix();
+    await runDap11H723Matrix();
       await runDap04Matrix();
       await runDap05Matrix();
       await runDap05CleanupMatrix();

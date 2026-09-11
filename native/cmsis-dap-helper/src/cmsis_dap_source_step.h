@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -56,6 +57,13 @@ class CmsisDapSourceStepper {
   Result stepInstruction(SourceStepResult& output, DapTransferDiagnostics& diag,
                          std::chrono::milliseconds timeout);
 
+  // Called exactly once, after the first successful resume within a runTo
+  // wait, so the client can show the target as running while the step waits
+  // for the temporary breakpoint (which may take seconds for a blocking call).
+  void setResumedListener(std::function<void()> listener) {
+    resumedListener_ = std::move(listener);
+  }
+
  private:
   struct Instruction {
     uint32_t width = 2;
@@ -79,6 +87,8 @@ class CmsisDapSourceStepper {
   CmsisDapTarget* target_;
   CortexMDebug* debug_;
   FpbBreakpointManager fpb_;
+  std::function<void()> resumedListener_;
+  bool resumedNotified_ = false;
 };
 
 }  // namespace cmsis_dap_helper

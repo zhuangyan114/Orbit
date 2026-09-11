@@ -354,6 +354,74 @@ describe('DapSession RTT polling lifecycle', () => {
     }
   });
 
+  it('retries a missing RTT control block magic after launch until firmware initializes it', async () => {
+    vi.useFakeTimers();
+    let startAttempts = 0;
+    const backend = launchBackend({ ok: true, data: { address: 0x2000408c, size: 0xa8, type: 'B' } });
+    backend.execute.mockImplementation(async (command: any) => {
+      if (command.cmd === 'connect') return { ok: true, data: { state: 'Connected' } };
+      if (command.cmd === 'loadSymbols') return { ok: true, data: 'symbols loaded' };
+      if (command.cmd === 'resolveSymbol') {
+        return { ok: true, data: { address: 0x2000408c, size: 0xa8, type: 'B' } };
+      }
+      if (command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
+      if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+      if (command.cmd === 'startRtt') {
+        startAttempts++;
+        if (startAttempts < 3) {
+          return {
+            ok: false,
+            errorCode: 'RttInvalidControlBlock',
+            error: 'RTT Control Block magic is not SEGGER RTT',
+          };
+        }
+        return { ok: true, data: {} };
+      }
+      if (command.cmd === 'readRtt') return { ok: true, data: { bytes: [0x41] } };
+      if (command.cmd === 'stopRtt') return { ok: true, data: {} };
+      return { ok: true, data: {} };
+    });
+    const session = new DapSession(backend as any);
+    const dapLog = vi.spyOn(log, 'dap').mockImplementation(() => {});
+    try {
+      const launchPromise = (session as any).handleLaunch(launchRequest({
+        rttPollIntervalMs: 10,
+        runToEntryPoint: false,
+      }));
+      await vi.advanceTimersByTimeAsync(200);
+      await launchPromise;
+
+      expect((session as any).rttAvailable).toBe(true);
+      expect((session as any).rttPollTimer).not.toBeNull();
+      expect((session as any).rttControlBlockAddress).toBe(0x2000408c);
+
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(startAttempts).toBe(1);
+      expect((session as any).rttStarted).toBe(false);
+      expect((session as any).rttAvailable).toBe(true);
+      expect(dapLog).toHaveBeenCalledWith(expect.stringContaining('action=retry'));
+      expect(dapLog).not.toHaveBeenCalledWith(expect.stringContaining('action=disabled'));
+
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(startAttempts).toBe(2);
+      expect((session as any).rttStarted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(startAttempts).toBe(3);
+      expect((session as any).rttStarted).toBe(true);
+      expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({ cmd: 'readRtt' }));
+      expect(backend.dispose).not.toHaveBeenCalled();
+    } finally {
+      (session as any).stopConnectionMonitor();
+      (session as any).stopRttLogPolling();
+      dapLog.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('retries a transient invalid RTT control block after restart at the configured interval', async () => {
     vi.useFakeTimers();
     let startAttempts = 0;

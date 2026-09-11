@@ -80,7 +80,3 @@ export function applyNormalizedDapLaunchConfig(
   if (targetConfig.runToEntryPoint === undefined) delete config.runToEntryPoint;
   else config.runToEntryPoint = targetConfig.runToEntryPoint;
 }
-
-export function cmsisDapFlashUnsupportedMessage(): string {
-  return 'CMSIS-DAP Flash Algorithm for STM32F407VET6 is not implemented; set flashBeforeDebug to false to skip flashing.';
-}

@@ -133,3 +133,23 @@ node scripts/automation-api/verify-hardware.js --live --authorize --probe cmsis-
 # node scripts/automation-api/verify-hardware.js --live --authorize --probe jlink-legacy --board STM32F407VET6
 # node scripts/automation-api/verify-hardware.js --live --authorize --probe cmsis-dap --board STM32F407VET6 --flash
 ```
+
+## STM32H723VGT6 device support (1.1.2)
+
+Device-support acceptance is separate from the Automation API Task 16 layers above. All levels ran on the same STM32H723VGT6 board. A level is `passed` only with the evidence JSON named below; nothing here collapses into "all passed".
+
+| Level | Scope | Result |
+|---|---|---|
+| P7-1 | read-only identity: SW-DP DPIDR, DBGMCU_IDCODE, Flash size register, RAM samples | **passed** (CMSIS-DAP, 2026-08-25) |
+| P7-2 | RAM stub write/read-back on AXI SRAM, DTCM, D2, D3 | **passed** (CMSIS-DAP, 2026-08-25) |
+| P7-3 | Flash Algorithm Init/UnInit round trip | **passed** (CMSIS-DAP, 2026-08-25) |
+| P7-4 | authorized test-sector erase/program/verify, then restore `0xFF` | **passed** (CMSIS-DAP, 2026-08-25; last 128 KiB sector ~1.11 s) |
+| P7-5 | real ELF `flashBeforeDebug: true` end to end (`h7vgt6_test.elf`) | **passed** (CMSIS-DAP, 2026-08-25) |
+| P7-6 | J-Link native owner: connect, `JLink.exe` flash, entry stop, breakpoint hit, Watch evaluate, native source step, AXI SRAM read, disconnect cleanup | **passed** (J-Link V9.56, 2026-09-11) |
+| P7-7 | long-run sampling, unplug / helper-crash disconnect behavior | **not verified** |
+
+Evidence JSON is in `outputs/h723-p7/`. The P7-6 run recorded owner `jlink-native` only (helper pid 3844), no legacy or CMSIS-DAP fallback, no leftover helper process; DPIDR `0x6BA02477`, VTref 3.285 V, DBGMCU_IDCODE `0x10016483` (DEV_ID `0x483`, REV_ID `0x1001`), Flash size 1024 KiB, vector table SP `0x20020000` / Reset `0x0801AFD1`. Hardware scripts: `scripts/cmsis-dap/verify-h723-*-hw.js` and `scripts/jlink/verify-h723-jlink-hw.js`; every one refuses without its own `--hardware`/`--authorize-*` flag.
+
+The J-Link path forwards `device` unchanged to the DLL and to `JLink.exe` instead of resolving the CMSIS-DAP flash registry, so it needs a device name the installed J-Link software knows. J-Link V9.56 has no `STM32H723VGT6`; the Commander reports it as unknown, falls back to `STM32H723VG` and can stall the automatic flash on a device-selection dialog until the 30 s flash timeout. Use `"device": "STM32H723VG"` with `probe: "jlink"`.
+
+Verified register facts, sector map, timings, and the Flash Algorithm sources are in [CMSIS-DAP Flash algorithm references](../cmsis-dap-flash-algorithm-references.md).

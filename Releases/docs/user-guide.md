@@ -1,6 +1,6 @@
 # Orbit — 用户使用与配置指南
 
-> 版本：1.0.0 文档
+> 版本：1.1.2 文档
 >
 > 本文按当前仓库源码、`package.json` 的贡献点和 Native helper 实现整理。配置名、默认值、范围和单位均以源码为准；外部扩展的具体版本和 UI 由外部扩展决定。
 
@@ -97,13 +97,24 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 它由烧录流程调用。launch 中有 `program` 且 `flashBeforeDebug` 没有设为 `false` 时，Orbit 会调用 JLink Commander，参数包含目标设备、`SWD`/`JTAG` 接口、速度和临时 CommanderScript；烧录默认超时为 30 秒。
 
-没有 `program`，或显式设置 `flashBeforeDebug: false` 时，不会因为 DAP 连接本身而调用 `JLink.exe`。J-Link DLL 仍然是调试连接的必需品。
+没有 `program`，或显式设置 `flashBeforeDebug: false` 时，不会因为 DAP 连接本身而调用 `JLink.exe`。同一会话 Restart 时，若 `flashBeforeDebug: true` 且 ELF 与刚刚烧录的固件相同，也不会再次调用 Commander。J-Link DLL 仍然是调试连接的必需品。
 
 ### 2.3 CMSIS-DAP / DAPLink
 
 `probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。1.1.0 真机验收覆盖 HID v1；v2 WinUSB 以设备枚举和握手为准，本版未做真机。
 
-CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。`flashBeforeDebug: false` 完全跳过烧录，仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
+CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`flashBeforeDebug: false` 完全跳过烧录（包括 Restart），仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
+
+当前 CMSIS-DAP 内置 Flash 目标：
+
+| `device` / 别名 | Flash | 真机验收 |
+| --- | --- | --- |
+| `STM32F407VET6` / `STM32F407VE` | 512 KiB，自研 F4 算法 | CMSIS-DAP HID v1 已验收 |
+| `STM32H723VGT6` / `STM32H723VG` | 1 MiB，自研 H7 算法 | CMSIS-DAP HID v1 已验收（P7-1～P7-5，2026-08-25）；J-Link 已验收（P7-6，2026-09-11）。长稳/断线（P7-7）未验收 |
+
+未注册的器件名会在擦除前返回 `TargetMismatch`，不会回退到 F407 算法。H723 的其他封装/容量（例如 512 KiB E 密度）以及 H725/H73x 不在本版注册表中。默认 `device` 仍是 `STM32F407VG`；调试 H723 必须显式写成 `STM32H723VGT6` 或 `STM32H723VG`。
+
+这张注册表只作用于 CMSIS-DAP 烧录；J-Link 链路不查注册表，`device` 会原样交给 J-Link DLL 和 `JLink.exe`，所以必须填已安装 J-Link 软件认识的器件名。实测 J-Link V9.56 的器件库没有 `STM32H723VGT6`：Commander 会提示器件名未知并降级到 `STM32H723VG`，自动烧录时还会弹出器件选择框、把流程卡到超时。`probe: "jlink"` 请写 `"device": "STM32H723VG"`。
 
 ## 3. `launch.json`
 
@@ -146,14 +157,48 @@ CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目
 }
 ```
 
+STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 走内置注册表，两个名称都可用：
+
+```jsonc
+{
+  "type": "orbit",
+  "request": "launch",
+  "probe": "cmsis-dap",
+  "cmsisDapTransport": "auto",
+  "program": "${workspaceFolder}/build/Debug/frame.elf",
+  "device": "STM32H723VGT6",
+  "deviceName": "STM32H723VGT6",
+  "svdFile": "${workspaceFolder}/STM32H723.svd",
+  "interface": "SWD",
+  "speedKHz": 4000,
+  "flashBeforeDebug": true
+}
+```
+
+同一块板改用 J-Link 时，`device` 要写成 J-Link 器件库里的名称（`deviceName` 只在 `device` 缺省时才会生效）：
+
+```jsonc
+{
+  "type": "orbit",
+  "request": "launch",
+  "probe": "jlink",
+  "program": "${workspaceFolder}/build/Debug/frame.elf",
+  "device": "STM32H723VG",
+  "svdFile": "${workspaceFolder}/STM32H723.svd",
+  "interface": "SWD",
+  "speedKHz": 4000,
+  "flashBeforeDebug": true
+}
+```
+
 ### 3.2 默认值和 launch 属性
 
 以下是 `package.json` 的 launch schema 以及 DAP 源码实际读取的值：
 
 | 属性 | 类型 / 单位 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `device` | string | `STM32F407VG` | 目标设备名；J-Link 用于 DLL 选型，CMSIS-DAP 用于 Flash Algorithm/芯片校验。 |
-| `deviceName` | string | `STM32F407VG` | `device` 的外部 MCU Debug Views 兼容别名；未填写时由 `device` 补齐。 |
+| `device` | string | `STM32F407VG` | 实际使用的目标设备名；J-Link 原样交给 DLL 与 `JLink.exe` 选型（必须是已安装 J-Link 软件认识的名称，例如 `STM32H723VG`），CMSIS-DAP 用于 Flash Algorithm 和芯片校验（走内置注册表）。 |
+| `deviceName` | string | `STM32F407VG` | 兼容别名；仅在 `device` 缺省时顶替 `device`，同时供外部 MCU Debug Views 使用。 |
 | `probe` | `jlink` / `cmsis-dap` | `jlink` | 当前 session 的唯一物理 owner 类型。 |
 | `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1。 |
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。 |
@@ -165,7 +210,7 @@ CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目
  | `svdPath` | path | `""` | `svdFile` 的兼容别名；未填写时跟随 `svdFile` 或 `orbit.defaultSvdFile`。 |
 | `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
 | `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
-| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验；`false` 明确跳过所有 Flash 操作。 |
+| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
 | `runToEntryPoint` | string / `false` | `main` | CMSIS-DAP 启动或 Restart 后停靠的符号；`false` 禁用 run-to-entry。 |
 | `rtos` | string | `""` | 传给 DAP capability/外部 RTOS Views 的 RTOS 名称，例如 `FreeRTOS`。 |
 | `rttLogEnabled` | boolean | `true` | 启动后读取 SEGGER RTT。 |
@@ -420,6 +465,8 @@ Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供
 
 当前源码保留 `svdFile` / `svdPath` / `deviceName` 供外部 MCU Debug Views 使用，但 Orbit 自身不解析 SVD，也不内置 Peripheral Viewer。寄存器名称、bit 字段、读写权限和显示质量取决于 SVD 文件及外部 Viewer。外部 Viewer 不显示时先检查扩展安装、`trackDebuggers`、SVD 路径和目标 device name。
 
+仓库不内置 SVD。STM32H723 请使用 ST 官方 `STM32H723.svd`，通过 `svdFile` / `svdPath` 或 `orbit.defaultSvdFile` 指向本地文件，并把 `device` / `deviceName` 设为 `STM32H723VGT6`（或别名 `STM32H723VG`）。F407 示例仍可用 `STM32F407.svd`；默认器件不会因为安装 1.1.2 而改成 H723。
+
 ## 11. Target owner 与调试通道
 
 ### 11.1 三类 owner
@@ -564,7 +611,8 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 
 - Native helper 和当前 J-Link DLL 集成是 Windows 目标；仓库没有把 Linux/macOS 作为当前 Native 运行目标。
 - CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。1.1.0 真机验收覆盖 v1 HID；v2 WinUSB 只有代码/Mock/构建证据，具体 probe 固件兼容性仍以设备枚举和握手为准。
-- `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。
+- `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。STM32H723VGT6 的 J-Link 链路已在 1.1.2 通过真机验收（P7-6，2026-09-11，owner 只出现 `jlink-native`）；`device` 必须写 J-Link 软件认识的名称（如 `STM32H723VG`），`STM32H723VGT6` 不在 J-Link V9.56 的器件库里。长稳/断线（P7-7）未验收。
+- CMSIS-DAP 内置 Flash 注册表当前只有 `STM32F407VET6` 与 `STM32H723VGT6`（及各自别名）。H723 需显式设置 `device`；默认值仍是 `STM32F407VG`。
 - `interface` schema 接受 `SWD` 和 `JTAG`，但 Legacy DLL 连接实现当前固定选择 SWD；JTAG 应使用 Native 并单独确认硬件。
 - J-Link 路径使用 6 个槽位索引；CMSIS-DAP 会读取 Cortex-M FPB 容量。任何路径槽位耗尽时新硬件断点都必须返回明确错误。
 - Native source-level step into/over/out 只属于 Native owner；Legacy 不能把普通单步宣传为 Native source-level stepping。

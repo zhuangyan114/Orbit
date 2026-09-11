@@ -2,7 +2,7 @@
   "name": "orbit-for-vscode",
   "displayName": "Orbit",
   "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -217,7 +217,7 @@
               },
               "flashBeforeDebug": {
                 "type": "boolean",
-                "description": "Flash and verify the current ELF through the selected J-Link or CMSIS-DAP owner before debugging",
+                "description": "Flash and verify the current ELF through the selected J-Link or CMSIS-DAP owner before debugging. Restart skips reflash when that ELF is unchanged.",
                 "default": true
               },
               "runToEntryPoint": {
@@ -501,7 +501,7 @@
         "orbit.flashBeforeDebug": {
           "type": "boolean",
           "default": true,
-          "description": "启动调试前烧录当前 ELF/AXF 文件"
+          "description": "启动调试前烧录当前 ELF/AXF 文件。同一会话 Restart 时若固件未变则跳过再烧。"
         },
         "orbit.recentSessions": {
           "type": "number",
@@ -529,6 +529,7 @@
     "test:cpp-channel:mock": "node scripts/cpp-channel-smoke.js --mock",
     "test:cmsis-dap:mock": "node scripts/cmsis-dap-smoke.js --mock",
     "test:cmsis-dap:algorithm": "node scripts/cmsis-dap/verify-flash-algorithm.js",
+    "test:cmsis-dap:all": "npm run test:cmsis-dap:mock && npm run test:cmsis-dap:algorithm && npm run test:cpp-channel:mock",
     "watch": "node esbuild.config.js --watch",
     "mcp": "node Releases/mcp/orbit-mcp-server.js",
     "lint": "eslint src --ext ts,tsx",

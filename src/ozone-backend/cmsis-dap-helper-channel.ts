@@ -287,6 +287,7 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
   method: string;
   sentAt: number;
+  onStepResumed?: () => void;
 }
 
 // The helper applies timeoutMs to the bounded control operation itself. Keep
@@ -393,18 +394,23 @@ export class CmsisDapHelperClient {
     method: string,
     params: Record<string, unknown> = {},
     schedule: Partial<NativeScheduleOptions> = {},
+    onStepResumed?: () => void,
   ): Promise<CppJLinkResult<T>> {
     const priority = schedule.priority || priorityForMethod(method);
     return this.scheduler.schedule(
-      () => this.sendRequest<T>(method, params),
+      () => this.sendRequest<T>(method, params, onStepResumed),
       { ...schedule, priority, label: schedule.label || method },
     );
   }
 
   /** Runs a control-priority request with Timeline/background reads paused. */
-  async controlRequest<T>(method: string, params: Record<string, unknown> = {}): Promise<CppJLinkResult<T>> {
+  async controlRequest<T>(
+    method: string,
+    params: Record<string, unknown> = {},
+    onStepResumed?: () => void,
+  ): Promise<CppJLinkResult<T>> {
     return this.scheduler.withPaused(['watch', 'timeline', 'background'], () =>
-      this.request<T>(method, params, { priority: 'control' }),
+      this.request<T>(method, params, { priority: 'control' }, onStepResumed),
     );
   }
 
@@ -444,7 +450,11 @@ export class CmsisDapHelperClient {
     };
   }
 
-  private sendRequest<T>(method: string, params: Record<string, unknown>): Promise<CppJLinkResult<T>> {
+  private sendRequest<T>(
+    method: string,
+    params: Record<string, unknown>,
+    onStepResumed?: () => void,
+  ): Promise<CppJLinkResult<T>> {
     if (!this.child || !this.child.stdin.writable) {
       return Promise.reject(this.exitError || new Error('CMSIS-DAP helper is not running'));
     }
@@ -461,7 +471,7 @@ export class CmsisDapHelperClient {
         );
         reject(new Error(`CMSIS-DAP helper request timed out: ${method}`));
       }, requestTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer, method, sentAt });
+      this.pending.set(id, { resolve, reject, timer, method, sentAt, onStepResumed });
       const requestLine = `${JSON.stringify({ id, method, params })}\n`;
       this.child!.stdin.write(requestLine, error => {
         if (!error) return;
@@ -505,13 +515,24 @@ export class CmsisDapHelperClient {
   }
 
   private handleLine(line: string) {
-    let response: { id: number | null; result: CppJLinkResult<unknown> };
+    let frame: { type?: unknown; event?: unknown; id?: unknown; result?: CppJLinkResult<unknown> };
     try {
-      response = JSON.parse(line) as { id: number | null; result: CppJLinkResult<unknown> };
+      frame = JSON.parse(line) as typeof frame;
     } catch (error) {
       this.onDiagnostic(`[cmsis-dap protocol] invalid response: ${truncateDiagnostic(line)}; ${error}`);
       return;
     }
+    if (frame.type === 'event') {
+      // The helper emits an event frame before the owning request's response
+      // (stepResumed), so the client can update the UI while the request is
+      // still waiting. It never resolves the pending request.
+      if (frame.event === 'stepResumed' && typeof frame.id === 'number') {
+        const pending = this.pending.get(frame.id);
+        if (pending?.onStepResumed) pending.onStepResumed();
+      }
+      return;
+    }
+    const response = frame as { id: number | null; result: CppJLinkResult<unknown> };
     if (typeof response.id !== 'number') {
       this.onDiagnostic(`[cmsis-dap protocol] response without request id: ${line}`);
       return;

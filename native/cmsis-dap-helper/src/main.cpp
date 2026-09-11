@@ -1342,17 +1342,33 @@ std::string cortexDiagnosticsJson(const char* operation,
   return json;
 }
 
-std::optional<uint32_t> controlTimeoutMs(const JsonValue& params) {
+// Halt/step/breakpoint control stays bounded at 10 s so a stuck core cannot
+// pin the helper. Flash Algorithm operations (especially 128 KiB H7 sector
+// erase) need a longer ceiling; 60 s covers the STM32H723 defaults of
+// eraseTimeoutMs=30000 / programTimeoutMs=15000 with headroom.
+constexpr uint64_t kControlTimeoutMaxMs = 10000;
+constexpr uint64_t kFlashAlgorithmTimeoutMaxMs = 60000;
+
+std::optional<uint32_t> boundedTimeoutMs(const JsonValue& params, uint64_t maxMs) {
   const uint64_t timeout = uintField(params, "timeoutMs").value_or(1000);
-  if (timeout == 0 || timeout > 10000) return std::nullopt;
+  if (timeout == 0 || timeout > maxMs) return std::nullopt;
   return static_cast<uint32_t>(timeout);
+}
+
+std::optional<uint32_t> controlTimeoutMs(const JsonValue& params) {
+  return boundedTimeoutMs(params, kControlTimeoutMaxMs);
+}
+
+std::optional<uint32_t> flashAlgorithmTimeoutMs(const JsonValue& params) {
+  return boundedTimeoutMs(params, kFlashAlgorithmTimeoutMaxMs);
 }
 
 std::string coreFailure(const Result& result, const char* operation, Channel& channel,
                         const std::chrono::steady_clock::time_point& started,
                         uint32_t timeoutMs, const DapTransferDiagnostics& diag,
                         const std::string& extra = "",
-                        const CortexMDebugDiagnostics* algorithm = nullptr);
+                        const CortexMDebugDiagnostics* algorithm = nullptr,
+                        const std::string& dataJson = "{}");
 std::string invalidControlTimeout(const char* operation, Channel& channel);
 
 std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
@@ -1362,7 +1378,7 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
     channel.clearFlashAlgorithmState();
     return resultJson(false, readyResult.message, channel.state(), 0, "{}", readyResult.errorCode);
   }
-  const auto timeout = controlTimeoutMs(params);
+  const auto timeout = flashAlgorithmTimeoutMs(params);
   if (!timeout) return invalidControlTimeout("flashAlgorithm", channel);
   const auto operation = stringField(params, "operation");
   const auto code = byteArrayField(params, "algorithm", 128 * 1024);
@@ -1377,6 +1393,30 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
   const auto size = uintField(params, "size");
   const auto staticBase = uintField(params, "staticBase").value_or(0);
   const auto clockHz = uintField(params, "clockHz").value_or(4000000);
+  // Optional target Flash diagnostic registers. Absent fields keep the
+  // STM32F407 defaults so existing sessions observe no protocol change; the
+  // two registers must be adjacent aligned words because both are fetched in
+  // one 2-word block read starting at the lower address.
+  const auto flashStatusAddressOpt = uintField(params, "flashStatusAddress");
+  const auto flashControlAddressOpt = uintField(params, "flashControlAddress");
+  const uint32_t flashStatusAddress =
+      static_cast<uint32_t>(flashStatusAddressOpt.value_or(kStm32F4FlashSr));
+  const uint32_t flashControlAddress =
+      static_cast<uint32_t>(flashControlAddressOpt.value_or(kStm32F4FlashCr));
+  const auto flashDiagParamsValid = (!flashStatusAddressOpt || flashStatusAddressOpt <= 0xFFFFFFFFu)
+      && (!flashControlAddressOpt || flashControlAddressOpt <= 0xFFFFFFFFu)
+      && (flashStatusAddress % 4u) == 0u && (flashControlAddress % 4u) == 0u
+      && (flashStatusAddress > flashControlAddress
+              ? flashStatusAddress - flashControlAddress
+              : flashControlAddress - flashStatusAddress) == 4u;
+  // Optional loader RAM window for the algorithm image, page buffer, and
+  // stack. Absent fields keep the STM32F407 128 KiB SRAM defaults.
+  const auto ramBaseOpt = uintField(params, "ramBase");
+  const auto ramSizeOpt = uintField(params, "ramSize");
+  const auto ramWindowParamsValid = (!ramBaseOpt || (ramBaseOpt <= 0xFFFFFFFFu && *ramBaseOpt % 4u == 0u))
+      && (!ramSizeOpt || *ramSizeOpt > 0u)
+      && (!ramBaseOpt || !ramSizeOpt
+          || (*ramBaseOpt <= 0xFFFFFFFFu - *ramSizeOpt && *ramSizeOpt <= 0x10000000u));
   const JsonValue* reusePageBufferValue = params.get("reusePageBuffer");
   const auto reusePageBuffer = boolField(params, "reusePageBuffer");
   if (!operation || (*operation != "init" && *operation != "uninit" && *operation != "eraseSector" &&
@@ -1385,13 +1425,22 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
       !targetAddress || !size || *algorithmAddress > 0xFFFFFFFFu || *entry > 0xFFFFFFFFu ||
       *bkptAddress > 0xFFFFFFFFu || *stackPointer > 0xFFFFFFFFu || *pageBufferAddress > 0xFFFFFFFFu ||
       stackSize > 0xFFFFFFFFu || staticBase > 0xFFFFFFFFu || *targetAddress > 0xFFFFFFFFu ||
-      *size > 0x10000u || clockHz > 0xFFFFFFFFu ||
+      (*size > 0x10000u && *operation != "eraseSector") ||
+      (*operation == "eraseSector" && *size > 0x100000u) || clockHz > 0xFFFFFFFFu ||
+      !flashDiagParamsValid || !ramWindowParamsValid ||
       (reusePageBufferValue && !reusePageBuffer.has_value()) ||
       ((*operation == "programPage" || *operation == "verify") && data->size() < *size)) {
     return resultJson(false, "flashAlgorithm parameters are invalid", channel.state(), 0, "{}",
                       ErrorCodes::kDapInvalidRequest,
                       "{\"operation\":\"flashAlgorithm\"}");
   }
+
+  // Both diagnostic registers are fetched in a single 2-word block read
+  // starting at the lower address (STM32F4: [SR, CR]; H723: [CR1, SR1]).
+  const uint32_t flashDiagBase =
+      flashStatusAddress < flashControlAddress ? flashStatusAddress : flashControlAddress;
+  const uint32_t flashStatusIndex = (flashStatusAddress - flashDiagBase) / 4u;
+  const uint32_t flashControlIndex = (flashControlAddress - flashDiagBase) / 4u;
 
   CmsisDapProtocol protocol(channel.transport.get());
   protocol.setEffectivePacketSize(channel.packetSize);
@@ -1419,6 +1468,8 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
   request.size = static_cast<uint32_t>(*size);
   request.staticBase = static_cast<uint32_t>(staticBase);
   request.timeoutMs = *timeout;
+  request.ramBase = static_cast<uint32_t>(ramBaseOpt.value_or(0x20000000u));
+  request.ramSize = static_cast<uint32_t>(ramSizeOpt.value_or(0x20000u));
   request.loadAlgorithmCode = !channel.flashAlgorithmLoaded
                               || channel.flashAlgorithmAddress != request.algorithmAddress
                               || channel.flashAlgorithmCode != code.value();
@@ -1451,11 +1502,11 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
     request.r0 = request.targetAddress;
   }
   std::vector<uint32_t> flashRegistersBefore;
-  const Result flashBeforeResult = target.readMemoryBlock(kStm32F4FlashSr, 2, flashRegistersBefore, diag,
+  const Result flashBeforeResult = target.readMemoryBlock(flashDiagBase, 2, flashRegistersBefore, diag,
                                                           std::chrono::milliseconds(*timeout));
   const bool flashRegistersBeforeValid = flashBeforeResult.ok && flashRegistersBefore.size() == 2;
-  const uint32_t flashStatusBefore = flashRegistersBeforeValid ? flashRegistersBefore[0] : 0;
-  const uint32_t flashControlBefore = flashRegistersBeforeValid ? flashRegistersBefore[1] : 0;
+  const uint32_t flashStatusBefore = flashRegistersBeforeValid ? flashRegistersBefore[flashStatusIndex] : 0;
+  const uint32_t flashControlBefore = flashRegistersBeforeValid ? flashRegistersBefore[flashControlIndex] : 0;
   const std::string flashBeforeDiagnostics =
       ",\"flashStatusBeforeValid\":" + std::string(flashRegistersBeforeValid ? "true" : "false") +
       (flashRegistersBeforeValid
@@ -1491,11 +1542,11 @@ std::string handleFlashAlgorithm(const JsonValue& params, Channel& channel) {
                                      operationDiagnosticsExtra,
                                      &operationDiagnostics);
   std::vector<uint32_t> flashRegisters;
-  const Result flashRegisterResult = target.readMemoryBlock(kStm32F4FlashSr, 2, flashRegisters, diag,
+  const Result flashRegisterResult = target.readMemoryBlock(flashDiagBase, 2, flashRegisters, diag,
                                                             std::chrono::milliseconds(*timeout));
   const bool flashRegistersValid = flashRegisterResult.ok && flashRegisters.size() == 2;
-  const uint32_t flashStatus = flashRegistersValid ? flashRegisters[0] : 0;
-  const uint32_t flashControl = flashRegistersValid ? flashRegisters[1] : 0;
+  const uint32_t flashStatus = flashRegistersValid ? flashRegisters[flashStatusIndex] : 0;
+  const uint32_t flashControl = flashRegistersValid ? flashRegisters[flashControlIndex] : 0;
   const std::string flashAfterDiagnostics =
       ",\"flashStatusValid\":" + std::string(flashRegistersValid ? "true" : "false") +
       (flashRegistersValid
@@ -1554,7 +1605,8 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
                         const std::chrono::steady_clock::time_point& started,
                         uint32_t timeoutMs, const DapTransferDiagnostics& diag,
                         const std::string& extra,
-                        const CortexMDebugDiagnostics* algorithm) {
+                        const CortexMDebugDiagnostics* algorithm,
+                        const std::string& dataJson) {
   channel.debugPowerReady = false;
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1566,13 +1618,17 @@ std::string coreFailure(const Result& result, const char* operation, Channel& ch
             << " message=" << result.message
             << " diagnostics=" << cortexDiagnosticsJson(operation, timeoutMs, diag, extra, algorithm)
             << std::endl;
-  return resultJson(false, result.message, channel.state(), elapsedMs, "{}",
+  return resultJson(false, result.message, channel.state(), elapsedMs, dataJson,
                     result.errorCode.empty() ? ErrorCodes::kInternalError : result.errorCode,
                     cortexDiagnosticsJson(operation, timeoutMs, diag, extra, algorithm));
 }
 
 std::string invalidControlTimeout(const char* operation, Channel& channel) {
-  return resultJson(false, "timeoutMs must be an integer in 1..10000",
+  const uint64_t maxMs = std::string(operation) == "flashAlgorithm"
+      ? kFlashAlgorithmTimeoutMaxMs
+      : kControlTimeoutMaxMs;
+  return resultJson(false,
+                    "timeoutMs must be an integer in 1.." + std::to_string(maxMs),
                     channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
                     "{\"operation\":\"" + std::string(operation) + "\",\"field\":\"timeoutMs\"}");
 }
@@ -2198,7 +2254,16 @@ std::string handleClearAllBreakpoints(const JsonValue& params, Channel& channel)
                                           "\"fpb\":" + data));
 }
 
-std::string handleSourceStep(const char* operation, const JsonValue& params, Channel& channel) {
+// Notifies the client that the target has resumed and the step is now waiting
+// for the temporary breakpoint. Written directly to the protocol stream so it
+// precedes the final response of the owning request.
+void emitStepResumed(const JsonValue& id) {
+  std::cout << "{\"type\":\"event\",\"event\":\"stepResumed\",\"id\":"
+            << jsonSerialize(id) << "}\n" << std::flush;
+}
+
+std::string handleSourceStep(const char* operation, const JsonValue& params, Channel& channel,
+                             const JsonValue& id) {
   const auto started = std::chrono::steady_clock::now();
   const Result ready = channel.ensureReady();
   if (!ready.ok) return coreFailure(ready, operation, channel, started, 0, {});
@@ -2213,6 +2278,7 @@ std::string handleSourceStep(const char* operation, const JsonValue& params, Cha
       ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
   if (!result.ok) return coreFailure(result, operation, channel, started, *timeout, diagnostics);
   CmsisDapSourceStepper stepper(&target, &debug, &channel.fpbState);
+  stepper.setResumedListener([&id] { emitStepResumed(id); });
   SourceStepResult step;
   if (std::string(operation) == "stepIntoSourceLine") {
     result = stepper.stepInto(static_cast<uint32_t>(uintField(params, "lineStart").value_or(0)),
@@ -2236,7 +2302,7 @@ std::string handleSourceStep(const char* operation, const JsonValue& params, Cha
   }
   const std::string stepJson = sourceStepJson(step);
   if (!result.ok) return coreFailure(result, operation, channel, started, *timeout, diagnostics,
-                                     "\"step\":" + stepJson);
+                                     "\"step\":" + stepJson, nullptr, stepJson);
   const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count();
   return resultJson(true, std::string("CMSIS-DAP ") + operation + " completed", "Halted",
@@ -2332,11 +2398,11 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
   } else if (name == "clearAllBreakpoints") {
     result = handleClearAllBreakpoints(*params, channel);
   } else if (name == "stepIntoSourceLine") {
-    result = handleSourceStep("stepIntoSourceLine", *params, channel);
+    result = handleSourceStep("stepIntoSourceLine", *params, channel, *id);
   } else if (name == "stepOverSourceLine") {
-    result = handleSourceStep("stepOverSourceLine", *params, channel);
+    result = handleSourceStep("stepOverSourceLine", *params, channel, *id);
   } else if (name == "stepOut") {
-    result = handleSourceStep("stepOut", *params, channel);
+    result = handleSourceStep("stepOut", *params, channel, *id);
   } else {
     const long long elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -4258,6 +4324,27 @@ int runSelfTest() {
   }
 
   {
+    // STM32H723 / Cortex-M7 C_STEP can re-halt with a new PC without latching
+    // S_RETIRE_ST. Instruction step must still succeed from the observed PC.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5690", mock), "dap11-h723-step-omit-retire-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics setupDiag;
+    CortexMDebugState halted;
+    expect(debug.halt(halted, setupDiag, std::chrono::milliseconds(100)).ok &&
+               halted.halted && halted.pcValid,
+           "dap11-h723-step-omit-retire-halt");
+    DapTransferDiagnostics diag;
+    CortexMDebugStepResult step;
+    const Result result = debug.stepInstruction(step, diag, std::chrono::milliseconds(100));
+    expect(result.ok && step.halted && step.pcAfter != step.pcBefore &&
+               !step.instructionRetired && step.interruptMaskCleared,
+           "dap11-h723-step-succeeds-without-s-retire-st");
+  }
+
+  {
     // Step-out needs PC/LR/SP from one stopped state. Read the initial DHCSR
     // once, then perform the architecturally required DCRSR/DCRDR sequence for
     // each register without repeating the halted-state query.
@@ -4680,6 +4767,35 @@ int runSelfTest() {
     expect(result.ok && step.classification == "branch" && !step.enteredCall &&
                step.trace.size() == 1 && !step.trace.front().call,
            "dap05-wide-conditional-branch-is-not-call");
+  }
+
+  {
+    // A call return breakpoint that never fires (1234:568C FPB never hits)
+    // must time out with StepTimeout, halt the target, and report the
+    // recovered halt PC so the client can move the UI to the real stop
+    // location instead of leaving the cursor on the timed-out line.
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "568C", mock), "dap05-step-timeout-recovery-open");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    CortexMDebug debug(&target);
+    DapTransferDiagnostics diag;
+    expect(target.initializeDebugPower(diag, std::chrono::milliseconds(100)).ok,
+           "dap05-step-timeout-recovery-debug-power");
+    mock.prepareSourceInstruction(0x080001C2u, {0x00, 0xF0, 0x0D, 0xF8});
+    FpbState fpbState;
+    CmsisDapSourceStepper stepper(&target, &debug, &fpbState);
+    int resumedCount = 0;
+    stepper.setResumedListener([&resumedCount] { ++resumedCount; });
+    SourceStepResult step;
+    const Result result = stepper.stepOver(0x080001C2u, 0x080001C6u, 4u, step, diag,
+                                           std::chrono::milliseconds(50));
+    expect(!result.ok && result.errorCode == "StepTimeout" &&
+               step.stopReason == "RecoveryHalt" &&
+               step.classification == "recoveredHalt" && step.cleanupOk,
+           "dap05-step-timeout-recovers-halt-and-pc");
+    expect(resumedCount == 1,
+           "dap05-step-timeout-notifies-resumed-once");
   }
 
   {

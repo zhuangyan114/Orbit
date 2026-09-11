@@ -71,6 +71,7 @@ MockCmsisDapTransport::MockCmsisDapTransport() {
   devices_.push_back(makeDevice("1234", "568D", "MOCK-0022", 65, 65, 0));
   devices_.push_back(makeDevice("1234", "568E", "MOCK-0023", 65, 65, 0));
   devices_.push_back(makeDevice("1234", "568F", "MOCK-0024", 65, 65, 0));
+  devices_.push_back(makeDevice("1234", "5690", "MOCK-0025", 65, 65, 0));
 }
 
 DeviceDescriptor MockCmsisDapTransport::makeDevice(const std::string& vid, const std::string& pid,
@@ -133,10 +134,33 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
       lost_ = false;
       pending_.clear();
       state_ = MockSwdState{};
-      state_.ram.assign(kMockRamSize, 0);
-      state_.flash.assign(kMockFlashSize, 0);
-      for (uint32_t i = 0; i < kMockRamSize; ++i) state_.ram[i] = mockByteAt(kMockRamBase + i);
-      for (uint32_t i = 0; i < kMockFlashSize; ++i) state_.flash[i] = mockByteAt(kMockFlashBase + i);
+      const std::string key = behaviorKey(candidate);
+      if (key == "1234:5690") {
+        // STM32H723VGT6 profile (independent fixture; see mock_transport.h).
+        MockTargetProfile h723;
+        h723.dpIdcode = 0x6BA02477u;
+        h723.idcodeAddress = 0x5C001000u;
+        h723.idcodeValue = 0x10000483u;
+        h723.flashSizeWordAddress = 0x1FF1E880u;
+        h723.flashSizeWordValue = 0x00000400u;
+        h723.ramBase = 0x24000000u;
+        h723.ramSize = 320u * 1024u;
+        h723.flashBase = 0x08000000u;
+        h723.flashSize = 1024u * 1024u;
+        h723.flashSectorSize = 128u * 1024u;
+        h723.flashWordSize = 32u;
+        h723.omitStepRetireSticky = true;
+        state_.profile = h723;
+        state_.dpIdcode = h723.dpIdcode;
+      }
+      state_.ram.assign(state_.profile.ramSize, 0);
+      state_.flash.assign(state_.profile.flashSize, 0);
+      for (uint32_t i = 0; i < state_.profile.ramSize; ++i) {
+        state_.ram[i] = mockByteAt(state_.profile.ramBase + i);
+      }
+      for (uint32_t i = 0; i < state_.profile.flashSize; ++i) {
+        state_.flash[i] = mockByteAt(state_.profile.flashBase + i);
+      }
       const uint32_t vectorWords[] = {
           kMockFlashVectorWord0, kMockFlashVectorWord1,
           kMockFlashVectorWord2, kMockFlashVectorWord3};
@@ -170,7 +194,6 @@ Result MockCmsisDapTransport::open(const DeviceDescriptor& device) {
       state_.registers[18] = state_.registers[13];
       injection_ = MockInjection{};
       commandHistory_.clear();
-      const std::string key = behaviorKey(candidate);
       if (key == "1234:567F") injection_.waitBudget = 2;
       if (key == "1234:5680") {
         injection_.faultOnFirst = true;
@@ -449,13 +472,14 @@ uint32_t MockCmsisDapTransport::readMemWord(uint32_t address) {
       && (address & 3u) == 0) {
     return state_.fpComp[(address - kMockFpbComp0) / 4u];
   }
-  if (address == 0xE0042000u) return 0x10006413u;
-  if (address == 0x1FFF7A20u) return 0x00020000u;
+  if (address == state_.profile.idcodeAddress) return state_.profile.idcodeValue;
+  if (address == state_.profile.flashSizeWordAddress) return state_.profile.flashSizeWordValue;
   const uint8_t* base = nullptr;
-  if (address >= kMockRamBase && address + 4 <= kMockRamBase + kMockRamSize) {
-    base = state_.ram.data() + (address - kMockRamBase);
-  } else if (address >= kMockFlashBase && address + 4 <= kMockFlashBase + kMockFlashSize) {
-    base = state_.flash.data() + (address - kMockFlashBase);
+  if (address >= state_.profile.ramBase && address + 4 <= state_.profile.ramBase + state_.profile.ramSize) {
+    base = state_.ram.data() + (address - state_.profile.ramBase);
+  } else if (address >= state_.profile.flashBase
+             && address + 4 <= state_.profile.flashBase + state_.profile.flashSize) {
+    base = state_.flash.data() + (address - state_.profile.flashBase);
   } else {
     // Unmapped memory reads as zero (documented mock behavior).
     return 0;
@@ -503,8 +527,10 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
                              (maskInterrupts ? kMockCoreDebugCMaskInts : 0u)
                        : 0;
     if (halt || step || (wasHalted && !debugEnabled)) {
-      state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady |
-                      kMockCoreDebugSRetireSt;
+      state_.dhcsr |= kMockCoreDebugSHalt | kMockCoreDebugSRegReady;
+      if (!(step && state_.profile.omitStepRetireSticky)) {
+        state_.dhcsr |= kMockCoreDebugSRetireSt;
+      }
     }
     if (step) {
       const uint32_t pc = state_.registers[15];
@@ -669,10 +695,11 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
   }
   uint8_t* base = nullptr;
   bool isFlash = false;
-  if (address >= kMockRamBase && address + 4 <= kMockRamBase + kMockRamSize) {
-    base = state_.ram.data() + (address - kMockRamBase);
-  } else if (address >= kMockFlashBase && address + 4 <= kMockFlashBase + kMockFlashSize) {
-    base = state_.flash.data() + (address - kMockFlashBase);
+  if (address >= state_.profile.ramBase && address + 4 <= state_.profile.ramBase + state_.profile.ramSize) {
+    base = state_.ram.data() + (address - state_.profile.ramBase);
+  } else if (address >= state_.profile.flashBase
+             && address + 4 <= state_.profile.flashBase + state_.profile.flashSize) {
+    base = state_.flash.data() + (address - state_.profile.flashBase);
     isFlash = true;
   } else {
     return;  // writes to unmapped memory are dropped
@@ -795,49 +822,74 @@ void MockCmsisDapTransport::runPreparedFlashAlgorithm() {
     lost_ = true;
     return;
   }
+  const MockTargetProfile& profile = state_.profile;
   if (injection_.flashBusy) {
     returnCode = 1;
   } else if (injection_.flashProtected && operation != "init" && operation != "uninit") {
     returnCode = 2;
   } else if (operation == "eraseSector") {
     injection_.flashEraseCount++;
-    if (address < kMockFlashBase || address + size > kMockFlashBase + kMockFlashSize || size == 0) {
+    bool rangeOk = address >= profile.flashBase && size != 0
+                   && address + size <= profile.flashBase + profile.flashSize;
+    if (rangeOk && profile.flashSectorSize != 0) {
+      // Uniform-sector profiles accept exactly one sector-aligned erase.
+      rangeOk = size == profile.flashSectorSize
+                && (address - profile.flashBase) % profile.flashSectorSize == 0;
+    }
+    if (!rangeOk) {
       returnCode = 3;
     } else {
-      std::fill(state_.flash.begin() + (address - kMockFlashBase),
-                state_.flash.begin() + (address - kMockFlashBase) + size,
+      std::fill(state_.flash.begin() + (address - profile.flashBase),
+                state_.flash.begin() + (address - profile.flashBase) + size,
                 static_cast<uint8_t>(0xFF));
     }
   } else if (operation == "programPage") {
     injection_.flashProgramCount++;
-    if (address < kMockFlashBase || address + size > kMockFlashBase + kMockFlashSize || data.size() < size) {
+    if (address < profile.flashBase || address + size > profile.flashBase + profile.flashSize
+        || data.size() < size) {
       returnCode = 3;
     } else {
       for (uint32_t index = 0; index < size; ++index) {
-        const uint8_t oldValue = state_.flash[address - kMockFlashBase + index];
+        const uint8_t oldValue = state_.flash[address - profile.flashBase + index];
         const uint8_t newValue = data[index];
         if ((oldValue & newValue) != newValue) {
           returnCode = 4;  // programming can only change 1 -> 0
           break;
         }
       }
+      if (returnCode == 0 && profile.flashWordSize != 0) {
+        // ECC-word profiles forbid programming into any flash word that is
+        // not fully erased, even when the new data only clears bits.
+        const uint32_t wordSize = profile.flashWordSize;
+        const uint32_t firstWord = (address - profile.flashBase) / wordSize;
+        const uint32_t lastWord = (address + size - 1 - profile.flashBase) / wordSize;
+        for (uint32_t word = firstWord; word <= lastWord && returnCode == 0; ++word) {
+          for (uint32_t index = 0; index < wordSize; ++index) {
+            if (state_.flash[word * wordSize + index] != 0xFFu) {
+              returnCode = 4;
+              break;
+            }
+          }
+        }
+      }
       if (returnCode == 0) {
         for (uint32_t index = 0; index < size; ++index) {
-          state_.flash[address - kMockFlashBase + index] &= data[index];
+          state_.flash[address - profile.flashBase + index] &= data[index];
         }
         if (injection_.verifyCorruption && size > 0) {
-          state_.flash[address - kMockFlashBase] |= 0x01u;
+          state_.flash[address - profile.flashBase] |= 0x01u;
           injection_.verifyCorruption = false;
         }
       }
     }
   } else if (operation == "verify") {
     injection_.flashVerifyCount++;
-    if (address < kMockFlashBase || address + size > kMockFlashBase + kMockFlashSize || data.size() < size) {
+    if (address < profile.flashBase || address + size > profile.flashBase + profile.flashSize
+        || data.size() < size) {
       returnCode = 3;
     } else {
       for (uint32_t index = 0; index < size; ++index) {
-        if (state_.flash[address - kMockFlashBase + index] != data[index]) {
+        if (state_.flash[address - profile.flashBase + index] != data[index]) {
           returnCode = 5;
           break;
         }

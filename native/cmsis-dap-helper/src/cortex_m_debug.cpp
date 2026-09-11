@@ -110,7 +110,7 @@ Result CortexMDebug::waitForHalt(bool halted, uint32_t& dhcsr,
                                  CortexMDebugDiagnostics* operationDiagnostics) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {
-    const Result result = readDhcsr(dhcsr, diag, timeout);
+    const Result result = readDhcsr(dhcsr, diag, ioTimeout(timeout));
     if (!result.ok) return result;
     if (((dhcsr & kCoreDebugSHalt) != 0) == halted) return Result::success();
     if ((dhcsr & kCoreDebugSLockup) != 0) break;
@@ -388,6 +388,8 @@ Result CortexMDebug::executeInstructionStep(
                                                kCoreDebugCStep | kCoreDebugCMaskInts,
                        diag, timeout);
   }
+  bool pcAfterValid = false;
+  bool checkedPcFallback = false;
   if (result.ok) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
@@ -397,8 +399,28 @@ Result CortexMDebug::executeInstructionStep(
       step.halted = (step.dhcsr & kCoreDebugSHalt) != 0;
       step.instructionRetired = (step.dhcsr & kCoreDebugSRetireSt) != 0;
       if (step.halted && step.instructionRetired) break;
-      if ((step.dhcsr & kCoreDebugSLockup) != 0 ||
-          std::chrono::steady_clock::now() >= deadline) {
+      const bool lockup = (step.dhcsr & kCoreDebugSLockup) != 0;
+      const bool timedOut = std::chrono::steady_clock::now() >= deadline;
+      // STM32H723 / Cortex-M7 has been observed to execute C_STEP and re-halt
+      // with a new PC without latching S_RETIRE_ST. Confirm retirement by PC
+      // once the core is halted, and again at timeout in case C_STEP was still
+      // in flight on the first check.
+      if (step.halted && !lockup && (!checkedPcFallback || timedOut)) {
+        uint32_t pcAfter = 0;
+        const Result pcResult =
+            readRegisterWithDhcsr(15, pcAfter, step.dhcsr, diag, timeout);
+        checkedPcFallback = true;
+        if (!pcResult.ok) {
+          result = pcResult;
+          break;
+        }
+        if (pcAfter != pcBefore) {
+          step.pcAfter = pcAfter;
+          pcAfterValid = true;
+          break;
+        }
+      }
+      if (lockup || timedOut) {
         result = Result::error(
             ErrorCodes::kDapControlTimeout,
             "Cortex-M instruction step did not retire before the control timeout");
@@ -407,7 +429,7 @@ Result CortexMDebug::executeInstructionStep(
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
-  if (result.ok) {
+  if (result.ok && !pcAfterValid) {
     result = readRegisterWithDhcsr(15, step.pcAfter, step.dhcsr, diag, timeout);
   }
 
@@ -430,8 +452,8 @@ Result CortexMDebug::executeFlashAlgorithm(const FlashAlgorithmRunRequest& reque
                                            DapTransferDiagnostics& diag,
                                            std::chrono::milliseconds timeout,
                                            CortexMDebugDiagnostics* operationDiagnostics) {
-  constexpr uint32_t kSramBase = 0x20000000u;
-  constexpr uint32_t kSramEnd = 0x20020000u;
+  const uint32_t kSramBase = request.ramBase;
+  const uint32_t kSramEnd = request.ramBase + request.ramSize;
   const auto inSram = [=](uint32_t address, uint32_t size) {
     return address >= kSramBase && size <= kSramEnd - address;
   };
@@ -583,7 +605,11 @@ Result CortexMDebug::executeFlashAlgorithm(const FlashAlgorithmRunRequest& reque
                             kCoreDebugCMaskInts,
                         diag, ioTimeout(timeout));
   if (!operation.ok) return operation;
-  operation = waitForHalt(true, dhcsr, diag, ioTimeout(timeout),
+  // Native DAP I/O stays bounded at 2 s, but the algorithm itself (128 KiB
+  // H7 sector erase, or a HardFaulted Verify) must be allowed to run until
+  // the caller's per-operation timeout. Capping waitForHalt at ioTimeout
+  // would report AlgorithmTimeout after 2 s even when eraseTimeoutMs is 30 s.
+  operation = waitForHalt(true, dhcsr, diag, timeout,
                           request.operation.c_str(), operationDiagnostics);
   if (!operation.ok) return operation;
   operation = writeWord(kCoreDebugDhcsr,

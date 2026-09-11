@@ -32,11 +32,14 @@ import {
   findDefaultHelperPath,
 } from './cmsis-dap-helper-channel';
 import {
+  CmsisDapFlashError,
   CmsisDapFlashOptions,
   CmsisDapFlashResult,
-  flashCmsisDapElf,
   FlashAlgorithmRunRequest,
   FlashAlgorithmRunData,
+  FlashTargetDefinition,
+  flashCmsisDapElf,
+  resolveFlashTarget,
 } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
 import { NativeSchedulerCancelledError } from './native-scheduler';
@@ -93,6 +96,12 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   stopRtt(): Promise<CppJLinkResult<any>>;
   readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
   flash?(elfPath: string, device: string, options?: CmsisDapFlashOptions): Promise<CppJLinkResult<CmsisDapFlashResult>>;
+  /**
+   * Registry definition of the session device, resolved at connect. Null when
+   * the device is missing or not registered; consumers must treat null as
+   * "no target knowledge", not as a specific target.
+   */
+  readonly flashTarget?: FlashTargetDefinition | null;
   getPerformanceDiagnostics?(): Record<string, unknown>;
   getSchedulerSnapshot?(): Record<string, unknown>;
   dispose(graceful?: boolean): Promise<void>;
@@ -115,6 +124,7 @@ export class SessionTargetSelector {
 
   get ownerKind(): SessionTargetOwnerKind { return this.owner?.kind || 'none'; }
   get usingNative(): boolean { return this.owner?.usingNative === true; }
+  get flashTarget(): FlashTargetDefinition | null { return this.owner?.flashTarget ?? null; }
 
   async connect(
     config: SessionTargetConnectConfig,
@@ -251,10 +261,12 @@ export class SessionTargetSelector {
   async stepIntoSourceLine(request: NativeStepIntoSourceLineRequest) {
     return this.call('stepIntoSourceLine', owner => owner.stepIntoSourceLine(request));
   }
-  async stepOverSourceLine(request: NativeStepOverRequest) {
-    return this.call('stepOverSourceLine', owner => owner.stepOverSourceLine(request));
+  async stepOverSourceLine(request: NativeStepOverRequest, onStepResumed?: () => void) {
+    return this.call('stepOverSourceLine', owner => owner.stepOverSourceLine(request, onStepResumed));
   }
-  async stepOut(request: NativeStepOutRequest) { return this.call('stepOut', owner => owner.stepOut(request)); }
+  async stepOut(request: NativeStepOutRequest, onStepResumed?: () => void) {
+    return this.call('stepOut', owner => owner.stepOut(request, onStepResumed));
+  }
 
   async dispose(graceful = true): Promise<void> {
     const owner = this.owner;
@@ -446,6 +458,12 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private readonly helper: CmsisDapHelperClient;
   private state: 'idle' | 'opened' | 'connected' | 'failed' = 'idle';
   private lastDevice: CmsisDapDeviceInfo | null = null;
+  private flashTargetDef: FlashTargetDefinition | null = null;
+
+  /** Registry definition of the connected device; null when unregistered. */
+  get flashTarget(): FlashTargetDefinition | null {
+    return this.flashTargetDef;
+  }
 
   getPerformanceDiagnostics(): Record<string, unknown> {
     return { owner: this.kind, ...this.helper.getPerformanceSnapshot() };
@@ -550,6 +568,15 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         );
       }
       this.state = 'connected';
+      // Resolve the session device once for data-driven gating (Watch writes).
+      // An unregistered device must not fail connect here; flash() re-resolves
+      // and reports the structured registry error at flash time.
+      try {
+        this.flashTargetDef = config.device ? resolveFlashTarget(config.device) : null;
+      } catch {
+        this.flashTargetDef = null;
+        log.dll(`[cmsis-dap] session device is not in the flash target registry device=${config.device} owner=cmsis-dap`);
+      }
       log.dll(`[cmsis-dap] connected port=${(connected.data as { port?: string })?.port || 'unknown'} owner=cmsis-dap `
         + `fpbRevision=${fpb.data.revision} codeComparators=${fpb.data.codeComparators} fpbSanitized=true`);
       return {
@@ -586,6 +613,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     await this.helper.dispose(true).catch(() => {});
     this.state = 'idle';
     this.lastDevice = null;
+    this.flashTargetDef = null;
     log.dll('[cmsis-dap] disconnected owner=cmsis-dap');
     return { ok: true, message: 'CMSIS-DAP disconnected', targetState: 'Disconnected', elapsedMs: 0, data: {} };
   }
@@ -650,6 +678,21 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   async flash(elfPath: string, device: string, options: CmsisDapFlashOptions = {}) {
     if (this.state !== 'connected') return this.invalidState<CmsisDapFlashResult>('flash');
+    // Resolve the device through the flash target registry before entering
+    // the control critical section so an unregistered device fails fast with
+    // a structured TargetMismatch instead of touching the target.
+    let target: FlashTargetDefinition;
+    try {
+      target = resolveFlashTarget(device);
+    } catch (error) {
+      if (!(error instanceof CmsisDapFlashError)) throw error;
+      log.dll(`[cmsis-dap] flash target resolution failed device=${device} owner=cmsis-dap `
+        + `errorCode=${error.code}`);
+      return failure<CmsisDapFlashResult>(error.message, error.code, {
+        ownerKind: 'cmsis-dap',
+        ...error.diagnostics,
+      });
+    }
     const result = await this.helper.withControlCriticalSection(async (controlRequest: CmsisDapControlRequest) =>
       flashCmsisDapElf({
         readDp: async reg => {
@@ -685,7 +728,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
             + `size=${report.size} elapsedMs=${report.elapsedMs} ok=${report.ok} `
             + `errorCode=${report.errorCode || ''}`);
         },
-      }));
+      }, target));
     const elapsedMs = result.reports.reduce((total, item) => total + item.elapsedMs, 0);
     if (!result.success) {
       return {
@@ -916,11 +959,13 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   async stepIntoSourceLine(request: NativeStepIntoSourceLineRequest) {
     return this.controlViaHelper<NativeStepIntoDiagnostics>('stepIntoSourceLine', request as unknown as Record<string, unknown>);
   }
-  async stepOverSourceLine(request: NativeStepOverRequest) {
-    return this.controlViaHelper<NativeStepOverDiagnostics>('stepOverSourceLine', request as unknown as Record<string, unknown>);
+  async stepOverSourceLine(request: NativeStepOverRequest, onStepResumed?: () => void) {
+    return this.controlViaHelper<NativeStepOverDiagnostics>(
+      'stepOverSourceLine', request as unknown as Record<string, unknown>, onStepResumed);
   }
-  async stepOut(request: NativeStepOutRequest) {
-    return this.controlViaHelper<NativeStepOutDiagnostics>('stepOut', request as unknown as Record<string, unknown>);
+  async stepOut(request: NativeStepOutRequest, onStepResumed?: () => void) {
+    return this.controlViaHelper<NativeStepOutDiagnostics>(
+      'stepOut', request as unknown as Record<string, unknown>, onStepResumed);
   }
   async dispose(graceful = true): Promise<void> {
     if (this.state !== 'idle') await this.disconnect().catch(() => {});
@@ -1010,13 +1055,16 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private async controlViaHelper<THelper>(
     method: string,
     params: Record<string, unknown>,
+    onStepResumed?: () => void,
   ): Promise<CppJLinkResult<THelper>> {
     if (this.state !== 'connected') {
       return this.invalidState<THelper>(method);
     }
     let result: CppJLinkResult<THelper>;
     try {
-      result = await this.helper.controlRequest<THelper>(method, params);
+      result = onStepResumed
+        ? await this.helper.controlRequest<THelper>(method, params, onStepResumed)
+        : await this.helper.controlRequest<THelper>(method, params);
     } catch (error) {
       if (error instanceof NativeSchedulerCancelledError) {
         return {

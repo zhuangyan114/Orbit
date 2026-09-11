@@ -113,7 +113,5 @@ control > watch > timeline > background
 - [Automation API v1](api/orbit-automation-api.md)
 - [验收矩阵](api/orbit-automation-acceptance-matrix.md)
 - [硬件验收](api/orbit-automation-hardware-acceptance.md)
-- [DAP/owner 验证矩阵](debug-engine-refactor/validation-matrix.md)
-- [Native scheduler 设计](debug-engine-refactor/native-scheduler-design.md)
-- [实时变量保护](debug-engine-refactor/realtime-variable-protection.md)
+- [CMSIS-DAP Flash 算法参考](cmsis-dap-flash-algorithm-references.md)
 - [`AGENTS.md`](../AGENTS.md)

@@ -23,9 +23,10 @@ STM32F407 and STM32H723 images are compiled from the original sources in
 
 Register facts verified against the ST sources above. CMSIS-DAP hardware
 acceptance P7-1 through P7-5 ran on STM32H723VGT6 with CMSIS-DAP_LU
-(VID `C251` PID `F001` serial `LU_2022_8888`, HID). Evidence JSON is in
-`outputs/h723-p7/`. J-Link (P7-6) and long-run disconnect (P7-7) are
-deferred until a J-Link session is available.
+(VID `C251` PID `F001` serial `LU_2022_8888`, HID). J-Link P7-6 ran on the
+same board with a J-Link (V9.56, VID `1366` PID `0101`, S/N `000164000406`).
+Evidence JSON is in `outputs/h723-p7/`. Long-run disconnect (P7-7) is
+deferred.
 
 | Fact | Value | Status |
 | --- | --- | --- |
@@ -47,7 +48,8 @@ deferred until a J-Link session is available.
 | AXI SRAM DAP write | `0x24000100` write/readback restored | verified on hardware P7-2 |
 | DTCM / D2 / D3 DAP write | DTCM `0x20000100`, SRAM1-3 `0x30000000`, SRAM4 `0x38000000` write/readback restored | verified on hardware P7-2 |
 | CMSIS-DAP ELF flash | `h7vgt6_test.elf` via `flashBeforeDebug: true`, owner=`cmsis-dap`, no J-Link fallback | verified on hardware P7-5 |
-| J-Link owner path | same board, DLL-side flash | deferred (P7-6, no J-Link session) |
+| J-Link owner path | `h7vgt6_test.elf`, `device: STM32H723VG` via `JLink.exe` Commander, owner=`jlink-native` only; DPIDR `0x6BA02477`, VTref 3.285 V, connect+flash+entry-stop ~2.4 s | verified on hardware P7-6 (2026-09-11) |
+| J-Link device database | J-Link V9.56 has no `STM32H723VGT6`; Commander reports the name as unknown, falls back to `STM32H723VG` and can stall on a device-selection dialog. Use `STM32H723VG` for `probe: "jlink"` | observed on hardware P7-6 |
 | Long-run / disconnect | sampling unplug / helper crash | deferred (P7-7) |
 
 ## Architecture decision

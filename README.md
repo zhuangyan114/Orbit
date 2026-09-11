@@ -63,7 +63,7 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 - [全套工具链教程](Releases/docs/全套工具链教程.md)：面向第一次从 Keil5 等集成 IDE 转到 VS Code 的用户，从零安装和配置 ARM GCC、CMake、CMake Tools、J-Link 与 Orbit，并完成第一次编译和调试。
 - [用户文档](Releases/docs/user-guide.md)：面向已经具备基本 VS Code/嵌入式开发环境的用户，作为 Orbit 的正式参考手册，覆盖安装要求、`launch.json`、Watch、Timeline、RTT、P-RTLog、RTOS Views、Memory View、Peripheral Viewer、Native/Legacy、Automation API、MCP、FAQ 和已知限制。
 - [Automation API v1](docs/api/orbit-automation-api.md)：本机 JSON-RPC / SSE 协议、握手、generation fence 和客户端快速开始。
-- [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)：自动化 / Mock / 真实硬件分层状态。Automation API 1.1.1 已通过 J-Link native 与 CMSIS-DAP HID v1（均无 flash）。1.1.2 另完成 STM32H723VGT6 的 CMSIS-DAP Flash 真机验收（P7-1～P7-5）；H723 的 J-Link 真机与长稳/断线不在本版范围。
+- [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)：自动化 / Mock / 真实硬件分层状态。Automation API 1.1.1 已通过 J-Link native 与 CMSIS-DAP HID v1（均无 flash）。STM32H723VGT6 的器件支持验收记录见[支持计划](docs/stm32h723-support-plan.md)：CMSIS-DAP Flash 已通过 P7-1～P7-5，J-Link 已通过 P7-6（2026-09-11）；长稳/断线（P7-7）未验收。
 
 两份教程互相补充，并不是重复内容：
 
@@ -90,12 +90,14 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 ## 1.1.2 更新日志
 
 - CMSIS-DAP 链路新增 STM32H723VGT6（别名 `STM32H723VG`）器件注册与自研 Flash Algorithm
+- STM32H723VGT6 的 J-Link 链路完成真机验收：连接、烧录、断点、Watch、源级单步与断开清理（P7-6）
+- 修复 CMSIS-DAP 源级步进等待临时断点期间的会话状态显示，并让 control 期间的目标状态查询不再排队
 
 ## 预告
 
 - 会尽快支持 CMSIS-DAP-V2
 - CMSIS-DAP 链路后续会尽快支持 F103C8T6
-- STM32H723 的 J-Link 真机验收放到后续版本
+- STM32H723 的长稳与断线行为（P7-7）待补验收
 
 ## 许可证
 

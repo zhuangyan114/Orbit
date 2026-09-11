@@ -1,5 +1,9 @@
 # Orbit for VS Code - Agent Guide
 
+## Git
+
+- Git 提交信息一律使用中文。
+
 ## Scope and Working Tree
 
 - This is a Windows VS Code extension. The supported target access stacks are J-Link (native C++ helper or in-process `koffi` legacy channel) and CMSIS-DAP/DAPLink (dedicated native C++ helper over WinUSB v2 or HID v1). Do not add OpenOCD, a GDB server, Ozone GUI automation, or `JLink.exe` as a normal debug-control path.

@@ -60,18 +60,25 @@ const lines = readline.createInterface({ input: child.stdout });
 const pending = new Map();
 let nextId = 1;
 let failures = 0;
+let lastStepEvent = null;
 
 lines.on('line', line => {
-  let response;
+  let frame;
   try {
-    response = JSON.parse(line);
+    frame = JSON.parse(line);
   } catch {
     throw new Error(`helper printed a non-JSON line: ${line}`);
   }
-  const resolve = pending.get(response.id);
+  if (frame.type === 'event') {
+    // Helper event frames (e.g. stepResumed) arrive before the owning
+    // request's response and never resolve the pending request.
+    if (frame.event === 'stepResumed') lastStepEvent = frame;
+    return;
+  }
+  const resolve = pending.get(frame.id);
   if (resolve) {
-    pending.delete(response.id);
-    resolve(response.result);
+    pending.delete(frame.id);
+    resolve(frame.result);
   }
 });
 
@@ -1074,6 +1081,7 @@ async function runDap05CleanupMatrix() {
   const user = await request('setBreakpoint', {
     address: 0x080001C0, preferredSlot: 0, timeoutMs: 100,
   });
+  lastStepEvent = null;
   const timedOut = await request('stepOverSourceLine', {
     lineStart: 0x080001C0, lineEnd: 0x080001C6, maxInstructionSteps: 16, timeoutMs: 10,
   });
@@ -1084,6 +1092,9 @@ async function runDap05CleanupMatrix() {
   check('dap05-cleanup: timeout reports the recovered halt PC', !timedOut.ok
     && timedOut.data && timedOut.data.stopReason === 'RecoveryHalt'
     && typeof timedOut.data.pcAfter === 'number', JSON.stringify(timedOut));
+  check('dap05-cleanup: helper emits stepResumed before waiting for halt', lastStepEvent !== null
+    && lastStepEvent.event === 'stepResumed'
+    && typeof lastStepEvent.id === 'number', JSON.stringify(lastStepEvent));
   const duplicate = await request('setBreakpoint', { address: 0x080001C0, timeoutMs: 100 });
   const reusedTemporarySlot = await request('setBreakpoint', {
     address: 0x080001C2, preferredSlot: 1, timeoutMs: 100,

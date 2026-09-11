@@ -261,10 +261,12 @@ export class SessionTargetSelector {
   async stepIntoSourceLine(request: NativeStepIntoSourceLineRequest) {
     return this.call('stepIntoSourceLine', owner => owner.stepIntoSourceLine(request));
   }
-  async stepOverSourceLine(request: NativeStepOverRequest) {
-    return this.call('stepOverSourceLine', owner => owner.stepOverSourceLine(request));
+  async stepOverSourceLine(request: NativeStepOverRequest, onStepResumed?: () => void) {
+    return this.call('stepOverSourceLine', owner => owner.stepOverSourceLine(request, onStepResumed));
   }
-  async stepOut(request: NativeStepOutRequest) { return this.call('stepOut', owner => owner.stepOut(request)); }
+  async stepOut(request: NativeStepOutRequest, onStepResumed?: () => void) {
+    return this.call('stepOut', owner => owner.stepOut(request, onStepResumed));
+  }
 
   async dispose(graceful = true): Promise<void> {
     const owner = this.owner;
@@ -957,11 +959,13 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   async stepIntoSourceLine(request: NativeStepIntoSourceLineRequest) {
     return this.controlViaHelper<NativeStepIntoDiagnostics>('stepIntoSourceLine', request as unknown as Record<string, unknown>);
   }
-  async stepOverSourceLine(request: NativeStepOverRequest) {
-    return this.controlViaHelper<NativeStepOverDiagnostics>('stepOverSourceLine', request as unknown as Record<string, unknown>);
+  async stepOverSourceLine(request: NativeStepOverRequest, onStepResumed?: () => void) {
+    return this.controlViaHelper<NativeStepOverDiagnostics>(
+      'stepOverSourceLine', request as unknown as Record<string, unknown>, onStepResumed);
   }
-  async stepOut(request: NativeStepOutRequest) {
-    return this.controlViaHelper<NativeStepOutDiagnostics>('stepOut', request as unknown as Record<string, unknown>);
+  async stepOut(request: NativeStepOutRequest, onStepResumed?: () => void) {
+    return this.controlViaHelper<NativeStepOutDiagnostics>(
+      'stepOut', request as unknown as Record<string, unknown>, onStepResumed);
   }
   async dispose(graceful = true): Promise<void> {
     if (this.state !== 'idle') await this.disconnect().catch(() => {});
@@ -1051,13 +1055,16 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private async controlViaHelper<THelper>(
     method: string,
     params: Record<string, unknown>,
+    onStepResumed?: () => void,
   ): Promise<CppJLinkResult<THelper>> {
     if (this.state !== 'connected') {
       return this.invalidState<THelper>(method);
     }
     let result: CppJLinkResult<THelper>;
     try {
-      result = await this.helper.controlRequest<THelper>(method, params);
+      result = onStepResumed
+        ? await this.helper.controlRequest<THelper>(method, params, onStepResumed)
+        : await this.helper.controlRequest<THelper>(method, params);
     } catch (error) {
       if (error instanceof NativeSchedulerCancelledError) {
         return {

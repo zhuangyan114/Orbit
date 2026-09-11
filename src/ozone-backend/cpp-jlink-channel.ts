@@ -123,8 +123,16 @@ export interface NativeStepExecutor {
   readRegister?(index: number): Promise<CppJLinkResult<{ value: number }>>;
   stepIntoInstruction(): Promise<CppJLinkResult<NativeStepIntoDiagnostics>>;
   stepIntoSourceLine(request: NativeStepIntoSourceLineRequest): Promise<CppJLinkResult<NativeStepIntoDiagnostics>>;
-  stepOverSourceLine(request: NativeStepOverRequest): Promise<CppJLinkResult<NativeStepOverDiagnostics>>;
-  stepOut(request: NativeStepOutRequest): Promise<CppJLinkResult<NativeStepOutDiagnostics>>;
+  /** `onStepResumed` fires once the owner resumed the target and is waiting
+   *  for the temporary breakpoint; owners without that signal ignore it. */
+  stepOverSourceLine(
+    request: NativeStepOverRequest,
+    onStepResumed?: () => void,
+  ): Promise<CppJLinkResult<NativeStepOverDiagnostics>>;
+  stepOut(
+    request: NativeStepOutRequest,
+    onStepResumed?: () => void,
+  ): Promise<CppJLinkResult<NativeStepOutDiagnostics>>;
 }
 
 export interface SessionNativeExecutor extends NativeStepExecutor {

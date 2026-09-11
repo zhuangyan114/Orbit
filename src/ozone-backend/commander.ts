@@ -330,15 +330,15 @@ export class OzoneBackend {
             ? (this.state = TargetState.Running, { ok: true, data: 'Running' })
             : { ok: false, error: 'Run failed' };
         case 'stepOver':
-          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepOver();
+          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepOver(command.onStepResumed);
           return await this.profileStepCommand('stepOver', () => this.doStepOver());
         case 'stepInto':
-          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepInto();
+          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepInto(command.onStepResumed);
           return await this.profileStepCommand('stepInto', () => this.doStepInto());
         case 'stepIntoInstruction':
           return await this.doStepIntoInstruction();
         case 'stepOut':
-          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepOut();
+          if (this.isCmsisDapOwner()) return await this.doCmsisDapStepOut(command.onStepResumed);
           return await this.profileStepCommand('stepOut', () => this.doStepOut());
         case 'reset':
           this.clearNativeStopInfo('reset requested');
@@ -1398,7 +1398,7 @@ case 'readVariableRuntime':
     return this.doSingleStep();
   }
 
-  private async doCmsisDapStepInto(): Promise<OzoneCommandResult> {
+  private async doCmsisDapStepInto(_onStepResumed?: () => void): Promise<OzoneCommandResult> {
     const pc = await this.readRegisterValue(REG_INDEXES.PC, 'PC');
     if (pc === null) return this.cmsisDapSourceStepPreparationError('stepInto', 'cannot read PC');
     const bounds = this.resolveNativeLineBounds(pc);
@@ -1415,7 +1415,7 @@ case 'readVariableRuntime':
     return this.continueCmsisDapStepAcrossSameSourceLine('stepInto', pc, bounds, result, run);
   }
 
-  private async doCmsisDapStepOver(): Promise<OzoneCommandResult> {
+  private async doCmsisDapStepOver(onStepResumed?: () => void): Promise<OzoneCommandResult> {
     const pc = await this.readRegisterValue(REG_INDEXES.PC, 'PC');
     if (pc === null) return this.cmsisDapSourceStepPreparationError('stepOver', 'cannot read PC');
     const bounds = this.resolveNativeLineBounds(pc);
@@ -1432,7 +1432,7 @@ case 'readVariableRuntime':
         timeoutMs: 10000,
         maxInstructionSteps: 128,
         breakpoints: this.snapshotBreakpoints(),
-      }),
+      }, onStepResumed),
     );
     const result = await run(bounds);
     return this.continueCmsisDapStepAcrossSameSourceLine('stepOver', pc, bounds, result, run);
@@ -1468,7 +1468,7 @@ case 'readVariableRuntime':
     return run(continuationBounds);
   }
 
-  private async doCmsisDapStepOut(): Promise<OzoneCommandResult> {
+  private async doCmsisDapStepOut(onStepResumed?: () => void): Promise<OzoneCommandResult> {
     const pc = await this.readRegisterValue(REG_INDEXES.PC, 'PC');
     if (pc === null) return this.cmsisDapSourceStepPreparationError('stepOut', 'cannot read PC');
     const functionRange = this.resolveFunctionRange(pc);
@@ -1479,7 +1479,7 @@ case 'readVariableRuntime':
       waitTimeoutMs: 10000,
       timeoutMs: 10000,
       breakpoints: this.snapshotBreakpoints(),
-    }));
+    }, onStepResumed));
   }
 
   private cmsisDapSourceStepPreparationError(capability: string, detail: string): OzoneCommandResult {

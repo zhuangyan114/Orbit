@@ -495,6 +495,64 @@ describe('DapSession CMSIS-DAP control routing', () => {
     expect(backend.execute).toHaveBeenCalledTimes(1);
   });
 
+  it('shows the target as running while a long stepOver waits for the temporary breakpoint', async () => {
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string; onStepResumed?: () => void }) => {
+        if (command.cmd === 'stepOver') {
+          command.onStepResumed?.();
+          return {
+            ok: true,
+            data: { mode: 'cmsis-dap', pcBefore: 0x080001C0, pcAfter: 0x080001C6 },
+          };
+        }
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        return { ok: false, error: `unexpected ${command.cmd}` };
+      }),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any)._probe = 'cmsis-dap';
+    (session as any).targetConnectionEstablished = true;
+    (session as any).phase = 'connected';
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleStep(request(1, 'next'), 'stepOver');
+
+    const continued = messages.filter(message => message.type === 'event' && message.event === 'continued');
+    const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
+    expect(continued).toHaveLength(1);
+    expect(continued[0]).toMatchObject({ body: { threadId: 1, allThreadsContinued: true } });
+    expect(stopped).toHaveLength(1);
+    expect(messages.indexOf(continued[0])).toBeLessThan(messages.indexOf(stopped[0]));
+    // The step ended halted: the session must finish in the halted state.
+    expect((session as any).targetRunning).toBe(false);
+    expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'stepOver',
+      onStepResumed: expect.any(Function),
+    }));
+  });
+
+  it('answers getTargetState from tracked state while a step holds the control gate', async () => {
+    const backend = {
+      execute: vi.fn(async () => ({ ok: false, error: 'must not reach the backend' })),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    (session as any).controlInProgress = true;
+    (session as any).targetRunning = true;
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+
+    await (session as any).handleGetTargetState(request(3, 'getTargetState'));
+    expect(messages.find(message => message.type === 'response'))
+      .toMatchObject({ success: true, body: { state: 'running' } });
+
+    (session as any).targetRunning = false;
+    await (session as any).handleGetTargetState(request(4, 'getTargetState'));
+    expect(messages.find(message => message.request_seq === 4))
+      .toMatchObject({ success: true, body: { state: 'halted' } });
+    expect(backend.execute).not.toHaveBeenCalled();
+  });
+
   it('emits continued only after CMSIS-DAP confirms Running, never through J-Link', async () => {
     const calls: string[] = [];
     const backend = {

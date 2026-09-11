@@ -224,6 +224,40 @@ describe('CMSIS-DAP helper control critical section', () => {
     });
   });
 
+  it('routes a stepResumed event frame to the owning request without resolving it', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const resumed: number[] = [];
+    const respond: Array<() => void> = [];
+    (helper as any).child = {
+      stdin: {
+        writable: true,
+        write(line: string) {
+          const request = JSON.parse(line);
+          (helper as any).handleLine(JSON.stringify({
+            type: 'event', event: 'stepResumed', id: request.id,
+          }));
+          // An unrelated event frame must not resolve or disturb the request.
+          (helper as any).handleLine(JSON.stringify({
+            type: 'event', event: 'stepResumed', id: 999,
+          }));
+          respond.push(() => {
+            (helper as any).handleLine(JSON.stringify({
+              id: request.id,
+              result: {
+                ok: true, message: 'step complete', targetState: 'Halted', elapsedMs: 1, data: {},
+              },
+            }));
+          });
+        },
+      },
+    };
+
+    const step = helper.controlRequest('stepOverSourceLine', {}, () => resumed.push(1));
+    expect(resumed).toEqual([1]);
+    respond[0]();
+    await expect(step).resolves.toMatchObject({ ok: true });
+  });
+
   it('gives RTT reads background priority so Timeline can run between polls', async () => {
     const helper = new CmsisDapHelperClient('unused-helper-path');
     const order: string[] = [];

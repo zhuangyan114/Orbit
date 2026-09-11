@@ -151,10 +151,10 @@ export type OzoneCommand =
   | { cmd: 'disconnect' }
   | { cmd: 'halt' }
   | { cmd: 'run' }
-  | { cmd: 'stepInto' }
-  | { cmd: 'stepIntoInstruction' }
-  | { cmd: 'stepOver' }
-  | { cmd: 'stepOut' }
+  | { cmd: 'stepInto'; onStepResumed?: () => void }
+  | { cmd: 'stepIntoInstruction'; onStepResumed?: () => void }
+  | { cmd: 'stepOver'; onStepResumed?: () => void }
+  | { cmd: 'stepOut'; onStepResumed?: () => void }
   | { cmd: 'reset' }
   | { cmd: 'runToEntryPoint'; symbol: string; reset: boolean }
   | { cmd: 'setBreakpoint'; file: string; line: number; type?: string; condition?: string }

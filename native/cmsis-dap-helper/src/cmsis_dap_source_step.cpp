@@ -98,6 +98,10 @@ Result CmsisDapSourceStepper::runTo(uint32_t currentPc, uint32_t address,
   output.returnAddress = temporary.address;
 
   Result operation = debug_->resume(diag, timeout);
+  if (operation.ok && !resumedNotified_) {
+    resumedNotified_ = true;
+    if (resumedListener_) resumedListener_();
+  }
   CortexMDebugState stopped;
   if (operation.ok) operation = waitForHalt(stopped, diag, timeout);
   if (!operation.ok) {

@@ -2746,6 +2746,20 @@ export class DapSession extends EventEmitter {
     });
   }
 
+  /**
+   * The CMSIS-DAP helper resumed the target and is now waiting for the
+   * temporary breakpoint, which may take seconds for a blocking call. Show
+   * the session as running so Watch/Timeline/webview state reflects the real
+   * execution instead of looking like the step was never issued. Sampling
+   * itself stays paused for the whole control critical section.
+   */
+  private onSourceStepResumed(cmd: string): void {
+    if (this.isSessionTerminating() || this.targetRunning) return;
+    this.setTargetRunning(true);
+    this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+    log.dap(`handleStep: ${cmd} helper resumed target, UI shows running`);
+  }
+
   private async handleStep(
     msg: DebugProtocolMessage,
     cmd: 'stepOver' | 'stepInto' | 'stepOut' | 'stepIntoInstruction',
@@ -2775,7 +2789,10 @@ export class DapSession extends EventEmitter {
         for (let attempt = 0; attempt < 3; attempt++) {
           log.dap(`handleStep: ${cmd} attempt ${attempt + 1}/3 start`);
           const tBackendStep = Date.now();
-          const result = await this.backend.execute({ cmd });
+          const result = await this.backend.execute({
+            cmd,
+            onStepResumed: () => this.onSourceStepResumed(cmd),
+          });
           const backendMs = Date.now() - tBackendStep;
           log.dap(`handleStep: ${cmd} attempt ${attempt + 1} result=${result.ok} ${result.ok ? '' : result.error}`);
           log.dap(`[stepProfile#${profileId}] ${cmd} backend=${backendMs}ms attempt=${attempt + 1} ok=${result.ok}`);
@@ -5034,6 +5051,13 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleGetTargetState(msg: DebugProtocolMessage) {
+    if (this.controlInProgress) {
+      // During control work (step/flash/continue) the native owner cannot
+      // serve state queries; answer from the session's tracked state so
+      // webviews keep updating instead of blocking behind the paused queue.
+      this.sendResponse(msg, { state: this.targetRunning ? 'running' : 'halted' });
+      return;
+    }
     const r = await this.queryTargetState('custom-request');
     this.sendResponse(msg, r.ok ? { state: r.data } : { state: 'error', error: r.error, errorCode: r.errorCode });
   }

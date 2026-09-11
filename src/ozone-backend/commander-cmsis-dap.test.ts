@@ -242,14 +242,19 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     const backend = new OzoneBackend(undefined, owner);
     addSourceLine(backend, 0x080001C0, 0x080001C6);
 
-    const result = await backend.execute({ cmd: 'stepOver' });
+    const onStepResumed = vi.fn();
+    const result = await backend.execute({ cmd: 'stepOver', onStepResumed });
 
     expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C6 } });
     expect(owner.stepOverSourceLine).toHaveBeenCalledOnce();
     expect(owner.stepOverSourceLine).toHaveBeenCalledWith(expect.objectContaining({
       waitTimeoutMs: 10000,
       timeoutMs: 10000,
-    }));
+    }), expect.any(Function));
+    expect(onStepResumed).not.toHaveBeenCalled();
+    const forwarded = (owner.stepOverSourceLine as any).mock.calls[0][1];
+    forwarded();
+    expect(onStepResumed).toHaveBeenCalledOnce();
     expect(owner.setBreakpoint).not.toHaveBeenCalled();
   });
 
@@ -345,14 +350,18 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     const backend = new OzoneBackend(undefined, owner);
     (backend as any).symbols = [{ name: 'callee', address: 0x080001E0, size: 0x20, type: 'T' }];
 
-    const result = await backend.execute({ cmd: 'stepOut' });
+    const onStepResumed = vi.fn();
+    const result = await backend.execute({ cmd: 'stepOut', onStepResumed });
 
     expect(result).toMatchObject({ ok: true, data: { mode: 'cmsis-dap', pcAfter: 0x080001C6 } });
     expect(owner.stepOut).toHaveBeenCalledOnce();
     expect(owner.stepOut).toHaveBeenCalledWith(expect.objectContaining({
       waitTimeoutMs: 10000,
       timeoutMs: 10000,
-    }));
+    }), expect.any(Function));
+    const forwarded = (owner.stepOut as any).mock.calls[0][1];
+    forwarded();
+    expect(onStepResumed).toHaveBeenCalledOnce();
     expect(owner.step).not.toHaveBeenCalled();
     expect(owner.setBreakpoint).not.toHaveBeenCalled();
   });

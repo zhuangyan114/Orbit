@@ -2254,7 +2254,16 @@ std::string handleClearAllBreakpoints(const JsonValue& params, Channel& channel)
                                           "\"fpb\":" + data));
 }
 
-std::string handleSourceStep(const char* operation, const JsonValue& params, Channel& channel) {
+// Notifies the client that the target has resumed and the step is now waiting
+// for the temporary breakpoint. Written directly to the protocol stream so it
+// precedes the final response of the owning request.
+void emitStepResumed(const JsonValue& id) {
+  std::cout << "{\"type\":\"event\",\"event\":\"stepResumed\",\"id\":"
+            << jsonSerialize(id) << "}\n" << std::flush;
+}
+
+std::string handleSourceStep(const char* operation, const JsonValue& params, Channel& channel,
+                             const JsonValue& id) {
   const auto started = std::chrono::steady_clock::now();
   const Result ready = channel.ensureReady();
   if (!ready.ok) return coreFailure(ready, operation, channel, started, 0, {});
@@ -2269,6 +2278,7 @@ std::string handleSourceStep(const char* operation, const JsonValue& params, Cha
       ensureDebugPower(channel, target, diagnostics, std::chrono::milliseconds(*timeout));
   if (!result.ok) return coreFailure(result, operation, channel, started, *timeout, diagnostics);
   CmsisDapSourceStepper stepper(&target, &debug, &channel.fpbState);
+  stepper.setResumedListener([&id] { emitStepResumed(id); });
   SourceStepResult step;
   if (std::string(operation) == "stepIntoSourceLine") {
     result = stepper.stepInto(static_cast<uint32_t>(uintField(params, "lineStart").value_or(0)),
@@ -2388,11 +2398,11 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
   } else if (name == "clearAllBreakpoints") {
     result = handleClearAllBreakpoints(*params, channel);
   } else if (name == "stepIntoSourceLine") {
-    result = handleSourceStep("stepIntoSourceLine", *params, channel);
+    result = handleSourceStep("stepIntoSourceLine", *params, channel, *id);
   } else if (name == "stepOverSourceLine") {
-    result = handleSourceStep("stepOverSourceLine", *params, channel);
+    result = handleSourceStep("stepOverSourceLine", *params, channel, *id);
   } else if (name == "stepOut") {
-    result = handleSourceStep("stepOut", *params, channel);
+    result = handleSourceStep("stepOut", *params, channel, *id);
   } else {
     const long long elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -4775,6 +4785,8 @@ int runSelfTest() {
     mock.prepareSourceInstruction(0x080001C2u, {0x00, 0xF0, 0x0D, 0xF8});
     FpbState fpbState;
     CmsisDapSourceStepper stepper(&target, &debug, &fpbState);
+    int resumedCount = 0;
+    stepper.setResumedListener([&resumedCount] { ++resumedCount; });
     SourceStepResult step;
     const Result result = stepper.stepOver(0x080001C2u, 0x080001C6u, 4u, step, diag,
                                            std::chrono::milliseconds(50));
@@ -4782,6 +4794,8 @@ int runSelfTest() {
                step.stopReason == "RecoveryHalt" &&
                step.classification == "recoveredHalt" && step.cleanupOk,
            "dap05-step-timeout-recovers-halt-and-pc");
+    expect(resumedCount == 1,
+           "dap05-step-timeout-notifies-resumed-once");
   }
 
   {

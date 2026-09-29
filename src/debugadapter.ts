@@ -1,5 +1,6 @@
 import { OzoneBackend } from './ozone-backend/commander';
 import { DapSession, DebugProtocolMessage } from './debug/dap-session';
+import { createAdapterExit } from './debug/adapter-exit';
 import { ExperimentalCppJLinkChannel } from './ozone-backend/cpp-jlink-channel';
 import { CmsisDapTargetChannel, LegacyJLinkTargetChannel, SessionTargetSelector } from './ozone-backend/session-target-channel';
 import { log } from './utils/logger';
@@ -20,20 +21,16 @@ try {
   const backend = new OzoneBackend(target, target);
   const session = new DapSession(backend);
   let disposePromise: Promise<void> | null = null;
-  let exitPromise: Promise<void> | null = null;
   const disposeSession = () => {
-    if (!disposePromise) disposePromise = session.dispose();
+    if (!disposePromise) disposePromise = Promise.resolve().then(() => session.dispose());
     return disposePromise;
   };
-  const exitAfterCleanup = (code: number) => {
-    if (exitPromise) return exitPromise;
-    exitPromise = (async () => {
-      await disposeSession();
-      await new Promise<void>(resolve => process.stdout.write('', () => resolve()));
-      process.exit(code);
-    })();
-    return exitPromise;
-  };
+  const exitAfterCleanup = createAdapterExit({
+    dispose: () => disposeSession(),
+    flushStdout: () => new Promise<void>(resolve => process.stdout.write('', () => resolve())),
+    exit: code => process.exit(code),
+    log: message => log.dap(message),
+  });
 
   let buffer = '';
 

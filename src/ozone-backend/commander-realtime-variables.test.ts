@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OzoneBackend } from './commander';
 
 type BackendInternals = {
@@ -849,13 +849,14 @@ describe('OzoneBackend realtime variables', () => {
     const backend = new OzoneBackend();
     const internal = backend as any;
     const writes: Array<{ address: number; bytes: number[] }> = [];
+    let runCount = 0;
     internal.targetIsHalted = async () => false;
     internal.ensureHalted = async () => true;
     internal.targetWriteMemory = async (address: number, bytes: Uint8Array) => {
       writes.push({ address, bytes: Array.from(bytes) });
       return true;
     };
-    internal.targetRun = async () => true;
+    internal.targetRun = async () => { runCount++; return true; };
 
     const result = await backend.execute({
       cmd: 'setWatchValue',
@@ -867,6 +868,52 @@ describe('OzoneBackend realtime variables', () => {
 
     expect(result.ok).toBe(true);
     expect(writes).toEqual([{ address: 0x20001020, bytes: [0, 0, 128, 63] }]);
+    expect(runCount).toBe(1);
+  });
+
+  it('does not halt or resume an already stopped target and adds no fixed delay', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as any;
+    const writes: number[] = [];
+    let ensureHaltedCount = 0;
+    let runCount = 0;
+    internal.targetIsHalted = async () => true;
+    internal.ensureHalted = async () => { ensureHaltedCount++; return true; };
+    internal.targetWriteMemory = async (address: number) => { writes.push(address); return true; };
+    internal.targetRun = async () => { runCount++; return true; };
+
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      timeoutSpy.mockClear();
+      const result = await backend.execute({
+        cmd: 'setWatchValue', expression: 'plain', value: 2, address: 0x20001024, typeName: 'float',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(writes).toEqual([0x20001024]);
+      expect(ensureHaltedCount).toBe(0);
+      expect(runCount).toBe(0);
+      expect(timeoutSpy).not.toHaveBeenCalled();
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('resumes a running target when a Watch memory write fails', async () => {
+    const backend = new OzoneBackend();
+    const internal = backend as any;
+    let runCount = 0;
+    internal.targetIsHalted = async () => false;
+    internal.ensureHalted = async () => true;
+    internal.targetWriteMemory = async () => false;
+    internal.targetRun = async () => { runCount++; return true; };
+
+    const result = await backend.execute({
+      cmd: 'setWatchValue', expression: 'plain', value: 2, address: 0x20001024, typeName: 'float',
+    });
+
+    expect(result.ok).toBe(false);
+    expect(runCount).toBe(1);
   });
 
   it('evaluates a scalar through a nested pointer member chain', async () => {

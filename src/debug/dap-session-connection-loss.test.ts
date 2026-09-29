@@ -80,4 +80,36 @@ describe('DapSession connection-loss cleanup', () => {
     expect(messages.some(message => message.type === 'response' && message.command === 'disconnect')).toBe(true);
     expect(messages.some(message => message.event === 'terminated')).toBe(true);
   });
+
+  it('keeps the DAP termination sequence when owner teardown throws', async () => {
+    const backend = backendWithState({ ok: true, data: TargetState.Halted });
+    (backend as any).dispose = vi.fn(async () => {
+      throw new Error('C++ J-Link helper did not exit after termination request (pid=3844)');
+    });
+    const session = connectedSession(backend);
+    const messages: any[] = [];
+    session.on('send', message => messages.push(message));
+    const shutdownRequested = vi.fn();
+    session.on('shutdownRequested', shutdownRequested);
+
+    await (session as any).handleDisconnect({ type: 'request', seq: 9, command: 'disconnect' });
+
+    expect(messages.some(message => message.type === 'response' && message.command === 'disconnect')).toBe(true);
+    expect(messages.some(message => message.event === 'terminated')).toBe(true);
+    expect(shutdownRequested).toHaveBeenCalledOnce();
+    expect((session as any).phase).toBe('terminated');
+  });
+
+  it('resolves dispose when forced owner disposal throws', async () => {
+    const backend = backendWithState({ ok: true, data: TargetState.Halted });
+    (backend as any).dispose = vi.fn(async () => {
+      throw new Error('CMSIS-DAP helper did not exit after termination request (pid=8120)');
+    });
+    const session = connectedSession(backend);
+
+    await expect(session.dispose()).resolves.toBeUndefined();
+
+    expect(backend.dispose).toHaveBeenCalledWith(false);
+    expect((session as any).phase).toBe('terminated');
+  });
 });

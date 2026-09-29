@@ -968,8 +968,22 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       'stepOut', request as unknown as Record<string, unknown>, onStepResumed);
   }
   async dispose(graceful = true): Promise<void> {
+    // A forced teardown must not queue behind a running Flash Algorithm critical
+    // section: `disconnect`/`close` are control RPCs, so during an in-flight
+    // erase they only complete when the algorithm deadline expires (30 s for
+    // STM32H723VGT6). The owner is already lost at that point, so skip the
+    // graceful handshake and release the helper process and the probe now.
+    if (!graceful) {
+      // `failed` is kept so the abandonment stays visible in diagnostics; a live
+      // state becomes idle because the helper process is gone.
+      if (this.state !== 'failed') this.state = 'idle';
+      this.lastDevice = null;
+      this.flashTargetDef = null;
+      await this.helper.dispose(false).catch(() => {});
+      log.dll(`[cmsis-dap] disposed owner=cmsis-dap graceful=false state=${this.state}`);
+      return;
+    }
     if (this.state !== 'idle') await this.disconnect().catch(() => {});
-    if (!graceful) await this.helper.dispose(false).catch(() => {});
   }
 
   private helperFailure<T = TargetChannelInfo>(stage: string, error: unknown): CppJLinkResult<T> {

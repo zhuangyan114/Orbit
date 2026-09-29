@@ -1830,6 +1830,27 @@ export class DapSession extends EventEmitter {
     }
   }
 
+  /**
+   * Reports liveness while a flash is pending. The J-Link pre-connect flash is
+   * the first target operation of a launch and its only bound is the 30 s
+   * JLink.exe timeout, so without a periodic line the UI shows nothing at all
+   * for half a minute when the probe is contended or absent.
+   */
+  private async withFlashProgress<T>(label: string, run: () => Promise<T>): Promise<T> {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      this.sendEvent('output', {
+        category: 'console',
+        output: `${label} still running (${Math.round((Date.now() - started) / 1000)}s)...\n`,
+      });
+    }, 5000);
+    try {
+      return await run();
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
   private async handleLaunch(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
@@ -1892,13 +1913,13 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
-        const flashResult = await this.backend.execute({
+        const flashResult = await this.withFlashProgress('Flashing', () => this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
           probe: targetConfig.probe,
           flashBeforeDebug: targetConfig.flashBeforeDebug,
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,
-        });
+        }));
         if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
         if (this.isSessionTerminating()) return;
         if (flashResult.ok) {
@@ -1947,13 +1968,13 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath} through the connected CMSIS-DAP owner...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
-        const flashResult = await this.backend.execute({
+        const flashResult = await this.withFlashProgress('Flashing', () => this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
           probe: targetConfig.probe,
           flashBeforeDebug: targetConfig.flashBeforeDebug,
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,
-        });
+        }));
         if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
         if (this.isSessionTerminating()) return;
         if (!flashResult.ok) {
@@ -2107,8 +2128,15 @@ export class DapSession extends EventEmitter {
     (this.backend as any).cancelFlash?.('DAP disconnect requested');
     try {
       this.forgetAllBreakpoints();
-      await this.backend.execute({ cmd: 'disconnect' });
-      await this.backend.dispose(true);
+      try {
+        await this.backend.execute({ cmd: 'disconnect' });
+        await this.backend.dispose(true);
+      } catch (error) {
+        // A failed owner teardown must not skip the DAP termination sequence:
+        // without `terminated` and `shutdownRequested` the adapter never exits
+        // and keeps the physical probe claimed for the next debug session.
+        log.dap(`disconnect-cleanup error=${error instanceof Error ? error.message : String(error)}`);
+      }
       this.backend.configureNativeSteps(false);
       this.setTargetRunning(true);
       this.sendResponse(msg);
@@ -5082,7 +5110,14 @@ export class DapSession extends EventEmitter {
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('DAP session disposed');
       (this.backend as any).cancelFlash?.('DAP session disposed');
-      await this.backend.dispose(false);
+      try {
+        await this.backend.dispose(false);
+      } catch (error) {
+        // The adapter exit path awaits this promise. A rejection here would be
+        // cached forever, skip `process.exit()`, and leave the probe claimed by
+        // a stranded adapter process, so disposal never propagates.
+        log.dap(`session-dispose error=${error instanceof Error ? error.message : String(error)}`);
+      }
       this.phase = 'terminated';
     })();
     return this.disposePromise;

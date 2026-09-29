@@ -11,6 +11,24 @@
 
 ## 修改记录
 
+### 改进：Timeline 支持多级指针，Watch 写入优化性能并保持控制安全边界
+
+- **日期**: 2026-09-29
+- **问题描述**: Timeline 快速采样此前只覆盖直接变量、结构体字段和单级指针，无法稳定读取全局指针及结构体中的多级指针；Watch 写入即使目标已经停止仍有固定等待，增加交互延迟，同时写入异常路径需要保证运行中的目标不会遗留在停止状态。
+- **根因分析**: 快速采样规格只有单级 `pointerAddress`/`pointeeOffset` 表达能力，规划器没有记录中间指针字段；Watch 写入路径存在固定 50 ms 等待，运行目标写入失败后需要可靠恢复。空指针、短读与地址溢出属于 Timeline 多级指针必须防御的边界。
+- **修改方案**: 增加有界 `pointerChain`（最多 3 次解引用），支持 `.`/`->` 类型检查、NULL/短读/地址溢出拒绝，并深拷贝缓存计划；Watch 写入先校验 32 位地址、数值编码和 CMSIS-DAP RAM 区域，仅在目标运行时停机，复用既有 target owner/control barrier，写入后在 `finally` 中恢复运行状态，移除 Watch 路径固定等待；`ensureHalted` 使用 5/10/20/50 ms 有界退避。
+- **涉及文件**: `src/ozone-backend/commander.ts:32,1272,2820-2950,3082-3290,4320-4565`、`src/ozone-backend/types.ts:95-108`、`src/ozone-backend/commander-multi-level-pointer.test.ts`、`src/ozone-backend/commander-realtime-variables.test.ts`
+- **验证结果**: `npm test`（62 个测试文件，847 项通过，1 项跳过）、`npm run typecheck`、`npm run build`、`git diff --check` 通过；未执行真实硬件性能验证。
+
+### Bug：调试会话连接丢失或适配器退出异常时残留 target owner
+
+- **日期**: 2026-09-29
+- **问题描述**: J-Link/CMSIS-DAP owner 在断线、强制断开或清理抛错时，DAP 会话可能无法完成 terminated/shutdown 流程，适配器进程继续占用探针，下一次调试启动会长时间等待或 Flash 超时；等待 Flash 时界面也缺少持续进度提示。
+- **根因分析**: 强制 dispose 仍可能排队等待目标 RPC；会话 dispose/显式 disconnect 对 owner 清理异常没有隔离处理；适配器退出路径没有统一的幂等清理和有界兜底退出。
+- **修改方案**: 强制 CMSIS-DAP disposal 直接释放 helper，正常 disposal 保留 disconnect/close 握手；DapSession 对清理异常做日志隔离并继续发送终止事件，在 Flash 等待期间定期报告进度；新增幂等 `createAdapterExit`，等待清理和 stdout flush，超时后强制退出；扩展连接状态和 owner 清理回归测试。
+- **涉及文件**: `src/debug/dap-session.ts:1830-1980,2100-2140,5093-5125`、`src/debugadapter.ts:1-45`、`src/debug/adapter-exit.ts`、`src/debug/adapter-exit.test.ts`、`src/extension.ts:465-490`、`src/ozone-backend/session-target-channel.ts:968-990`、`src/debug/dap-session-connection-loss.test.ts`、`src/ozone-backend/session-target-disconnect.test.ts`
+- **验证结果**: 相关 Vitest、类型检查和构建验证通过；未执行真实硬件断线/探针占用验证。
+
 ### Bug: CMSIS-DAP 调试 H723 入口停下后 RTT/P-RTLog 永久不显示
 
 - **日期**: 2026-08-24

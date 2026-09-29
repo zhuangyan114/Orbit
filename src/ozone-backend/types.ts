@@ -95,6 +95,8 @@ export interface FastDataSampleSpec {
   size: number;
   pointerAddress?: number;
   pointeeOffset?: number;
+  /** Bounded chain: the first entry identifies pointer storage; later entries carry offsets to the next pointer or scalar. */
+  pointerChain?: Array<{ pointerAddress: number; offset: number }>;
   typeName?: string;
   isFloat?: boolean;
   signed?: boolean;

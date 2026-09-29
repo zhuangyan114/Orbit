@@ -29,6 +29,8 @@ const REG_INDEXES: Record<string, number> = {
   SP: 13, LR: 14, PC: 15, xPSR: 16,
 };
 
+const FAST_SAMPLE_MAX_POINTER_DEREFERENCES = 3;
+
 interface NativeStopInfo {
   pcBefore: number;
   pcAfter: number;
@@ -1272,10 +1274,12 @@ case 'readVariableRuntime':
     const immediate = await this.targetIsHalted();
     log.step(`ensureHalted: immediate=${immediate}`);
     if (immediate) return true;
-    for (let i = 0; i < 10; i++) {
-      await new Promise<void>(r => setTimeout(r, 50));
+    // Exponential backoff: 5, 10, 20, then 50ms (max 10 polls, 385ms total).
+    const delays = [5, 10, 20, 50, 50, 50, 50, 50, 50, 50];
+    for (let i = 0; i < delays.length; i++) {
+      await new Promise<void>(r => setTimeout(r, delays[i]));
       const check = await this.targetIsHalted();
-      log.step(`ensureHalted: poll ${i + 1} isHalted=${check}`);
+      log.step(`ensureHalted: poll ${i + 1} delay=${delays[i]}ms isHalted=${check}`);
       if (check) return true;
     }
     log.step('ensureHalted: timeout waiting for halt');
@@ -2826,7 +2830,13 @@ case 'readVariableRuntime':
     return plan.map(item => ({
       expression: item.expression,
       ...(item.error ? { error: item.error } : {}),
-      ...(item.spec ? { spec: { ...item.spec, format: item.spec.format ? { ...item.spec.format } : undefined } } : {}),
+      ...(item.spec ? {
+        spec: {
+          ...item.spec,
+          pointerChain: item.spec.pointerChain?.map(step => ({ ...step })),
+          format: item.spec.format ? { ...item.spec.format } : undefined,
+        },
+      } : {}),
     }));
   }
 
@@ -2860,7 +2870,7 @@ case 'readVariableRuntime':
       };
     }
 
-    const fieldMatch = expression.match(/^(\w+)((?:\.|->)[A-Za-z_]\w+)+$/);
+    const fieldMatch = expression.match(/^(\w+)((?:\.|->)[A-Za-z_]\w*)+$/);
     if (fieldMatch) {
       const [, baseName] = fieldMatch;
       const baseSym = this.findSymbolByName(baseName);
@@ -2868,18 +2878,20 @@ case 'readVariableRuntime':
       const varTypeOffset = this.dwarfInfo.varToType.get(baseSym.name);
       const baseType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
       let currentType = baseType;
-      let pointerAddress: number | undefined;
       let fieldOffset = 0;
+      const pointerChain: Array<{ pointerAddress: number; offset: number }> = [];
+      let canUseArrow = currentType?.kind === 'pointer';
+
       if (currentType?.kind === 'pointer') {
         if (!currentType.typeOffset) return null;
-        pointerAddress = baseSym.address;
+        pointerChain.push({ pointerAddress: baseSym.address, offset: 0 });
         currentType = this.resolveDwarfType(currentType.typeOffset);
       }
 
       const segments = [...expression.slice(baseName.length).matchAll(/(\.|->)([A-Za-z_]\w*)/g)];
       for (let index = 0; index < segments.length; index++) {
         const [, operator, fieldName] = segments[index];
-        if (operator === '->' && pointerAddress === undefined) return null;
+        if (operator === '->' && !canUseArrow) return null;
         if ((currentType?.kind !== 'struct' && currentType?.kind !== 'union') || !currentType.fields) return null;
         const field = currentType.fields.find(candidate => candidate.name === fieldName);
         if (!field) return null;
@@ -2887,24 +2899,68 @@ case 'readVariableRuntime':
         fieldOffset += field.byteOffset;
 
         if (index < segments.length - 1) {
+          if (fieldType?.kind === 'pointer') {
+            if (!fieldType.typeOffset) return null;
+            if (pointerChain.length === 0) {
+              pointerChain.push({ pointerAddress: baseSym.address + fieldOffset, offset: 0 });
+            } else {
+              pointerChain.push({ pointerAddress: 0, offset: fieldOffset });
+            }
+            if (pointerChain.length > FAST_SAMPLE_MAX_POINTER_DEREFERENCES) return null;
+            currentType = this.resolveDwarfType(fieldType.typeOffset);
+            fieldOffset = 0;
+            canUseArrow = true;
+            continue;
+          }
           if (fieldType?.kind !== 'struct' && fieldType?.kind !== 'union') return null;
           currentType = fieldType;
+          canUseArrow = false;
           continue;
         }
 
+        // Final segment: must be a scalar
         if (!this.isFastScalarType(fieldType)) return null;
         const size = this.getScalarReadSize(undefined, fieldType);
         const typeName = this.getDwarfTypeName(field.typeOffset) || fieldType?.typeName || fieldType?.name || '';
-        return {
-          expression,
-          address: pointerAddress === undefined ? baseSym.address + fieldOffset : pointerAddress,
-          size,
-          ...(pointerAddress === undefined ? {} : { pointerAddress, pointeeOffset: fieldOffset }),
-          typeName,
-          isFloat: this.isFloatType(fieldType),
-          signed: this.isSignedIntegerType(fieldType),
-          format: this.fastDataSampleFormat(fieldType, typeName),
-        };
+        if (pointerChain.length >= 1) {
+          pointerChain.push({ pointerAddress: 0, offset: fieldOffset });
+
+          if (pointerChain.length === 2) {
+            return {
+              expression,
+              address: pointerChain[0].pointerAddress,
+              size,
+              pointerAddress: pointerChain[0].pointerAddress,
+              pointeeOffset: pointerChain[1].offset,
+              typeName,
+              isFloat: this.isFloatType(fieldType),
+              signed: this.isSignedIntegerType(fieldType),
+              format: this.fastDataSampleFormat(fieldType, typeName),
+            };
+          } else {
+            return {
+              expression,
+              address: pointerChain[0].pointerAddress,
+              size,
+              pointerChain,
+              typeName,
+              isFloat: this.isFloatType(fieldType),
+              signed: this.isSignedIntegerType(fieldType),
+              format: this.fastDataSampleFormat(fieldType, typeName),
+            };
+          }
+        } else {
+          // Direct access (no pointer)
+          return {
+            expression,
+            address: baseSym.address + fieldOffset,
+            size,
+            typeName,
+            isFloat: this.isFloatType(fieldType),
+            signed: this.isSignedIntegerType(fieldType),
+            format: this.fastDataSampleFormat(fieldType, typeName),
+          };
+        }
       }
     }
 
@@ -3026,14 +3082,48 @@ case 'readVariableRuntime':
     priority: 'watch' | 'timeline' = 'timeline',
   ): Promise<WatchValue[]> {
     const rawByIndex: Array<Uint8Array | null> = Array(specs.length).fill(null);
-    const resolvedAddresses = specs.map(spec => spec.address);
-    const initialReads = specs.map(spec => ({
-      address: spec.pointerAddress ?? spec.address,
-      size: spec.pointerAddress === undefined ? spec.size : 4,
-    }));
+    const resolvedAddresses = specs.map(spec => spec?.address ?? 0);
+    const validSpecs = specs.map(spec => {
+      if (!spec || typeof spec !== 'object') return false;
+      if (!Number.isInteger(spec.size) || spec.size < 1 || spec.size > 8) return false;
+      if (spec.pointerChain !== undefined && !Array.isArray(spec.pointerChain)) return false;
+      if (Array.isArray(spec.pointerChain) && spec.pointerChain.length > 0) {
+        const firstStep = spec.pointerChain[0];
+        return spec.pointerChain.length >= 3
+          && spec.pointerChain.length <= FAST_SAMPLE_MAX_POINTER_DEREFERENCES + 1
+          && Number.isInteger(firstStep?.pointerAddress)
+          && firstStep.pointerAddress > 0
+          && firstStep.pointerAddress <= 0xFFFF_FFFC
+          && firstStep.offset === 0
+          && spec.pointerChain.slice(1).every(step => !!step
+            && Number.isInteger(step.offset) && step.offset >= 0 && step.pointerAddress === 0);
+      }
+      if (!Number.isInteger(spec.address) || spec.address < 0 || spec.address > 0xFFFF_FFFF) return false;
+      if (spec.address + spec.size > 0x1_0000_0000) return false;
+      if (spec.pointerAddress !== undefined) {
+        return Number.isInteger(spec.pointerAddress)
+          && spec.pointerAddress > 0
+          && spec.pointerAddress <= 0xFFFF_FFFC
+          && Number.isInteger(spec.pointeeOffset)
+          && (spec.pointeeOffset ?? -1) >= 0;
+      }
+      return true;
+    });
+
+    const initialReads = specs.map(spec => {
+      if (Array.isArray(spec?.pointerChain) && spec.pointerChain.length > 0) {
+        return { address: spec.pointerChain[0]?.pointerAddress ?? 0, size: 4 };
+      }
+      return {
+        address: spec?.pointerAddress ?? spec?.address ?? 0,
+        size: spec?.pointerAddress === undefined ? spec?.size ?? 1 : 4,
+      };
+    });
 
     if (this.sessionTarget && specs.length > 0) {
-      const merged = this.mergeFastSampleReads(initialReads.map((read, index) => ({ index, ...read })));
+      const merged = this.mergeFastSampleReads(initialReads
+        .map((read, index) => ({ index, ...read }))
+        .filter(read => validSpecs[read.index]));
       const result = await this.sessionTarget.readMemoryBatch(
         merged.map(read => ({ address: read.address, size: read.size })),
         priority === 'timeline'
@@ -3045,22 +3135,78 @@ case 'readVariableRuntime':
       }
     }
     for (let index = 0; index < specs.length; index++) {
+      if (!validSpecs[index]) continue;
       if (rawByIndex[index]) continue;
       const initial = initialReads[index];
       rawByIndex[index] = await this.targetReadMemory(initial.address, initial.size, priority);
     }
 
+    for (let index = 0; index < specs.length; index++) {
+      const spec = specs[index];
+      if (!validSpecs[index] || !Array.isArray(spec.pointerChain) || spec.pointerChain.length === 0) continue;
+
+      let currentPointer = 0;
+      let isValid = true;
+      for (let chainIndex = 0; chainIndex < spec.pointerChain.length; chainIndex++) {
+        const step = spec.pointerChain[chainIndex];
+        if (chainIndex === 0) {
+          const pointerBytes = rawByIndex[index];
+          if (!pointerBytes || pointerBytes.length !== 4) {
+            isValid = false;
+            break;
+          }
+          currentPointer = this.readUnsignedLittleEndian(pointerBytes, pointerBytes.length) >>> 0;
+          if (!currentPointer) {
+            isValid = false;
+            break;
+          }
+        } else if (chainIndex < spec.pointerChain.length - 1) {
+          const readAddress = this.checkedFastSampleAddress(currentPointer, step.offset, 4);
+          if (readAddress === null) {
+            isValid = false;
+            break;
+          }
+          const pointerBytes = await this.targetReadMemory(readAddress, 4, priority);
+          if (!pointerBytes || pointerBytes.length !== 4) {
+            isValid = false;
+            break;
+          }
+          currentPointer = this.readUnsignedLittleEndian(pointerBytes, pointerBytes.length) >>> 0;
+          if (!currentPointer) {
+            isValid = false;
+            break;
+          }
+        } else {
+          const finalAddress = this.checkedFastSampleAddress(currentPointer, step.offset, spec.size);
+          if (finalAddress === null) {
+            isValid = false;
+            break;
+          }
+          resolvedAddresses[index] = finalAddress;
+          rawByIndex[index] = await this.targetReadMemory(finalAddress, spec.size, priority);
+        }
+      }
+
+      if (!isValid) {
+        rawByIndex[index] = null;
+      }
+    }
+
     const indirectReads: Array<{ index: number; address: number; size: number }> = [];
     for (let index = 0; index < specs.length; index++) {
       const spec = specs[index];
-      if (spec.pointerAddress === undefined) continue;
+      if (!validSpecs[index] || spec.pointerChain || spec.pointerAddress === undefined) continue;
       const pointerBytes = rawByIndex[index];
-      const pointer = pointerBytes ? this.readUnsignedLittleEndian(pointerBytes, pointerBytes.length) >>> 0 : 0;
+      const pointer = pointerBytes?.length === 4 ? this.readUnsignedLittleEndian(pointerBytes, 4) >>> 0 : 0;
       if (!pointer || spec.pointeeOffset === undefined) {
         rawByIndex[index] = null;
         continue;
       }
-      const address = (pointer + spec.pointeeOffset) >>> 0;
+      const address = this.checkedFastSampleAddress(pointer, spec.pointeeOffset, spec.size);
+      if (address === null) {
+        rawByIndex[index] = null;
+        continue;
+      }
       resolvedAddresses[index] = address;
       rawByIndex[index] = null;
       indirectReads.push({ index, address, size: spec.size });
@@ -3089,8 +3235,11 @@ case 'readVariableRuntime':
     for (let index = 0; index < specs.length; index++) {
       const spec = specs[index];
       const raw = rawByIndex[index];
-      if (!raw) {
-        results.push({ expression: spec.expression, value: 0, display: '', hex: '', error: `read failed at 0x${resolvedAddresses[index].toString(16)}` });
+      if (!raw || raw.length !== spec.size) {
+        const error = validSpecs[index]
+          ? `read failed at 0x${resolvedAddresses[index].toString(16)}`
+          : 'invalid or unsupported sampling specification';
+        results.push({ expression: spec?.expression || '', value: 0, display: '', hex: '', error });
         continue;
       }
 
@@ -3128,6 +3277,17 @@ case 'readVariableRuntime':
       });
     }
     return results;
+  }
+
+  private checkedFastSampleAddress(base: number, offset: number, size: number): number | null {
+    if (!Number.isInteger(base) || base <= 0 || base > 0xFFFF_FFFF
+      || !Number.isInteger(offset) || offset < 0
+      || !Number.isInteger(size) || size < 1 || size > 8) return null;
+    const address = base + offset;
+    return Number.isSafeInteger(address) && address > 0 && address <= 0xFFFF_FFFF
+      && address + size <= 0x1_0000_0000
+      ? address
+      : null;
   }
 
   private async doEvaluateExpression(
@@ -4321,12 +4481,6 @@ case 'readVariableRuntime':
       return { ok: false, error: `Symbol not found: ${expression}` };
     }
 
-    const wasRunning = !(await this.targetIsHalted());
-    if (wasRunning) {
-      const halted = await this.ensureHalted();
-      if (!halted) return { ok: false, error: 'halt failed' };
-    }
-
     const varTypeOffset = sym ? this.dwarfInfo.varToType.get(sym.name) : undefined;
     const resolvedType = varTypeOffset ? this.resolveDwarfType(varTypeOffset) : null;
     const normalizedTypeName = this.normalizeTypeName(typeName || '');
@@ -4335,12 +4489,14 @@ case 'readVariableRuntime':
     const requestedTypeSize = typeName ? this.getBuiltinTypeSize(typeName) : 0;
     const valueType = requestedType || resolvedType;
     const writeSize = Math.max(Math.min(requestedTypeSize || valueType?.byteSize || sym?.size || 4, 8), 1);
+
+    if (!Number.isInteger(writeAddress) || writeAddress < 0 || writeAddress > 0xFFFF_FFFF
+      || writeAddress + writeSize > 0x1_0000_0000) {
+      return { ok: false, error: `Invalid Watch write range at 0x${writeAddress.toString(16)}`, errorCode: 'InvalidWatchWriteAddress' };
+    }
+
     if (this.isCmsisDapOwner()) {
       const flashTarget = this.sessionTarget?.flashTarget;
-      // With a registry entry, any of the target's RAM regions is permitted and
-      // DAP reachability failures surface through the write path itself.
-      // Without one (device missing/unregistered) keep the conservative
-      // STM32F407 SRAM window this gate has always used.
       const allowed = flashTarget
         ? findRamRegion(flashTarget, writeAddress, writeSize) !== undefined
         : writeAddress >= 0x20000000 && writeAddress + writeSize <= 0x20020000;
@@ -4355,6 +4511,7 @@ case 'readVariableRuntime':
         };
       }
     }
+
     const buf = new Uint8Array(writeSize);
     const isFloat = this.isFloatType(valueType) || /^(float|float32_t|fp32|double|float64_t|fp64)$/.test(normalizedTypeName);
     if (isFloat) {
@@ -4369,10 +4526,41 @@ case 'readVariableRuntime':
       }
     }
 
-    const ok = await this.targetWriteMemory(writeAddress, buf);
+    log.eval('doSetWatchValue: using control write path');
+    const wasRunning = !(await this.targetIsHalted());
+    if (wasRunning) {
+      const halted = await this.ensureHalted();
+      if (!halted) return { ok: false, error: 'halt failed' };
+    }
 
-    if (wasRunning) await this.targetRun();
-    await new Promise<void>(r => setTimeout(r, 50));
+    let ok = false;
+    let resumed = true;
+    let writeError: unknown;
+    try {
+      ok = await this.targetWriteMemory(writeAddress, buf);
+    } catch (error) {
+      writeError = error;
+    } finally {
+      if (wasRunning) {
+        try {
+          resumed = await this.targetRun();
+        } catch {
+          resumed = false;
+        }
+      }
+    }
+
+    if (!resumed) {
+      return {
+        ok: false,
+        error: ok ? 'write succeeded but target could not be resumed' : 'write failed and target could not be resumed',
+        errorCode: 'TargetResumeFailed',
+      };
+    }
+    if (writeError) {
+      const message = writeError instanceof Error ? writeError.message : String(writeError);
+      return { ok: false, error: `write failed: ${message}`, errorCode: 'MemoryWriteFailed' };
+    }
     return ok
       ? { ok: true, data: { expression, value } }
       : { ok: false, error: 'write failed' };

@@ -93,6 +93,12 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 - STM32H723VGT6 的 J-Link 链路完成真机验收：连接、烧录、断点、Watch、源级单步与断开清理（P7-6）
 - 修复 CMSIS-DAP 源级步进等待临时断点期间的会话状态显示，并让 control 期间的目标状态查询不再排队
 
+## 1.1.3 更新日志
+
+- WATCH 写入按目标运行状态停机/恢复，移除固定等待，并在写入失败时尽量恢复运行状态
+- TIMELINE 支持最多三级指针解引用的快速采样，拒绝空指针和无效地址
+- 修复调试会话断线/清理异常后适配器可能继续占用探针的问题
+
 ## 预告
 
 - 会尽快支持 CMSIS-DAP-V2

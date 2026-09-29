@@ -465,15 +465,22 @@ export async function activate(context: vscode.ExtensionContext) {
         // Release any pre-existing extension-host legacy session before the DAP
         // process selects its sole session owner.
         await backend.execute({ cmd: 'disconnect' });
-        await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
-          type: ORBIT_DAP_TYPE,
-          request: 'launch',
-          name: 'Orbit Debug',
-          program: elfPath,
-          device,
-          interface: interface_,
-          speedKHz,
-        });
+        try {
+          const started = await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
+            type: ORBIT_DAP_TYPE,
+            request: 'launch',
+            name: 'Orbit Debug',
+            program: elfPath,
+            device,
+            interface: interface_,
+            speedKHz,
+          });
+          if (!started) {
+            vscode.window.showErrorMessage('Orbit: Debug session could not be started. Check the Orbit output logs for the launch failure.');
+          }
+        } catch (error: any) {
+          vscode.window.showErrorMessage(`Orbit: Debug session failed to start: ${error?.message || error}`);
+        }
       }),
     );
 

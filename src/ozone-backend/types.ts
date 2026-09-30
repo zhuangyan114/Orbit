@@ -1,8 +1,9 @@
 export type DebugProbe = 'jlink' | 'cmsis-dap';
+export type DebugProbePreference = DebugProbe | 'auto';
 export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb';
 
 export interface DebugProbeLaunchConfig {
-  probe?: DebugProbe;
+  probe?: DebugProbePreference;
   cmsisDapTransport?: CmsisDapTransport;
   cmsisDapSerial?: string;
   cmsisDapVid?: string;
@@ -149,6 +150,7 @@ export interface AIResult {
 }
 
 export type OzoneCommand =
+  | { cmd: 'resolveProbe'; config: DebugSessionConfig }
   | { cmd: 'connect'; config: DebugSessionConfig }
   | { cmd: 'disconnect' }
   | { cmd: 'halt' }

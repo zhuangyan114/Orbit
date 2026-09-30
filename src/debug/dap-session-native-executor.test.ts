@@ -12,7 +12,9 @@ describe('DapSession native executor lifecycle', () => {
   it('selects the target owner through the backend connect only once', async () => {
     vi.useFakeTimers();
     const backend = {
-      execute: vi.fn(async () => ({ ok: true, data: {} })),
+      execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'resolveProbe'
+        ? { ok: true, data: { probe: 'jlink' } }
+        : { ok: true, data: {} }),
       configureNativeSteps: vi.fn(),
       dispose: vi.fn(),
     } as unknown as OzoneBackend;

@@ -1,8 +1,8 @@
 {
   "name": "orbit-for-vscode",
-  "displayName": "Orbit",
+  "displayName": "Orbit STM32 Debugger",
   "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -146,19 +146,28 @@
               },
               "deviceName": {
                 "type": "string",
-                "description": "Target device name alias used by external MCU debug views",
-                "default": "STM32F407VG"
+                "description": "Optional target device name alias used by external MCU debug views; when omitted it follows device"
               },
               "probe": {
                 "type": "string",
-                "description": "Physical debug probe owner",
-                "enum": ["jlink", "cmsis-dap"],
-                "default": "jlink"
+                "description": "Physical debug probe owner. auto detects J-Link first, then CMSIS-DAP; when both are connected, J-Link is always selected.",
+                "enum": [
+                  "auto",
+                  "jlink",
+                  "cmsis-dap"
+                ],
+                "default": "auto"
               },
               "cmsisDapTransport": {
                 "type": "string",
                 "description": "CMSIS-DAP transport preference; auto prefers v2 WinUSB and falls back to HID",
-                "enum": ["auto", "cmsis-dap-v2", "cmsis-dap", "hid", "winusb"],
+                "enum": [
+                  "auto",
+                  "cmsis-dap-v2",
+                  "cmsis-dap",
+                  "hid",
+                  "winusb"
+                ],
                 "default": "auto"
               },
               "cmsisDapSerial": {
@@ -193,12 +202,12 @@
               },
               "svdFile": {
                 "type": "string",
-                "description": "Optional CMSIS-SVD file used by Peripheral Viewer",
+                "description": "Optional CMSIS-SVD file used by Peripheral Viewer; when omitted Orbit searches locally and can retrieve the matching device SVD on demand",
                 "default": ""
               },
               "svdPath": {
                 "type": "string",
-                "description": "Optional CMSIS-SVD file alias used by some Peripheral Viewer versions",
+                "description": "Optional CMSIS-SVD file alias used by some Peripheral Viewer versions; follows the resolved svdFile when omitted",
                 "default": ""
               },
               "interface": {
@@ -228,7 +237,9 @@
                   },
                   {
                     "type": "boolean",
-                    "enum": [false]
+                    "enum": [
+                      false
+                    ]
                   }
                 ],
                 "description": "CMSIS-DAP startup symbol to stop at after Launch or Restart; false disables run-to-entry",
@@ -313,7 +324,11 @@
               },
               "nativeDebugEngineMode": {
                 "type": "string",
-                "enum": ["legacy", "native", "auto"],
+                "enum": [
+                  "legacy",
+                  "native",
+                  "auto"
+                ],
                 "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback; an already connected Native owner never hot-switches",
                 "default": "auto"
               }
@@ -368,7 +383,12 @@
         "orbit.defaultSvdFile": {
           "type": "string",
           "default": "",
-          "description": "用于外设查看器的默认 CMSIS-SVD 文件路径"
+          "description": "用于外设查看器的默认 CMSIS-SVD 文件路径；留空时 Orbit 自动查找或按需获取"
+        },
+        "orbit.svdAutoDownload": {
+          "type": "boolean",
+          "default": true,
+          "description": "本地没有匹配 SVD 时，按芯片系列下载并缓存一个 Keil Device Family Pack，仅提取当前芯片对应的 SVD；失败不会阻止调试"
         },
         "orbit.defaultRtos": {
           "type": "string",
@@ -480,7 +500,11 @@
         },
         "orbit.nativeDebugEngine.mode": {
           "type": "string",
-          "enum": ["legacy", "native", "auto"],
+          "enum": [
+            "legacy",
+            "native",
+            "auto"
+          ],
           "default": "auto",
           "description": "目标所有者选择：legacy 仅使用 koffi；native 失败时不回退；auto 仅在 Native 连接前启动失败时回退。"
         },
@@ -545,6 +569,7 @@
     "dev": "npm run build && code --extensionDevelopmentPath=."
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.90.0",
     "@vscode/codicons": "^0.0.36",
@@ -558,6 +583,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
+    "adm-zip": "^0.6.1",
     "koffi": "^3.1.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",

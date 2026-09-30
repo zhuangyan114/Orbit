@@ -315,6 +315,8 @@ export class OzoneBackend {
         return { ok: false, error: 'Target access is owned by the active ozone DAP session' };
       }
       switch (command.cmd) {
+        case 'resolveProbe':
+          return await this.doResolveProbe(command.config);
         case 'connect':
           return await this.doConnect(command.config);
         case 'disconnect':
@@ -636,8 +638,8 @@ case 'readVariableRuntime':
 
   private async doConnect(config: DebugSessionConfig): Promise<OzoneCommandResult> {
     this.clearNativeStopInfo('new connect');
-    if (config.probe !== undefined && config.probe !== 'jlink' && config.probe !== 'cmsis-dap') {
-      return invalidConfiguration('probe', 'jlink or cmsis-dap', config.probe);
+    if (config.probe !== undefined && config.probe !== 'auto' && config.probe !== 'jlink' && config.probe !== 'cmsis-dap') {
+      return invalidConfiguration('probe', 'auto, jlink, or cmsis-dap', config.probe);
     }
     if (config.cmsisDapTransport !== undefined
       && config.cmsisDapTransport !== 'auto'
@@ -647,7 +649,15 @@ case 'readVariableRuntime':
       && config.cmsisDapTransport !== 'winusb') {
       return invalidConfiguration('cmsisDapTransport', 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb', config.cmsisDapTransport);
     }
-    const requestedProbe: DebugProbe = config.probe === undefined ? 'jlink' : config.probe;
+    let requestedProbe: DebugProbe;
+    if (config.probe === undefined || config.probe === 'auto') {
+      const resolved = await this.doResolveProbe(config);
+      if (!resolved.ok) return resolved;
+      requestedProbe = (resolved.data as { probe: DebugProbe }).probe;
+      config = { ...config, probe: requestedProbe };
+    } else {
+      requestedProbe = config.probe;
+    }
     const selectedProbe = this.selectedProbe();
     if (selectedProbe && selectedProbe !== requestedProbe) {
       return {
@@ -721,7 +731,39 @@ case 'readVariableRuntime':
     this.sessionGeneration++;
     this.invalidateFastPlan('session connected');
 
-    return { ok: true, data: { state: TargetState.Connected } };
+    return {
+      ok: true,
+      data: {
+        state: TargetState.Connected,
+        probe: this.selectedProbe() || requestedProbe,
+        ownerKind: this.sessionTarget && 'ownerKind' in this.sessionTarget
+          ? this.sessionTarget.ownerKind
+          : 'jlink-legacy',
+      },
+    };
+  }
+
+  private async doResolveProbe(config: DebugSessionConfig): Promise<OzoneCommandResult> {
+    if (config.probe === 'jlink' || config.probe === 'cmsis-dap') {
+      return { ok: true, data: { probe: config.probe, policy: 'explicit' } };
+    }
+    if (!(this.sessionTarget instanceof SessionTargetSelector)) {
+      return { ok: true, data: { probe: 'jlink', policy: 'legacy-default' } };
+    }
+    const result = await this.sessionTarget.resolveProbe(config);
+    if (!result.ok || !result.data) {
+      return {
+        ok: false,
+        errorCode: result.errorCode || 'DeviceNotFound',
+        error: `${result.errorCode || 'DeviceNotFound'}: ${result.message}`,
+        diagnostics: result.diagnostics,
+      };
+    }
+    return {
+      ok: true,
+      data: { probe: result.data.probe, policy: 'jlink-first' },
+      diagnostics: result.diagnostics,
+    };
   }
 
   private selectedProbe(): DebugProbe | null {

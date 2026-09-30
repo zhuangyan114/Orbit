@@ -37,6 +37,7 @@ flowchart TD
 
     JLink["J-Link probe\nSWD / JTAG"]
     DapProbe["CMSIS-DAP / DAPLink probe\nWinUSB v2 or HID v1 / SWD"]
+    ProbeDiscovery["short-lived probe discovery\nJ-Link first"]
     Target["STM32 / ARM Cortex-M\nFirmware + ELF/DWARF"]
     ExternalViews["Memory View / Peripheral Viewer / RTOS Views"]
 
@@ -56,6 +57,9 @@ flowchart TD
     Selector -->|"probe=jlink, native"| JNative --> JHelper --> JLink
     Selector -->|"probe=jlink, legacy"| JLegacy --> JLink
     Selector -->|"probe=cmsis-dap"| Cmsis --> CHelper --> DapProbe
+    Selector -->|"probe=auto"| ProbeDiscovery
+    ProbeDiscovery -->|"J-Link found"| JNative
+    ProbeDiscovery -->|"only CMSIS-DAP found"| Cmsis
     JLink --> Target
     DapProbe --> Target
 ```
@@ -73,6 +77,7 @@ flowchart TD
 
 ## Owner 选择
 
+- `probe: "auto"` 先运行只读可用性发现：J-Link 成功即选择 J-Link；只有 J-Link 不可用时才枚举 CMSIS-DAP。两者同时连接时固定选择 J-Link。discovery helper 在正式连接前释放，不成为 target owner，也不执行 Flash。
 - `probe: "jlink"` 使用 `jlink-native` 或 `jlink-legacy`。`auto` 只允许在 native 启动/初始化失败且进程完全退出后创建 legacy；已连接 owner 丢失时不热切换。
 - `probe: "cmsis-dap"` 只创建 `cmsis-dap` owner。`cmsisDapTransport: "auto"` 优先 WinUSB v2，再选择兼容的 HID v1；不会回退到 J-Link、Legacy 或第二个 helper。
 - Flash、DAP、Watch、Timeline、RTT、RTOS View、Memory View 和 Peripheral Viewer 都复用当前 owner。

@@ -27,31 +27,26 @@ Do not use this skill for:
 
 ## Goal
 
-让当前 STM32 firmware workspace 获得四个可复现的 Orbit debug launch，分别覆盖 J-Link/CMSIS-DAP 与烧录/不烧录组合；如果已有配置，合并真实工程值，不用模板芯片、ELF、SVD 或 RTOS 覆盖项目事实。工程实际使用 FreeRTOS 时，**默认一次配齐 RTOS Views 全面板**（workspace tracker + launch `rtos` + 固件 trace/stack/runtime-stat/queue registry），不要只配 launch 然后把固件缺口留给用户。
+让当前 STM32 firmware workspace 默认只保留一个精简、可复现的 `Orbit Debug` launch：标准 DAP 字段加一次真实芯片型号，其余使用 Orbit 的自动探针、ELF、SVD、SWD/4000 kHz 和 Native 默认值。只有用户明确要求固定 probe、禁用 Flash、指定 ELF/SVD/RTOS/RTT 或需要多个快捷入口时才增加对应字段或配置。工程实际使用 FreeRTOS 时，**默认一次配齐 RTOS Views 全面板**（workspace tracker + launch `rtos` + 固件 trace/stack/runtime-stat/queue registry），不要只配 launch 然后把固件缺口留给用户。
 
 具体 JSON、CMake、RTOS、RTT、P-RTLog 和 MCP 示例必须先阅读 `references/configuration-details.md`。完整配置项、默认值、范围和功能说明以仓库内 `Releases/docs/user-guide.md` 与当前 `package.json` 为准。
 
 ## Required launch output
 
-每次调用本 skill 配置工程时，都要确保 `.vscode/launch.json` 的 `configurations` 中存在以下四项：
+默认确保 `.vscode/launch.json` 中存在一项：
 
-| Name | `probe` | `flashBeforeDebug` |
-| --- | --- | --- |
-| `Orbit: J-Link (Flash)` | `jlink` | `true` |
-| `Orbit: J-Link (No Flash)` | `jlink` | `false` |
-| `Orbit: DAPLink (Flash)` | `cmsis-dap` | `true` |
-| `Orbit: DAPLink (No Flash)` | `cmsis-dap` | `false` |
-
-四项复用同一组已核实的 `program`、`device`、`deviceName`、`interface`、`speedKHz`、SVD、RTOS、RTT 和 P-RTLog 工程值。保留非 Orbit 配置和用户额外命名的配置；按上述名称更新已有标准项，不重复追加同名项。
-
-DAPLink 两项默认只写：
-
-```json
-"probe": "cmsis-dap",
-"cmsisDapTransport": "auto"
+```jsonc
+{
+  "name": "Orbit Debug",
+  "type": "orbit",
+  "request": "launch",
+  "device": "当前工程已核实的 MCU 型号"
+}
 ```
 
-只有用户明确要求绑定某一只 probe 时，才在两项 DAPLink 配置中加入 `cmsisDapVid`、`cmsisDapPid`、`cmsisDapSerial` 或 `cmsisDapPath`。PnP/HID 枚举发现的 VID/PID/Serial 只是诊断信息，不能自动写入 launch，也不能因为当前只连接一只设备就固定它。
+省略 `probe` 等价于 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。省略 `interface`、`speedKHz`、`nativeDebugEngineMode` 分别使用 `SWD`、`4000`、`auto`。`deviceName` 自动跟随 `device`。保留非 Orbit 配置和用户额外命名的配置，不为了瘦身删除用户已有的显式变体。
+
+只有用户明确要求强制 DAPLink 时才写 `"probe": "cmsis-dap"`；强制 J-Link 时写 `"probe": "jlink"`。只有用户明确要求绑定某一只 DAPLink probe 时才加入 `cmsisDapVid`、`cmsisDapPid`、`cmsisDapSerial` 或 `cmsisDapPath`。PnP/HID 枚举发现的 VID/PID/Serial 只是诊断信息，不能自动写入 launch，也不能因为当前只连接一只设备就固定它。
 
 ## One-pass workflow
 
@@ -83,22 +78,15 @@ DAPLink 两项默认只写：
 
 ### 4. Configure `launch.json`
 
-确保生成或更新四项标准配置，而不是只生成当前接入 probe 的一项。最小输出形状为：
+默认生成或更新单项 `Orbit Debug`，只写 `name`、`type`、`request`、`device`。先核实 `device`；再判断自动 ELF 是否唯一、自动 SVD 是否能精确匹配，以及工程是否实际使用 RTOS/特殊 RTT。只有自动行为不足以表达工程事实时才添加相应字段。
 
-```text
-Orbit: J-Link (Flash)    -> probe=jlink,     flashBeforeDebug=true
-Orbit: J-Link (No Flash)  -> probe=jlink,     flashBeforeDebug=false
-Orbit: DAPLink (Flash)   -> probe=cmsis-dap, flashBeforeDebug=true
-Orbit: DAPLink (No Flash) -> probe=cmsis-dap, flashBeforeDebug=false
-```
+`program` 为空时，源码按 `build/Debug`、`build/Release`、`build` 检查第一个 `.elf` 或 `.axf`。若存在多个候选或自动路径不是 active ELF，显式写 `program`。SVD 优先使用显式 `svdFile` / `svdPath` 和 `orbit.defaultSvdFile`，否则依次查工作区、本机 CMSIS Pack、缓存，并可按需下载一个对应 STM32 系列的 Keil DFP、只提取当前芯片 SVD；需要离线固定版本时才显式写 SVD 并关闭 `orbit.svdAutoDownload`。
 
-先核实一次 `program`、`device`、`deviceName`、`interface`、`speedKHz`、`svdFile` / `svdPath`、`rtos`、RTT 和 P-RTLog 字段，再复制到四项标准配置。每对配置只在 `flashBeforeDebug` 上不同；两类 probe 只在 owner/transport 专属字段上不同。`program` 为空时，源码会检查 `build/Debug`、`build/Release`、`build` 中的第一个 `.elf` 或 `.axf`；不要假设这个自动选择一定是用户想要的 ELF。
-
-项目级值优先写在 launch；`orbit.*` 是共享默认值。`deviceName`、`svdFile`、`svdPath` 是兼容外部 MCU Debug Views 的字段，保留别名时仍要指向同一实际目标。
+`orbit.*` 是共享默认值。不要重复写与默认值相同的 `deviceName`、`interface`、`speedKHz`、`nativeDebugEngineMode`、`cmsisDapTransport`、`flashBeforeDebug` 或 SVD 字段。用户要求多个快捷入口时，才从同一已核实基础配置派生显式 probe/Flash 变体。
 
 Native owner 规则：
 
-- `nativeDebugEngineMode: "auto"`：Native helper 优先；仅在 Native 启动/初始化失败，或已完全 dispose 的 Native owner 报告 `NativeOwnerLost` 时允许 Legacy fallback；
+- `nativeDebugEngineMode: "auto"`：Native helper 优先；仅在 Native 启动/初始化失败且尚未建立 owner 时允许 Legacy fallback；已连接 owner 丢失会结束当前 session；
 - `nativeDebugEngineMode: "native"`：只使用 Native，初始化失败即失败；
 - `nativeDebugEngineMode: "legacy"`：只使用 Legacy `koffi` channel；
 - `nativeDebugEngineEnabled: false` 且 mode 为 `auto`：使用 Legacy；
@@ -106,9 +94,10 @@ Native owner 规则：
 
 CMSIS-DAP owner 规则：
 
+- `probe: "auto"` 先检测 J-Link；检测成功即选 J-Link，只有 J-Link 不可用时才枚举 CMSIS-DAP；
 - `probe: "cmsis-dap"` 只能创建唯一的 `orbit-cmsis-dap-helper.exe` owner；不得回退 J-Link、Legacy 或第二个 helper；
-- 两项 DAPLink 标准配置默认使用 `cmsisDapTransport: "auto"`，优先 v2 WinUSB 并兼容 v1 HID；
-- 默认省略 `cmsisDapSerial`、`cmsisDapVid`、`cmsisDapPid` 和 `cmsisDapPath`。只有用户明确要求固定具体 probe 时才加入，并在烧录/不烧录两项中保持相同选择器；
+- DAPLink 默认 `cmsisDapTransport: "auto"`，优先 v2 WinUSB 并兼容 v1 HID；该字段可省略；
+- 默认省略 `cmsisDapSerial`、`cmsisDapVid`、`cmsisDapPid` 和 `cmsisDapPath`。只有用户明确要求固定具体 probe 时才加入；
 - 不从 Windows 枚举、当前连接设备、验收 fixture 或示例值推断绑定。尤其不得默认写入 `C251`、`F001`、`LU_2022_8888`；
 - 当前 CMSIS-DAP 调试接口为 SWD。不要把 J-Link 的 `nativeDebugEngineMode` 当成 CMSIS-DAP transport 开关；
 - `flashBeforeDebug: true` 使用当前 CMSIS-DAP owner 和匹配目标的 Flash Algorithm；`false` 不得触发 erase/program/verify 或 Flash-only reset；
@@ -186,7 +175,7 @@ Orbit 的 MCP client/server 关系必须保持清楚：
 报告必须包含：
 
 - 修改的文件和保留的用户配置；
-- 四个标准 launch name，以及它们共享的 ELF/AXF、device、interface、speed、SVD、RTOS；
+- `Orbit Debug` 的精简字段、自动默认项，以及因工程事实而保留的显式 ELF/AXF、probe、SVD、RTOS 或 Flash 覆盖项；
 - RTOS Views 全面板：已写入的 FreeRTOS 宏、runtime 时基（DWT 或已有定时器）、registry 对象名称；若用户要求跳过固件补丁，列出仍缺的面板；
 - probe、transport、serial/VID/PID（若使用）、J-Link DLL/JLink.exe 或 CMSIS-DAP helper、最终 owner 和 fallback 状态；
 - RTT/P-RTLog 状态以及 `.pw_tokenizer.entries` 是否被 source/build 检查发现；
@@ -197,7 +186,7 @@ Orbit 的 MCP client/server 关系必须保持清楚：
 ## Editing rules
 
 - 修改 JSON 数组时去重加入 `"orbit"` 和兼容别名 `"ozone"`，保留其他 debugger 类型、注释和用户值。
-- 更新四个标准 launch 时按 name 去重；默认 DAPLink 项不得包含 probe selector。只有当前请求明确要求绑定时，才把相同 selector 写入两项 DAPLink 配置。
+- 更新 `Orbit Debug` 时按 name 去重；不删除用户已有的其他 launch。只有当前请求明确要求绑定 DAPLink 时才写 probe selector。
 - 使用 `${workspaceFolder}` 表示提交到 firmware workspace 的路径；不要硬编码本机扩展仓库路径，除非没有可解析的已安装扩展路径且用户明确同意。
 - `.vscode/*.json` 可能是 JSONC；不要为验证而删除注释。
 - 不要启用 P-RTLog 来处理普通文本 RTT。

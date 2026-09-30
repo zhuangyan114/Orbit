@@ -15,6 +15,7 @@
 | `orbit.defaultSpeed` | number, kHz | `4000` | 默认 target interface speed。|
 | `orbit.defaultProgram` | path | `""` | 默认 ELF/AXF；空值时扫描 `build/Debug`、`build/Release`、`build`。|
 | `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的 SVD 默认路径。|
+| `orbit.svdAutoDownload` | boolean | `true` | 本地没有匹配项时按需下载并缓存对应 STM32 系列的一个 Keil DFP，只提取当前芯片 SVD。|
 | `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称；例如实际使用 FreeRTOS 时写 `FreeRTOS`。|
 | `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次 stack trace 后是否请求外部 RTOS Views focus/refresh。|
 | `orbit.rttLogEnabled` | boolean | `true` | 是否读取 SEGGER RTT。|
@@ -48,67 +49,27 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 
 ## Launch configuration
 
-每次调用 Orbit-Config-skill 都生成或更新四项标准配置。下面是结构示例；`program`、`device`、`deviceName`、SVD、RTOS 和速度必须替换为当前工程已核实的值：
+默认只生成或更新一项精简配置。芯片型号必须来自当前工程证据；其余与默认行为相同的字段不要重复写：
 
 ```jsonc
 {
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Orbit: J-Link (Flash)",
+      "name": "Orbit Debug",
       "type": "orbit",
       "request": "launch",
-      "probe": "jlink",
-      "program": "${workspaceFolder}/build/Debug/firmware.elf",
-      "device": "STM32F407VE",
-      "deviceName": "STM32F407VET6",
-      "interface": "SWD",
-      "speedKHz": 4000,
-      "flashBeforeDebug": true
-    },
-    {
-      "name": "Orbit: J-Link (No Flash)",
-      "type": "orbit",
-      "request": "launch",
-      "probe": "jlink",
-      "program": "${workspaceFolder}/build/Debug/firmware.elf",
-      "device": "STM32F407VE",
-      "deviceName": "STM32F407VET6",
-      "interface": "SWD",
-      "speedKHz": 4000,
-      "flashBeforeDebug": false
-    },
-    {
-      "name": "Orbit: DAPLink (Flash)",
-      "type": "orbit",
-      "request": "launch",
-      "probe": "cmsis-dap",
-      "cmsisDapTransport": "auto",
-      "program": "${workspaceFolder}/build/Debug/firmware.elf",
-      "device": "STM32F407VE",
-      "deviceName": "STM32F407VET6",
-      "interface": "SWD",
-      "speedKHz": 4000,
-      "flashBeforeDebug": true
-    },
-    {
-      "name": "Orbit: DAPLink (No Flash)",
-      "type": "orbit",
-      "request": "launch",
-      "probe": "cmsis-dap",
-      "cmsisDapTransport": "auto",
-      "program": "${workspaceFolder}/build/Debug/firmware.elf",
-      "device": "STM32F407VE",
-      "deviceName": "STM32F407VET6",
-      "interface": "SWD",
-      "speedKHz": 4000,
-      "flashBeforeDebug": false
+      "device": "STM32F407VET6"
     }
   ]
 }
 ```
 
-默认 DAPLink 配置不包含以下选择器：
+省略 `probe` 等价于 `auto`：先检测 J-Link，J-Link 不可用时才检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。默认还包括 SWD、4000 kHz、Native auto、Flash、RTT，以及自动 ELF/SVD 解析。`deviceName` 自动跟随 `device`。
+
+只有自动 ELF 选择不唯一或不正确时才写 `program`；只有用户要求固定/离线 SVD 时才写 `svdFile` / `svdPath`。要强制使用 DAPLink，增加 `"probe": "cmsis-dap"`；要强制使用 J-Link，增加 `"probe": "jlink"`；要跳过擦除、编程和校验，增加 `"flashBeforeDebug": false`。
+
+默认配置不包含以下 DAPLink 选择器：
 
 ```json
 "cmsisDapVid": "C251",
@@ -116,23 +77,23 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 "cmsisDapSerial": "LU_2022_8888"
 ```
 
-上面的值是特定验收设备示例，不是通用默认值。只有用户明确要求绑定该设备时，才把所需选择器同时加入 `Orbit: DAPLink (Flash)` 和 `Orbit: DAPLink (No Flash)`；仅检测到设备或只连接一只 probe 不构成绑定要求。
+上面的值是特定验收设备示例，不是通用默认值。只有用户明确要求绑定该设备时，才把所需选择器加入显式 `probe: "cmsis-dap"` 配置；仅检测到设备或只连接一只 probe 不构成绑定要求。
 
 当前 `package.json` debug schema 注册的 launch properties 如下。`default` 是 schema/config provider 的默认值，不代表当前板卡一定应使用该值。
 
 | Property | Type / unit | Default / range | 说明 |
 | --- | --- | --- | --- |
 | `device` | string | `STM32F407VG` | 目标 device；J-Link 用于 DLL 选型，CMSIS-DAP 用于芯片/Flash Algorithm 校验。|
-| `deviceName` | string | `STM32F407VG` | 外部 MCU Views 兼容别名；provider 默认跟随 `device`。|
-| `probe` | `jlink` / `cmsis-dap` | `jlink` | 每个 session 的物理 target owner 类型。|
+| `deviceName` | string | 跟随 `device` | 外部 MCU Views 兼容别名；通常无需填写。|
+| `probe` | `auto` / `jlink` / `cmsis-dap` | `auto` | 每个 session 的物理 target owner 类型；`auto` 固定 J-Link 优先。|
 | `cmsisDapTransport` | enum | `auto` | `auto`、`cmsis-dap-v2`/`winusb`、`cmsis-dap`/`hid`。|
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。|
 | `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。|
 | `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。|
 | `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、许可和目标适配已确认的 Flash Algorithm。|
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF；provider 可能自动从 build 目录选择。|
-| `svdFile` | path | `""` | SVD 兼容字段。|
-| `svdPath` | path | `""` | SVD 兼容字段；provider 默认跟随 `svdFile`。|
+| `svdFile` | path | 自动解析 | SVD 兼容字段；显式值优先级最高。|
+| `svdPath` | path | 跟随 `svdFile` | SVD 兼容字段；未填写时可从工作区、本机 Pack、缓存或按需下载解析。|
 | `interface` | `SWD` / `JTAG` | `SWD` | 调试接口；当前 CMSIS-DAP 路径使用 SWD。|
 | `speedKHz` | number, kHz | `4000` | target interface speed。|
 | `flashBeforeDebug` | boolean | `true` | 使用当前 owner 烧录/校验；`false` 明确跳过。|
@@ -155,7 +116,7 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 
 源码还支持 `elfPath` 作为 `program` 的兼容别名。`probe`、`interface`、`device`、`speedKHz`、`flashBeforeDebug`、`rtos` 和所有 RTT/P-RTLog/owner 字段最终由 DAP session 使用。
 
-项目实际值确认顺序建议：`.ioc` 的 `Mcu.Name`、startup file、linker script、CMake compile definitions、SVD 文件名、同板已知可用配置。`device`、`deviceName`、SVD 和 active ELF 必须属于同一目标。
+项目实际值确认顺序建议：`.ioc` 的 `Mcu.Name`、startup file、linker script、CMake compile definitions、SVD 文件名、同板已知可用配置。`device`、最终解析的 `deviceName`/SVD 和 active ELF 必须属于同一目标。
 
 ## ARM GCC toolchain
 
@@ -187,7 +148,7 @@ set(CMAKE_SIZE "${ARM_TOOLCHAIN_BIN_DIR}/arm-none-eabi-size.exe")
 
 ## CMSIS-DAP / DAPLink
 
-`probe: "cmsis-dap"` 启动 `out/native/win32-x64/orbit-cmsis-dap-helper.exe`，不加载 J-Link DLL。`cmsisDapTransport: "auto"` 优先 WinUSB v2 并兼容 HID v1。标准配置保持未绑定；用户明确要求选择特定设备时，才使用 serial、VID/PID 或 interface path。
+`probe: "auto"` 先用短生命周期 helper 检测 J-Link，只有 J-Link 不可用时才枚举 CMSIS-DAP；发现 helper 会在正式 owner 建立前释放。`probe: "cmsis-dap"` 启动 `out/native/win32-x64/orbit-cmsis-dap-helper.exe`，不加载 J-Link DLL。`cmsisDapTransport: "auto"` 优先 WinUSB v2 并兼容 HID v1。标准配置保持未绑定；用户明确要求选择特定设备时，才使用 serial、VID/PID 或 interface path。
 
 CMSIS-DAP owner 负责协议 framing、SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm 和内存型 RTT。它不回退到 J-Link/Legacy，也不允许 Watch、Timeline、RTT 或 Viewer 创建第二个 target owner。
 

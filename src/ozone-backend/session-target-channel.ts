@@ -10,6 +10,7 @@ import {
   NativeStepOutRequest,
   NativeStepOverDiagnostics,
   NativeStepOverRequest,
+  ProbeDiscoveryResult,
 } from './cpp-jlink-channel';
 import {
   CmsisDapDeviceInfo,
@@ -44,7 +45,7 @@ import {
 import { JLinkDLL } from './jlink-dll';
 import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
-import { CmsisDapTransport, DebugProbe } from './types';
+import { CmsisDapTransport, DebugProbe, DebugProbePreference } from './types';
 
 export type SessionTargetOwnerKind = 'none' | 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
 export type SessionTargetMode = 'legacy' | 'native' | 'auto';
@@ -59,7 +60,7 @@ export interface TargetChannelInfo {
 }
 
 export interface SessionTargetConnectConfig extends CppJLinkConnectConfig {
-  probe?: DebugProbe;
+  probe?: DebugProbePreference;
   cmsisDapTransport?: CmsisDapTransport;
   cmsisDapSerial?: string;
   cmsisDapVid?: string;
@@ -74,6 +75,7 @@ let nextSessionId = 1;
 export interface SessionTargetOwner extends NativeStepExecutor {
   readonly kind: Exclude<SessionTargetOwnerKind, 'none'>;
   readonly usingNative: boolean;
+  detectProbe?(config: SessionTargetConnectConfig): Promise<CppJLinkResult<ProbeDiscoveryResult>>;
   connect(config: SessionTargetConnectConfig): Promise<CppJLinkResult<TargetChannelInfo>>;
   disconnect(): Promise<CppJLinkResult>;
   halt(): Promise<CppJLinkResult<any>>;
@@ -125,6 +127,61 @@ export class SessionTargetSelector {
   get ownerKind(): SessionTargetOwnerKind { return this.owner?.kind || 'none'; }
   get usingNative(): boolean { return this.owner?.usingNative === true; }
   get flashTarget(): FlashTargetDefinition | null { return this.owner?.flashTarget ?? null; }
+
+  async resolveProbe(config: SessionTargetConnectConfig): Promise<CppJLinkResult<{ probe: DebugProbe }>> {
+    if (this.owner) {
+      return failure<{ probe: DebugProbe }>(
+        'cannot discover probes after a session target owner has been selected',
+        'OwnerAlreadySelected',
+      );
+    }
+
+    const jlink = this.createNative();
+    try {
+      const detected = jlink.detectProbe
+        ? await jlink.detectProbe(config)
+        : failure<ProbeDiscoveryResult>('J-Link owner does not support probe discovery', 'UnsupportedCapability');
+      if (detected.ok && detected.data?.available) {
+        log.dll(`target-owner session=${this.sessionId} discovery selected probe=jlink policy=jlink-first`);
+        return {
+          ok: true,
+          message: 'J-Link probe selected by auto discovery',
+          targetState: 'Disconnected',
+          elapsedMs: detected.elapsedMs,
+          data: { probe: 'jlink' },
+          diagnostics: { policy: 'jlink-first', jlink: detected.data },
+        };
+      }
+      log.dll(`target-owner session=${this.sessionId} discovery probe=jlink available=false code=${detected.errorCode || 'none'}`);
+    } finally {
+      await jlink.dispose(false).catch(() => {});
+    }
+
+    const cmsisDap = this.createCmsisDap();
+    try {
+      const detected = cmsisDap.detectProbe
+        ? await cmsisDap.detectProbe(config)
+        : failure<ProbeDiscoveryResult>('CMSIS-DAP owner does not support probe discovery', 'UnsupportedCapability');
+      if (detected.ok && detected.data?.available) {
+        log.dll(`target-owner session=${this.sessionId} discovery selected probe=cmsis-dap policy=jlink-first`);
+        return {
+          ok: true,
+          message: 'CMSIS-DAP probe selected by auto discovery',
+          targetState: 'Disconnected',
+          elapsedMs: detected.elapsedMs,
+          data: { probe: 'cmsis-dap' },
+          diagnostics: { policy: 'jlink-first', cmsisDap: detected.data },
+        };
+      }
+      return failure<{ probe: DebugProbe }>(
+        'auto probe discovery found neither J-Link nor CMSIS-DAP',
+        'DeviceNotFound',
+        { policy: 'jlink-first', cmsisDap: detected.diagnostics },
+      );
+    } finally {
+      await cmsisDap.dispose(false).catch(() => {});
+    }
+  }
 
   async connect(
     config: SessionTargetConnectConfig,
@@ -478,18 +535,37 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       );
   }
 
+  async detectProbe(config: SessionTargetConnectConfig): Promise<CppJLinkResult<ProbeDiscoveryResult>> {
+    const effectiveTransport = config.cmsisDapTransport || 'auto';
+    const started = await this.ensureHelperStarted(effectiveTransport);
+    if (!started.ok) return started as unknown as CppJLinkResult<ProbeDiscoveryResult>;
+    try {
+      const enumeration = await this.helper.request<{ devices: CmsisDapDeviceInfo[] }>(
+        'enumDevices',
+        this.deviceSelector(config, effectiveTransport),
+      );
+      if (!enumeration.ok) return enumeration as unknown as CppJLinkResult<ProbeDiscoveryResult>;
+      const count = enumeration.data?.devices.length ?? 0;
+      return {
+        ok: true,
+        message: count > 0 ? 'CMSIS-DAP probe found' : 'no CMSIS-DAP probe found',
+        targetState: 'Disconnected',
+        elapsedMs: enumeration.elapsedMs,
+        data: { available: count > 0, count },
+        diagnostics: { ownerKind: this.kind, transport: effectiveTransport },
+      };
+    } catch (error) {
+      return this.helperFailure<ProbeDiscoveryResult>('enumDevices', error);
+    }
+  }
+
   async connect(config: SessionTargetConnectConfig): Promise<CppJLinkResult<TargetChannelInfo>> {
     const transport = config.cmsisDapTransport || 'auto';
     const effectiveTransport = transport;
 
     log.dll(`[cmsis-dap] connect transport=${effectiveTransport} serial=${config.cmsisDapSerial || ''} vid=${config.cmsisDapVid || ''} pid=${config.cmsisDapPid || ''}`);
 
-    let hello: Awaited<ReturnType<CmsisDapHelperClient['start']>>;
-    try {
-      hello = await this.helper.start(effectiveTransport);
-    } catch (error) {
-      return this.failAndDispose(this.helperFailure('start', error), 'start');
-    }
+    const hello = await this.ensureHelperStarted(effectiveTransport);
     if (!hello.ok) {
       return this.failAndDispose(
         {
@@ -501,11 +577,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       );
     }
 
-    const selector: Record<string, string> = { transport: effectiveTransport };
-    if (config.cmsisDapVid) selector.vid = config.cmsisDapVid;
-    if (config.cmsisDapPid) selector.pid = config.cmsisDapPid;
-    if (config.cmsisDapSerial) selector.serial = config.cmsisDapSerial;
-    if (config.cmsisDapPath) selector.path = config.cmsisDapPath;
+    const selector = this.deviceSelector(config, effectiveTransport);
 
     try {
       const enumeration = await this.helper.request<{ devices: CmsisDapDeviceInfo[] }>('enumDevices', selector);
@@ -984,6 +1056,37 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       return;
     }
     if (this.state !== 'idle') await this.disconnect().catch(() => {});
+  }
+
+  private async ensureHelperStarted(
+    transport: CmsisDapTransport,
+  ): Promise<Awaited<ReturnType<CmsisDapHelperClient['start']>>> {
+    if (this.helper.started) {
+      return {
+        ok: true,
+        message: 'CMSIS-DAP helper already started',
+        targetState: 'Disconnected',
+        elapsedMs: 0,
+        data: { protocol: 2, helperVersion: 'active', platform: 'win32-x64', capabilities: [] },
+      };
+    }
+    try {
+      return await this.helper.start(transport);
+    } catch (error) {
+      return this.helperFailure('start', error);
+    }
+  }
+
+  private deviceSelector(
+    config: SessionTargetConnectConfig,
+    transport: CmsisDapTransport,
+  ): Record<string, string> {
+    const selector: Record<string, string> = { transport };
+    if (config.cmsisDapVid) selector.vid = config.cmsisDapVid;
+    if (config.cmsisDapPid) selector.pid = config.cmsisDapPid;
+    if (config.cmsisDapSerial) selector.serial = config.cmsisDapSerial;
+    if (config.cmsisDapPath) selector.path = config.cmsisDapPath;
+    return selector;
   }
 
   private helperFailure<T = TargetChannelInfo>(stage: string, error: unknown): CppJLinkResult<T> {

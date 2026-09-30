@@ -262,7 +262,7 @@ describe('OzoneBackend extension-host ownership guard', () => {
     });
 
     expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
-    if (!result.ok) expect(result.error).toContain('probe must be one of jlink or cmsis-dap');
+    if (!result.ok) expect(result.error).toContain('probe must be one of auto, jlink, or cmsis-dap');
     expect(jlink.open).not.toHaveBeenCalled();
     expect(jlink.connect).not.toHaveBeenCalled();
   });

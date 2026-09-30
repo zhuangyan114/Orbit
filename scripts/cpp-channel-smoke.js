@@ -52,6 +52,9 @@ async function main() {
     requiredCapabilities: ['basicDebug', 'readRegister', 'readMemory', 'writeMemory', 'readMemoryBatch', 'hardwareBreakpoints', 'reset'],
   });
   if (!hello.ok) throw new Error(hello.message);
+  if (!hello.data.capabilities.includes('probeDiscovery')) {
+    throw new Error('hello is missing probeDiscovery capability');
+  }
   console.log(`hello: protocol=${hello.data.protocol}, helper=${hello.data.helperVersion}`);
 
   if (loadOnly || runHardware) {
@@ -61,6 +64,12 @@ async function main() {
   }
 
   if (runHardware) {
+    const probe = await request('probe', { dllPath });
+    if (!probe.ok || probe.data.available !== true) {
+      throw new Error(`probe discovery failed: ${JSON.stringify(probe)}`);
+    }
+    console.log(`probe: available, version=${probe.data.dllVersion}`);
+
     const connect = await request('connect', { dllPath, device, speedKHz, interface: 'SWD' });
     if (!connect.ok) throw new Error(`${connect.errorCode}: ${connect.message}`);
     console.log(`connect: ${connect.data.dllPath}`);

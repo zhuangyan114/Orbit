@@ -120,74 +120,52 @@ CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目
 
 ### 3.1 最小配置
 
-下面的配置使用 J-Link 默认 owner：
+推荐配置如下。用户只需填写一次芯片型号；`probe` 默认 `auto`，`interface` 默认 `SWD`，`speedKHz` 默认 `4000`，`nativeDebugEngineMode` 默认 `auto`。`deviceName` 自动跟随 `device`，`program` 和 SVD 按后文规则自动解析：
 
 ```jsonc
 {
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Orbit: Debug STM32",
+      "name": "Orbit Debug",
       "type": "orbit",
       "request": "launch",
-      "probe": "jlink",
-      "program": "${workspaceFolder}/build/Debug/frame.elf",
-      "device": "STM32F407IG",
-      "interface": "SWD",
-      "speedKHz": 4000,
-      "nativeDebugEngineMode": "auto"
+      "device": "STM32F407IG"
     }
   ]
 }
 ```
 
-有线 CMSIS-DAP/DAPLink 的最小差异配置为：
+`probe: "auto"` 使用确定性优先级：先检测 J-Link，只有没有可用 J-Link 时才检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。探针发现只做枚举/可用性检查，不选择目标、不烧录，并在建立正式 owner 前释放发现 helper。需要强制使用 DAPLink 时只增加一项：
 
 ```jsonc
 {
   "type": "orbit",
   "request": "launch",
   "probe": "cmsis-dap",
-  "cmsisDapTransport": "auto",
-  "program": "${workspaceFolder}/build/Debug/frame.elf",
-  "device": "STM32F407VG",
-  "interface": "SWD",
-  "speedKHz": 4000,
-  "flashBeforeDebug": true
+  "device": "STM32F407VG"
 }
 ```
 
-STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 走内置注册表，两个名称都可用：
+STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 走内置注册表，两个名称都可用，其他默认项无需重复：
 
 ```jsonc
 {
   "type": "orbit",
   "request": "launch",
   "probe": "cmsis-dap",
-  "cmsisDapTransport": "auto",
-  "program": "${workspaceFolder}/build/Debug/frame.elf",
-  "device": "STM32H723VGT6",
-  "deviceName": "STM32H723VGT6",
-  "svdFile": "${workspaceFolder}/STM32H723.svd",
-  "interface": "SWD",
-  "speedKHz": 4000,
-  "flashBeforeDebug": true
+  "device": "STM32H723VGT6"
 }
 ```
 
-同一块板改用 J-Link 时，`device` 要写成 J-Link 器件库里的名称（`deviceName` 只在 `device` 缺省时才会生效）：
+同一块板强制改用 J-Link 时，`device` 要写成 J-Link 器件库里的名称；`deviceName` 会自动使用同一值：
 
 ```jsonc
 {
   "type": "orbit",
   "request": "launch",
   "probe": "jlink",
-  "program": "${workspaceFolder}/build/Debug/frame.elf",
-  "device": "STM32H723VG",
-  "svdFile": "${workspaceFolder}/STM32H723.svd",
-  "interface": "SWD",
-  "speedKHz": 4000,
-  "flashBeforeDebug": true
+  "device": "STM32H723VG"
 }
 ```
 
@@ -198,16 +176,16 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 
 | 属性 | 类型 / 单位 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | `device` | string | `STM32F407VG` | 实际使用的目标设备名；J-Link 原样交给 DLL 与 `JLink.exe` 选型（必须是已安装 J-Link 软件认识的名称，例如 `STM32H723VG`），CMSIS-DAP 用于 Flash Algorithm 和芯片校验（走内置注册表）。 |
-| `deviceName` | string | `STM32F407VG` | 兼容别名；仅在 `device` 缺省时顶替 `device`，同时供外部 MCU Debug Views 使用。 |
-| `probe` | `jlink` / `cmsis-dap` | `jlink` | 当前 session 的唯一物理 owner 类型。 |
+| `deviceName` | string | 跟随 `device` | 兼容别名；通常无需填写，同时供外部 MCU Debug Views 使用。若只提供旧字段 `deviceName`，它也可顶替 `device`。 |
+| `probe` | `auto` / `jlink` / `cmsis-dap` | `auto` | 当前 session 的唯一物理 owner 类型。`auto` 先检测 J-Link、再检测 CMSIS-DAP；两者同时存在时固定选择 J-Link。 |
 | `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1。 |
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。 |
 | `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。 |
 | `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。 |
 | `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、来源和许可已确认的 Flash Algorithm binary/manifest。 |
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF 路径；用于可选烧录、符号和 DWARF。 |
-| `svdFile` | path | `""` | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径。 |
- | `svdPath` | path | `""` | `svdFile` 的兼容别名；未填写时跟随 `svdFile` 或 `orbit.defaultSvdFile`。 |
+| `svdFile` | path | 自动解析 | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径；显式值优先级最高。 |
+| `svdPath` | path | 跟随 `svdFile` | `svdFile` 的兼容别名；两者都未填写时按设置、本地文件、缓存、在线 Pack 的顺序解析。 |
 | `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
 | `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
 | `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
@@ -255,7 +233,8 @@ DAP 源码还接受下列兼容输入：
 | `orbit.defaultInterface` | `SWD` / `JTAG` | `SWD` | 默认调试接口。 |
 | `orbit.defaultSpeed` | number，kHz | `4000` | 默认接口速度。 |
 | `orbit.defaultProgram` | path | `""` | 默认 ELF/AXF；空值时自动扫描 `build/Debug`、`build/Release`、`build`。 |
-| `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的默认 CMSIS-SVD。 |
+| `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的默认 CMSIS-SVD；优先于自动查找和下载。 |
+| `orbit.svdAutoDownload` | boolean | `true` | 本地没有匹配 SVD 时按需下载并缓存一个对应 STM32 系列的 Keil DFP；只提取当前芯片 SVD，失败不阻止调试。 |
 | `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称，例如 `FreeRTOS`。 |
 | `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次 stack trace 后自动 focus/refresh 外部 RTOS Views；关闭可减少调试会话额外开销。 |
 | `orbit.rttLogEnabled` | boolean | `true` | 是否读取 RTT。 |
@@ -463,9 +442,18 @@ Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供
 }
 ```
 
-当前源码保留 `svdFile` / `svdPath` / `deviceName` 供外部 MCU Debug Views 使用，但 Orbit 自身不解析 SVD，也不内置 Peripheral Viewer。寄存器名称、bit 字段、读写权限和显示质量取决于 SVD 文件及外部 Viewer。外部 Viewer 不显示时先检查扩展安装、`trackDebuggers`、SVD 路径和目标 device name。
+Orbit 不内置 Peripheral Viewer，但会为外部 MCU Debug Views 解析 `svdFile` / `svdPath`。解析优先级为：
 
-仓库不内置 SVD。STM32H723 请使用 ST 官方 `STM32H723.svd`，通过 `svdFile` / `svdPath` 或 `orbit.defaultSvdFile` 指向本地文件，并把 `device` / `deviceName` 设为 `STM32H723VGT6`（或别名 `STM32H723VG`）。F407 示例仍可用 `STM32F407.svd`；默认器件不会因为安装 1.1.2 而改成 H723。
+1. launch 中显式填写的 `svdFile` 或 `svdPath`；
+2. `orbit.defaultSvdFile`；
+3. 工作区内文件名与芯片系列完全匹配的 SVD，例如 `STM32F407.svd`；
+4. `CMSIS_PACK_ROOT` 或 `%LOCALAPPDATA%\Arm\Packs` 中已安装的 Keil DFP；
+5. Orbit 扩展全局存储中的 SVD 缓存；
+6. `orbit.svdAutoDownload: true` 时，读取 Keil 官方 PDSC，下载对应系列的一个 Device Family Pack 并缓存，只从包内提取当前芯片系列的 SVD。
+
+自动下载的单位是一个芯片系列 Pack，例如 F407 使用 `Keil.STM32F4xx_DFP`。Pack 压缩包本身可能包含同系列多个 SVD，但 Orbit 不会下载所有厂商或所有 STM32 系列，也不会把其他 SVD 解压到缓存。后续同型号 launch 直接复用缓存。若离线、型号无法识别、Pack 中没有精确匹配项或下载失败，Orbit 会写入 DAP 日志并继续调试，只是 Peripheral Viewer 暂时没有寄存器描述。
+
+寄存器名称、bit 字段、读写权限和显示质量仍取决于 SVD 文件及外部 Viewer。外部 Viewer 不显示时先检查扩展安装、`trackDebuggers`、最终 SVD 路径和目标 device name。需要完全离线或固定版本时，设置 `orbit.svdAutoDownload: false` 并显式提供 SVD。
 
 ## 11. Target owner 与调试通道
 
@@ -481,6 +469,7 @@ Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供
 
 当前每个 DAP session 由 `SessionTargetSelector` 选择且只持有一个物理 owner：
 
+- `probe: "auto"`：先用短生命周期 discovery helper 检测 J-Link；检测成功即固定选择 J-Link，不再检测/打开 DAPLink。只有 J-Link 不可用时才枚举 CMSIS-DAP。因此两者同时连接时始终选择 J-Link；发现阶段结束并释放 helper 后才建立唯一正式 owner；
 - `probe: "cmsis-dap"`：只建立 CMSIS-DAP owner；失败或 owner loss 都不回退 J-Link；
 - `probe: "jlink"`：再由以下 Native/Legacy 设置选择 J-Link owner；
 - `nativeDebugEngineMode: "legacy"`：只建立 Legacy owner；
@@ -587,7 +576,7 @@ Watch 和 Timeline 都依赖当前 DAP session 的目标状态。Timeline 在目
 
 ### Q7：RTOS Views、Memory View 或 Peripheral Viewer 没有跟踪到 Orbit。
 
-确认外部扩展已安装，并检查对应的 `trackDebuggers` 数组是否包含 `orbit`；兼容配置可同时保留 `ozone`。可以执行 MCU Debug Views 集成命令后 Reload Window。Peripheral Viewer 还需要有效 `svdFile` / `svdPath`；RTOS Views 还需要外部扩展能解析当前 ELF、RTOS 和目标状态。
+确认外部扩展已安装，并检查对应的 `trackDebuggers` 数组是否包含 `orbit`；兼容配置可同时保留 `ozone`。可以执行 MCU Debug Views 集成命令后 Reload Window。Peripheral Viewer 还需要最终解析到有效 `svdFile` / `svdPath`；自动获取失败时查看 `outputs/Log/dap.log` 的 `[svd]` 日志。RTOS Views 还需要外部扩展能解析当前 ELF、RTOS 和目标状态。
 
 ### Q8：`nativeDebugEngineMode: "auto"` 为什么变成 Legacy？
 
@@ -620,7 +609,7 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 - Timeline 只保留约 10 分钟历史，且停止期间不回填数据。
 - 快速 Timeline 只接受当前源码能解析的表达式；不支持的表达式会被采样计划拒绝。
 - RTOS Views、Memory View 和 Peripheral Viewer 不随 Orbit 的源码自动获得全部功能；它们需要外部扩展、正确的 tracking 配置和与当前固件匹配的 ELF/SVD。
-- Orbit 不解析 SVD，也不内置 RTOS kernel 解析器。
+- Orbit 负责定位、按需获取和传递 SVD 路径，但不自行渲染 SVD 寄存器树，也不内置 RTOS kernel 解析器。
 - P-RTLog token 必须在当前 ELF 的 `.pw_tokenizer.entries` 中；`pRtLogRoot` 当前不是 token 搜索路径。
 - Automation API v1 默认关闭。1.1.0 硬件层：J-Link native 与 CMSIS-DAP HID v1 已通过（无 flash）；J-Link legacy 与显式 Flash 不在本版范围，不得与 Mock/自动化结果合并成“全部通过”。
 - J-Link Legacy 不提供 Native source-level `stepInto`/`stepOver`/`stepOut`；这些调用必须返回 `CapabilityUnavailable`，不得启动第二个 owner 来模拟。

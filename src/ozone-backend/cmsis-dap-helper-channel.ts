@@ -350,6 +350,8 @@ export class CmsisDapHelperClient {
     private readonly onDiagnostic: (message: string) => void = () => {},
   ) {}
 
+  get started() { return this.child !== null; }
+
   async start(transport: 'auto' | 'hid' | 'winusb' | 'cmsis-dap' | 'cmsis-dap-v2' = 'auto'): Promise<CppJLinkResult<{ protocol: number; helperVersion: string; platform: string; capabilities: string[] }>> {
     if (this.child) throw new Error('CMSIS-DAP helper is already started');
     this.exitError = null;

@@ -302,8 +302,14 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
         webviewOptions: { retainContextWhenHidden: true },
       }),
-      vscode.debug.registerDebugConfigurationProvider('orbit', new OzoneDebugConfigurationProvider()),
-      vscode.debug.registerDebugConfigurationProvider('ozone', new OzoneDebugConfigurationProvider()),
+      vscode.debug.registerDebugConfigurationProvider(
+        'orbit',
+        new OzoneDebugConfigurationProvider(path.join(context.globalStorageUri.fsPath, 'svd-cache'))
+      ),
+      vscode.debug.registerDebugConfigurationProvider(
+        'ozone',
+        new OzoneDebugConfigurationProvider(path.join(context.globalStorageUri.fsPath, 'svd-cache'))
+      ),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
         if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneClearDebugConsole') {
           vscode.commands.executeCommand('workbench.debug.action.clearRepl');

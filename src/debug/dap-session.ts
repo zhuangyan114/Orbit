@@ -7,7 +7,7 @@ import { StringDecoder } from 'string_decoder';
 import { OzoneBackend } from '../ozone-backend/commander';
 import {
   DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock,
-  OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
+  DebugProbe, OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
 } from '../ozone-backend/types';
 import { parseElf32LoadSegments } from '../ozone-backend/cmsis-dap-flasher';
 import { PRtLogDecoder } from './p-rtlog-decoder';
@@ -1865,6 +1865,46 @@ export class DapSession extends EventEmitter {
       this._rtos = args.rtos || args.defaultRtos || '';
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = targetConfig.flashBeforeDebug;
+      let resolvedProbe: DebugProbe = targetConfig.probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink';
+      if (targetConfig.probe === 'auto') {
+        const probeResult = await this.backend.execute({
+          cmd: 'resolveProbe',
+          config: {
+            device,
+            interface: interface_,
+            speedKHz,
+            probe: 'auto',
+            cmsisDapTransport: targetConfig.cmsisDapTransport,
+            cmsisDapSerial: targetConfig.cmsisDapSerial,
+            cmsisDapVid: targetConfig.cmsisDapVid,
+            cmsisDapPid: targetConfig.cmsisDapPid,
+            cmsisDapPath: targetConfig.cmsisDapPath,
+            cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
+            flashBeforeDebug: targetConfig.flashBeforeDebug,
+            nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy'
+              ? args.nativeDebugEngineMode
+              : 'auto',
+            nativeDebugEngineEnabled: args.nativeDebugEngineEnabled !== false,
+          },
+        });
+        if (!probeResult.ok) {
+          this.phase = 'idle';
+          const error = probeResult.error || 'DeviceNotFound: auto probe discovery found no supported probe';
+          this.sendEvent('output', { category: 'stderr', output: `Probe discovery failed: ${error}\n` });
+          this.sendResponse(msg, undefined, false, error);
+          return;
+        }
+        const discoveredProbe = (probeResult.data as { probe?: unknown } | undefined)?.probe;
+        if (discoveredProbe !== 'jlink' && discoveredProbe !== 'cmsis-dap') {
+          this.phase = 'idle';
+          const error = 'MalformedResponse: auto probe discovery returned no supported probe';
+          this.sendEvent('output', { category: 'stderr', output: `Probe discovery failed: ${error}\n` });
+          this.sendResponse(msg, undefined, false, error);
+          return;
+        }
+        resolvedProbe = discoveredProbe;
+        log.dap(`Launch probe auto selected=${resolvedProbe} policy=jlink-first`);
+      }
       this.rttLogEnabled = args.rttLogEnabled !== false;
       this.rttAvailable = true;
       this.rttBufferIndex = Math.floor(this.clampNumber(args.rttBufferIndex, 0, 0, 15));
@@ -1882,9 +1922,14 @@ export class DapSession extends EventEmitter {
       this._device = device;
       this._interface = interface_;
       this._speedKHz = speedKHz;
-      this._probe = targetConfig.probe;
+      this._probe = resolvedProbe;
       this._flashEnabled = flashEnabled;
-      this._runToEntryPoint = targetConfig.runToEntryPoint ?? false;
+      if (resolvedProbe === 'cmsis-dap') {
+        const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
+        this._runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
+      } else {
+        this._runToEntryPoint = false;
+      }
       this._cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath || '';
       this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connecting';
       log.dap(`Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
@@ -1909,13 +1954,13 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: tokenLoad.ok ? 'console' : 'stderr', output });
       }
 
-      if (elfPath && this._flashEnabled && targetConfig.probe !== 'cmsis-dap') {
+      if (elfPath && this._flashEnabled && resolvedProbe !== 'cmsis-dap') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
         const flashResult = await this.withFlashProgress('Flashing', () => this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
-          probe: targetConfig.probe,
+          probe: resolvedProbe,
           flashBeforeDebug: targetConfig.flashBeforeDebug,
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,
@@ -1940,7 +1985,7 @@ export class DapSession extends EventEmitter {
           device,
           interface: interface_,
           speedKHz,
-          probe: targetConfig.probe,
+          probe: resolvedProbe,
           cmsisDapTransport: targetConfig.cmsisDapTransport,
           cmsisDapSerial: targetConfig.cmsisDapSerial,
           cmsisDapVid: targetConfig.cmsisDapVid,
@@ -1964,13 +2009,13 @@ export class DapSession extends EventEmitter {
       this.connectionFailureCount = 0;
       this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connected';
 
-      if (elfPath && this._flashEnabled && targetConfig.probe === 'cmsis-dap') {
+      if (elfPath && this._flashEnabled && resolvedProbe === 'cmsis-dap') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath} through the connected CMSIS-DAP owner...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
         const flashResult = await this.withFlashProgress('Flashing', () => this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
-          probe: targetConfig.probe,
+          probe: resolvedProbe,
           flashBeforeDebug: targetConfig.flashBeforeDebug,
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,

@@ -4,42 +4,43 @@
     {
       "id": 1,
       "prompt": "请为 STM32F407VET6 工程配置 Orbit。ELF 是 ${workspaceFolder}/build/Debug/app.elf，SVD 是 ${workspaceFolder}/STM32F407VETx.svd，SWD 4000 kHz，FreeRTOS。",
-      "expected_output": "生成四个标准 launch：J-Link/DAPLink 各有烧录和不烧录配置，四项共享已核实的工程字段，默认 DAPLink 不含设备选择器。工程含 FreeRTOS 时同时默认写入全面板 USER CODE（trace/runtime-stat/queue registry），不要只写 rtos 字段。",
+      "expected_output": "生成一个 Orbit Debug launch；只保留标准 DAP 字段、已核实 device、明确 ELF/SVD/FreeRTOS 工程事实所需字段，不重复 SWD/4000/probe auto/deviceName 等默认项。工程含 FreeRTOS 时同时默认写入全面板 USER CODE（trace/runtime-stat/queue registry）。",
       "files": [],
       "assertions": [
-        "恰好包含四个标准 Orbit launch name",
-        "每种 probe 都同时包含 flashBeforeDebug true 和 false",
-        "两项 DAPLink 使用 cmsisDapTransport=auto 且不含 VID/PID/Serial/Path"
+        "包含单个 Orbit Debug 标准 launch",
+        "device 只填写一次且不重复 interface=SWD、speedKHz=4000、probe=auto、deviceName",
+        "明确的 ELF/SVD/rtos 工程事实仍被保留"
       ]
     },
     {
       "id": 2,
       "prompt": "帮我配置 Orbit。当前检测到 CMSIS-DAP VID=C251、PID=F001、Serial=LU_2022_8888，但我没有要求固定某一只探针。",
-      "expected_output": "仍生成四个标准 launch；检测信息不写入两项 DAPLink 配置。",
+      "expected_output": "生成一个 probe auto 的精简 Orbit Debug launch；检测信息不写入配置，auto 在 J-Link 和 DAPLink 同时存在时选择 J-Link。",
       "files": [],
       "assertions": [
-        "生成四个标准 Orbit launch",
-        "两项 DAPLink 均省略 cmsisDapVid、cmsisDapPid、cmsisDapSerial 和 cmsisDapPath"
+        "生成单个精简 Orbit Debug launch",
+        "省略 cmsisDapVid、cmsisDapPid、cmsisDapSerial 和 cmsisDapPath",
+        "明确说明 probe auto 的 J-Link 优先规则"
       ]
     },
     {
       "id": 3,
       "prompt": "配置 Orbit，并把 DAPLink 配置明确绑定到 VID C251、PID F001、Serial LU_2022_8888。",
-      "expected_output": "生成四个标准 launch；仅两项 DAPLink 配置包含用户明确指定的相同选择器。",
+      "expected_output": "生成一个显式 probe=cmsis-dap 的 Orbit Debug launch，并写入用户指定的选择器；不生成无关 J-Link/Flash 变体。",
       "files": [],
       "assertions": [
-        "生成四个标准 Orbit launch",
-        "两项 DAPLink 都包含 C251/F001/LU_2022_8888",
-        "两项 J-Link 不包含 CMSIS-DAP 选择器"
+        "生成单个显式 CMSIS-DAP Orbit Debug launch",
+        "配置包含 C251/F001/LU_2022_8888",
+        "不生成无关的 J-Link 或 No Flash 变体"
       ]
     },
     {
       "id": 4,
       "prompt": "为当前 STM32 CubeMX FreeRTOS 工程配置 Orbit。工程有 FreeRTOSConfig.h，但没开 TRACE/runtime-stat，也没有 vQueueAddToRegistry。",
-      "expected_output": "除四个标准 launch 外，默认在 USER CODE 写入全面板钩子：trace/stack-high/runtime-stat 宏、DWT 时基、rtosViewQueue/Mutex/Semaphore 并 registry；编译后 ELF 含 ulRunTimeCounter 和 xQueueRegistry。",
+      "expected_output": "生成单个精简 Orbit Debug launch，并在 USER CODE 写入全面板钩子：trace/stack-high/runtime-stat 宏、DWT 时基、rtosViewQueue/Mutex/Semaphore 并 registry；编译后 ELF 含 ulRunTimeCounter 和 xQueueRegistry。",
       "files": [],
       "assertions": [
-        "生成四个标准 Orbit launch 且 rtos=FreeRTOS",
+        "生成单个精简 Orbit Debug launch 且 rtos=FreeRTOS",
         "FreeRTOSConfig.h USER CODE 含 configUSE_TRACE_FACILITY、configGENERATE_RUN_TIME_STATS、portGET_RUN_TIME_COUNTER_VALUE",
         "freertos.c 实现 configureTimerForRunTimeStats/getRunTimeCounterValue 或填入已有桩",
         "创建并 vQueueAddToRegistry rtosViewQueue、rtosViewMutex、rtosViewSemaphore，除非工程已注册同名对象",

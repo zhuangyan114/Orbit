@@ -3,14 +3,26 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getOrbitConfiguration } from '../utils/orbit-settings';
 import { ORBIT_DAP_TYPE } from '../utils/debug-session-type';
+import { log } from '../utils/logger';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
+import { resolveSvdForDevice } from './svd-resolver';
 
 export class OzoneDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
-  resolveDebugConfiguration(
-    _folder: vscode.WorkspaceFolder | undefined,
+  private readonly svdCacheRoot: string;
+
+  constructor(svdCacheRoot?: string) {
+    this.svdCacheRoot = svdCacheRoot ?? path.join(
+      process.env.LOCALAPPDATA ?? process.cwd(),
+      'Orbit',
+      'svd-cache'
+    );
+  }
+
+  async resolveDebugConfiguration(
+    folder: vscode.WorkspaceFolder | undefined,
     config: vscode.DebugConfiguration,
-    _token?: vscode.CancellationToken
-  ): vscode.ProviderResult<vscode.DebugConfiguration> {
+    token?: vscode.CancellationToken
+  ): Promise<vscode.DebugConfiguration> {
     const cfg = getOrbitConfiguration();
 
     if (!config.request) {
@@ -47,11 +59,28 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
       }
       config.program = program;
     }
-    if (config.svdFile === undefined) {
-      config.svdFile = cfg.get<string>('defaultSvdFile', '');
-    }
-    if (config.svdPath === undefined) {
-      config.svdPath = config.svdFile || cfg.get<string>('defaultSvdFile', '');
+    const explicitSvd = typeof config.svdFile === 'string' && config.svdFile.trim()
+      ? config.svdFile.trim()
+      : typeof config.svdPath === 'string' && config.svdPath.trim()
+        ? config.svdPath.trim()
+        : cfg.get<string>('defaultSvdFile', '').trim();
+    if (explicitSvd) {
+      config.svdFile = explicitSvd;
+      config.svdPath = explicitSvd;
+    } else if (!token?.isCancellationRequested) {
+      const workspaceRoot = folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const resolution = await resolveSvdForDevice(String(config.device), {
+        workspaceRoot,
+        cacheRoot: this.svdCacheRoot,
+        allowDownload: cfg.get<boolean>('svdAutoDownload', true),
+      });
+      if (resolution.path && !token?.isCancellationRequested) {
+        config.svdFile = resolution.path;
+        config.svdPath = resolution.path;
+        log.dap(`[svd] ${config.device} -> ${resolution.path} (${resolution.source})`);
+      } else if (resolution.warning) {
+        log.dap(`[svd] ${resolution.warning}; 调试继续，但外设寄存器视图不可用`);
+      }
     }
     if (config.rtos === undefined) {
       config.rtos = cfg.get<string>('defaultRtos', '');

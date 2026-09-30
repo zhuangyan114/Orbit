@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="resources/orbit-icon-256.png" width="128" height="128" alt="Orbit icon">
+  <img src="https://cdn.jsdelivr.net/gh/zhuangyan114/Orbit@master/resources/orbit-icon-256.png" width="128" height="128" alt="Orbit icon">
 </p>
 
 <h1 align="center">Orbit — The Debugger for What’s Next</h1>
@@ -10,16 +10,16 @@
 </p>
 
 <p align="center">
-  <a href="Releases/docs/全套工具链教程.md">全套工具链教程</a> ·
-  <a href="Releases/docs/user-guide.md">用户文档</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md">全套工具链教程</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md">用户文档</a> ·
   <a href="https://github.com/zhuangyan114/Orbit/releases">Orbit Releases</a>
 </p>
 
-> 本 README 是 Orbit 正式版 1.1.2 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
+> 本 README 是 Orbit 正式版 1.1.4 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
 
 ## Orbit 是什么
 
-Orbit 是一个运行在 VS Code 中的嵌入式调试前端。它以 Debug Adapter Protocol（DAP）承接 VS Code 的调试请求，通过 J-Link DLL 或原生 CMSIS-DAP helper（真机验收为 v1 HID；v2 WinUSB 有代码/Mock，本版未做真机）访问 STM32 / ARM Cortex-M 目标，并在同一目标所有权模型下提供：
+Orbit 是一个运行在 VS Code 中的嵌入式调试前端。它以 Debug Adapter Protocol（DAP）承接 VS Code 的调试请求，通过 J-Link DLL 或原生 CMSIS-DAP helper 访问 STM32 / ARM Cortex-M 目标，并在同一目标所有权模型下提供：
 
 - 源码级启动、暂停、继续、单步、复位和断点；
 - 可展开的 Watch 表达式、运行时数值写入和变化高亮；
@@ -36,11 +36,33 @@ Orbit 的目标不是复制一个完整 IDE，而是把“程序停在哪里、�
 
 Orbit 暴露 `orbit` DAP 调试器类型，使用 ELF/AXF 载入符号、行号和 DWARF 类型信息；旧配置中的 `ozone` 类型仍作为兼容别名保留。标准 DAP 的 `evaluate`、可展开 `variablesReference`、结构体/数组/指针子节点、`memoryReference`、读写内存和 RTOS capability 会保留给 VS Code 及外部视图使用。
 
-`probe: "jlink"`（默认）选择 J-Link；`probe: "cmsis-dap"` 选择 CMSIS-DAP/DAPLink。`cmsisDapTransport: "auto"` 优先 v2 WinUSB 并兼容 v1 HID。
+默认 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。也可以用 `probe: "jlink"` 或 `probe: "cmsis-dap"` 固定 owner。`cmsisDapTransport: "auto"` 优先 v2 WinUSB 并兼容 v1 HID。
+
+最小 `launch.json` 只需要标准 DAP 字段和芯片型号：
+
+```jsonc
+{
+  "version": "0.2.0",
+  "configurations": [{
+    "name": "Orbit Debug",
+    "type": "orbit",
+    "request": "launch",
+    "device": "STM32F407IG"
+  }]
+}
+```
+
+Orbit 默认使用 SWD / 4000 kHz / Native auto，并从 `build/Debug`、`build/Release`、`build` 自动寻找 ELF/AXF。`deviceName` 自动跟随 `device`。没有显式 SVD 时，Orbit 会先查工作区、本机 CMSIS Pack 和缓存；仍未找到才按需下载一个对应 STM32 系列的 Keil Device Family Pack，只提取当前芯片的 SVD。下载或解析失败不阻止调试。
 
 ### 运行时查看变量
 
 WATCH 和 TIMELINE 是两个 VS Code Webview 视图。Watch 负责表达式列表、子节点展开、数值编辑和发送到 Timeline；Timeline 负责采样通道、曲线、时间窗口、自动跟随、手动缩放及悬停读数。两者的表达式与视图状态保存在 VS Code workspace state 中。
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/zhuangyan114/Orbit@master/resources/timeline-demo.png" alt="Timeline Demo">
+</p>
+
+> j-link 连接时 TIMELINE 采样率可达1KHZ
 
 > CMSIS-DAP-V1 带宽较低,WATCH变量较多,结构体展开较多,或者RTT轮询过快过多时,可能出现TimeLine卡顿的情况
 
@@ -98,6 +120,10 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 - WATCH 写入按目标运行状态停机/恢复，移除固定等待，并在写入失败时尽量恢复运行状态
 - TIMELINE 支持最多三级指针解引用的快速采样，拒绝空指针和无效地址
 - 修复调试会话断线/清理异常后适配器可能继续占用探针的问题
+
+## 1.1.4 更新日志
+
+- 减小 launch.josn 最少需要配置，降低上手难度
 
 ## 预告
 

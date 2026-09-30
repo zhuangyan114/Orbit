@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 describe('DAP launch probe configuration', () => {
-  it('defaults to the existing J-Link path and enables flashing', () => {
+  it('defaults to deterministic auto probe discovery and enables flashing', () => {
     expect(normalizeDapLaunchConfig({})).toEqual({
-      probe: 'jlink',
+      probe: 'auto',
       cmsisDapTransport: 'auto',
       flashBeforeDebug: true,
     });
@@ -61,13 +61,13 @@ describe('DAP launch probe configuration', () => {
 
   it('rejects an explicitly invalid probe instead of falling back to J-Link', () => {
     expect(() => normalizeDapLaunchConfig({ probe: 'cmsis_dap' })).toThrowError(
-      'InvalidConfiguration: probe must be one of jlink or cmsis-dap; received "cmsis_dap"',
+      'InvalidConfiguration: probe must be one of auto, jlink, or cmsis-dap; received "cmsis_dap"',
     );
     expect(() => normalizeDapLaunchConfig({ probe: 'CMSIS-DAP' })).toThrowError(
-      'InvalidConfiguration: probe must be one of jlink or cmsis-dap; received "CMSIS-DAP"',
+      'InvalidConfiguration: probe must be one of auto, jlink, or cmsis-dap; received "CMSIS-DAP"',
     );
     expect(() => normalizeDapLaunchConfig({ probe: 'foo' })).toThrowError(
-      'InvalidConfiguration: probe must be one of jlink or cmsis-dap; received "foo"',
+      'InvalidConfiguration: probe must be one of auto, jlink, or cmsis-dap; received "foo"',
     );
   });
 

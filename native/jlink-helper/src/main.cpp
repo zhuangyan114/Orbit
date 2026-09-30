@@ -398,6 +398,38 @@ class JLinkChannel {
     return success(data, "J-Link DLL loaded", started);
   }
 
+  // Probe discovery deliberately stops at JLINK_Open. It may claim the USB
+  // probe inside this helper process, but it never selects a target device,
+  // configures SWD/JTAG, or calls JLINK_Connect. The discovery helper is
+  // disposed before the session creates its single physical target owner.
+  std::string probeAvailable(const JsonValue& params) {
+    const auto started = std::chrono::steady_clock::now();
+    if (!module_) {
+      const auto loadError = load(stringField(params, "dllPath").value_or(""));
+      if (loadError) {
+        return success("{\"available\":false,\"reason\":\"dll-unavailable\"}",
+                       "J-Link DLL is unavailable", started);
+      }
+    }
+    if (!symbolsReady_) {
+      return success("{\"available\":false,\"reason\":\"dll-symbols-unavailable\"}",
+                     "J-Link DLL symbols are unavailable", started);
+    }
+    if (!wasOpened_) {
+      const int result = open_();
+      if (result < 0) {
+        return success("{\"available\":false,\"reason\":\"probe-not-found\"}",
+                       "no J-Link probe found", started);
+      }
+      wasOpened_ = true;
+      std::cerr << "[JLinkHelper] JLINK_Open discovery OK" << std::endl;
+    }
+    const int version = getDllVersion_();
+    const std::string data = "{\"available\":true,\"dllPath\":\"" + jsonEscape(loadedPath_) +
+                             "\",\"dllVersion\":" + std::to_string(version) + "}";
+    return success(data, "J-Link probe found", started);
+  }
+
   std::string connect(const JsonValue& params) {
     const auto started = std::chrono::steady_clock::now();
     const std::string device = stringField(params, "device").value_or("STM32F407VG");
@@ -1510,11 +1542,12 @@ int main() {
         } else {
           result = "{\"ok\":true,\"message\":\"orbit-jlink-helper ready\",\"targetState\":\"Disconnected\",\"elapsedMs\":0,"
                    "\"data\":{\"protocol\":2,\"helperVersion\":\"0.2.0\",\"platform\":\"win32-x64\"," 
-                   "\"capabilities\":[\"basicDebug\",\"readRegister\",\"readMemory\",\"hardwareBreakpoints\"," 
+                   "\"capabilities\":[\"probeDiscovery\",\"basicDebug\",\"readRegister\",\"readMemory\",\"hardwareBreakpoints\","
                    "\"writeMemory\",\"readMemoryBatch\",\"reset\",\"rtt\"," 
                    "\"stepIntoInstruction\",\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\"]}}";
         }
       } else if (*method == "load") result = channel.loadJLink(*params);
+      else if (*method == "probe") result = channel.probeAvailable(*params);
       else if (*method == "connect") result = channel.connect(*params);
       else if (*method == "halt") result = channel.halt();
       else if (*method == "run") result = channel.run();

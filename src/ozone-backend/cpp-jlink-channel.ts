@@ -18,6 +18,14 @@ export interface CppJLinkConnectConfig {
   dllPath?: string;
 }
 
+export interface ProbeDiscoveryResult {
+  available: boolean;
+  reason?: string;
+  dllPath?: string;
+  dllVersion?: number;
+  count?: number;
+}
+
 export interface CppJLinkResult<T = Record<string, never>> {
   ok: boolean;
   message: string;
@@ -169,6 +177,8 @@ export class CppJLinkHelperClient {
     private readonly onDiagnostic: (message: string) => void = () => {},
   ) {}
 
+  get started() { return this.child !== null; }
+
   async start(): Promise<CppJLinkResult<{ protocol: number; helperVersion: string; capabilities: string[] }>> {
     if (this.child) throw new Error('C++ J-Link helper is already started');
     this.exitError = null;
@@ -207,7 +217,7 @@ export class CppJLinkHelperClient {
       clientProtocol: 2,
       extensionVersion: 'experimental',
       requiredCapabilities: [
-        'basicDebug', 'readRegister', 'readMemory', 'writeMemory',
+        'probeDiscovery', 'basicDebug', 'readRegister', 'readMemory', 'writeMemory',
         'readMemoryBatch', 'hardwareBreakpoints', 'reset',
         'stepIntoInstruction', 'stepIntoSourceLine', 'stepOverSourceLine', 'stepOut',
       ],
@@ -364,10 +374,22 @@ export class ExperimentalCppJLinkChannel {
 
   get usingNative() { return this.nativeConnected; }
 
-  async connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp' | 'koffi'; dllPath?: string }>> {
+  async detectProbe(config: CppJLinkConnectConfig): Promise<CppJLinkResult<ProbeDiscoveryResult>> {
     try {
       const hello = await this.helper.start();
-      if (!hello.ok) return this.failNative(`helper handshake failed: ${hello.message}`);
+      if (!hello.ok) return this.failNative<ProbeDiscoveryResult>(`helper handshake failed: ${hello.message}`);
+      return await this.helper.request<ProbeDiscoveryResult>('probe', { dllPath: config.dllPath });
+    } catch (error) {
+      return this.failNative<ProbeDiscoveryResult>(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp' | 'koffi'; dllPath?: string }>> {
+    try {
+      if (!this.helper.started) {
+        const hello = await this.helper.start();
+        if (!hello.ok) return this.failNative(`helper handshake failed: ${hello.message}`);
+      }
       const result = await this.helper.request<{ dllPath: string }>('connect', { ...config });
       if (result.ok) {
         this.nativeConnected = true;
@@ -503,7 +525,7 @@ export class ExperimentalCppJLinkChannel {
     }
   }
 
-  private async failNative(reason: string): Promise<CppJLinkResult<{ channel: 'cpp' }>> {
+  private async failNative<T = { channel: 'cpp' }>(reason: string): Promise<CppJLinkResult<T>> {
     this.nativeConnected = false;
     await this.helper.dispose(false);
     return this.failure(`C++ channel unavailable: ${reason}`, 'NativeChannelUnavailable');

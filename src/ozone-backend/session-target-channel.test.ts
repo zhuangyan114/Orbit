@@ -300,6 +300,56 @@ function owner(
 }
 
 describe('SessionTargetSelector owner lifecycle', () => {
+  it('auto discovery selects J-Link first without constructing CMSIS-DAP', async () => {
+    const jlink = owner('jlink-native', vi.fn());
+    jlink.detectProbe = vi.fn(async () => ({
+      ok: true,
+      message: 'J-Link probe found',
+      targetState: 'Disconnected' as const,
+      elapsedMs: 1,
+      data: { available: true },
+    }));
+    const createCmsisDap = vi.fn();
+    const selector = new SessionTargetSelector(() => jlink, vi.fn(), createCmsisDap);
+
+    await expect(selector.resolveProbe({
+      probe: 'auto', device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000,
+    })).resolves.toMatchObject({ ok: true, data: { probe: 'jlink' } });
+    expect(createCmsisDap).not.toHaveBeenCalled();
+    expect(jlink.dispose).toHaveBeenCalledWith(false);
+    expect(selector.ownerKind).toBe('none');
+  });
+
+  it('auto discovery selects CMSIS-DAP only when J-Link is unavailable', async () => {
+    const jlink = owner('jlink-native', vi.fn());
+    jlink.detectProbe = vi.fn(async () => ({
+      ok: true,
+      message: 'no J-Link probe found',
+      targetState: 'Disconnected' as const,
+      elapsedMs: 1,
+      data: { available: false },
+    }));
+    const cmsisDap = {
+      ...owner('jlink-native', vi.fn()),
+      kind: 'cmsis-dap' as const,
+      detectProbe: vi.fn(async () => ({
+        ok: true,
+        message: 'CMSIS-DAP probe found',
+        targetState: 'Disconnected' as const,
+        elapsedMs: 1,
+        data: { available: true, count: 1 },
+      })),
+    } as unknown as SessionTargetOwner;
+    const selector = new SessionTargetSelector(() => jlink, vi.fn(), () => cmsisDap);
+
+    await expect(selector.resolveProbe({
+      probe: 'auto', device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000,
+    })).resolves.toMatchObject({ ok: true, data: { probe: 'cmsis-dap' } });
+    expect(jlink.dispose).toHaveBeenCalledWith(false);
+    expect(cmsisDap.dispose).toHaveBeenCalledWith(false);
+    expect(selector.ownerKind).toBe('none');
+  });
+
   it('routes CMSIS-DAP RTT through the helper owner with structured results', async () => {
     const helper = fakeCmsisDapHelper();
     const channel = new CmsisDapTargetChannel({ helperClient: helper });

@@ -1,10 +1,10 @@
 import {
   CmsisDapTransport,
-  DebugProbe,
+  DebugProbePreference,
 } from '../ozone-backend/types';
 
 export interface NormalizedDapLaunchConfig {
-  probe: DebugProbe;
+  probe: DebugProbePreference;
   cmsisDapTransport: CmsisDapTransport;
   cmsisDapSerial?: string;
   cmsisDapVid?: string;
@@ -24,7 +24,7 @@ export class DapLaunchConfigError extends Error {
   ) {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'probe'
-      ? 'jlink or cmsis-dap'
+      ? 'auto, jlink, or cmsis-dap'
       : 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb';
     super(`InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
     this.name = 'DapLaunchConfigError';
@@ -36,7 +36,7 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
   const args = input && typeof input === 'object'
     ? input as Record<string, unknown>
     : {};
-  if (args.probe !== undefined && args.probe !== 'jlink' && args.probe !== 'cmsis-dap') {
+  if (args.probe !== undefined && args.probe !== 'auto' && args.probe !== 'jlink' && args.probe !== 'cmsis-dap') {
     throw new DapLaunchConfigError('probe', args.probe);
   }
   if (args.cmsisDapTransport !== undefined
@@ -48,7 +48,7 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     throw new DapLaunchConfigError('cmsisDapTransport', args.cmsisDapTransport);
   }
   const config: NormalizedDapLaunchConfig = {
-    probe: args.probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink',
+    probe: args.probe === 'jlink' || args.probe === 'cmsis-dap' ? args.probe : 'auto',
     cmsisDapTransport: args.cmsisDapTransport === undefined ? 'auto' : args.cmsisDapTransport,
     flashBeforeDebug: args.flashBeforeDebug !== false,
   };

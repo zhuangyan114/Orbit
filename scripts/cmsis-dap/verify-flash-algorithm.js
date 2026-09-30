@@ -125,7 +125,7 @@ for (const algorithm of algorithms) {
     throw new Error(`Flash Algorithm source is missing: ${sourcePath}`);
   }
 
-  const source = fs.readFileSync(sourcePath, 'utf8');
+  const source = fs.readFileSync(sourcePath, 'utf8').replace(/\r\n?/g, '\n');
   if (!source.includes('cpsid i') || source.includes('cpsie i')) {
     throw new Error('Flash Algorithm must keep interrupts masked through the RAM return-to-BKPT path');
   }

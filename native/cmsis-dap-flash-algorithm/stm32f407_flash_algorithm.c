@@ -2,12 +2,19 @@
 
 /*
  * Orbit's first CMSIS-DAP Flash Algorithm is intentionally source-built.
- * It implements only the STM32F407 512 KiB Flash window used by DAP-02A.
+ * Density-specific images implement the STM32F407VE 512 KiB or IG 1 MiB
+ * Flash window. The default build retains the original VE boundary.
  * There is no startup code, libc, vector table, or external algorithm blob.
  */
 
 #define FLASH_BASE 0x08000000u
-#define FLASH_END 0x08080000u
+#ifndef ORBIT_F407_FLASH_SIZE_KIB
+#define ORBIT_F407_FLASH_SIZE_KIB 512
+#endif
+#if ORBIT_F407_FLASH_SIZE_KIB != 512 && ORBIT_F407_FLASH_SIZE_KIB != 1024
+#error Unsupported STM32F407 Flash density
+#endif
+#define FLASH_END (FLASH_BASE + ORBIT_F407_FLASH_SIZE_KIB * 1024u)
 #define FLASH_REG_BASE 0x40023C00u
 
 #define FLASH_ACR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x00u))
@@ -126,7 +133,8 @@ static int flash_word(uint32_t address, uint32_t value) {
   return wait_ready();
 }
 
-static int sector_number(uint32_t address) {
+// Keep the density-dependent sector table out of the fixed 0x100-byte entry slot.
+__attribute__((noinline)) static int sector_number(uint32_t address) {
   if (address == 0x08000000u) return 0;
   if (address == 0x08004000u) return 1;
   if (address == 0x08008000u) return 2;
@@ -135,6 +143,12 @@ static int sector_number(uint32_t address) {
   if (address == 0x08020000u) return 5;
   if (address == 0x08040000u) return 6;
   if (address == 0x08060000u) return 7;
+#if ORBIT_F407_FLASH_SIZE_KIB == 1024
+  if (address == 0x08080000u) return 8;
+  if (address == 0x080A0000u) return 9;
+  if (address == 0x080C0000u) return 10;
+  if (address == 0x080E0000u) return 11;
+#endif
   return -1;
 }
 

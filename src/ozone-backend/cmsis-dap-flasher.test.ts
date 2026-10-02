@@ -4,6 +4,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
   STM32F407VET6,
+  STM32F407IG,
   STM32H723VGT6,
   calculateEraseSectors,
   CmsisDapFlashError,
@@ -77,6 +78,90 @@ function makeElf(segments: TestSegment[], overrides: Partial<{
   });
   return bytes;
 }
+
+describe('STM32F407IG CMSIS-DAP flash model', () => {
+  it.each(['STM32F407IG', 'STM32F407IGT6', 'STM32F407IGT7', 'STM32F407IGH6', 'STM32F407IGH7', ' stm32f407ig '])(
+    'resolves %s to the 1 MiB profile', device => {
+      expect(resolveFlashTarget(device)).toBe(STM32F407IG);
+      expect(() => validateTargetDeviceName(device, STM32F407IG)).not.toThrow();
+    },
+  );
+
+  it('plans all twelve sectors and keeps the 512 KiB profile separate', () => {
+    expect(STM32F407IG.flashSize).toBe(0x100000);
+    expect(STM32F407IG.preflight.expectedFlashSizeKiB).toBe(1024);
+    const segments = parseElf32LoadSegments(makeElf([
+      { address: 0x0807FFFC, bytes: [1, 2, 3, 4, 5, 6, 7, 8] },
+      { address: 0x080FFFFC, bytes: [9, 10, 11, 12] },
+    ]));
+    expect(calculateEraseSectors(segments, STM32F407IG).map(sector => sector.number)).toEqual([7, 8, 11]);
+    expect(STM32F407IG.sectors.slice(8)).toEqual([
+      { number: 8, address: 0x08080000, size: 0x20000 },
+      { number: 9, address: 0x080A0000, size: 0x20000 },
+      { number: 10, address: 0x080C0000, size: 0x20000 },
+      { number: 11, address: 0x080E0000, size: 0x20000 },
+    ]);
+    expect(() => calculateEraseSectors(segments, STM32F407VET6)).toThrow();
+    expect(() => validateTargetDeviceName('STM32F407VE', STM32F407IG)).toThrow();
+    expect(() => validateTargetDeviceName('STM32F407IG', STM32F407VET6)).toThrow();
+    expect(() => calculateEraseSectors(parseElf32LoadSegments(makeElf([
+      { address: 0x080FFFFE, bytes: [1, 2, 3, 4] },
+    ])), STM32F407IG)).toThrow();
+  });
+
+  it.each([1024, 512])('checks %i KiB before running the high-half Flash flow', async capacity => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-f407ig-'));
+    try {
+      const elfPath = path.join(tempDir, 'image.elf');
+      fs.writeFileSync(elfPath, makeElf([{ address: 0x080FFFFC, bytes: [1, 2, 3, 4] }]));
+      const algorithmPath = path.join(tempDir, 'algorithm.bin');
+      const algorithm = Buffer.alloc(0x600, 0xBF);
+      algorithm[0x500] = 0x00;
+      algorithm[0x501] = 0xBE;
+      fs.writeFileSync(algorithmPath, algorithm);
+      const calls: Array<{ operation: string; targetAddress: number; size: number }> = [];
+      const result = await flashCmsisDapElf({
+        async readDp() { return { ok: true, value: 0x2BA01477 }; },
+        async readMemory(address: number) {
+          if (address === 0xE0042000) return { ok: true, bytes: [0x13, 0x64, 0x00, 0x10] };
+          if (address === 0x1FFF7A22) return { ok: true, bytes: [capacity & 0xFF, capacity >> 8] };
+          throw new Error(`unexpected read at ${address.toString(16)}`);
+        },
+        async runAlgorithm(request) {
+          calls.push(request);
+          return { ok: true, message: 'mock complete', data: {
+            returnCode: 0, pc: request.bkptAddress, dhcsr: 0x00030003,
+          } };
+        },
+      }, elfPath, 'STM32F407IG', { algorithmPath }, STM32F407IG);
+      if (capacity === 512) {
+        expect(result.success).toBe(false);
+        expect(result.errorCode).toBe('TargetMismatch');
+        expect(result.diagnostics).toMatchObject({ expectedKiB: 1024, actualKiB: 512 });
+        expect(calls).toEqual([]);
+      } else {
+        expect(result.success).toBe(true);
+        expect(calls.map(call => [call.operation, call.targetAddress])).toEqual([
+          ['init', 0x08000000], ['eraseSector', 0x080E0000],
+          ['programPage', 0x080FFFFC], ['verify', 0x080FFFFC], ['uninit', 0x08000000],
+        ]);
+        expect(result.erasedSectors.map(sector => sector.number)).toEqual([11]);
+      }
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads a dedicated built-in 1 MiB algorithm in ordinary SRAM', () => {
+    const algorithm = loadFlashAlgorithm(STM32F407IG);
+    expect(path.basename(algorithm.path)).toBe('orbit-stm32f407ig-flash-algorithm.bin');
+    expect(algorithm.pageSize).toBe(0x4000);
+    expect(algorithm.preservesPageBuffer).toBe(true);
+    const layout = planFlashRamLayout(STM32F407IG, algorithm.code.length, algorithm.pageSize);
+    expect(layout.algorithm.address).toBe(0x20000000);
+    expect(layout.stackPointer).toBe(0x20020000);
+  });
+});
 
 describe('STM32F407VET6 CMSIS-DAP flash model', () => {
   it('rejects an algorithm whose completion entry is not a Thumb BKPT', () => {
@@ -757,7 +842,7 @@ describe('CMSIS-DAP flash target registry', () => {
       expect(mismatch.message).toContain('STM32F407VET6');
       expect(mismatch.diagnostics).toMatchObject({
         device: 'STM32F429VGT6',
-        supportedTargets: ['STM32F407VET6', 'STM32H723VGT6'],
+        supportedTargets: ['STM32F407VET6', 'STM32F407IG', 'STM32H723VGT6'],
       });
     }
   });

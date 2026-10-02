@@ -142,6 +142,27 @@ export const STM32F407VET6: FlashTargetDefinition = Object.freeze({
   programTimeoutMs: 5000,
 });
 
+/** STM32F407IG package variants share the RM0090 1 MiB Flash layout. */
+export const STM32F407IG: FlashTargetDefinition = Object.freeze({
+  ...STM32F407VET6,
+  name: 'STM32F407IG',
+  aliases: ['STM32F407IGT6', 'STM32F407IGT7', 'STM32F407IGH6', 'STM32F407IGH7'],
+  flashSize: 1024 * 1024,
+  sectors: [
+    ...STM32F407VET6.sectors,
+    { number: 8, address: 0x08080000, size: 0x20000 },
+    { number: 9, address: 0x080A0000, size: 0x20000 },
+    { number: 10, address: 0x080C0000, size: 0x20000 },
+    { number: 11, address: 0x080E0000, size: 0x20000 },
+  ],
+  preflight: {
+    ...STM32F407VET6.preflight,
+    expectedFlashSizeKiB: 1024,
+  },
+  // A separate density-specific image retains the VE loader's 512 KiB limit.
+  algorithm: 'stm32f407ig',
+});
+
 export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
   name: 'STM32H723VGT6',
   // STM32H723VG is the density/package prefix used by project files; it is
@@ -201,7 +222,7 @@ export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
   programTimeoutMs: 15000,
 });
 
-const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6, STM32H723VGT6];
+const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6, STM32F407IG, STM32H723VGT6];
 
 /** All registered flash targets, in registration order. */
 export function listFlashTargets(): readonly FlashTargetDefinition[] {
@@ -615,6 +636,16 @@ const BUILTIN_FLASH_ALGORITHMS: ReadonlyMap<string, BuiltinFlashAlgorithmMetadat
       // The built-in algorithm accepts up to 64 KiB per ProgramPage. A 16 KiB
       // buffer matches STM32F4's smallest erase sector and avoids paying the
       // CMSIS-DAP register/RAM-upload overhead once per 1 KiB slice.
+      pageSize: 0x4000,
+      preservesPageBuffer: true,
+    } satisfies BuiltinFlashAlgorithmMetadata),
+  ],
+  [
+    'stm32f407ig',
+    Object.freeze({
+      fileName: 'orbit-stm32f407ig-flash-algorithm.bin',
+      entries: DEFAULT_ALGORITHM_ENTRIES,
+      staticBase: 0,
       pageSize: 0x4000,
       preservesPageBuffer: true,
     } satisfies BuiltinFlashAlgorithmMetadata),

@@ -2532,6 +2532,29 @@ class FakeWinUsbIo : public WinUsbIo {
     handle = initializeResult ? interfaceHandle : nullptr;
     return initializeResult;
   }
+  BOOL getDescriptor(WINUSB_INTERFACE_HANDLE, UCHAR type, UCHAR index, USHORT language,
+                     PUCHAR buffer, ULONG capacity, PULONG transferred) override {
+    *transferred = 0;
+    const std::vector<uint8_t>* bytes = nullptr;
+    if (type == 1 && index == 0 && language == 0 && descriptorAvailable) bytes = &deviceDescriptor;
+    if (type == 3 && index == 0 && language == 0) bytes = &languageDescriptor;
+    if (type == 3 && index != 0 && language == 0x0411) {
+      const auto item = stringDescriptors.find(index);
+      if (item != stringDescriptors.end()) bytes = &item->second;
+    }
+    if (!bytes || bytes->size() > capacity) return FALSE;
+    std::memcpy(buffer, bytes->data(), bytes->size());
+    *transferred = static_cast<ULONG>(bytes->size());
+    return TRUE;
+  }
+  static std::vector<uint8_t> usbString(const std::u16string& value) {
+    std::vector<uint8_t> bytes{static_cast<uint8_t>(2 + value.size() * 2), 3};
+    for (char16_t character : value) {
+      bytes.push_back(static_cast<uint8_t>(character));
+      bytes.push_back(static_cast<uint8_t>(character >> 8));
+    }
+    return bytes;
+  }
   BOOL queryInterfaceSettings(WINUSB_INTERFACE_HANDLE, USB_INTERFACE_DESCRIPTOR& descriptor,
                               DWORD& error) override {
     error = ERROR_SUCCESS;
@@ -2592,6 +2615,14 @@ class FakeWinUsbIo : public WinUsbIo {
   HANDLE fileHandle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x8000));
   WINUSB_INTERFACE_HANDLE interfaceHandle = reinterpret_cast<WINUSB_INTERFACE_HANDLE>(static_cast<uintptr_t>(0x8001));
   uint16_t protocolPacketSize = 512;
+  bool descriptorAvailable = true;
+  // Independent USB wire fixtures: device descriptor + Japanese LANGID.
+  std::vector<uint8_t> deviceDescriptor{18, 1, 0, 2, 0, 0, 0, 64,
+                                       0xED, 0xFA, 0x70, 0x48, 0, 1, 1, 2, 3, 1};
+  std::vector<uint8_t> languageDescriptor{6, 3, 0x11, 0x04, 0x09, 0x04};
+  std::map<unsigned int, std::vector<uint8_t>> stringDescriptors{
+      {1, usbString(u"Horco")}, {2, usbString(u"Horco CMSIS-DAP v2")},
+      {3, usbString(u"507874001033")}};
   BOOL initializeResult = TRUE;
   DWORD initializeError = ERROR_SUCCESS;
   BOOL writeResult = TRUE;
@@ -2908,6 +2939,46 @@ int runSelfTest() {
   }
 
   // --- CMSIS-DAP v2 WinUSB transport through the injected backend. ---
+  {
+    FakeWinUsbIo io;
+    DeviceDescriptor device;
+    device.path = "\\\\?\\usb#vid_faed&pid_4870&mi_00#8&14a501f9&0&0000";
+    device.vid = "FAED";
+    device.pid = "4870";
+    DeviceSelector selector;
+    selector.serial = "507874001033";
+    expect(identifyWinUsbDevice(io, io.interfaceHandle, selector, device) &&
+               device.manufacturer == "Horco" && device.product == "Horco CMSIS-DAP v2" &&
+               device.serial == "507874001033",
+           "winusb-composite-usb-identity-real-serial-and-advertised-language");
+    selector.product = "CMSIS-DAP v2";
+    expect(identifyWinUsbDevice(io, io.interfaceHandle, selector, device), "winusb-product-filter");
+    selector.serial = "8&14a501f9&0&0000";
+    expect(!identifyWinUsbDevice(io, io.interfaceHandle, selector, device),
+           "winusb-instance-token-is-not-a-serial");
+    selector.path = device.path;
+    selector.product = "different product";
+    expect(identifyWinUsbDevice(io, io.interfaceHandle, selector, device),
+           "winusb-explicit-path-overrides-identity-filters");
+    selector = DeviceSelector{};
+    io.stringDescriptors[1] = FakeWinUsbIo::usbString(u"\u6d4b\u8bd5");
+    expect(identifyWinUsbDevice(io, io.interfaceHandle, selector, device) &&
+               device.manufacturer == "\xE6\xB5\x8B\xE8\xAF\x95", "winusb-usb-string-utf8");
+    for (const auto& malformed : std::vector<std::vector<uint8_t>>{
+             {8, 3, 'x', 0}, {3, 3, 'x'}, {4, 1, 'x', 0}, {0, 3}}) {
+      io.stringDescriptors[2] = malformed;
+      identifyWinUsbDevice(io, io.interfaceHandle, selector, device);
+      expect(device.product.empty(), "winusb-malformed-usb-product-not-used");
+    }
+    selector.serial = "507874001033";
+    io.descriptorAvailable = false;
+    expect(!identifyWinUsbDevice(io, io.interfaceHandle, selector, device) && device.serial.empty(),
+           "winusb-missing-descriptor-cannot-match-serial");
+    io.descriptorAvailable = true;
+    io.languageDescriptor = {6, 3, 0x11, 0x04};
+    expect(!identifyWinUsbDevice(io, io.interfaceHandle, selector, device) && device.product.empty(),
+           "winusb-truncated-language-descriptor-not-used");
+  }
   {
     FakeWinUsbIo io;
     CmsisDapWinUsbTransport transport(&io);
@@ -4439,6 +4510,21 @@ int runSelfTest() {
     const Result erase = debug.executeFlashAlgorithm(
         eraseRequest, eraseResult, diag, std::chrono::milliseconds(100));
     expect(erase.ok && eraseResult.returnCode == 0, "dap02a-algorithm-preerase");
+    // F407 sector 5 is 128 KiB, as large as the complete SRAM window. Erase
+    // has no page payload and must not reserve its sector size in RAM.
+    std::vector<uint8_t> noPageData;
+    FlashAlgorithmRunRequest largeEraseRequest = eraseRequest;
+    largeEraseRequest.data = &noPageData;
+    largeEraseRequest.targetAddress = 0x08020000u;
+    largeEraseRequest.r0 = largeEraseRequest.targetAddress;
+    largeEraseRequest.size = 0x20000u;
+    mock.prepareFlashAlgorithm("eraseSector", largeEraseRequest.targetAddress,
+                               largeEraseRequest.size, {}, largeEraseRequest.bkptAddress);
+    FlashAlgorithmRunResult largeEraseResult;
+    const Result largeErase = debug.executeFlashAlgorithm(
+        largeEraseRequest, largeEraseResult, diag, std::chrono::milliseconds(100));
+    expect(largeErase.ok && largeEraseResult.returnCode == 0,
+           "dap02a-algorithm-128k-erase-no-128k-ram-buffer");
     mock.prepareFlashAlgorithm("programPage", request.targetAddress, request.size, data,
                                request.bkptAddress);
     FlashAlgorithmRunResult algorithmResult;
@@ -4508,6 +4594,16 @@ int runSelfTest() {
                                         std::chrono::milliseconds(100)).ok,
            "dap02a-algorithm-code-buffer-overlap-rejected");
     FlashAlgorithmRunRequest unalignedStack = request;
+    // Check actual payload length, even if operation size understates it.
+    std::vector<uint8_t> oversizedPageData(0x20000, 0xFF);
+    FlashAlgorithmRunRequest oversizedPayload = request;
+    oversizedPayload.data = &oversizedPageData;
+    DapTransferDiagnostics invalidPayloadDiag;
+    const Result invalidPayload = debug.executeFlashAlgorithm(
+        oversizedPayload, invalidResult, invalidPayloadDiag, std::chrono::milliseconds(100));
+    expect(!invalidPayload.ok && invalidPayload.errorCode == ErrorCodes::kDapInvalidRequest &&
+               invalidPayloadDiag.packets == 0,
+           "dap02a-algorithm-actual-payload-overflow-rejected-before-io");
     unalignedStack.stackPointer -= 4u;
     expect(!debug.executeFlashAlgorithm(unalignedStack, invalidResult, diag,
                                         std::chrono::milliseconds(100)).ok,

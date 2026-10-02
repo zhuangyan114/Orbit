@@ -101,7 +101,7 @@ function Find-ArmGnuTool {
 
 function Build-FlashAlgorithm {
   param(
-    [ValidateSet('stm32f407', 'stm32h723')]
+    [ValidateSet('stm32f407', 'stm32f407ig', 'stm32h723')]
     [string]$Algorithm,
     [ValidateSet('cortex-m4', 'cortex-m7')]
     [string]$Cpu
@@ -114,6 +114,7 @@ function Build-FlashAlgorithm {
   }
 
   $sourceDir = Join-Path $repoRoot 'native/cmsis-dap-flash-algorithm'
+  $sourceAlgorithm = if ($Algorithm -eq 'stm32f407ig') { 'stm32f407' } else { $Algorithm }
   $buildDir = Join-Path $repoRoot "out/native/cmsis-dap-flash-algorithm-build"
   $objectFile = Join-Path $buildDir "${Algorithm}_flash_algorithm.o"
   $elfFile = Join-Path $buildDir "${Algorithm}_flash_algorithm.elf"
@@ -139,10 +140,13 @@ function Build-FlashAlgorithm {
     '-Wextra',
     '-Werror',
     '-c',
-    (Join-Path $sourceDir "${Algorithm}_flash_algorithm.c"),
+    (Join-Path $sourceDir "${sourceAlgorithm}_flash_algorithm.c"),
     '-o',
     $objectFile
   )
+  if ($Algorithm -eq 'stm32f407ig') {
+    $commonFlags += '-DORBIT_F407_FLASH_SIZE_KIB=1024'
+  }
   & $armGcc @commonFlags
   if ($LASTEXITCODE -ne 0) { throw "Flash Algorithm ($Algorithm) compilation failed with exit code $LASTEXITCODE" }
 
@@ -154,7 +158,7 @@ function Build-FlashAlgorithm {
     '-Wl,--gc-sections',
     '-Wl,--build-id=none',
     "-Wl,-Map=$mapFile",
-    "-Wl,-T,$(Join-Path $sourceDir "${Algorithm}_flash_algorithm.ld")",
+    "-Wl,-T,$(Join-Path $sourceDir "${sourceAlgorithm}_flash_algorithm.ld")",
     $objectFile,
     '-o',
     $elfFile
@@ -191,5 +195,6 @@ foreach ($entry in $projects) {
 
 if ($Project -eq 'cmsis-dap' -or $Project -eq 'all') {
   Build-FlashAlgorithm -Algorithm 'stm32f407' -Cpu 'cortex-m4'
+  Build-FlashAlgorithm -Algorithm 'stm32f407ig' -Cpu 'cortex-m4'
   Build-FlashAlgorithm -Algorithm 'stm32h723' -Cpu 'cortex-m7'
 }

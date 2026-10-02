@@ -69,7 +69,33 @@ Three designs were compared:
    critical path, while still requiring a target-side memory-write primitive.
 
 The selected implementation is a clean-room, source-built loader family:
-STM32F407VET6 (512 KiB Flash) and STM32H723VGT6 (1 MiB Flash). It is
+STM32F407VET6 (512 KiB Flash), STM32F407IG (1 MiB Flash), and
+STM32H723VGT6 (1 MiB Flash). It is
 deliberately narrower than a general CMSIS-Pack engine. A future user-provided
 Pack/FLM can be accepted via `cmsisDapFlashAlgorithmPath`, but an algorithm
 with unknown redistribution rights is rejected rather than embedded.
+
+## STM32F407IG adaptation (2026-10-02)
+
+The IG density is 1 MiB per [ST's STM32F407IG product page](https://www.st.com/en/microcontrollers-microprocessors/stm32f407ig.html).
+RM0090 defines the same F4 controller with twelve sectors: four 16 KiB,
+one 64 KiB, and seven 128 KiB, covering `0x08000000–0x080FFFFF`.
+The added sectors 8–11 start at `0x08080000`, `0x080A0000`,
+`0x080C0000`, and `0x080E0000`. The IG profile uses the existing read-only
+preflight registers (`DBGMCU_IDCODE=0xE0042000`, DEV_ID `0x413`, Flash
+capacity at `0x1FFF7A22`) and requires 1024 KiB before any algorithm call.
+The family ID and capacity do not distinguish package variants or prove an
+exact SKU; the configured name must agree with the board/project.
+
+`scripts/build-native.ps1` builds `orbit-stm32f407ig-flash-algorithm.bin`
+from Orbit's existing MIT-licensed `stm32f407_flash_algorithm.c` and linker
+script with `ORBIT_F407_FLASH_SIZE_KIB=1024`. The original `stm32f407`
+image remains a 512 KiB build; sectors 8–11 are excluded from that image.
+Both images retain the fixed entry offsets and use the 128 KiB ordinary
+SRAM window, keeping the existing exclusion of CCM PT_LOAD segments.
+No external binary or vendor source code is embedded. On 2026-10-02 the
+user confirmed normal operation on the current IG board/firmware after the
+128 KiB sector RAM-validation fix. This is basic user hardware confirmation;
+full-sector/bank coverage, additional probes/transports, and long-run/disconnect
+acceptance remain unverified. The confirmed fix is recorded in
+`docs/bug-fix-log.md`.

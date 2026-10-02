@@ -7,8 +7,11 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <sstream>
+
+#include "trace_control.h"
 
 namespace cmsis_dap_helper {
 namespace {
@@ -50,16 +53,6 @@ std::string idFromPath(const std::string& path, const char* key) {
   });
   if (value.size() > 4) value.resize(4);
   return value;
-}
-
-std::string serialFromPath(const std::string& path) {
-  const size_t first = path.find('#');
-  if (first == std::string::npos) return {};
-  const size_t second = path.find('#', first + 1);
-  if (second == std::string::npos) return {};
-  const size_t third = path.find('#', second + 1);
-  return path.substr(second + 1, third == std::string::npos ? std::string::npos
-                                                            : third - second - 1);
 }
 
 std::string errorMessage(DWORD error) {
@@ -111,6 +104,54 @@ void appendInterfacePaths(const GUID& guid, std::vector<std::wstring>& paths) {
 
 }  // namespace
 
+bool identifyWinUsbDevice(WinUsbIo& io, WINUSB_INTERFACE_HANDLE handle,
+                         const DeviceSelector& selector, DeviceDescriptor& device) {
+  device.manufacturer.clear();
+  device.product.clear();
+  device.serial.clear();
+  USB_DEVICE_DESCRIPTOR descriptor{};
+  ULONG transferred = 0;
+  if (io.getDescriptor(handle, USB_DEVICE_DESCRIPTOR_TYPE, 0, 0,
+                       reinterpret_cast<PUCHAR>(&descriptor), sizeof(descriptor), &transferred) &&
+      transferred == sizeof(descriptor) && descriptor.bLength == sizeof(descriptor) &&
+      descriptor.bDescriptorType == USB_DEVICE_DESCRIPTOR_TYPE) {
+    // String index 0 lists supported languages; do not assume English.
+    uint8_t languages[256]{};
+    transferred = 0;
+    if (io.getDescriptor(handle, USB_STRING_DESCRIPTOR_TYPE, 0, 0, languages,
+                         sizeof(languages), &transferred) &&
+        transferred >= 4 && transferred <= sizeof(languages) &&
+        languages[1] == USB_STRING_DESCRIPTOR_TYPE && languages[0] >= 4 &&
+        languages[0] <= transferred && (languages[0] % 2) == 0) {
+      const USHORT language = static_cast<USHORT>(languages[2] | (languages[3] << 8));
+      const auto readString = [&](UCHAR index) -> std::string {
+        if (index == 0) return {};
+        uint8_t bytes[256]{};
+        ULONG size = 0;
+        if (!io.getDescriptor(handle, USB_STRING_DESCRIPTOR_TYPE, index, language,
+                              bytes, sizeof(bytes), &size) ||
+            size < 2 || size > sizeof(bytes) || bytes[1] != USB_STRING_DESCRIPTOR_TYPE ||
+            bytes[0] < 2 || bytes[0] > size || (bytes[0] % 2) != 0) return {};
+        std::wstring value;
+        for (size_t offset = 2; offset < bytes[0]; offset += 2) {
+          const wchar_t character = static_cast<wchar_t>(bytes[offset] | (bytes[offset + 1] << 8));
+          if (character == L'\0') break;
+          value.push_back(character);
+        }
+        return wstringToUtf8(value);
+      };
+      device.manufacturer = readString(descriptor.iManufacturer);
+      device.product = readString(descriptor.iProduct);
+      device.serial = readString(descriptor.iSerialNumber);
+    }
+  }
+  if (!selector.path.empty()) return selector.path == device.path;
+  return (selector.vid.empty() || selector.vid == device.vid) &&
+         (selector.pid.empty() || selector.pid == device.pid) &&
+         (selector.serial.empty() || selector.serial == device.serial) &&
+         (selector.product.empty() || device.product.find(selector.product) != std::string::npos);
+}
+
 HANDLE RealWinUsbIo::createEvent() { return CreateEventW(nullptr, TRUE, FALSE, nullptr); }
 HANDLE RealWinUsbIo::createFile(const wchar_t* path) {
   return CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -121,6 +162,11 @@ BOOL RealWinUsbIo::initialize(HANDLE file, WINUSB_INTERFACE_HANDLE& out, DWORD& 
   const BOOL ok = WinUsb_Initialize(file, &out);
   error = ok ? ERROR_SUCCESS : GetLastError();
   return ok;
+}
+BOOL RealWinUsbIo::getDescriptor(WINUSB_INTERFACE_HANDLE handle, UCHAR type, UCHAR index,
+                                  USHORT language, PUCHAR buffer, ULONG capacity,
+                                  PULONG transferred) {
+  return WinUsb_GetDescriptor(handle, type, index, language, buffer, capacity, transferred);
 }
 BOOL RealWinUsbIo::queryInterfaceSettings(WINUSB_INTERFACE_HANDLE handle,
                                           USB_INTERFACE_DESCRIPTOR& descriptor, DWORD& error) {
@@ -178,13 +224,11 @@ Result RealWinUsbIo::enumerate(const DeviceSelector& selector,
     device.path = wstringToUtf8(interfacePath);
     device.vid = idFromPath(device.path, "vid");
     device.pid = idFromPath(device.path, "pid");
-    device.serial = serialFromPath(device.path);
     device.transport = "winusb";
     if (!selector.path.empty() && selector.path != device.path) continue;
     if (selector.path.empty()) {
       if (!selector.vid.empty() && selector.vid != device.vid) continue;
       if (!selector.pid.empty() && selector.pid != device.pid) continue;
-      if (!selector.serial.empty() && selector.serial != device.serial) continue;
     }
     const std::wstring widePath = utf8ToWide(device.path);
     HANDLE queryFile = createFile(widePath.c_str());
@@ -195,6 +239,7 @@ Result RealWinUsbIo::enumerate(const DeviceSelector& selector,
       closeHandle(queryFile);
       continue;
     }
+    const bool matchesIdentity = identifyWinUsbDevice(*this, queryInterfaceHandle, selector, device);
     USB_INTERFACE_DESCRIPTOR interfaceDescriptor{};
     if (queryInterfaceSettings(queryInterfaceHandle, interfaceDescriptor, queryError)) {
       device.interfaceNumber = interfaceDescriptor.bInterfaceNumber;
@@ -213,7 +258,7 @@ Result RealWinUsbIo::enumerate(const DeviceSelector& selector,
     }
     freeInterface(queryInterfaceHandle);
     closeHandle(queryFile);
-    if (device.bulkInEndpoint == 0 || device.bulkOutEndpoint == 0) continue;
+    if (!matchesIdentity || device.bulkInEndpoint == 0 || device.bulkOutEndpoint == 0) continue;
     out.push_back(std::move(device));
   }
   return Result::success();
@@ -290,6 +335,18 @@ Result CmsisDapWinUsbTransport::writePacket(const uint8_t* data, size_t length,
   size_t transferred = 0; ++counters_.writeReports; counters_.writePayloadBytes += length;
   counters_.writeReportBytes += packet.size();
   Result result = transfer(true, packet, transferred, timeout);
+  if (rawTraceEnabled()) {
+    std::ostringstream trace;
+    trace << "[cmsis-dap-winusb] write endpoint=" << static_cast<unsigned int>(bulkOutEndpoint_)
+          << " requested=" << length << " transferred=" << transferred
+          << " code=" << result.errorCode << " bytes=";
+    for (uint8_t byte : packet) {
+      char hex[4];
+      std::snprintf(hex, sizeof(hex), "%02X ", byte);
+      trace << hex;
+    }
+    std::cerr << trace.str() << '\n';
+  }
   return result;
 }
 
@@ -301,6 +358,17 @@ Result CmsisDapWinUsbTransport::readPacket(uint8_t* data, size_t capacity, size_
   std::vector<uint8_t> packet(payloadCapacity_, 0); size_t transferred = 0;
   ++counters_.readReports;
   const Result result = transfer(false, packet, transferred, timeout);
+  if (rawTraceEnabled()) {
+    std::ostringstream trace;
+    trace << "[cmsis-dap-winusb] read endpoint=" << static_cast<unsigned int>(bulkInEndpoint_)
+          << " transferred=" << transferred << " code=" << result.errorCode << " bytes=";
+    for (size_t index = 0; index < std::min(transferred, packet.size()); ++index) {
+      char hex[4];
+      std::snprintf(hex, sizeof(hex), "%02X ", packet[index]);
+      trace << hex;
+    }
+    std::cerr << trace.str() << '\n';
+  }
   if (!result.ok) return result;
   if (transferred > capacity) return Result::error(ErrorCodes::kMalformedResponse, "WinUSB response exceeds caller capacity");
   if (transferred > 0) std::memcpy(data, packet.data(), transferred);
@@ -342,6 +410,7 @@ Result CmsisDapWinUsbTransport::transfer(bool write, std::vector<uint8_t>& buffe
   const DWORD wait = io_->waitForSingleObject(overlapped.hEvent, static_cast<DWORD>(std::max<int64_t>(0, timeout.count())));
   if (wait == WAIT_TIMEOUT) {
     const Result settled = settleTimeout(write, overlapped, write ? bulkOutEndpoint_ : bulkInEndpoint_, bytes);
+    transferred = bytes;
     io_->closeHandle(overlapped.hEvent); return settled;
   }
   DWORD finalError = ERROR_SUCCESS;

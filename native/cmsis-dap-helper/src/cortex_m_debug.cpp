@@ -475,7 +475,10 @@ Result CortexMDebug::executeFlashAlgorithm(const FlashAlgorithmRunRequest& reque
                          "Flash Algorithm code and page buffer data are required");
   }
   const uint32_t codeSize = static_cast<uint32_t>(request.code->size());
-  const uint32_t pageBufferSize = (request.size + 3u) & ~3u;
+  // size describes the Flash operation: EraseSector may cover 128 KiB while
+  // sending no RAM payload. Validate the bytes actually uploaded/reused in
+  // the page buffer, including any extra bytes supplied beyond program size.
+  const uint32_t pageBufferSize = (static_cast<uint32_t>(request.data->size()) + 3u) & ~3u;
   const uint32_t codeEnd = request.algorithmAddress + codeSize;
   const uint32_t pageBufferEnd = request.pageBufferAddress + pageBufferSize;
   const uint32_t stackBase = request.stackPointer - request.stackSize;

@@ -171,7 +171,10 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
         message: 'CMSIS-DAP connected',
         targetState: 'Unknown' as const,
         elapsedMs: 1,
-        data: { channel: 'cmsis-dap' as const },
+        data: {
+          channel: 'cmsis-dap' as const,
+          diagnostics: { device: { transport: 'winusb', product: 'Horco CMSIS-DAP v2', serial: '507874001033' } },
+        },
       })),
     });
     const backend = new OzoneBackend(undefined, owner);
@@ -191,6 +194,10 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     });
 
     expect(result.ok).toBe(true);
+    expect(result).toMatchObject({
+      data: { ownerKind: 'cmsis-dap', probe: 'cmsis-dap' },
+      diagnostics: { device: { transport: 'winusb', product: 'Horco CMSIS-DAP v2', serial: '507874001033' } },
+    });
     expect(stepLog).toHaveBeenCalledWith(expect.stringContaining('owner=cmsis-dap'));
     expect(stepLog).not.toHaveBeenCalledWith(expect.stringContaining('legacy'));
     stepLog.mockRestore();

@@ -11,6 +11,7 @@
 - Source is under `src/` and `native/`; do not manually edit generated `dist/` bundles.
 - Before changing a debugging bug, load `.agent/skills/ozone-debug-fix/SKILL.md`.
 - Before inspecting, changing, diagnosing, or verifying any DAPLink/CMSIS-DAP path, also load `.agent/skills/daplink-debug-fix/SKILL.md`.
+- Before adding or extending a CMSIS-DAP chip model, density, or Flash Algorithm, also load `.agent/skills/cmsis-dap-add-target/SKILL.md` for sources, change boundaries, acceptance, and PR requirements.
 
 ## Build and Test
 

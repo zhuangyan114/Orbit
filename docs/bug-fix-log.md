@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### Bug：CMSIS-DAP 调试 STM32F407IG 时 128 KiB 扇区擦除被误判为 RAM 布局非法
+
+- **日期**: 2026-10-02
+- **问题描述**: 新增 STM32F407IG 的 1 MiB Flash 支持后，烧录 `frame.elf` 仍报 `AlgorithmError: Flash Algorithm RAM layout, Thumb entry, BKPT, or stack alignment is invalid`。Horco CMSIS-DAP v1（VID `FAED` / PID `4870`，HID）连接成功，唯一 owner 为 `cmsis-dap`；日志记录 Init 和扇区 0–4 擦除成功，到扇区 5（`0x08020000`，131072 字节）返回 `DapInvalidRequest`。
+- **根因分析**: `CortexMDebug::executeFlashAlgorithm()` 用 `request.size` 计算 RAM 页缓冲区占用，但该字段在 EraseSector 中表示 Flash 扇区大小，实际页数据为空。128 KiB 扇区被误当成 128 KiB RAM 缓冲区，与算法/栈共处 128 KiB SRAM 时越界。此前主机侧测试 mock 掉了 native 校验，未覆盖这个组合；H7 较大的 loader RAM 也未暴露该问题。
+- **修改方案**: 注册 STM32F407IG 及明确别名、12 扇区和 1024 KiB preflight；从现有 F407 源码按容量构建独立 1 MiB 镜像，保留 VE 的 512 KiB 边界。native 布局改为按实际页数据长度校验，保留入口/BKPT、栈对齐和重叠检查；新增 128 KiB 无页数据擦除、实际 payload 越界拒绝的 selftest，以及经 JSON-RPC 调用实际 helper 的 mock 回归。
+- **涉及文件**: `src/ozone-backend/cmsis-dap-flasher.ts:146`、`cmsis-dap-flasher.test.ts:82`、`session-target-channel.test.ts:394`；`native/cmsis-dap-flash-algorithm/stm32f407_flash_algorithm.c:11`；`native/cmsis-dap-helper/src/cortex_m_debug.cpp:478`、`main.cpp:4442`；`scripts/build-native.ps1:101`、`scripts/cmsis-dap/verify-flash-algorithm.js:16`、`scripts/cmsis-dap-smoke.js:401`。
+- **验证结果**: 新增 native 回归在旧代码上复现同一失败，修复后通过。全量 Vitest 63 文件、872 项通过、1 项跳过；类型检查、扩展/native 构建、算法镜像校验、CMSIS-DAP/J-Link mock、helper selftest 和 `git diff --check` 通过。fix1 VSIX 的算法/helper 与构建产物一致，包内 `koffi` 加载及 helper selftest 通过。**用户于 2026-10-02 明确确认 STM32F407IG 已正常使用，并授权写入本记录**；这是当前板卡/固件的基本使用确认，未追加全扇区、多探针/transport、断线或长稳专项验收。
+
 ### 改进：Timeline 支持多级指针，Watch 写入优化性能并保持控制安全边界
 
 - **日期**: 2026-09-29

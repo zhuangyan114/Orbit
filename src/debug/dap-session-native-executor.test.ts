@@ -83,6 +83,57 @@ describe('DapSession native executor lifecycle', () => {
     }));
   });
 
+  it.each([
+    ['cmsis-dap', 'winusb', 'CMSIS-DAP v2 / WinUSB'],
+    ['cmsis-dap', 'hid', 'CMSIS-DAP v1 / HID'],
+    ['cmsis-dap', undefined, 'CMSIS-DAP / 未知传输'],
+    ['jlink-native', undefined, 'J-Link / native C++ helper'],
+    ['jlink-legacy', undefined, 'J-Link / legacy koffi'],
+  ])('prints the actual %s/%s path after auto selection', async (ownerKind, transport, expectedPath) => {
+    vi.useFakeTimers();
+    const probe = ownerKind === 'cmsis-dap' ? 'cmsis-dap' : 'jlink';
+    const backend = {
+      execute: vi.fn(async (command: { cmd: string }) => {
+        if (command.cmd === 'resolveProbe') return { ok: true, data: { probe } };
+        if (command.cmd === 'connect') return {
+          ok: true,
+          data: { ownerKind },
+          diagnostics: { device: { transport, product: 'Horco CMSIS-DAP v2', serial: '507874001033' } },
+        };
+        if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+        return { ok: true, data: {} };
+      }),
+      configureNativeSteps: vi.fn(),
+      dispose: vi.fn(),
+    } as unknown as OzoneBackend;
+    const session = new DapSession(backend);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+    const launch = (session as any).handleLaunch({
+      type: 'request', seq: 4, command: 'launch', arguments: {
+        probe: 'auto', cmsisDapTransport: 'auto', nativeDebugEngineMode: 'auto',
+        flashBeforeDebug: false, rttLogEnabled: false, loggingEnabled: false,
+      },
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    await launch;
+
+    const pathOutputs = messages.filter(message => message.event === 'output'
+      && message.body?.output?.includes('[Orbit] 调试路径:'));
+    expect(pathOutputs).toHaveLength(1);
+    expect(pathOutputs[0].body).toMatchObject({
+      category: 'console',
+      output: `[Orbit] 调试路径: ${expectedPath} (owner=${ownerKind})`
+        + (probe === 'cmsis-dap' ? ' | Horco CMSIS-DAP v2 | SN=507874001033' : '') + '\n',
+    });
+    const launchResponse = messages.find(message => message.type === 'response' && message.command === 'launch');
+    expect(launchResponse?.success).toBe(true);
+    expect(messages.indexOf(pathOutputs[0])).toBeLessThan(messages.indexOf(launchResponse!));
+    expect(vi.mocked(backend.execute).mock.calls.filter(([command]) => command.cmd === 'connect')).toHaveLength(1);
+    expect(backend.execute).not.toHaveBeenCalledWith({ cmd: 'getPerformanceDiagnostics' });
+    await (session as any).handleDisconnect({ type: 'request', seq: 5, command: 'disconnect' });
+  });
+
   it('forwards explicit CMSIS-DAP flash skip and selectors to the connect command', async () => {
     const backend = {
       execute: vi.fn(async (command: { cmd: string }) => command.cmd === 'connect'
@@ -91,6 +142,9 @@ describe('DapSession native executor lifecycle', () => {
       configureNativeSteps: vi.fn(),
     } as unknown as OzoneBackend;
     const session = new DapSession(backend);
+
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
 
     await (session as any).handleLaunch({
       type: 'request', seq: 3, command: 'launch',
@@ -117,6 +171,8 @@ describe('DapSession native executor lifecycle', () => {
       }),
     }));
     expect(backend.execute).not.toHaveBeenCalledWith(expect.objectContaining({ cmd: 'flash' }));
+    expect(messages.some(message => message.event === 'output'
+      && message.body?.output?.includes('[Orbit] 调试路径:'))).toBe(false);
   });
 
   it('sends the step response before the stopped event once native reports halted', async () => {

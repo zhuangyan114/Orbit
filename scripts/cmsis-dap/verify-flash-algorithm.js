@@ -13,6 +13,23 @@ const bkptOffset = 0x500;
  * silently weaken the other target's checks.
  */
 function verifyF407Source(source) {
+  // Keep VE and IG density boundaries independent of the host registry.
+  for (const required of [
+    '#define ORBIT_F407_FLASH_SIZE_KIB 512',
+    '#if ORBIT_F407_FLASH_SIZE_KIB != 512 && ORBIT_F407_FLASH_SIZE_KIB != 1024',
+    '#define FLASH_END (FLASH_BASE + ORBIT_F407_FLASH_SIZE_KIB * 1024u)',
+  ]) {
+    if (!source.includes(required)) throw new Error(`STM32F407 density guard is missing: ${required}`);
+  }
+  const igSectors = source.match(/#if ORBIT_F407_FLASH_SIZE_KIB == 1024\n([\s\S]*?)#endif/);
+  if (!igSectors || igSectors[1].trim() !== [
+    'if (address == 0x08080000u) return 8;',
+    'if (address == 0x080A0000u) return 9;',
+    'if (address == 0x080C0000u) return 10;',
+    'if (address == 0x080E0000u) return 11;',
+  ].join('\n  ')) {
+    throw new Error('STM32F407IG sectors 8-11 must use exact starts and only appear in the 1 MiB image');
+  }
   const initBody = source.match(/int Init\([\s\S]*?\n}\n\n__attribute__\(\(section\("\.text\.uninit"/);
   if (!initBody || !initBody[0].includes('wait_busy()') || initBody[0].includes('wait_ready()')) {
     throw new Error('Init must wait for BSY only, clear stale status flags, and then unlock Flash');
@@ -104,6 +121,12 @@ const algorithms = [
   {
     name: 'stm32f407',
     binaryFile: 'orbit-stm32f407-flash-algorithm.bin',
+    sourceFile: 'stm32f407_flash_algorithm.c',
+    verifySource: verifyF407Source,
+  },
+  {
+    name: 'stm32f407ig',
+    binaryFile: 'orbit-stm32f407ig-flash-algorithm.bin',
     sourceFile: 'stm32f407_flash_algorithm.c',
     verifySource: verifyF407Source,
   },

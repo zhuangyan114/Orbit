@@ -34,6 +34,9 @@ class WinUsbIo {
   virtual HANDLE createEvent() = 0;
   virtual HANDLE createFile(const wchar_t* path) = 0;
   virtual BOOL initialize(HANDLE file, WINUSB_INTERFACE_HANDLE& interfaceHandle, DWORD& error) = 0;
+  virtual BOOL getDescriptor(WINUSB_INTERFACE_HANDLE interfaceHandle, UCHAR type, UCHAR index,
+                             USHORT language, PUCHAR buffer, ULONG capacity,
+                             PULONG transferred) = 0;
   virtual BOOL queryInterfaceSettings(WINUSB_INTERFACE_HANDLE interfaceHandle,
                                       USB_INTERFACE_DESCRIPTOR& descriptor, DWORD& error) = 0;
   virtual BOOL queryPipe(WINUSB_INTERFACE_HANDLE interfaceHandle, UCHAR index,
@@ -58,6 +61,9 @@ class RealWinUsbIo final : public WinUsbIo {
   HANDLE createEvent() override;
   HANDLE createFile(const wchar_t* path) override;
   BOOL initialize(HANDLE file, WINUSB_INTERFACE_HANDLE& interfaceHandle, DWORD& error) override;
+  BOOL getDescriptor(WINUSB_INTERFACE_HANDLE interfaceHandle, UCHAR type, UCHAR index,
+                     USHORT language, PUCHAR buffer, ULONG capacity,
+                     PULONG transferred) override;
   BOOL queryInterfaceSettings(WINUSB_INTERFACE_HANDLE interfaceHandle,
                               USB_INTERFACE_DESCRIPTOR& descriptor, DWORD& error) override;
   BOOL queryPipe(WINUSB_INTERFACE_HANDLE interfaceHandle, UCHAR index,
@@ -73,6 +79,11 @@ class RealWinUsbIo final : public WinUsbIo {
   BOOL freeInterface(WINUSB_INTERFACE_HANDLE interfaceHandle) override;
   BOOL closeHandle(HANDLE object) override;
 };
+
+// Read USB identity before applying serial/product filters. Composite interface
+// path tokens are Windows instance identifiers, not the probe's serial number.
+bool identifyWinUsbDevice(WinUsbIo& io, WINUSB_INTERFACE_HANDLE handle,
+                         const DeviceSelector& selector, DeviceDescriptor& device);
 
 class CmsisDapWinUsbTransport final : public CmsisDapTransport {
  public:

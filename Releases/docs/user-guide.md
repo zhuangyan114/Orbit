@@ -1,6 +1,6 @@
 # Orbit — 用户使用与配置指南
 
-> 版本：1.1.2 文档
+> 版本：1.1.5 文档
 >
 > 本文按当前仓库源码、`package.json` 的贡献点和 Native helper 实现整理。配置名、默认值、范围和单位均以源码为准；外部扩展的具体版本和 UI 由外部扩展决定。
 
@@ -41,7 +41,7 @@
 | 操作系统 | Native helper 的 CMake 配置明确要求 Windows；Native 发布目标为 `win32-x64`。当前产品应按 Windows 环境准备。 |
 | VS Code | `package.json` 声明 `engines.vscode: ^1.90.0`，即 VS Code 1.90.0 以上且仍在 1.x 主版本范围内。 |
 | 目标 | 产品定位为 STM32 / ARM Cortex-M；J-Link 需要 DLL 可识别的 device，CMSIS-DAP 烧录需要匹配目标的 Flash Algorithm。 |
-| 调试器 | 支持 SEGGER J-Link，以及标准 CMSIS-DAP/DAPLink probe（1.1.0 真机为 v1 HID；v2 WinUSB 有代码/Mock）。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
+| 调试器 | 支持 SEGGER J-Link，以及标准 CMSIS-DAP/DAPLink probe。v1 HID 有真实调试证据；Horco v2 WinUSB 已通过自动发现、握手及 SWD 只读访问，控制/烧录与性能专项验收见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
 | 固件文件 | `program` 使用 ELF/AXF。符号、源码行和 DWARF 类型质量取决于文件是否包含相应调试信息。 |
 | 外部视图 | RTOS Views、Memory View、Peripheral Viewer 和 debug tracker 由外部扩展提供，Orbit 不在 `extensionDependencies` 中自动安装它们。 |
 | 源码构建 | 仅在从源码构建 Native helper 时需要 CMake 3.20+，以及 Visual Studio C++ 工具或 x64 MinGW-w64。 |
@@ -101,15 +101,46 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 ### 2.3 CMSIS-DAP / DAPLink
 
-`probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。1.1.0 真机验收覆盖 HID v1；v2 WinUSB 以设备枚举和握手为准，本版未做真机。
+`probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。Horco v2（`FAED:4870`）于 2026-10-02 通过真实 WinUSB 自动选择、bulk 握手、DP power-up、MEM-AP 与运行态查询；USB 名称和 serial 从描述符读取，复合接口的 Windows instance token 不作为 serial。详细证据与尚未验收的控制/烧录/性能范围见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。
+
+已有 `device`/`program` 配置可继续使用；锁定 v2 和具体探针时增加以下字段：
+
+```jsonc
+"probe": "cmsis-dap",
+"cmsisDapTransport": "cmsis-dap-v2",
+"cmsisDapSerial": "507874001033"
+```
+
+`winusb` 与 `cmsis-dap-v2` 等价；显式选择 v2 时不会退到 HID。当前 v2 只读验收时钟为 1000 kHz，未执行 erase/program/verify；初次验证可使用 `flashBeforeDebug: false`。如果同时接着 J-Link，需要 `probe: "cmsis-dap"` 才能固定使用 DAPLink。
 
 CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`flashBeforeDebug: false` 完全跳过烧录（包括 Restart），仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
 
 当前 CMSIS-DAP 内置 Flash 目标：
 
+DAPLink + STM32F407IG 可使用以下配置。`program` 未指定时会自动寻找工作区的 ELF/AXF；如有多个固件，应显式指定实际项目的 ELF 路径。
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [{
+    "name": "Orbit DAPLink STM32F407IG",
+    "type": "orbit",
+    "request": "launch",
+    "device": "STM32F407IG",
+    "probe": "cmsis-dap",
+    "cmsisDapTransport": "auto",
+    "flashBeforeDebug": true,
+    "runToEntryPoint": "main"
+  }]
+}
+```
+
+`flashBeforeDebug: true` 会擦除 ELF 涉及的扇区、编程并校验；板上已有相同固件且只需调试时设为 `false`。IG 的 Flash 范围为 `0x08000000–0x080FFFFF`，烧录前要求 `DEV_ID=0x413` 和容量寄存器报告 1024 KiB。此 ID 属于 F405/407/415/417 家族，不能单独证明封装型号；`device` 应与板上芯片及工程一致。算法、缓冲区和栈使用 `0x20000000` 起的 128 KiB 普通 SRAM；Flash ELF 校验沿用 F407VE 的 RAM 窗口，暂不接受 CCM RAM 中的 PT_LOAD 段。用户于 2026-10-02 确认修复后当前板卡/固件正常使用；全扇区、其他探针/transport、断线和长稳专项验收仍需单独补充。
+
 | `device` / 别名 | Flash | 真机验收 |
 | --- | --- | --- |
 | `STM32F407VET6` / `STM32F407VE` | 512 KiB，自研 F4 算法 | CMSIS-DAP HID v1 已验收 |
+| `STM32F407IG` / `STM32F407IGT6` / `STM32F407IGT7` / `STM32F407IGH6` / `STM32F407IGH7` | 1 MiB，12 扇区，独立 F4 算法镜像 | 用户于 2026-10-02 确认当前板卡/固件正常使用（HID v1）；其他组合及专项验收未覆盖 |
 | `STM32H723VGT6` / `STM32H723VG` | 1 MiB，自研 H7 算法 | CMSIS-DAP HID v1 已验收（P7-1～P7-5，2026-08-25）；J-Link 已验收（P7-6，2026-09-11）。长稳/断线（P7-7）未验收 |
 
 未注册的器件名会在擦除前返回 `TargetMismatch`，不会回退到 F407 算法。H723 的其他封装/容量（例如 512 KiB E 密度）以及 H725/H73x 不在本版注册表中。默认 `device` 仍是 `STM32F407VG`；调试 H723 必须显式写成 `STM32H723VGT6` 或 `STM32H723VG`。
@@ -463,7 +494,7 @@ Orbit 不内置 Peripheral Viewer，但会为外部 MCU Debug Views 解析 `svdF
 | --- | --- | --- |
 | Native | 独立的 `orbit-jlink-helper.exe`，通过 JSON-lines 与 DAP 侧通信；helper 内加载 J-Link DLL | 拥有 Native source-level step into/over/out、批量内存读取和 NativeScheduler；目标为 Windows x64。 |
 | Legacy | Node 进程中的 `koffi` 直接加载 `JLink_x64.dll` | 保留现有调试和 DAP 兼容路径；Native source-level step API 在该 owner 上不可用。 |
-| CMSIS-DAP | 独立的 `orbit-cmsis-dap-helper.exe`，HID v1 已真机验收；WinUSB v2 有代码/Mock | 提供 SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm、Watch/Timeline 和内存型 RTT；不加载 J-Link DLL。 |
+| CMSIS-DAP | 独立的 `orbit-cmsis-dap-helper.exe`，HID v1 已真机验收；Horco WinUSB v2 已通过只读连接/内存验收 | 提供 SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm、Watch/Timeline 和内存型 RTT；不加载 J-Link DLL。具体 transport 的验收范围见第 2.3 节。 |
 
 ### 11.2 owner 选择
 
@@ -599,9 +630,9 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 ### 当前实现限制
 
 - Native helper 和当前 J-Link DLL 集成是 Windows 目标；仓库没有把 Linux/macOS 作为当前 Native 运行目标。
-- CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。1.1.0 真机验收覆盖 v1 HID；v2 WinUSB 只有代码/Mock/构建证据，具体 probe 固件兼容性仍以设备枚举和握手为准。
+- CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。HID 有真实调试证据；Horco v2 已通过只读连接/内存验收，但真实 v2 烧录、调试控制、Watch/Timeline/RTT 与性能/长稳仍待专项验证；具体 probe 固件兼容性不能从一个组合外推。
 - `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。STM32H723VGT6 的 J-Link 链路已在 1.1.2 通过真机验收（P7-6，2026-09-11，owner 只出现 `jlink-native`）；`device` 必须写 J-Link 软件认识的名称（如 `STM32H723VG`），`STM32H723VGT6` 不在 J-Link V9.56 的器件库里。长稳/断线（P7-7）未验收。
-- CMSIS-DAP 内置 Flash 注册表当前只有 `STM32F407VET6` 与 `STM32H723VGT6`（及各自别名）。H723 需显式设置 `device`；默认值仍是 `STM32F407VG`。
+- CMSIS-DAP 内置 Flash 注册表包含 `STM32F407VET6`、`STM32F407IG` 与 `STM32H723VGT6`（及各自别名）。IG 与 H723 需显式设置 `device`；默认值仍是 `STM32F407VG`。IG 已有用户基本使用确认，专项验收范围见第 2.3 节。
 - `interface` schema 接受 `SWD` 和 `JTAG`，但 Legacy DLL 连接实现当前固定选择 SWD；JTAG 应使用 Native 并单独确认硬件。
 - J-Link 路径使用 6 个槽位索引；CMSIS-DAP 会读取 Cortex-M FPB 容量。任何路径槽位耗尽时新硬件断点都必须返回明确错误。
 - Native source-level step into/over/out 只属于 Native owner；Legacy 不能把普通单步宣传为 Native source-level stepping。

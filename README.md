@@ -15,7 +15,7 @@
   <a href="https://github.com/zhuangyan114/Orbit/releases">Orbit Releases</a>
 </p>
 
-> 本 README 是 Orbit 正式版 1.1.4 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
+> 本 README 是 Orbit 正式版 1.1.5 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
 
 ## Orbit 是什么
 
@@ -38,6 +38,8 @@ Orbit 暴露 `orbit` DAP 调试器类型，使用 ELF/AXF 载入符号、行号�
 
 默认 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。也可以用 `probe: "jlink"` 或 `probe: "cmsis-dap"` 固定 owner。`cmsisDapTransport: "auto"` 优先 v2 WinUSB 并兼容 v1 HID。
 
+Horco CMSIS-DAP v2（`FAED:4870`）已完成 USB 名称/真实序列号适配，自动选择、bulk 协议握手和 SWD 只读目标访问于 2026-10-02 通过真机验证。可用 `"probe": "cmsis-dap"` 与 `"cmsisDapTransport": "cmsis-dap-v2"` 锁定 v2；烧录、调试控制、性能与长稳的验证范围见 [WinUSB 适配报告](docs/cmsis-dap-v2-winusb-report.md)。
+
 最小 `launch.json` 只需要标准 DAP 字段和芯片型号：
 
 ```jsonc
@@ -53,6 +55,8 @@ Orbit 暴露 `orbit` DAP 调试器类型，使用 ELF/AXF 载入符号、行号�
 ```
 
 Orbit 默认使用 SWD / 4000 kHz / Native auto，并从 `build/Debug`、`build/Release`、`build` 自动寻找 ELF/AXF。`deviceName` 自动跟随 `device`。没有显式 SVD 时，Orbit 会先查工作区、本机 CMSIS Pack 和缓存；仍未找到才按需下载一个对应 STM32 系列的 Keil Device Family Pack，只提取当前芯片的 SVD。下载或解析失败不阻止调试。
+
+使用 DAPLink 调试 STM32F407IG 时，在配置中同时指定 `"device": "STM32F407IG"` 和 `"probe": "cmsis-dap"`。CMSIS-DAP 内置 IG 的 1 MiB Flash 配置和独立算法镜像，支持扇区 0–11；烧录前校验 F4 芯片 ID 与 1024 KiB 容量。用户已于 2026-10-02 确认当前板卡/固件正常使用；全扇区、多探针与长稳专项验收仍需单独补充。完整配置见[用户文档](Releases/docs/user-guide.md#23-cmsis-dap--daplink)，修复经过见[修复日志](docs/bug-fix-log.md)。
 
 ### 运行时查看变量
 
@@ -79,6 +83,21 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 
 工作区打开 `orbit.automation.enabled` 后，每个 VS Code 窗口在 `127.0.0.1` 上发布独立的 Automation API v1（`/v1/rpc`、`/v1/events`）。客户端按 `projectId`/`instanceId` 握手，再绑定精确的 `sessionId`/`sessionGeneration`。Node CLI、Python 标准和 MCP 都走同一协议，不会另开第二条目标连接。默认只授 `read`；写入、控制、Flash 需要额外 scope。真实硬件验收与 Mock 分层记录，见 [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)。
 
+
+## 参与 CMSIS-DAP 芯片适配
+
+Orbit 主要由个人维护，维护者能持有和测试的芯片、板卡与探针组合有限。CMSIS-DAP 规范提供主机与探针间的通信方式；Flash 控制器、容量、扇区、RAM、编程粒度、缓存和保护行为仍由具体芯片决定。增加一个器件名并不代表它已经能可靠烧录，实际支持需要资料、实现、边界测试和开发板验证共同完成。
+
+因此，CMSIS-DAP 链路的型号覆盖需要社区协作。有对应开发板的贡献者可以补齐实板证据；没有板卡也可以整理权威资料、实现型号描述或算法、补充回归测试。型号、容量、探针和 HID/WinUSB 分别记录验证状态，避免把一个组合的成功外推为整个系列支持。
+
+新增芯片请从 **[CMSIS-DAP 新芯片适配 Skill](.agent/skills/cmsis-dap-add-target/SKILL.md)** 开始。它同时供人阅读和 AI 编码助手执行，规定资料来源、代码风格、允许修改的层、owner/Flash 安全边界、验收流程和 PR 格式；已有调试故障另遵循 [DAPLink 调试准则](.agent/skills/daplink-debug-fix/SKILL.md)。
+
+1. 提供完整型号、容量、板卡/探针和目标能力，按[资料与改动边界](.agent/skills/cmsis-dap-add-target/references/sources-and-boundaries.md)整理数据手册、参考手册、勘误及算法许可。
+2. 优先新增目标描述并复用公共链路；需要修改 helper 时，补充真正执行 native 校验的回归。涉及 Flash 算法和镜像时，保证来源可追溯、构建可复现。
+3. 按[验收流程与标准](.agent/skills/cmsis-dap-add-target/references/acceptance.md)记录自动化、基本实板调试、完整烧录、运行时及断线/长稳结果。缺少板卡时可以提交资料 PR 或注明“待硬件验收”的 Draft PR。
+4. 使用[新芯片 PR 模板](.agent/skills/cmsis-dap-add-target/references/pr-template.md)提交中文标题和说明，列出已验证范围、证据和缺口，让其他持板者能继续验收。
+
+F407IG 适配曾在小扇区擦除通过后，因公共 helper 把 128 KiB 扇区误当成 RAM 缓冲区而失败。这个案例说明主机单元测试、native mock 和实板验证都各有作用；我们会把发现的问题转为可复用回归，让后续芯片适配也受益。
 
 ## 文档与发布
 
@@ -125,9 +144,13 @@ Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以�
 
 - 减小 launch.josn 最少需要配置，降低上手难度
 
-## 预告
+## 1.1.5 更新日志
 
-- 会尽快支持 CMSIS-DAP-V2
+- 修复 CMSIS-DAP v2 WinUSB 的 USB 身份识别和真实序列号筛选，`auto` 优先选择 v2
+- 新增 CMSIS-DAP STM32F407IG 的 1 MiB Flash 支持，并修复 128 KiB 扇区擦除时的算法 RAM 布局校验
+- 调试启动连接成功后，在调试控制台显示实际 owner 路径和 CMSIS-DAP v1/HID 或 v2/WinUSB 传输
+
+
 
 ## 许可证
 

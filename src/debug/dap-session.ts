@@ -2009,6 +2009,31 @@ export class DapSession extends EventEmitter {
       this.connectionFailureCount = 0;
       this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connected';
 
+      // Report the selected owner and opened device, never the requested auto preference.
+      const ownerKind = (connectResult.data as { ownerKind?: string } | undefined)?.ownerKind || 'unknown';
+      const connectedDevice = connectResult.diagnostics?.device as {
+        transport?: string; product?: string; serial?: string;
+      } | undefined;
+      let debugPath = ownerKind === 'jlink-native'
+        ? 'J-Link / native C++ helper'
+        : ownerKind === 'jlink-legacy' ? 'J-Link / legacy koffi' : '未知路径';
+      if (ownerKind === 'cmsis-dap') {
+        debugPath = connectedDevice?.transport === 'winusb'
+          ? 'CMSIS-DAP v2 / WinUSB'
+          : connectedDevice?.transport === 'hid'
+            ? 'CMSIS-DAP v1 / HID'
+            : `CMSIS-DAP / ${connectedDevice?.transport || '未知传输'}`;
+      }
+      const deviceDetails = ownerKind === 'cmsis-dap'
+        ? [connectedDevice?.product, connectedDevice?.serial ? `SN=${connectedDevice.serial}` : '']
+          .filter(Boolean).join(' | ')
+        : '';
+      const connectionSummary = `[Orbit] 调试路径: ${debugPath} (owner=${ownerKind})`
+        + (deviceDetails ? ` | ${deviceDetails}` : '');
+      const singleLineSummary = connectionSummary.replace(/[\r\n]+/g, ' ');
+      this.sendEvent('output', { category: 'console', output: `${singleLineSummary}\n` });
+      log.dap(`${ownerKind === 'cmsis-dap' ? '[cmsis-dap] ' : ''}${singleLineSummary}`);
+
       if (elfPath && this._flashEnabled && resolvedProbe === 'cmsis-dap') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath} through the connected CMSIS-DAP owner...\n` });
         const flashAbortController = new AbortController();

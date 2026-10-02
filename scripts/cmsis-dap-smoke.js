@@ -398,6 +398,10 @@ async function runDap02AMatrix() {
     check('dap02a: cached algorithm skips erase code upload', erase.ok
       && erase.diagnostics.blockWrites === 0, JSON.stringify(erase));
     const first = [0x00, 0x01, 0x02, 0x03];
+    const largeErase = await request('flashAlgorithm', flashAlgorithmParams('eraseSector', 0x08020000, 0x20000));
+    check('dap02a: F407 128 KiB erase uses no RAM page payload', largeErase.ok
+      && largeErase.data.returnCode === 0 && largeErase.diagnostics.blockWrites === 0,
+    JSON.stringify(largeErase));
     const program = await request('flashAlgorithm', flashAlgorithmParams('programPage', 0x08000000, first.length, first));
     check('dap02a: 1-to-0 program', program.ok && program.data.returnCode === 0, JSON.stringify(program));
     check('dap02a: cached algorithm writes only program buffer', program.ok

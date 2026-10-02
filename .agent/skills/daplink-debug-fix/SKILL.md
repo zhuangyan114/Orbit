@@ -5,6 +5,8 @@ description: Use whenever a task mentions DAPLink, CMSIS-DAP, CMSIS-DAP HID or W
 
 # CMSIS-DAP/DAPLink 准则
 
+新增芯片型号、容量或 Flash Algorithm 时，同时遵循 [CMSIS-DAP 新芯片适配流程](../cmsis-dap-add-target/SKILL.md)；一般调试故障不必加载该适配流程。
+
 本准则适用于 Orbit for VS Code 中所有 CMSIS-DAP/DAPLink 工作。它覆盖有线 HID、WinUSB、未来无线 DAPLink、SWD/DP/AP、Cortex-M 控制、Flash Algorithm、Watch、Timeline、RTT 和 Viewer。J-Link 专属问题仍使用 `ozone-debug-fix`；同时涉及两条链路时，分别遵守两套规则。
 
 ## 核心原则
@@ -24,7 +26,7 @@ CMSIS-DAP 是调试协议，DAPLink 是实现该协议的探针固件/产品。`
 ## 强制前置检查
 
 1. 先阅读仓库 `AGENTS.md`、本技能和 `ozone-debug-fix`；确认任务属于诊断、修改还是验收。
-2. 修改前执行 `git status --short`，保留用户已有改动，不修改 `dist/`，不提交 Git。
+2. 修改前执行 `git status --short`，保留用户已有改动，不修改 `dist/`；未经用户要求不提交、推送或合并 Git 改动。
 3. 结构化调用关系优先使用 CodeGraph；配置、文档、日志和 raw trace 使用直接读取或 `rg`。
 4. 在提出修复前保存最小复现：helper RPC、DAP raw frame、日志、mock trace 或硬件证据。
 5. 记录当前 session 的 physical owner、target owner、native/legacy 路径和是否存在活动 DAP session。
@@ -115,7 +117,7 @@ mock 必须独立维护协议 oracle；不得只用 production 常量和同一�
 | DAP_Connect 成功就是调试连接成功 | 仍需 DPIDR、CTRL/STAT 和 DP/AP ACK |
 | mock 内存读成功就是硬件通过 | 还需真实目标和完整时序证据 |
 | DAPLink 每个芯片都要重写传输层 | 通信和 Cortex-M 层复用，Flash/SVD/内存参数按型号或家族适配 |
-| OpenOCD 可以直接当生产后端 | 只能作为参考，除非明确设计外部 backend 并处理 owner/进程边界 |
+| OpenOCD 可以直接当生产后端 | 按 AGENTS.md 仅作为资料参考，不得添加为正常调试控制路径或用它绕过 owner |
 | `.data` 的 p_vaddr 就是烧录地址 | p_vaddr 是运行地址，p_paddr 通常是 Flash LMA |
 | waitForHalt 超时只能修超时 | 先区分入口、Flash busy、fault、返回地址和 BKPT 失败 |
 | 读取一个变量成功就是 Watch 通过 | 还需 owner 路由、运行态采样、调度公平和 session fence |

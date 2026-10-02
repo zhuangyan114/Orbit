@@ -683,6 +683,7 @@ case 'readVariableRuntime':
         : config.nativeDebugEngineMode === undefined && config.nativeDebugEngineEnabled === true
           ? 'auto'
           : 'legacy';
+    let connectionDiagnostics: Record<string, unknown> | undefined;
     if (this.sessionTarget) {
       const connected = this.sessionTarget instanceof SessionTargetSelector
         ? await this.sessionTarget.connect(config, nativeMode)
@@ -694,6 +695,7 @@ case 'readVariableRuntime':
           error: `${connected.errorCode ? `${connected.errorCode}: ` : ''}${connected.message}`,
         };
       }
+      connectionDiagnostics = connected.data?.diagnostics;
     } else {
       if (!this.jlink.open()) return { ok: false, error: 'Failed to load JLink DLL' };
       if (!this.jlink.connect(config.device, config.speedKHz)) {
@@ -736,10 +738,11 @@ case 'readVariableRuntime':
       data: {
         state: TargetState.Connected,
         probe: this.selectedProbe() || requestedProbe,
-        ownerKind: this.sessionTarget && 'ownerKind' in this.sessionTarget
-          ? this.sessionTarget.ownerKind
+        ownerKind: this.sessionTarget
+          ? 'ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind
           : 'jlink-legacy',
       },
+      ...(connectionDiagnostics ? { diagnostics: connectionDiagnostics } : {}),
     };
   }
 

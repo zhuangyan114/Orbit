@@ -1,6 +1,6 @@
 # Orbit — 用户使用与配置指南
 
-> 版本：1.1.5 文档
+> 版本：1.1.6 文档
 >
 > 本文按当前仓库源码、`package.json` 的贡献点和 Native helper 实现整理。配置名、默认值、范围和单位均以源码为准；外部扩展的具体版本和 UI 由外部扩展决定。
 
@@ -141,9 +141,24 @@ DAPLink + STM32F407IG 可使用以下配置。`program` 未指定时会自动寻
 | --- | --- | --- |
 | `STM32F407VET6` / `STM32F407VE` | 512 KiB，自研 F4 算法 | CMSIS-DAP HID v1 已验收 |
 | `STM32F407IG` / `STM32F407IGT6` / `STM32F407IGT7` / `STM32F407IGH6` / `STM32F407IGH7` | 1 MiB，12 扇区，独立 F4 算法镜像 | 用户于 2026-10-02 确认当前板卡/固件正常使用（HID v1）；其他组合及专项验收未覆盖 |
+| `STM32F103C8T6` / `STM32F103C8` | 64 KiB，64 个 1 KiB 页，20 KiB SRAM，自研 Cortex-M3 / F1 半字算法 | 源码和自动化适配；HID / WinUSB 实板烧录、调试及长稳待验收 |
 | `STM32H723VGT6` / `STM32H723VG` | 1 MiB，自研 H7 算法 | CMSIS-DAP HID v1 已验收（P7-1～P7-5，2026-08-25）；J-Link 已验收（P7-6，2026-09-11）。长稳/断线（P7-7）未验收 |
 
 未注册的器件名会在擦除前返回 `TargetMismatch`，不会回退到 F407 算法。H723 的其他封装/容量（例如 512 KiB E 密度）以及 H725/H73x 不在本版注册表中。默认 `device` 仍是 `STM32F407VG`；调试 H723 必须显式写成 `STM32H723VGT6` 或 `STM32H723VG`。
+
+STM32F103C8T6 的最小配置如下，`program` 可按需指定；使用本次源码构建，已发布旧版本不包含这一适配：
+
+```jsonc
+{
+  "name": "Orbit DAPLink STM32F103C8T6",
+  "type": "orbit",
+  "request": "launch",
+  "device": "STM32F103C8T6",
+  "probe": "cmsis-dap"
+}
+```
+
+F103C8 按官方 64 KiB 容量校验，不开放部分板卡宣称的额外 Flash，也不包含 F103CB 或兼容芯片。Flash 范围为 `0x08000000–0x0800FFFF`，SRAM 为 `0x20000000–0x20004FFF`。烧录前验证 DPIDR `0x1BA01477`、DEV_ID `0x410` 和容量寄存器 `0x1FFFF7E0` 的 64 KiB；不匹配返回 `TargetMismatch`。算法开启 HSI 供 FPEC 使用，保持系统时钟和预取配置，并在 UnInit 重新锁定 Flash。只调试已有固件时增加 `"flashBeforeDebug": false`。
 
 这张注册表只作用于 CMSIS-DAP 烧录；J-Link 链路不查注册表，`device` 会原样交给 J-Link DLL 和 `JLink.exe`，所以必须填已安装 J-Link 软件认识的器件名。实测 J-Link V9.56 的器件库没有 `STM32H723VGT6`：Commander 会提示器件名未知并降级到 `STM32H723VG`，自动烧录时还会弹出器件选择框、把流程卡到超时。`probe: "jlink"` 请写 `"device": "STM32H723VG"`。
 
@@ -216,7 +231,7 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 
 | `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、来源和许可已确认的 Flash Algorithm binary/manifest。 |
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF 路径；用于可选烧录、符号和 DWARF。 |
 | `svdFile` | path | 自动解析 | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径；显式值优先级最高。 |
-| `svdPath` | path | 跟随 `svdFile` | `svdFile` 的兼容别名；两者都未填写时按设置、本地文件、缓存、在线 Pack 的顺序解析。 |
+| `svdPath` | path | 跟随 `svdFile` | `svdFile` 的兼容别名；两者都未填写时先查设置、本地文件和缓存，缺失时后台获取在线 Pack。 |
 | `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
 | `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
 | `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
@@ -265,7 +280,7 @@ DAP 源码还接受下列兼容输入：
 | `orbit.defaultSpeed` | number，kHz | `4000` | 默认接口速度。 |
 | `orbit.defaultProgram` | path | `""` | 默认 ELF/AXF；空值时自动扫描 `build/Debug`、`build/Release`、`build`。 |
 | `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的默认 CMSIS-SVD；优先于自动查找和下载。 |
-| `orbit.svdAutoDownload` | boolean | `true` | 本地没有匹配 SVD 时按需下载并缓存一个对应 STM32 系列的 Keil DFP；只提取当前芯片 SVD，失败不阻止调试。 |
+| `orbit.svdAutoDownload` | boolean | `true` | 本地没有匹配 SVD 时直接启动调试，后台下载并缓存对应系列的 Keil DFP；失败重试，成功后下次启动自动使用。 |
 | `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称，例如 `FreeRTOS`。 |
 | `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次 stack trace 后自动 focus/refresh 外部 RTOS Views；关闭可减少调试会话额外开销。 |
 | `orbit.rttLogEnabled` | boolean | `true` | 是否读取 RTT。 |
@@ -320,13 +335,23 @@ Timeline 通道可以直接在 Timeline 中添加，也可以在 Watch 行的操
 - 默认自动跟随最新采样；关闭自动跟随后可以拖动时间轴查看历史。
 - 横轴单位是毫秒；默认每格 100 ms，共 8 个横向 division。
 - 可放大、缩小、输入每格时间和每个通道的 Y 轴 `/div`。
+- 滚轮以鼠标所在时间点缩放；工具栏加减号和时间/div 输入以图表中心缩放。缩放后可以拖动查看历史，右键空白区域恢复追踪。
 - Y 轴默认自动缩放；手动设置 `/div` 后进入手动缩放，双击可回到自动缩放。
 - 鼠标悬停显示各通道在光标时间附近的值；数据点之间使用相邻点插值显示提示值。
-- Clear 会清除当前采样数据，但不会自动删除表达式列表。
+- 单击图表空白处依次放置 A/B 时间游标，拖动游标调整位置，图内显示时间差；右键游标删除它。
+- 清除实时数据会结束当前记录并开始新记录，原记录保留为历史标签，表达式列表继续使用。
 
-Timeline 状态保存为 `ozoneTimelineState`，包括自动跟随、时间每格、通道启用状态、颜色和 Y 轴设置。历史数据按源码保留约 10 分钟，并保留一个窗口前置点连接曲线边界；内部会使用 30 秒滞后避免频繁裁剪。
+实时调试页和历史标签分别保留变量、颜色、比例、视口、追踪与游标配置。新调试记录继承工作区保存的调试配置；CSV 标签使用文件中的配置，其修改不会覆盖下一次调试的变量列表。
 
-### 5.3 采样语义
+### 5.3 保存、打开与恢复记录
+
+- “保存全部 CSV”保存当前记录；“保存 A/B 区间”保存两条游标之间的数据。文件同时包含原始采样与视图配置。
+- 默认保存目录为工程 `.vscode/timeline`，文件名使用调试开始时间；可以在保存对话框中选择其他位置。
+- “打开 CSV”在独立历史标签中查看数据，无需连接目标板；实时采集继续写入实时记录。
+- “恢复记录”列出已打开工程 `.vscode/timeline` 下手动保存的 CSV。重载窗口后不恢复未保存的临时记录。
+- 采集期间持续写入临时磁盘缓存，内存保持有界，支持回看超过十分钟的历史；实际保留时长受磁盘空间和写入能力限制。
+
+### 5.4 采样语义
 
 - 目标停止时不生成新的 Timeline 采样点；恢复运行后从新的实时读取继续，不回填停止期间的时间槽。
 - 活动 DAP session 使用 J-Link Native/Legacy 或 CMSIS-DAP 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
@@ -480,9 +505,9 @@ Orbit 不内置 Peripheral Viewer，但会为外部 MCU Debug Views 解析 `svdF
 3. 工作区内文件名与芯片系列完全匹配的 SVD，例如 `STM32F407.svd`；
 4. `CMSIS_PACK_ROOT` 或 `%LOCALAPPDATA%\Arm\Packs` 中已安装的 Keil DFP；
 5. Orbit 扩展全局存储中的 SVD 缓存；
-6. `orbit.svdAutoDownload: true` 时，读取 Keil 官方 PDSC，下载对应系列的一个 Device Family Pack 并缓存，只从包内提取当前芯片系列的 SVD。
+6. 本地没有匹配 SVD 且 `orbit.svdAutoDownload: true` 时，先启动调试，再后台读取 Keil 官方 PDSC、下载对应系列的一个 Device Family Pack 并缓存，只从包内提取当前芯片系列的 SVD。
 
-自动下载的单位是一个芯片系列 Pack，例如 F407 使用 `Keil.STM32F4xx_DFP`。Pack 压缩包本身可能包含同系列多个 SVD，但 Orbit 不会下载所有厂商或所有 STM32 系列，也不会把其他 SVD 解压到缓存。后续同型号 launch 直接复用缓存。若离线、型号无法识别、Pack 中没有精确匹配项或下载失败，Orbit 会写入 DAP 日志并继续调试，只是 Peripheral Viewer 暂时没有寄存器描述。
+自动下载的单位是一个芯片系列 Pack，例如 F407 使用 `Keil.STM32F4xx_DFP`。Pack 压缩包本身可能包含同系列多个 SVD，但 Orbit 不会下载所有厂商或所有 STM32 系列，也不会把其他 SVD 解压到缓存。下载完全在后台进行，每次下载最多等待 15 秒，失败后分别等待 5 秒、15 秒再尝试，最多 3 次。同系列 SVD 的并发请求合并，关闭扩展时取消下载。成功后，下次启动自动使用缓存；当前会话继续调试，外部 Peripheral Viewer 暂时没有寄存器描述。下载失败写入 DAP 日志，不中断会话。
 
 寄存器名称、bit 字段、读写权限和显示质量仍取决于 SVD 文件及外部 Viewer。外部 Viewer 不显示时先检查扩展安装、`trackDebuggers`、最终 SVD 路径和目标 device name。需要完全离线或固定版本时，设置 `orbit.svdAutoDownload: false` 并显式提供 SVD。
 
@@ -632,7 +657,7 @@ Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源
 - Native helper 和当前 J-Link DLL 集成是 Windows 目标；仓库没有把 Linux/macOS 作为当前 Native 运行目标。
 - CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。HID 有真实调试证据；Horco v2 已通过只读连接/内存验收，但真实 v2 烧录、调试控制、Watch/Timeline/RTT 与性能/长稳仍待专项验证；具体 probe 固件兼容性不能从一个组合外推。
 - `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。STM32H723VGT6 的 J-Link 链路已在 1.1.2 通过真机验收（P7-6，2026-09-11，owner 只出现 `jlink-native`）；`device` 必须写 J-Link 软件认识的名称（如 `STM32H723VG`），`STM32H723VGT6` 不在 J-Link V9.56 的器件库里。长稳/断线（P7-7）未验收。
-- CMSIS-DAP 内置 Flash 注册表包含 `STM32F407VET6`、`STM32F407IG` 与 `STM32H723VGT6`（及各自别名）。IG 与 H723 需显式设置 `device`；默认值仍是 `STM32F407VG`。IG 已有用户基本使用确认，专项验收范围见第 2.3 节。
+- CMSIS-DAP 内置 Flash 注册表包含 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 与 `STM32F103C8T6`（及各自别名）。这些目标需显式设置 `device`；默认值仍是 `STM32F407VG`。F103C8T6 实板待验收；IG 已有用户基本使用确认，专项验收范围见第 2.3 节。
 - `interface` schema 接受 `SWD` 和 `JTAG`，但 Legacy DLL 连接实现当前固定选择 SWD；JTAG 应使用 Native 并单独确认硬件。
 - J-Link 路径使用 6 个槽位索引；CMSIS-DAP 会读取 Cortex-M FPB 容量。任何路径槽位耗尽时新硬件断点都必须返回明确错误。
 - Native source-level step into/over/out 只属于 Native owner；Legacy 不能把普通单步宣传为 Native source-level stepping。

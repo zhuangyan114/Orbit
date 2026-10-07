@@ -1,157 +1,165 @@
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/zhuangyan114/Orbit@master/resources/orbit-icon-256.png" width="128" height="128" alt="Orbit icon">
+  <a href="https://marketplace.visualstudio.com/items?itemName=orbit-debug.orbit-for-vscode"><img src="https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-icon-256.png" width="96" height="96" alt="Orbit 图标"></a>
 </p>
 
 <h1 align="center">Orbit — The Debugger for What’s Next</h1>
 
 <p align="center">
-  面向 STM32 / ARM Cortex-M 的 VS Code 调试前端：直接连接 J-Link 或 CMSIS-DAP/DAPLink，<br>
-  把源码调试、运行时变量、波形、RTT 日志和自动化实验放在同一条目标访问链路上。
+  在 VS Code 里调试 STM32 / ARM Cortex-M，支持 J-Link 和 DAPLink。<br>
+  直接读 MCU 变量画波形，不用写串口发送代码；参数可以在 Watch 里改。<br>
+  断点、单步、RTT 日志也在这里，AI 可以通过 MCP 操作调试器。
 </p>
 
 <p align="center">
-  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md">全套工具链教程</a> ·
-  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md">用户文档</a> ·
-  <a href="https://github.com/zhuangyan114/Orbit/releases">Orbit Releases</a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=orbit-debug.orbit-for-vscode">插件市场安装</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/releases">离线下载</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/README.md#开始使用">快速开始</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md">从零搭环境</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md">用户手册</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md#12-mcp-与-plugin-api">MCP 接入</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/issues">反馈问题</a>
 </p>
 
-> 本 README 是 Orbit 正式版 1.1.5 的产品介绍与架构说明。首次使用请先阅读[全套工具链教程](Releases/docs/全套工具链教程.md)；需要查询 Orbit 的完整配置、功能细节和已知限制时，请阅读[用户文档](Releases/docs/user-guide.md)。
+[![Orbit 功能总览：源码调试、变量读写、TIMELINE 波形、RTT 日志和自动化接口](https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-feature-overview-promo.png)](https://github.com/zhuangyan114/Orbit/blob/master/resources/orbit-feature-overview-promo.png)
 
-## Orbit 是什么
+## 功能
 
-Orbit 是一个运行在 VS Code 中的嵌入式调试前端。它以 Debug Adapter Protocol（DAP）承接 VS Code 的调试请求，通过 J-Link DLL 或原生 CMSIS-DAP helper 访问 STM32 / ARM Cortex-M 目标，并在同一目标所有权模型下提供：
+### TIMELINE 高频波形
 
-- 源码级启动、暂停、继续、单步、复位和断点；
-- 可展开的 Watch 表达式、运行时数值写入和变化高亮；
-- Timeline 实时采样、缩放、悬停读数和短期历史保留；
-- SEGGER RTT 输出、ANSI 处理和 P-RTLog tokenized 帧解码；
-- 通过标准 DAP memory / variables 能力接入外部 Memory View、Peripheral Viewer 和 RTOS Views；
-- 面向脚本和 AI 工具的本机 Automation API v1（Node / Python / MCP 共用同一协议）。
+- **通过 J-Link / DAPLink 直接采样 MCU 变量**，不需要专门的波形上报代码，也不额外占用串口。
+- 支持多变量曲线、时间窗口缩放、游标读数和 CSV 导出。
+- A/B 时间游标测量时间差，可保存全部数据或游标区间，再通过 CSV 和多个标签页回看；长期记录持续写盘，查看历史时实时采集继续。
+- **J-Link 采样可达 1 kHz，无线 DAPLink 有约 400 Hz 的使用记录。** 实际速率取决于目标、表达式数量和并行负载。
 
-Orbit 的目标不是复制一个完整 IDE，而是把“程序停在哪里、变量现在是多少、波形怎样变化、日志从哪里来、实验是否可重复”连接到同一套调试会话中。
+[![Orbit TIMELINE：真实调试界面与多变量波形](https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-timeline-promo.png)](https://github.com/zhuangyan114/Orbit/blob/master/resources/orbit-timeline-promo.png)
 
-## 能力
+采样率指变量读取速率，不是界面刷新率。具体配置和结果见[无线 DAPLink 对照记录](https://github.com/zhuangyan114/Orbit/blob/master/docs/cmsis-dap-v1-v2-timeline-2026-10-02.md)。
 
-### 源码调试
+### Watch 变量读写
 
-Orbit 暴露 `orbit` DAP 调试器类型，使用 ELF/AXF 载入符号、行号和 DWARF 类型信息；旧配置中的 `ozone` 类型仍作为兼容别名保留。标准 DAP 的 `evaluate`、可展开 `variablesReference`、结构体/数组/指针子节点、`memoryReference`、读写内存和 RTOS capability 会保留给 VS Code 及外部视图使用。
+- 查看变量和表达式，展开结构体、数组与指针，数值变化高亮。
+- **直接修改可写变量，无需重新编译烧录或实现串口调参命令。**
 
-默认 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。也可以用 `probe: "jlink"` 或 `probe: "cmsis-dap"` 固定 owner。`cmsisDapTransport: "auto"` 优先 v2 WinUSB 并兼容 v1 HID。
+### 源码调试与固件烧录
 
-Horco CMSIS-DAP v2（`FAED:4870`）已完成 USB 名称/真实序列号适配，自动选择、bulk 协议握手和 SWD 只读目标访问于 2026-10-02 通过真机验证。可用 `"probe": "cmsis-dap"` 与 `"cmsisDapTransport": "cmsis-dap-v2"` 锁定 v2；烧录、调试控制、性能与长稳的验证范围见 [WinUSB 适配报告](docs/cmsis-dap-v2-winusb-report.md)。
+- 支持断点、单步、暂停、继续、复位和调用堆栈。
+- **自动查找 ELF/AXF**，通常只需在 `launch.json` 中指定芯片型号。
+- 启动前可烧录并校验固件；烧录支持取决于芯片与探针链路。
 
-最小 `launch.json` 只需要标准 DAP 字段和芯片型号：
+### RTT 彩色日志
+
+- 在 `Orbit RTT Log` 终端显示日志，保留 ANSI 颜色，也可输出到 Debug Console。
+- 支持 P-RTLog 二进制日志解码，读取 ELF 中的 token 信息。
+
+[![Orbit RTT 日志：真实终端中的彩色日志输出](https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-rtt-promo.png)](https://github.com/zhuangyan114/Orbit/blob/master/resources/orbit-rtt-promo.png)
+
+日志需要固件接入 RTT；P-RTLog 解码需要匹配的固件和 ELF 信息。接法和配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
+
+### MCP 与 AI 自动调试
+
+- 提供 Python、Node.js 和 MCP 接口，支持变量读写、波形记录、断点管理和调试控制。
+- **AI 可通过 MCP 实际操作调试器，自动执行已配置、已授权的调试流程。**
+- 脚本和 AI 复用当前调试连接，不另开连接抢占探针。
+
+自动化默认关闭；开启后默认只授予读取权限。记录、写入、控制和烧录等操作需要对应授权，AI 结论仍需实板验证。配置见 [MCP 接入指南](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md#12-mcp-与-plugin-api)和 [Automation API 文档](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-api.md)。
+
+### 内存与外设视图
+
+兼容 Memory View、Peripheral Viewer，查看内存和外设寄存器；需要另外安装对应扩展。
+
+**Orbit 的差异在于 VS Code 内使用、兼容 J-Link 与 DAPLink，并支持 MCP 自动化。** [Ozone](https://www.segger.com/products/development-tools/ozone-j-link-debugger/technology/tool-overview/) 已有 Watch、变量修改和波形采样，上限更高，但不支持 DAPLink；[VOFA+](https://www.vofa.plus/docs/learning/) 通过串口或网络接收上报数据，Orbit 则通过探针直接读取变量。
+
+## 开始使用
+
+### 准备这些东西
+
+| 你需要 | 说明 |
+| --- | --- |
+| Windows x64 + VS Code | 当前发布目标是 Windows；VS Code 需要 1.90.0 及以上的 1.x 版本 |
+| STM32 / ARM Cortex-M 开发板 | 芯片和探针组合需要在支持范围内，尤其是 CMSIS-DAP 烧录 |
+| J-Link 或 CMSIS-DAP / DAPLink | J-Link 需要安装 SEGGER 软件包；CMSIS-DAP v1 使用 HID，v2 使用 WinUSB |
+| 带调试信息的 ELF/AXF | Orbit 负责调试，不替你编译固件；先确认工程能编译 |
+| GNU Arm 工具链 | 确保 `arm-none-eabi-nm`、`arm-none-eabi-objdump`、`arm-none-eabi-addr2line` 可用，建议加入 `PATH` |
+
+如果你还没有完整的 VS Code + ARM GCC + CMake 环境，先看[全套工具链教程](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md)，不用在这里猜该装什么。
+
+### 安装，然后按 F5
+
+1. 在 VS Code 扩展页搜索 **Orbit STM32 Debugger**，选择扩展 ID 为 `orbit-debug.orbit-for-vscode` 的插件安装，也可以直接打开[插件市场页面](https://marketplace.visualstudio.com/items?itemName=orbit-debug.orbit-for-vscode)。需要离线安装时，从 [Releases](https://github.com/zhuangyan114/Orbit/releases) 下载 VSIX，再执行 `Extensions: Install from VSIX...`。安装后重新加载窗口。
+2. 打开固件工程文件夹，编译得到 ELF/AXF，连接开发板和探针。
+3. 新建 `.vscode/launch.json`。下面用 STM32F407IG 举例，**把芯片型号改成你自己的即可，ELF/AXF 文件会自动查找**：
 
 ```jsonc
 {
   "version": "0.2.0",
-  "configurations": [{
-    "name": "Orbit Debug",
-    "type": "orbit",
-    "request": "launch",
-    "device": "STM32F407IG"
-  }]
+  "configurations": [
+    {
+      "name": "Orbit Debug",
+      "type": "orbit",
+      "request": "launch",
+      "device": "STM32F407IG"
+    }
+  ]
 }
 ```
 
-Orbit 默认使用 SWD / 4000 kHz / Native auto，并从 `build/Debug`、`build/Release`、`build` 自动寻找 ELF/AXF。`deviceName` 自动跟随 `device`。没有显式 SVD 时，Orbit 会先查工作区、本机 CMSIS Pack 和缓存；仍未找到才按需下载一个对应 STM32 系列的 Keil Device Family Pack，只提取当前芯片的 SVD。下载或解析失败不阻止调试。
+4. 选择 `Orbit Debug`，按 **F5**。连上后，先打一个断点、读一个变量，再打开 TIMELINE 试一条曲线。
 
-使用 DAPLink 调试 STM32F407IG 时，在配置中同时指定 `"device": "STM32F407IG"` 和 `"probe": "cmsis-dap"`。CMSIS-DAP 内置 IG 的 1 MiB Flash 配置和独立算法镜像，支持扇区 0–11；烧录前校验 F4 芯片 ID 与 1024 KiB 容量。用户已于 2026-10-02 确认当前板卡/固件正常使用；全扇区、多探针与长稳专项验收仍需单独补充。完整配置见[用户文档](Releases/docs/user-guide.md#23-cmsis-dap--daplink)，修复经过见[修复日志](docs/bug-fix-log.md)。
+**默认启动前会烧录固件。** 只想调试板子里现有的程序时，加上 `"flashBeforeDebug": false`，并确保 ELF 与板上固件一致。
 
-### 运行时查看变量
+通常不需要填写 `program`：Orbit 会依次在 `build/Debug`、`build/Release`、`build` 中自动查找 ELF/AXF。工程里有多个固件，或输出到其他目录时，也可以用 `program` 手动指定。
 
-WATCH 和 TIMELINE 是两个 VS Code Webview 视图。Watch 负责表达式列表、子节点展开、数值编辑和发送到 Timeline；Timeline 负责采样通道、曲线、时间窗口、自动跟随、手动缩放及悬停读数。两者的表达式与视图状态保存在 VS Code workspace state 中。
+默认优先选择 J-Link；两种探针都插着、但你想用 DAPLink 时，加上 `"probe": "cmsis-dap"`。CMSIS-DAP 默认优先 v2 WinUSB，也兼容 v1 HID。更多配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 
-<p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/zhuangyan114/Orbit@master/resources/timeline-demo.png" alt="Timeline Demo">
-</p>
+## 限制
 
-> j-link 连接时 TIMELINE 采样率可达1KHZ
+Orbit 主要由个人维护，板子、探针和测试时间都有限。能在一块板上跑通，不等于所有芯片都已经适配。
 
-> CMSIS-DAP-V1 带宽较低,WATCH变量较多,结构体展开较多,或者RTT轮询过快过多时,可能出现TimeLine卡顿的情况
+- **当前发布只面向 Windows x64。** macOS / Linux 暂未提供支持。
+- **CMSIS-DAP 的芯片支持不是填个型号就有。** 连接、调试和烧录也不是一回事；烧录还需要匹配的 Flash 算法和容量校验。
+  1.1.6 已加入 `STM32F103C8T6` / `STM32F103C8` 的 64 KiB Flash、20 KiB SRAM 和半字编程算法；完整实板验收尚未完成。配置与各型号验收范围见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
+- **表达式不是越复杂越好。** 类型和地址解析依赖 ELF/DWARF；局部变量可能只在暂停且对应栈帧有效时能访问。高频采样优先从简单、可解析的变量开始。
+- **采样和日志要共享带宽。** 大量 Watch 展开、复杂表达式或高日志负载可能拖慢波形；高速采样期间，RTT 文本轮询可能暂停，结束后恢复。
+- **RTOS 视图目前有已知问题，暂不建议使用。** 不建议依赖它完成任务分析。
 
-### 日志与实时数据
+碰到问题可以提 [Issue](https://github.com/zhuangyan114/Orbit/issues)。附上芯片完整型号、探针和传输方式、Orbit 版本、`launch.json`、复现步骤及相关日志，比一句“连不上”更容易定位。发之前记得删掉敏感路径和身份信息。
 
-  RTT 由选定的目标 owner 读取，既可以显示在 `Orbit RTT Log` 终端，也可以显示在 Debug Console。启用 P-RTLog 后，Orbit 从 ELF 的 `.pw_tokenizer.entries` 节加载 token 数据，再把 RTT 二进制帧转换为带级别、模块和位置的文本。
+## 欢迎加入
 
-### 外部调试插件
+Orbit 还有不少要打磨的地方。我手里的开发板十分有限，所以CMSIS-DAP链路目前支持芯片较少。
 
-Memory View、Peripheral Viewer、RTOS Views 和 debug tracker 不是 Orbit 内置的独立实现,不过 Orbit 对他们进行了支持。 \
-Orbit 通过 DAP memory / variables、`deviceName`、`svdFile` / `svdPath` 以及 `trackDebuggers` 设置为这些外部扩展提供连接面；它们的版本、寄存器树和 RTOS 解析能力由外部扩展决定。
-
-### 自动化与 AI 接入
-
-工作区打开 `orbit.automation.enabled` 后，每个 VS Code 窗口在 `127.0.0.1` 上发布独立的 Automation API v1（`/v1/rpc`、`/v1/events`）。客户端按 `projectId`/`instanceId` 握手，再绑定精确的 `sessionId`/`sessionGeneration`。Node CLI、Python 标准和 MCP 都走同一协议，不会另开第二条目标连接。默认只授 `read`；写入、控制、Flash 需要额外 scope。真实硬件验收与 Mock 分层记录，见 [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)。
+如果你想适配新的 CMSIS-DAP 芯片，从[新芯片适配指南](https://github.com/zhuangyan114/Orbit/blob/master/.agent/skills/cmsis-dap-add-target/SKILL.md)开始。
 
 
-## 参与 CMSIS-DAP 芯片适配
+## 文档和开发
 
-Orbit 主要由个人维护，维护者能持有和测试的芯片、板卡与探针组合有限。CMSIS-DAP 规范提供主机与探针间的通信方式；Flash 控制器、容量、扇区、RAM、编程粒度、缓存和保护行为仍由具体芯片决定。增加一个器件名并不代表它已经能可靠烧录，实际支持需要资料、实现、边界测试和开发板验证共同完成。
+| 想做什么 | 去哪里看 |
+| --- | --- |
+| 从 Keil 等环境转到 VS Code | [全套工具链教程](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md) |
+| 查 Watch、TIMELINE、RTT 和配置 | [用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md) |
+| 接 Python / Node.js / MCP | [Automation API](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-api.md) |
+| 看实现结构 | [架构说明](https://github.com/zhuangyan114/Orbit/blob/master/docs/architecture.md) |
+| 看测试到了哪一步 | [自动化与硬件验收](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-hardware-acceptance.md) |
+| 看各版本更新 | [更新日志](https://github.com/zhuangyan114/Orbit/blob/master/CHANGELOG.md) |
+| 查已确认的修复 | [修复记录](https://github.com/zhuangyan114/Orbit/blob/master/docs/bug-fix-log.md) |
 
-因此，CMSIS-DAP 链路的型号覆盖需要社区协作。有对应开发板的贡献者可以补齐实板证据；没有板卡也可以整理权威资料、实现型号描述或算法、补充回归测试。型号、容量、探针和 HID/WinUSB 分别记录验证状态，避免把一个组合的成功外推为整个系列支持。
+<details>
+<summary>从源码构建</summary>
 
-新增芯片请从 **[CMSIS-DAP 新芯片适配 Skill](.agent/skills/cmsis-dap-add-target/SKILL.md)** 开始。它同时供人阅读和 AI 编码助手执行，规定资料来源、代码风格、允许修改的层、owner/Flash 安全边界、验收流程和 PR 格式；已有调试故障另遵循 [DAPLink 调试准则](.agent/skills/daplink-debug-fix/SKILL.md)。
+除 Node.js / npm 外，Native helper 构建还需要 CMake 3.20+ 和 Windows C++ 编译环境（Visual Studio C++ 工具或 x64 MinGW-w64）。
 
-1. 提供完整型号、容量、板卡/探针和目标能力，按[资料与改动边界](.agent/skills/cmsis-dap-add-target/references/sources-and-boundaries.md)整理数据手册、参考手册、勘误及算法许可。
-2. 优先新增目标描述并复用公共链路；需要修改 helper 时，补充真正执行 native 校验的回归。涉及 Flash 算法和镜像时，保证来源可追溯、构建可复现。
-3. 按[验收流程与标准](.agent/skills/cmsis-dap-add-target/references/acceptance.md)记录自动化、基本实板调试、完整烧录、运行时及断线/长稳结果。缺少板卡时可以提交资料 PR 或注明“待硬件验收”的 Draft PR。
-4. 使用[新芯片 PR 模板](.agent/skills/cmsis-dap-add-target/references/pr-template.md)提交中文标题和说明，列出已验证范围、证据和缺口，让其他持板者能继续验收。
+```powershell
+npm install
+npm run build
+npm run build:native
+npm run typecheck
+npm test
+```
 
-F407IG 适配曾在小扇区擦除通过后，因公共 helper 把 128 KiB 扇区误当成 RAM 缓冲区而失败。这个案例说明主机单元测试、native mock 和实板验证都各有作用；我们会把发现的问题转为可复用回归，让后续芯片适配也受益。
+启动扩展开发窗口可执行 `npm run dev`。源码在 `src/` 和 `native/`，不要直接修改生成的 `dist/` 文件。自动化测试通过不等于实板验收通过。
 
-## 文档与发布
-
-- [全套工具链教程](Releases/docs/全套工具链教程.md)：面向第一次从 Keil5 等集成 IDE 转到 VS Code 的用户，从零安装和配置 ARM GCC、CMake、CMake Tools、J-Link 与 Orbit，并完成第一次编译和调试。
-- [用户文档](Releases/docs/user-guide.md)：面向已经具备基本 VS Code/嵌入式开发环境的用户，作为 Orbit 的正式参考手册，覆盖安装要求、`launch.json`、Watch、Timeline、RTT、P-RTLog、RTOS Views、Memory View、Peripheral Viewer、Native/Legacy、Automation API、MCP、FAQ 和已知限制。
-- [Automation API v1](docs/api/orbit-automation-api.md)：本机 JSON-RPC / SSE 协议、握手、generation fence 和客户端快速开始。
-- [硬件验收](docs/api/orbit-automation-hardware-acceptance.md)：自动化 / Mock / 真实硬件分层状态。Automation API 1.1.1 已通过 J-Link native 与 CMSIS-DAP HID v1（均无 flash）。同一文档记录 STM32H723VGT6 的器件支持验收：CMSIS-DAP Flash P7-1～P7-5、J-Link P7-6（2026-09-11）已通过；长稳/断线（P7-7）未验收。
-
-两份教程互相补充，并不是重复内容：
-
-| 文档 | 适用对象 | 主要内容 |
-| --- | --- | --- |
-| [全套工具链教程](Releases/docs/全套工具链教程.md) | 没有完整 VS Code + ARM GCC + CMake 环境，或第一次使用 Orbit 的用户 | 按步骤搭建开发环境，完成工具安装、CMake 配置、编译、J-Link 安装和首次调试 |
-| [用户文档](Releases/docs/user-guide.md) | 已能编译工程，需要深入使用 Orbit 的用户 | 查阅 Orbit 的配置项、调试视图、实时数据、日志、MCP、调试通道、常见问题和能力边界 |
-
-推荐阅读顺序：第一次使用 Orbit 时先看[全套工具链教程](Releases/docs/全套工具链教程.md)，完成环境搭建后再把[用户文档](Releases/docs/user-guide.md)作为功能参考手册。
-
-- [Orbit Releases](https://github.com/zhuangyan114/Orbit/releases)：正式版 VSIX 及后续发布资产。
-
-## 1.1.0 更新日志
-
-- 增加了对 DAP-Link-V1 的支持
-- 大幅优化了Timeline的采样效率和显示逻辑
-- 修复了许多bug,优化了调试体验
-- 当时 CMSIS-DAP 链路仅支持 STM32F407VET6
-
-## 1.1.1 更新日志
-
-- 开放调试API，支持python，nodejs调用，AI可直接调用MCP调试
-
-## 1.1.2 更新日志
-
-- CMSIS-DAP 链路新增 STM32H723VGT6（别名 `STM32H723VG`）器件注册与自研 Flash Algorithm
-- STM32H723VGT6 的 J-Link 链路完成真机验收：连接、烧录、断点、Watch、源级单步与断开清理（P7-6）
-- 修复 CMSIS-DAP 源级步进等待临时断点期间的会话状态显示，并让 control 期间的目标状态查询不再排队
-
-## 1.1.3 更新日志
-
-- WATCH 写入按目标运行状态停机/恢复，移除固定等待，并在写入失败时尽量恢复运行状态
-- TIMELINE 支持最多三级指针解引用的快速采样，拒绝空指针和无效地址
-- 修复调试会话断线/清理异常后适配器可能继续占用探针的问题
-
-## 1.1.4 更新日志
-
-- 减小 launch.josn 最少需要配置，降低上手难度
-
-## 1.1.5 更新日志
-
-- 修复 CMSIS-DAP v2 WinUSB 的 USB 身份识别和真实序列号筛选，`auto` 优先选择 v2
-- 新增 CMSIS-DAP STM32F407IG 的 1 MiB Flash 支持，并修复 128 KiB 扇区擦除时的算法 RAM 布局校验
-- 调试启动连接成功后，在调试控制台显示实际 owner 路径和 CMSIS-DAP v1/HID 或 v2/WinUSB 传输
-
-
+</details>
 
 ## 许可证
 
-MIT
+[MIT](https://github.com/zhuangyan114/Orbit/blob/master/LICENSE)。SEGGER 软件包等外部依赖仍遵循各自的许可。

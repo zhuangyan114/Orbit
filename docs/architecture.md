@@ -80,8 +80,8 @@ flowchart TD
 - `probe: "auto"` 先运行只读可用性发现：J-Link 成功即选择 J-Link；只有 J-Link 不可用时才枚举 CMSIS-DAP。两者同时连接时固定选择 J-Link。discovery helper 在正式连接前释放，不成为 target owner，也不执行 Flash。
 - `probe: "jlink"` 使用 `jlink-native` 或 `jlink-legacy`。`auto` 只允许在 native 启动/初始化失败且进程完全退出后创建 legacy；已连接 owner 丢失时不热切换。
 - `probe: "cmsis-dap"` 只创建 `cmsis-dap` owner。`cmsisDapTransport: "auto"` 优先 WinUSB v2，再选择兼容的 HID v1；不会回退到 J-Link、Legacy 或第二个 helper。`tcp` 由同一个 helper 通过 TCP（OpenOCD cmsis-dap `tcp` 帧格式）连接 `cmsisDapPath` 指定的网络探针。
-- XR-DAP 探针端采样仍属于这个 owner。`dataSamplingStart` 先交给 `ProbeTimelineSampler`（`src/debug/probe-timeline-sampler.ts`）：经 commander `startProbeSampling` → `CmsisDapTargetChannel` → helper `xrSamplingStart` 让探针定时采样，再以 timeline 优先级轮询 `xrSamplingRead`，用 `ProbeClock` 把探针时间戳换算到 Timeline 时钟；不支持或读取失败时由 DAP session 退回 `readFastDataSampling` 轮询。
-- 探针采样期间只接受 DAP_Info 和厂商命令。helper 在 `dispatch()` 入口按 `xrSamplingRoute()` 处理每个请求：标量读取和运行态 DHCSR 查询改用厂商 READ，其余请求先停止采样、执行后恢复（停止期间探针缓存的帧保留），`open`/`connect`/`disconnect`/`close`/`shutdown` 结束采样。
+- XR-DAP 探针端采样是默认关闭的可选功能，与 TCP 传输独立。只有 launch 配置显式设置 `cmsisDapXrSampling: true` 且实际 owner 为 CMSIS-DAP 时，`dataSamplingStart` 才创建 `ProbeTimelineSampler`（`src/debug/probe-timeline-sampler.ts`）：经 commander `startProbeSampling` → `CmsisDapTargetChannel` → helper `xrSamplingStart` 让探针定时采样，再以 timeline 优先级轮询 `xrSamplingRead`，用 `ProbeClock` 换算探针时钟；不支持或读取失败时退回主机采样。普通会话直接走原有 `readFastDataSampling`，不查询 XR INFO、不发送 XR 命令。
+- XR 已启用且正在采样期间，helper 在 `dispatch()` 入口按 `xrSamplingRoute()` 处理请求：标量读取和运行态 DHCSR 查询改用厂商 READ，其余请求先停止采样、执行后恢复；`open`/`connect`/`disconnect`/`close`/`shutdown` 结束采样。未开启 XR 时，helper 拒绝 XR RPC，也不按设备序列号自动发送 XR 停止命令。自动 RTT 文本轮询只在 XR 采样活动期间暂停。详见 [XR-DAP 隔离边界](xr-dap-isolation.md)。
 - Flash、DAP、Watch、Timeline、RTT、RTOS View、Memory View 和 Peripheral Viewer 都复用当前 owner。
 - owner loss、session termination 或 replacement 会取消排队工作、阻止旧 generation 发布，并在退出前释放 helper。
 

@@ -2,6 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 describe('DAP launch probe configuration', () => {
+  it('requires an explicit boolean opt-in for XR without coupling it to TCP', () => {
+    expect(normalizeDapLaunchConfig({ probe: 'cmsis-dap', cmsisDapTransport: 'tcp' }))
+      .not.toHaveProperty('cmsisDapXrSampling');
+    for (const enabled of [false, true]) {
+      const config: Record<string, unknown> = {};
+      applyNormalizedDapLaunchConfig(config, normalizeDapLaunchConfig({ cmsisDapXrSampling: enabled }));
+      expect(config.cmsisDapXrSampling).toBe(enabled);
+    }
+    expect(() => normalizeDapLaunchConfig({ cmsisDapXrSampling: 'true' })).toThrowError(/cmsisDapXrSampling/);
+  });
   it('defaults to deterministic auto probe discovery and enables flashing', () => {
     expect(normalizeDapLaunchConfig({})).toEqual({
       probe: 'auto',

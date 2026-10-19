@@ -70,6 +70,7 @@ export interface SessionTargetConnectConfig extends CppJLinkConnectConfig {
   cmsisDapPid?: string;
   cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
+  cmsisDapXrSampling?: boolean;
   flashBeforeDebug?: boolean;
 }
 
@@ -543,6 +544,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private lastDevice: CmsisDapDeviceInfo | null = null;
   /** XR-DAP sampling support of the connected probe; null until queried. */
   private probeSamplingSupport: boolean | null = null;
+  private xrSamplingEnabled = false;
   private flashTargetDef: FlashTargetDefinition | null = null;
   private timelineBatchLogAt = performance.now();
   private timelineBatchTotals = { requests: 0, reads: 0, bytes: 0, queueMs: 0, rpcMs: 0, helperMs: 0, packets: 0, waitRetries: 0, faultClears: 0 };
@@ -622,7 +624,10 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         }, 'enumDevices');
       }
 
-      const opened = await this.helper.request<CmsisDapDeviceInfo>('open', selector);
+      const opened = await this.helper.request<CmsisDapDeviceInfo>('open', {
+        ...selector,
+        ...(config.cmsisDapXrSampling === true ? { xrSampling: true } : {}),
+      });
       if (!opened.ok) return this.failAndDispose(opened, 'open');
       this.lastDevice = opened.data ?? null;
       this.state = 'opened';
@@ -671,6 +676,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       }
       this.state = 'connected';
       this.probeSamplingSupport = null;
+      this.xrSamplingEnabled = config.cmsisDapXrSampling === true;
       // Resolve the session device once for data-driven gating (Watch writes).
       // An unregistered device must not fail connect here; flash() re-resolves
       // and reports the structured registry error at flash time.
@@ -703,6 +709,8 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
 
   async disconnect(): Promise<CppJLinkResult> {
+    this.xrSamplingEnabled = false;
+    this.probeSamplingSupport = null;
     if (this.state === 'idle' || this.state === 'failed') {
       return { ok: true, message: 'CMSIS-DAP already disconnected', targetState: 'Disconnected', elapsedMs: 0, data: {} };
     }
@@ -1010,7 +1018,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   /** Probes once per connection for the XR-DAP vendor sampling extension. */
   async supportsProbeSampling(): Promise<boolean> {
-    if (this.state !== 'connected') return false;
+    if (!this.xrSamplingEnabled || this.state !== 'connected') return false;
     if (this.probeSamplingSupport !== null) return this.probeSamplingSupport;
     const info = await this.helper.request<{ features: number }>('xrInfo', {}, { priority: 'control' })
       .catch(() => null);
@@ -1025,10 +1033,12 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   async startProbeSampling(periodUs: number, items: ProbeSamplingItem[]) {
     if (this.state !== 'connected') return this.invalidState<ProbeSamplingStartResult>('xrSamplingStart');
+    if (!this.xrSamplingEnabled) return failure<ProbeSamplingStartResult>('XR-DAP sampling is disabled', 'UnsupportedCapability');
     return this.controlViaHelper<ProbeSamplingStartResult>('xrSamplingStart', { periodUs, items });
   }
   async readProbeSampling(): Promise<CppJLinkResult<ProbeSamplingReadResult>> {
     if (this.state !== 'connected') return this.invalidState<ProbeSamplingReadResult>('xrSamplingRead');
+    if (!this.xrSamplingEnabled) return failure<ProbeSamplingReadResult>('XR-DAP sampling is disabled', 'UnsupportedCapability');
     try {
       return await this.helper.request<ProbeSamplingReadResult>(
         'xrSamplingRead',
@@ -1047,6 +1057,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   async stopProbeSampling() {
     if (this.state !== 'connected') return this.invalidState<{ stats?: ProbeSamplingStats }>('xrSamplingStop');
+    if (!this.xrSamplingEnabled) return failure<{ stats?: ProbeSamplingStats }>('XR-DAP sampling is disabled', 'UnsupportedCapability');
     return this.controlViaHelper<{ stats?: ProbeSamplingStats }>('xrSamplingStop', {});
   }
   async readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {

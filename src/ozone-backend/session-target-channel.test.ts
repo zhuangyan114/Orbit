@@ -350,6 +350,42 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(selector.ownerKind).toBe('none');
   });
 
+  it.each(['hid', 'winusb', 'tcp'] as const)('keeps XR disabled for ordinary %s connections and direct sampling requests', async transport => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    expect((await channel.connect({ device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+      probe: 'cmsis-dap', cmsisDapTransport: transport })).ok).toBe(true);
+    expect(await channel.supportsProbeSampling()).toBe(false);
+    expect(await channel.startProbeSampling(1000, [])).toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    expect(await channel.readProbeSampling()).toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    expect(await channel.stopProbeSampling()).toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    expect((helper.request as any).mock.calls.some(([method]: [string]) => method.startsWith('xr'))).toBe(false);
+    expect((helper.controlRequest as any).mock.calls.some(([method]: [string]) => method.startsWith('xr'))).toBe(false);
+    const open = (helper.request as any).mock.calls.find(([method]: [string]) => method === 'open');
+    expect(open[1]).not.toHaveProperty('xrSampling');
+    await channel.disconnect();
+  });
+
+  it('passes explicit XR opt-in to the same helper and clears it when reconnecting normally', async () => {
+    const base = fakeCmsisDapHelper();
+    const helper = fakeCmsisDapHelper({ request: vi.fn(async (method: string, params: any, options: any) => {
+      if (method === 'xrInfo') return { ok: true, data: { features: 4 } };
+      return base.request(method, params, options);
+    }) as any });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const config = { device: 'STM32F407VET6', interface: 'SWD' as const, speedKHz: 1000, probe: 'cmsis-dap' as const };
+    expect((await channel.connect({ ...config, cmsisDapXrSampling: true })).ok).toBe(true);
+    expect(helper.request).toHaveBeenCalledWith('open', expect.objectContaining({ xrSampling: true }));
+    expect(await channel.supportsProbeSampling()).toBe(true);
+    expect(await channel.supportsProbeSampling()).toBe(true);
+    expect((helper.request as any).mock.calls.filter(([method]: [string]) => method === 'xrInfo')).toHaveLength(1);
+    await channel.disconnect();
+    expect((await channel.connect(config)).ok).toBe(true);
+    expect(await channel.supportsProbeSampling()).toBe(false);
+    expect((helper.request as any).mock.calls.filter(([method]: [string]) => method === 'xrInfo')).toHaveLength(1);
+    await channel.disconnect();
+  });
+
   it('routes CMSIS-DAP RTT through the helper owner with structured results', async () => {
     const helper = fakeCmsisDapHelper();
     const channel = new CmsisDapTargetChannel({ helperClient: helper });

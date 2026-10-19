@@ -4,7 +4,9 @@ import {
   DebugProbe,
   StackFrame, MemoryBlock, TargetState, WatchValue,
   FastDataSamplePlanItem, FastDataSampleSpec,
+  ProbeSampleBatch, ProbeSampleFrame, ProbeSamplingStarted,
 } from './types';
+import { probeSamplingItems } from './probe-sampling-plan';
 import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
@@ -112,6 +114,10 @@ export class OzoneBackend {
   private readonly fastSamplingReadMs = new BoundedMetric(8_192);
   private readonly fastSamplingFormatMs = new BoundedMetric(8_192);
   private readonly fastSamplingCounts = { captures: 0, batchRequests: 0, fallbackReads: 0, cacheHits: 0 };
+  /** Specs of the running probe-side sampling, indexed like the probe items. */
+  private probeSamplingSpecs: FastDataSampleSpec[] = [];
+  /** Identifies the latest probe sampling start; set before its helper call is queued. */
+  private probeSamplingRun = 0;
   private planCacheHit = 0;
   private planCacheMiss = 0;
   private planCacheInvalidation = 0;
@@ -464,6 +470,12 @@ case 'readVariableRuntime':
           return { ok: true, data: this.prepareFastDataSampling(command.expressions) };
         case 'readFastDataSampling':
           return { ok: true, data: await this.readFastDataSampling(command.specs, command.priority) };
+        case 'startProbeSampling':
+          return await this.startProbeSampling(command.specs, command.periodUs);
+        case 'readProbeSampling':
+          return await this.readProbeSampling();
+        case 'stopProbeSampling':
+          return await this.stopProbeSampling(command.run);
         case 'getPerformanceDiagnostics':
           return {
             ok: true,
@@ -678,8 +690,9 @@ case 'readVariableRuntime':
       && config.cmsisDapTransport !== 'cmsis-dap-v2'
       && config.cmsisDapTransport !== 'cmsis-dap'
       && config.cmsisDapTransport !== 'hid'
-      && config.cmsisDapTransport !== 'winusb') {
-      return invalidConfiguration('cmsisDapTransport', 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb', config.cmsisDapTransport);
+      && config.cmsisDapTransport !== 'winusb'
+      && config.cmsisDapTransport !== 'tcp') {
+      return invalidConfiguration('cmsisDapTransport', 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp', config.cmsisDapTransport);
     }
     let requestedProbe: DebugProbe;
     if (config.probe === undefined || config.probe === 'auto') {
@@ -3288,6 +3301,99 @@ case 'readVariableRuntime':
     }
     this.fastSamplingFormatMs.record(performance.now() - formatStartedAt);
     return results;
+  }
+
+  /** Formats XR frames separately so their evolution cannot change the host fast-read path. */
+  private formatProbeSample(spec: FastDataSampleSpec, raw: Uint8Array, address?: number): WatchValue {
+    let value: number | string;
+    let display: string;
+    let hex: string;
+    let exactValue: string | undefined;
+    let numericValueExact: boolean | undefined;
+    if (spec.isFloat) {
+      value = this.readBytesAsFloat(raw, spec.size);
+      display = spec.size === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+      hex = `0x${Array.from(raw.slice(0, spec.size)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+    } else {
+      const formatted = this.formatScalarValue(
+        raw,
+        spec.size,
+        spec.format || { kind: 'base', encoding: spec.signed ? 'signed' : 'unsigned', name: spec.typeName || '' },
+      );
+      value = formatted.value;
+      display = formatted.display;
+      hex = formatted.hex;
+      exactValue = formatted.exactValue;
+      numericValueExact = formatted.numericValueExact;
+    }
+    return {
+      expression: spec.expression,
+      value,
+      display,
+      hex,
+      exactValue,
+      numericValueExact,
+      address,
+      typeName: spec.typeName,
+    };
+  }
+
+  private async startProbeSampling(specs: FastDataSampleSpec[], periodUs: number): Promise<OzoneCommandResult> {
+    const target = this.sessionTarget;
+    if (!this.isCmsisDapOwner() || !target?.startProbeSampling || !(await target.supportsProbeSampling?.())) {
+      return { ok: false, errorCode: 'UnsupportedCapability', error: 'probe-side sampling needs an XR-DAP CMSIS-DAP probe' };
+    }
+    const items = probeSamplingItems(specs);
+    if (!items) {
+      return { ok: false, errorCode: 'UnsupportedCapability', error: 'an expression does not fit the XR-DAP item encoding' };
+    }
+    const run = ++this.probeSamplingRun;
+    const result = await target.startProbeSampling(Math.max(1, Math.round(periodUs)), items);
+    if (!result.ok || !result.data) {
+      return { ok: false, errorCode: result.errorCode || 'ProbeSamplingFailed', error: result.message };
+    }
+    if (run === this.probeSamplingRun) this.probeSamplingSpecs = specs;
+    const data: ProbeSamplingStarted = { ...result.data, run };
+    return { ok: true, data };
+  }
+
+  /** Reads buffered probe frames and formats each value like a fast-sampling read. */
+  private async readProbeSampling(): Promise<OzoneCommandResult> {
+    const target = this.sessionTarget;
+    const specs = this.probeSamplingSpecs;
+    if (!target?.readProbeSampling || specs.length === 0) {
+      return { ok: false, errorCode: 'InvalidState', error: 'probe-side sampling is not running' };
+    }
+    const result = await target.readProbeSampling();
+    if (!result.ok || !result.data) {
+      return { ok: false, errorCode: result.errorCode || 'ProbeSamplingFailed', error: result.message };
+    }
+    const frames: ProbeSampleFrame[] = result.data.frames.map(frame => ({
+      timestampUs: frame.t,
+      values: frame.v.flatMap(([index, ok, hexBytes]) => {
+        const spec = specs[index];
+        if (!spec || !ok) return [];
+        return [this.formatProbeSample(spec, Buffer.from(hexBytes, 'hex'))];
+      }),
+    }));
+    const data: ProbeSampleBatch = {
+      probeNowUs: result.data.probeNowUs,
+      probeNowAgeUs: result.data.probeNowAgeUs,
+      pendingBytes: result.data.pendingBytes,
+      frames,
+      stats: result.data.stats,
+    };
+    return { ok: true, data };
+  }
+
+  private async stopProbeSampling(run?: number): Promise<OzoneCommandResult> {
+    // A newer start already replaced the subscription this stop refers to.
+    if (run !== undefined && run !== this.probeSamplingRun) return { ok: true, data: { stale: true } };
+    this.probeSamplingSpecs = [];
+    const target = this.sessionTarget;
+    if (!target?.stopProbeSampling) return { ok: true, data: {} };
+    const result = await target.stopProbeSampling();
+    return result.ok ? { ok: true, data: result.data ?? {} } : { ok: false, errorCode: result.errorCode, error: result.message };
   }
 
   private checkedFastSampleAddress(base: number, offset: number, size: number): number | null {

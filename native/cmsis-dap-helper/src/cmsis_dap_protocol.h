@@ -188,6 +188,12 @@ class CmsisDapProtocol {
                                const std::vector<uint32_t>& values, uint8_t& ack,
                                uint16_t& completed, std::chrono::milliseconds timeout);
 
+  // Sends one vendor command (0x80..0xFF) and returns the raw response. No
+  // command-id check and no stale-report retry: a probe without the command
+  // answers the single byte 0xFF, which the caller interprets.
+  Result vendorExchange(const std::vector<uint8_t>& command, std::vector<uint8_t>& response,
+                        std::chrono::milliseconds timeout);
+
   // Effective payload capacity of one report (report length minus id byte).
   size_t payloadCapacity() const;
 

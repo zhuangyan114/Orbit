@@ -9,6 +9,7 @@ import {
   NativeTaskPriority,
 } from './native-scheduler';
 import { BoundedMetric, MetricStats } from '../utils/bounded-metric';
+import { CmsisDapTransport, ProbeSamplingStats } from './types';
 
 /**
  * Stable error codes from the CMSIS-DAP helper JSON-lines protocol. Codes in
@@ -159,6 +160,38 @@ export interface CmsisDapMemoryReadResult {
 
 export interface CmsisDapMemoryBatchReadResult {
   reads: CmsisDapMemoryReadResult[];
+}
+
+/**
+ * One XR-DAP probe-side sampling location: the probe reads `base`, follows
+ * `derefs.length` pointers (adding each offset before the pointer read), then
+ * reads `size` bytes at the last pointer plus `finalOffset`.
+ */
+export interface ProbeSamplingItem {
+  size: 1 | 2 | 4 | 8;
+  base: number;
+  derefs?: number[];
+  finalOffset?: number;
+  div?: number;
+  phase?: number;
+}
+
+export interface ProbeSamplingStartResult {
+  /** Period actually used; the helper lengthens a period the probe cannot keep. */
+  periodUs: number;
+  maxFrameBytes: number;
+  estFrameUs: number;
+}
+
+export interface ProbeSamplingReadResult {
+  /** Probe clock at the midpoint of the first SUB_READ round trip. */
+  probeNowUs: number;
+  /** Microseconds from that midpoint to the end of the helper call. */
+  probeNowAgeUs: number;
+  pendingBytes: number;
+  /** t: probe µs; v: [item index, 1 = ok, little-endian hex bytes]. */
+  frames: Array<{ t: number; v: Array<[number, 0 | 1, string]> }>;
+  stats: ProbeSamplingStats;
 }
 
 export interface CmsisDapMemoryBlockReadResult {
@@ -358,7 +391,7 @@ export class CmsisDapHelperClient {
 
   get started() { return this.child !== null; }
 
-  async start(transport: 'auto' | 'hid' | 'winusb' | 'cmsis-dap' | 'cmsis-dap-v2' = 'auto'): Promise<CppJLinkResult<{ protocol: number; helperVersion: string; platform: string; capabilities: string[] }>> {
+  async start(transport: CmsisDapTransport = 'auto'): Promise<CppJLinkResult<{ protocol: number; helperVersion: string; platform: string; capabilities: string[] }>> {
     if (this.child) throw new Error('CMSIS-DAP helper is already started');
     this.exitError = null;
     this.intentionalStop = false;

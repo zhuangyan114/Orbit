@@ -12,6 +12,7 @@ export interface NormalizedDapLaunchConfig {
   cmsisDapPid?: string;
   cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
+  cmsisDapXrSampling?: boolean;
   flashBeforeDebug: boolean;
   runToEntryPoint?: string | false;
 }
@@ -20,14 +21,16 @@ export class DapLaunchConfigError extends Error {
   readonly errorCode = 'InvalidConfiguration' as const;
 
   constructor(
-    readonly field: 'probe' | 'cmsisDapTransport' | 'rmlinkDeviceId',
+    readonly field: 'probe' | 'cmsisDapTransport' | 'rmlinkDeviceId' | 'cmsisDapXrSampling',
     value: unknown,
   ) {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'rmlinkDeviceId' ? 'a 12-digit RMLink device ID' : field === 'probe'
       ? 'auto, jlink, or cmsis-dap'
-      : 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb';
-    super(`InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
+      : 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp';
+    super(field === 'cmsisDapXrSampling'
+      ? `InvalidConfiguration: ${field} must be a boolean; received ${received}`
+      : `InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
     this.name = 'DapLaunchConfigError';
     Object.setPrototypeOf(this, DapLaunchConfigError.prototype);
   }
@@ -45,8 +48,12 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     && args.cmsisDapTransport !== 'cmsis-dap-v2'
     && args.cmsisDapTransport !== 'cmsis-dap'
     && args.cmsisDapTransport !== 'hid'
-    && args.cmsisDapTransport !== 'winusb') {
+    && args.cmsisDapTransport !== 'winusb'
+    && args.cmsisDapTransport !== 'tcp') {
     throw new DapLaunchConfigError('cmsisDapTransport', args.cmsisDapTransport);
+  }
+  if (args.cmsisDapXrSampling !== undefined && typeof args.cmsisDapXrSampling !== 'boolean') {
+    throw new DapLaunchConfigError('cmsisDapXrSampling', args.cmsisDapXrSampling);
   }
   const config: NormalizedDapLaunchConfig = {
     probe: args.probe === 'jlink' || args.probe === 'cmsis-dap' ? args.probe : 'auto',
@@ -60,6 +67,7 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     if(args.flashBeforeDebug===undefined)config.flashBeforeDebug=false;
     config.runToEntryPoint=false;
   }
+  if (typeof args.cmsisDapXrSampling === 'boolean') config.cmsisDapXrSampling = args.cmsisDapXrSampling;
 
   if (config.probe === 'cmsis-dap' && !config.rmlinkDeviceId) {
     const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
@@ -85,6 +93,7 @@ export function applyNormalizedDapLaunchConfig(
   config.cmsisDapPid = targetConfig.cmsisDapPid;
   config.cmsisDapPath = targetConfig.cmsisDapPath;
   config.cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath;
+  config.cmsisDapXrSampling = targetConfig.cmsisDapXrSampling;
   config.flashBeforeDebug = targetConfig.flashBeforeDebug;
   if (targetConfig.runToEntryPoint === undefined) delete config.runToEntryPoint;
   else config.runToEntryPoint = targetConfig.runToEntryPoint;

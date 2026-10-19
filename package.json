@@ -202,13 +202,14 @@
               },
               "cmsisDapTransport": {
                 "type": "string",
-                "description": "CMSIS-DAP transport preference; auto prefers v2 WinUSB and falls back to HID",
+                "description": "CMSIS-DAP transport preference; auto prefers v2 WinUSB and falls back to HID; tcp connects to a network probe given by cmsisDapPath",
                 "enum": [
                   "auto",
                   "cmsis-dap-v2",
                   "cmsis-dap",
                   "hid",
-                  "winusb"
+                  "winusb",
+                  "tcp"
                 ],
                 "default": "auto"
               },
@@ -227,9 +228,14 @@
                 "description": "Optional CMSIS-DAP USB product ID selector",
                 "default": ""
               },
+              "cmsisDapXrSampling": {
+                "type": "boolean",
+                "description": "Opt in to XR-DAP vendor Timeline sampling. Disabled by default, independent of TCP/HID/WinUSB. Requires compatible XR firmware; automatic RTT text polling pauses only while XR sampling is active.",
+                "default": false
+              },
               "cmsisDapPath": {
                 "type": "string",
-                "description": "Optional CMSIS-DAP device interface path selector",
+                "description": "Optional CMSIS-DAP device interface path selector; with cmsisDapTransport tcp, the probe address host or host:port (default port 3241)",
                 "default": ""
               },
               "cmsisDapFlashAlgorithmPath": {

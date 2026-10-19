@@ -26,7 +26,7 @@ export class DapLaunchConfigError extends Error {
   ) {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'rmlinkDeviceId' ? 'a 12-digit RMLink device ID' : field === 'probe'
-      ? 'auto, jlink, or cmsis-dap'
+      ? 'auto, jlink, cmsis-dap, or rmlink'
       : 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp';
     super(field === 'cmsisDapXrSampling'
       ? `InvalidConfiguration: ${field} must be a boolean; received ${received}`
@@ -40,7 +40,7 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
   const args = input && typeof input === 'object'
     ? input as Record<string, unknown>
     : {};
-  if (args.probe !== undefined && args.probe !== 'auto' && args.probe !== 'jlink' && args.probe !== 'cmsis-dap') {
+  if (args.probe !== undefined && args.probe !== 'auto' && args.probe !== 'jlink' && args.probe !== 'cmsis-dap' && args.probe !== 'rmlink') {
     throw new DapLaunchConfigError('probe', args.probe);
   }
   if (args.cmsisDapTransport !== undefined
@@ -56,20 +56,21 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     throw new DapLaunchConfigError('cmsisDapXrSampling', args.cmsisDapXrSampling);
   }
   const config: NormalizedDapLaunchConfig = {
-    probe: args.probe === 'jlink' || args.probe === 'cmsis-dap' ? args.probe : 'auto',
+    probe: args.probe === 'jlink' || args.probe === 'cmsis-dap' || args.probe === 'rmlink' ? args.probe : 'auto',
     cmsisDapTransport: args.cmsisDapTransport === undefined ? 'auto' : args.cmsisDapTransport,
     flashBeforeDebug: args.flashBeforeDebug !== false,
   };
   if(args.rmlinkDeviceId!==undefined) {
     if(typeof args.rmlinkDeviceId!=='string' || !/^[0-9a-fA-F]{12}$/.test(args.rmlinkDeviceId))throw new DapLaunchConfigError('rmlinkDeviceId',args.rmlinkDeviceId);
     if(args.probe==='jlink')throw new DapLaunchConfigError('probe',args.probe);
-    config.rmlinkDeviceId=args.rmlinkDeviceId.toLowerCase();config.probe='cmsis-dap';
-    if(args.flashBeforeDebug===undefined)config.flashBeforeDebug=false;
-    config.runToEntryPoint=false;
+    config.rmlinkDeviceId=args.rmlinkDeviceId.toLowerCase();config.probe='rmlink';
+    // Keep the original ID-only opt-in compatible. Explicit RMLink launches
+    // follow the normal F5 Flash default.
+    if(args.probe!=='rmlink' && args.flashBeforeDebug===undefined)config.flashBeforeDebug=false;
   }
   if (typeof args.cmsisDapXrSampling === 'boolean') config.cmsisDapXrSampling = args.cmsisDapXrSampling;
 
-  if (config.probe === 'cmsis-dap' && !config.rmlinkDeviceId) {
+  if (config.probe === 'cmsis-dap' || config.probe === 'rmlink') {
     const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
     config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
   }

@@ -1890,7 +1890,7 @@ export class DapSession extends EventEmitter {
       this._rtos = args.rtos || args.defaultRtos || '';
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = targetConfig.flashBeforeDebug;
-      let resolvedProbe: DebugProbe = targetConfig.probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink';
+      let resolvedProbe: DebugProbe = targetConfig.probe === 'auto' ? 'jlink' : targetConfig.probe;
       if (targetConfig.probe === 'auto') {
         const probeResult = await this.backend.execute({
           cmd: 'resolveProbe',
@@ -1947,11 +1947,12 @@ export class DapSession extends EventEmitter {
       this._device = device;
       this._interface = interface_;
       this._speedKHz = speedKHz;
-      this._probe = resolvedProbe;
+      // RMLink owns the same Cortex-M control contract through its service.
+      this._probe = resolvedProbe === 'rmlink' ? 'cmsis-dap' : resolvedProbe;
       this.xrSamplingEnabled = resolvedProbe === 'cmsis-dap' && !targetConfig.rmlinkDeviceId
         && !this.backend.supportsProbeSubscriptions && targetConfig.cmsisDapXrSampling === true;
       this._flashEnabled = flashEnabled;
-      if (resolvedProbe === 'cmsis-dap') {
+      if (resolvedProbe === 'cmsis-dap' || resolvedProbe === 'rmlink') {
         const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
         this._runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
       } else {
@@ -1981,7 +1982,7 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: tokenLoad.ok ? 'console' : 'stderr', output });
       }
 
-      if (elfPath && this._flashEnabled && resolvedProbe !== 'cmsis-dap') {
+      if (elfPath && this._flashEnabled && resolvedProbe === 'jlink') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
@@ -2048,7 +2049,9 @@ export class DapSession extends EventEmitter {
         ? 'J-Link / native C++ helper'
         : ownerKind === 'jlink-legacy' ? 'J-Link / legacy koffi' : '未知路径';
       if (ownerKind === 'cmsis-dap') {
-        debugPath = connectedDevice?.transport === 'winusb'
+        debugPath = resolvedProbe === 'rmlink'
+          ? 'RMLink / 连接服务（板端订阅、缓存烧录）'
+          : connectedDevice?.transport === 'winusb'
           ? 'CMSIS-DAP v2 / WinUSB'
           : connectedDevice?.transport === 'hid'
             ? 'CMSIS-DAP v1 / HID'
@@ -2057,7 +2060,8 @@ export class DapSession extends EventEmitter {
               : `CMSIS-DAP / ${connectedDevice?.transport || '未知传输'}`;
       }
       const deviceDetails = ownerKind === 'cmsis-dap'
-        ? [connectedDevice?.product, connectedDevice?.serial ? `SN=${connectedDevice.serial}` : '']
+        ? [resolvedProbe === 'rmlink' ? `ID=${targetConfig.rmlinkDeviceId || connectResult.diagnostics?.deviceId || 'auto'}` : connectedDevice?.product,
+          connectedDevice?.serial ? `SN=${connectedDevice.serial}` : '']
           .filter(Boolean).join(' | ')
         : '';
       const connectionSummary = `[Orbit] 调试路径: ${debugPath} (owner=${ownerKind})`
@@ -2066,7 +2070,7 @@ export class DapSession extends EventEmitter {
       this.sendEvent('output', { category: 'console', output: `${singleLineSummary}\n` });
       log.dap(`${ownerKind === 'cmsis-dap' ? '[cmsis-dap] ' : ''}${singleLineSummary}`);
 
-      if (elfPath && this._flashEnabled && resolvedProbe === 'cmsis-dap') {
+      if (elfPath && this._flashEnabled && resolvedProbe !== 'jlink') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath} through the connected CMSIS-DAP owner...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
@@ -5027,16 +5031,17 @@ export class DapSession extends EventEmitter {
     if(this.backend.supportsProbeSubscriptions) {
       await this.probeSamplingCleanup;
       const generation=this.probeSamplingGeneration;
-      let offset:number|undefined,lastSeq:number|undefined;
+      let offset:number|undefined;
       try {
         this.probeSamplingStop=await this.backend.subscribeProbeSamples('memory_series',specs,
           Math.max(200,Math.round(this.dataSamplingIntervalMs*1000)),sample=>{
           if(generation!==this.probeSamplingGeneration || !this.dataSamplingActive || !this.targetRunning || !sample.values)return;
           const probeMs=Number(sample.timestampUs)/1000;
           offset??=this.nowMs()-probeMs;
-          const timestamp=this.timelineNowMs(probeMs+offset);
-          const gap=lastSeq!==undefined && sample.sequence!==((lastSeq+1)>>>0);
-          lastSeq=sample.sequence;
+          // The probe keeps sampling time independently of host delivery and
+          // pause notifications. Subtracting later host pauses can move an
+          // in-flight pre-pause batch backwards. Keep its real elapsed time.
+          const timestamp=probeMs+offset;
           specs.forEach((spec,i)=>{
             if(!(sample.validBitmap&(1<<i)))return;
             const raw=sample.values![i],bytes=Buffer.alloc(4);bytes.writeUInt32LE(raw);
@@ -5045,7 +5050,14 @@ export class DapSession extends EventEmitter {
             if(!Number.isFinite(value))return;
             const pending=this.dataSamplingPending.get(spec.expression);if(!pending)return;
             const display=String(value);
+            // Sequence also counts missed scheduling slots. At overload, a
+            // skipped 200 us slot is not a visible disconnection. Use each
+            // field's actual sample time; probe loss/deadline counters remain
+            // available independently of this 5 ms display policy.
+            const lastTimestamp=this.dataSamplingLastTimestamp.get(spec.expression);
+            const gap=lastTimestamp!==undefined && timestamp-lastTimestamp>5;
             pending.push({timestamp,value,display,...(gap || !this.dataSamplingSeenExpressions.has(spec.expression)?{startsNewSegment:true}:{})});
+            this.dataSamplingLastTimestamp.set(spec.expression,timestamp);
             this.dataSamplingSeenExpressions.add(spec.expression);this.dataSamplingLastDisplay.set(spec.expression,display);
             this.dataSamplingCounts.samplesAccepted++;
           });

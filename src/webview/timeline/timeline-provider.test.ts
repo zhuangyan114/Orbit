@@ -41,6 +41,35 @@ async function imported() {
 function debugStart() { state.session = { id: 'new', name: '新调试', type: 'orbit' }; state.start(state.session); return (provider as any).tabs.get((provider as any).liveId); }
 
 describe('Timeline record and debug configuration isolation', () => {
+  it('pushes a resolution-tagged live tail while recording all raw samples', async () => {
+    const live = debugStart();
+    const input = { expression: 'live_motor', color: '#ABCDEF', currentValue: '99', data: Array.from({ length: 100 }, (_, index) => ({ timestamp: 1700000000000 + index, value: index === 45 ? 500 : index, display: String(index) })) };
+    manager.samples([{ ...input, data: input.data.slice(0, 1) }]);
+    expect(state.messages.filter(m => m.command === 'samples').at(-1).snapshots).toEqual([]);
+    await (provider as any).handleMessage({ command: 'loadRange', tabId: live.info.id, recordId: live.info.recordId, requestId: 1, generation: 7, resolutionKey: 100, targetBuckets: 1, start: 0, end: 0 });
+    manager.samples([{ ...input, data: input.data.slice(1) }]);
+    const pushed = state.messages.filter(m => m.command === 'samples').at(-1);
+    expect(pushed).toMatchObject({ generation: 7, resolutionKey: 100, tabId: live.info.id, recordId: live.info.recordId });
+    expect(pushed.snapshots[0].data.map((point: any) => point.timestamp)).toEqual([1, 45, 99]);
+    expect(live.store.acceptedRows).toBe(100);
+    const [raw] = await live.store.query(0, 99, 1, true);
+    expect(raw.data).toHaveLength(100);
+    expect(raw.data[45].value).toBe(500);
+  });
+
+  it('selects the new live record on debug restart while retaining the previous history', async () => {
+    const first = debugStart();
+    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: 1700000000100, value: 5, display: '5' }] }]);
+    state.terminate(state.session);
+    state.session = { id: 'restart', name: '重启调试', type: 'orbit' };
+    state.start(state.session);
+    const current = (provider as any).tabs.get((provider as any).liveId);
+    expect(current.info.id).not.toBe(first.info.id);
+    expect((provider as any).activeId).toBe(current.info.id);
+    expect(state.messages.filter(m => m.command === 'activate').at(-1).tab.id).toBe(current.info.id);
+    expect((provider as any).tabs.get(first.info.id).info.kind).toBe('history');
+    expect(first.store.acceptedRows).toBe(1);
+  });
   it('delivers real rangeSamples replies from an initially empty live record', async () => {
     const live = debugStart();
     const request = { command: 'loadRange', tabId: live.info.id, recordId: live.info.recordId, requestId: 1, generation: 1, resolutionKey: 1, targetBuckets: 20, start: 0, end: 20 };
@@ -52,7 +81,8 @@ describe('Timeline record and debug configuration isolation', () => {
       { timestamp: 1700000000110, value: 6, display: '6' },
     ] }]);
     expect(state.messages.at(-1)).toMatchObject({ command: 'samples', historyBounds: { start: 0, end: 10 } });
-    expect(state.messages.at(-1)).toMatchObject({ sampleRateHz: 100, snapshots: [] });
+    expect(state.messages.at(-1)).toMatchObject({ sampleRateHz: 100, generation: 1, resolutionKey: 1 });
+    expect(state.messages.at(-1).snapshots[0].data.map((point: any) => point.timestamp)).toEqual([0, 10]);
     await (provider as any).handleMessage({ ...request, requestId: 2 });
     const reply = state.messages.at(-1);
     expect(reply).toMatchObject({ command: 'rangeSamples', tabId: live.info.id, recordId: live.info.recordId, requestId: 2, generation: 1, range: { start: 0, end: 10 } });

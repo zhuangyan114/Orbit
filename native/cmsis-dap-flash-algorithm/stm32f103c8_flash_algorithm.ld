@@ -26,6 +26,9 @@ SECTIONS
     . = ORIGIN(RAM) + 0x500;
     KEEP(*(.text.bkpt))
     ASSERT(. <= ORIGIN(RAM) + 0x510, "BKPT sentinel exceeds its slot");
+    . = ORIGIN(RAM) + 0x600;
+    KEEP(*(.text.eraseChip))
+    ASSERT(. <= ORIGIN(RAM) + 0x700, "EraseChip entry exceeds its slot");
     *(.text*)
     *(.rodata*)
     . = ALIGN(4);

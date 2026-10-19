@@ -224,9 +224,11 @@ export class SessionTargetSelector {
       );
     }
 
-    if (config.rmlinkDeviceId) {
+    if (config.probe === 'rmlink' || config.rmlinkDeviceId) {
+      log.dll(`target-owner session=${this.sessionId} select probe=rmlink owner=none command=connect`);
       const owner=this.createRMLink();const result=await owner.connect(config);
       if(result.ok)this.owner=owner;else await owner.dispose(false);
+      log.dll(`target-owner session=${this.sessionId} selected probe=rmlink owner=${result.ok?'cmsis-dap':'none'} command=connect ok=${result.ok} code=${result.errorCode || 'none'}`);
       return result;
     }
     if (config.probe === 'cmsis-dap') {

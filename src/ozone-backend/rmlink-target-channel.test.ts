@@ -10,7 +10,8 @@ class ClientModel {
   opened=0;closed=0;calls:string[]=[];failed=false;rejectOnce=false;
   images:Array<{data:Buffer;address:number}>=[];
   streamOpens=0;flashError:Error|null=null;flashSignal:AbortSignal|undefined;
-  async init() {}
+  devices=[{device_id:'50787d15a924',paired:true,connected:true}];
+  async init() {return {devices:this.devices};}
   async open() {this.opened++;}
   async close() {this.closed++;}
   async target(command:string) {
@@ -38,6 +39,38 @@ class ClientModel {
   }
 }
 describe('RMLink public-service owner',()=>{
+  it('runs to an entry address through the same public service owner',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+    let received:any;
+    model.target=async(command:string,parameters?:any)=>{received={command,parameters};return {state:'Halted',pc:0x08001000,cleanupOk:true} as any;};
+    expect(await owner.runToAddress(0x08001001,true)).toMatchObject({ok:true,targetState:'Halted',data:{pc:0x08001000,cleanupOk:true}});
+    expect(received).toEqual({command:'run_to_address',parameters:{address:0x08001001,reset:true}});
+    expect(model.opened).toBe(1);await owner.dispose();
+  });
+  it('routes probe=rmlink to one service owner without requiring USB selectors or a device ID',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    const forbidden=()=>{throw new Error('competing probe');};
+    const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+    expect(await selector.connect({probe:'rmlink',device:'STM32F103C8',interface:'SWD',speedKHz:4000}))
+      .toMatchObject({ok:true,data:{diagnostics:{transport:'rmlink-service',deviceId:'50787d15a924'}}});
+    expect(model.opened).toBe(1);expect(model.calls).toEqual(['connect']);
+    await selector.dispose();expect(model.closed).toBe(1);
+  });
+  it('never guesses between multiple paired devices or falls back after a busy target',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    model.devices.push({device_id:'50787d15a925',paired:true,connected:true});
+    expect((await owner.connect({probe:'rmlink',device:'STM32F103C8',speedKHz:4000})).errorCode).toBe('AmbiguousDevice');
+    expect(model.opened).toBe(0);
+    model.devices=[];
+    expect((await owner.connect({probe:'rmlink',device:'STM32F103C8',speedKHz:4000})).errorCode).toBe('DeviceNotFound');
+    model.target=async()=>{throw Object.assign(new Error('busy'),{errorCode:'TargetBusy',httpStatus:409});};
+    const forbidden=()=>{throw new Error('competing probe');};
+    const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+    expect(await selector.connect({probe:'rmlink',rmlinkDeviceId:'50787d15a924',device:'STM32F103C8',speedKHz:4000}))
+      .toMatchObject({ok:false,errorCode:'TargetBusy',message:expect.stringContaining('未执行烧录')});
+    expect(selector.ownerKind).toBe('none');expect(model.opened).toBe(1);
+  });
   it('preserves observed Cortex-M control state through the service owner contract',async()=>{
     const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
     await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});

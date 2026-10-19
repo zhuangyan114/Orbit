@@ -5,8 +5,10 @@ import { RMLinkClient, CaptureSample, SubscriptionConfig } from '../../clients/r
 import type { SessionTargetOwner, SessionTargetConnectConfig, TargetChannelInfo } from './session-target-channel';
 import type { CppJLinkResult, NativeStepIntoDiagnostics, NativeStepIntoSourceLineRequest, NativeStepOverDiagnostics, NativeStepOverRequest, NativeStepOutDiagnostics } from './cpp-jlink-channel';
 import { NativeScheduler } from './native-scheduler';
+import { log } from '../utils/logger';
 import {readFile} from 'node:fs/promises';
-import {parseElf32LoadSegments,resolveFlashTarget,CmsisDapFlashOptions,CmsisDapFlashResult,FlashTargetDefinition} from './cmsis-dap-flasher';
+import {parseElf32LoadSegments,calculateEraseSectors,coalesceFlashProgramRanges,resolveFlashTarget,CmsisDapFlashOptions,CmsisDapFlashResult,FlashTargetDefinition} from './cmsis-dap-flasher';
+import type { CmsisDapRunToAddressResult } from './cmsis-dap-helper-channel';
 
 export class RMLinkTargetChannel implements SessionTargetOwner {
   readonly kind = 'cmsis-dap' as const;
@@ -27,14 +29,30 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   constructor(client = new RMLinkClient()) { this.client = client; }
   get usingNative() { return this.connected; }
   async connect(config: SessionTargetConnectConfig): Promise<CppJLinkResult<TargetChannelInfo>> {
-    if (!config.rmlinkDeviceId) return this.failure('rmlinkDeviceId required','InvalidConfiguration');
+    if (config.interface && config.interface!=='SWD') return this.failure('RMLink currently requires interface: SWD','InvalidConfiguration');
     try {
-      await this.client.init(); await this.client.open(config.rmlinkDeviceId);
-      await this.client.target('connect',{clock_hz: config.speedKHz ? config.speedKHz*1000 : 4000000});
+      const status=await this.client.init() as {devices?:Array<{device_id:string;paired:boolean;connected:boolean}>};
+      let deviceId=config.rmlinkDeviceId;
+      if(!deviceId){
+        const candidates=(status?.devices || []).filter(d=>d.paired && d.connected);
+        if(candidates.length!==1)return this.failure(
+          candidates.length?'Multiple RMLink devices are online; set rmlinkDeviceId.':'No paired RMLink device is online. Start the RMLink connection service and check the hotspot.',
+          candidates.length?'AmbiguousDevice':'DeviceNotFound');
+        deviceId=candidates[0].device_id;
+      }
+      const target=resolveFlashTarget(config.device);
+      await this.client.open(deviceId);
+      await this.client.target('connect',{clock_hz: config.speedKHz ? config.speedKHz*1000 : 4000000,device:target.name});
       this.connected = true;
-      this.flashTarget=resolveFlashTarget(config.device) || null;
-      return this.success({channel:'cmsis-dap',diagnostics:{transport:'rmlink-service',subscriptions:true}});
-    } catch (error) { await this.client.close().catch(()=>{}); return this.failure(String(error),'RMLinkConnectFailed'); }
+      this.flashTarget=target;
+      return this.success({channel:'cmsis-dap',diagnostics:{transport:'rmlink-service',deviceId,subscriptions:true}});
+    } catch (error) {
+      await this.client.close().catch(()=>{});
+      const code=(error as {errorCode?:string;code?:string}).errorCode || (error as {code?:string}).code;
+      return this.failure(code==='TargetBusy'
+        ? 'RMLink 目标正被另一个调试会话占用，请结束那个会话后重试。当前未执行烧录。'
+        : String(error),code || 'RMLinkConnectFailed');
+    }
   }
   private success<T>(data:T):CppJLinkResult<T> { return {ok:true,message:'RMLink',targetState:this.connected?'Unknown':'Disconnected',elapsedMs:0,data}; }
   private failure<T>(message:string,errorCode='UnsupportedCapability'):CppJLinkResult<T> { return {ok:false,message,errorCode,targetState:'Error',elapsedMs:0}; }
@@ -50,6 +68,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     },{priority:'control'}); }
     catch(error) {
       const response=error as {httpStatus?:number;errorCode?:string};
+      log.dll(`[rmlink] request failed command=${command} status=${response.httpStatus ?? 'transport'} code=${response.errorCode ?? 'unknown'} error=${String(error)}`);
       if(response.httpStatus && response.httpStatus<500)return this.failure(String(error),response.errorCode || 'RMLinkRequestFailed');
       this.connected=false;return this.failure(String(error),'NativeOwnerLost');
     }
@@ -58,6 +77,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   run() { return this.control('run'); }
   step() { return this.control('step'); }
   reset() { return this.control('reset'); }
+  runToAddress(address:number,reset:boolean) { return this.control<CmsisDapRunToAddressResult>('run_to_address',{address,reset}); }
   getState() { return this.control<{state:string}>('state'); }
   readRegister(index:number) { return this.control<{value:number}>('read_register',{index}); }
   async readMemory(address:number,size:number):Promise<CppJLinkResult<{bytes:Uint8Array}>> {
@@ -100,7 +120,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
           for(const listener of this.listeners) {
             try{listener(sample);}catch{this.listeners.delete(listener);}
           }
-        } } catch(error) { if(!abort.signal.aborted)this.connected=false; }
+        } } catch(error) { if(!abort.signal.aborted){log.dll(`[rmlink] capture stream lost: ${String(error)}`);this.connected=false;} }
       })();
     }
     return r;
@@ -130,16 +150,37 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     this.flashing=true;
     try {
       const target=resolveFlashTarget(device);
-      if(!target || target.algorithm!=='stm32f103c8')return this.failure('RMLink enhanced Flash supports registered F103C8 only','TargetMismatch');
+      if(this.flashTarget?.name!==target.name)return this.failure('Flash target differs from the connected shared-package target','TargetMismatch');
       if(options.signal?.aborted)return this.failure('Flash cancelled','RequestCancelled');
-      const segments=parseElf32LoadSegments(await readFile(elfPath)).filter(s=>s.fileSize>0);
-      if(!segments.length || segments.some(s=>s.loadAddress<target.flashBase || s.loadAddress+s.fileSize>target.flashBase+target.flashSize))
-        return this.failure('ELF contains unsupported load ranges','InvalidConfiguration');
-      const begin=Math.floor(Math.min(...segments.map(s=>s.loadAddress))/1024)*1024;
-      const end=Math.ceil(Math.max(...segments.map(s=>s.loadAddress+s.fileSize))/1024)*1024;
-      const image=Buffer.alloc(end-begin,0xff);for(const segment of segments)image.set(segment.bytes,segment.loadAddress-begin);
+      const segments=parseElf32LoadSegments(await readFile(elfPath));
+      const sectors=calculateEraseSectors(segments,target);
+      const ranges=coalesceFlashProgramRanges(segments,target);
+      if(!sectors.length)return this.failure('ELF has no supported Flash load bytes','InvalidConfiguration');
+      const groups:Array<{address:number;size:number}>=[];
+      for(const sector of sectors) {
+        const previous=groups[groups.length-1];
+        if(previous && previous.address+previous.size===sector.address)previous.size+=sector.size;
+        else groups.push({address:sector.address,size:sector.size});
+      }
+      const images=groups.map(group=>{
+        const image=Buffer.alloc(group.size,0xff);
+        for(const range of ranges) {
+          const first=Math.max(group.address,range.address),last=Math.min(group.address+group.size,range.address+range.bytes.length);
+          if(first<last)image.set(range.bytes.subarray(first-range.address,last-range.address),first-group.address);
+        }
+        return {...group,image};
+      });
       const result=await this.scheduler.schedule(async()=>{
-        try {return await this.client.flashImage(image,begin,options.signal);}
+        try {
+          const jobs:Array<Record<string,unknown>>=[];
+          for(let i=0;i<images.length;i++) {
+            const group=images[i];
+            const job=await this.client.flashImage(group.image,group.address,options.signal,{resetAfter:i===images.length-1,timeoutMs:660000});
+            if(job.verified!==true)throw new Error('Flash did not report a complete image verification');
+            jobs.push(job);
+          }
+          return {...jobs[jobs.length-1],verified:true,jobs};
+        }
         finally {
           // COMMIT stops board subscriptions. End the corresponding local
           // generation too, so subscriptions after Flash open a fresh stream.
@@ -152,11 +193,11 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
         this.breakpoints.clear();this.rttIds.clear();this.rttData.clear();
         this.activeCaptures.clear();
         return this.success({success:true,message:'RMLink service programmed and fully verified the image',
-          reports:[],erasedSectors:target.sectors.filter(s=>s.address>=begin && s.address<end),target,diagnostics:result});
+          reports:[],erasedSectors:sectors,target,diagnostics:result});
     }catch(error){
-      const failure=error as {name?:string;errorCode?:string;ownerLost?:boolean};
+      const failure=error as {name?:string;errorCode?:string;code?:string;ownerLost?:boolean};
       if(failure.ownerLost)this.connected=false;
-      return this.failure(String(error),failure.errorCode==='FlashCancelled' || failure.name==='AbortError'?'RequestCancelled':failure.ownerLost?'NativeOwnerLost':'OutcomeUnknown');
+      return this.failure(String(error),failure.errorCode==='FlashCancelled' || failure.name==='AbortError'?'RequestCancelled':failure.ownerLost?'NativeOwnerLost':failure.errorCode || failure.code || 'OutcomeUnknown');
     }finally{this.flashing=false;}
   }
   async stepIntoInstruction():Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {

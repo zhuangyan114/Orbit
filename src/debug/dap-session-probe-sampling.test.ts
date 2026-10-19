@@ -26,7 +26,7 @@ function probeRead(session: any) {
   };
 }
 
-function fixture(start: any = { ok: true, data: { periodUs: 1000, estFrameUs: 90, maxFrameBytes: 15, run: 1 } }) {
+function fixture(start: any = { ok: true, data: { periodUs: 1000, estFrameUs: 90, maxFrameBytes: 15, run: 1 } }, xrEnabled = true) {
   const commands: any[] = [];
   const backend = {
     execute: vi.fn(async (command: any) => {
@@ -34,11 +34,15 @@ function fixture(start: any = { ok: true, data: { periodUs: 1000, estFrameUs: 90
       if (command.cmd === 'prepareFastDataSampling') return { ok: true, data: [{ expression: 'power', spec }] };
       if (command.cmd === 'startProbeSampling') return start;
       if (command.cmd === 'readProbeSampling') return probeRead(session);
+      if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
       return { ok: true, data: {} };
     }),
+    configureNativeSteps: vi.fn(),
     dispose() {},
   };
   const session = new DapSession(backend as any);
+  (session as any)._probe = 'cmsis-dap';
+  if (xrEnabled) (session as any).xrSamplingEnabled = true;
   (session as any).setTargetRunning(true);
   const sent: DebugProtocolMessage[] = [];
   session.on('send', message => sent.push(message));
@@ -64,6 +68,51 @@ describe('DapSession Timeline sampling source', () => {
     expect(f.internal.dataSamplingTimer).toBeNull();
   });
 
+  it.each([
+    ['cmsis-dap', undefined, false],
+    ['cmsis-dap', false, false],
+    ['cmsis-dap', true, true],
+    ['jlink', true, false],
+  ])('launches %s with XR option %s using the intended owner configuration', async (probe, option, enabled) => {
+    const f = fixture(undefined, false);
+    try {
+      const launch = f.internal.handleLaunch(request(10, 'launch', {
+        probe, cmsisDapTransport: 'tcp', cmsisDapPath: 'localhost:3241',
+        cmsisDapXrSampling: option, flashBeforeDebug: false, rttLogEnabled: false,
+      }));
+      await vi.advanceTimersByTimeAsync(250);
+      await launch;
+      expect(f.sent.find(m => m.request_seq === 10)).toMatchObject({ success: true });
+      expect(f.commands.find(c => c.cmd === 'connect').config.cmsisDapXrSampling).toBe(enabled);
+      expect(f.internal.xrSamplingEnabled).toBe(enabled);
+      expect(f.internal.probeSampler).toBeNull();
+      expect(f.commands.some(c => /ProbeSampling$/.test(c.cmd))).toBe(false);
+    } finally {
+      f.internal.stopConnectionMonitor();
+      f.internal.stopRttLogPolling();
+    }
+  });
+
+  it('uses the original host loop by default without probing XR or allocating its sampler', async () => {
+    const f = fixture(undefined, false);
+    await f.startSampling({ probeSampling: true });
+    expect(f.sent.find(m => m.request_seq === 1)).toMatchObject({ success: true, body: { source: 'host' } });
+    expect(f.commands.some(c => /ProbeSampling$/.test(c.cmd))).toBe(false);
+    expect(f.internal.probeSampler).toBeNull();
+    expect(f.internal.dataSamplingTimer).not.toBeNull();
+    f.internal.stopDataSampling();
+    expect(f.commands.some(c => /ProbeSampling$/.test(c.cmd))).toBe(false);
+  });
+
+  it('keeps J-Link on the host loop even when XR is enabled in the configuration', async () => {
+    const f = fixture();
+    f.internal._probe = 'jlink';
+    await f.startSampling();
+    expect(f.sent.find(m => m.request_seq === 1)).toMatchObject({ success: true, body: { source: 'host' } });
+    expect(f.commands.some(c => /ProbeSampling$/.test(c.cmd))).toBe(false);
+    expect(f.internal.probeSampler).toBeNull();
+  });
+
   it('polls from the host when the probe cannot sample', async () => {
     const f = fixture({ ok: false, errorCode: 'UnsupportedCapability', error: 'no XR-DAP' });
     await f.startSampling();
@@ -75,7 +124,7 @@ describe('DapSession Timeline sampling source', () => {
     const f = fixture();
     await f.startSampling({ probeSampling: false });
     expect(f.commands.some(c => c.cmd === 'startProbeSampling')).toBe(false);
-    expect(f.internal.probeSampler.active).toBe(false);
+    expect(f.internal.probeSampler).toBeNull();
   });
 
   it('never plots a probe frame before the previous point across a Timeline pause', async () => {

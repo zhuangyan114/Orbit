@@ -3241,14 +3241,46 @@ case 'readVariableRuntime':
         results.push({ expression: spec?.expression || '', value: 0, display: '', hex: '', error });
         continue;
       }
-      results.push(this.formatFastSample(spec, raw, resolvedAddresses[index]));
+
+      let value: number | string;
+      let display: string;
+      let hex: string;
+      let exactValue: string | undefined;
+      let numericValueExact: boolean | undefined;
+      if (spec.isFloat) {
+        value = this.readBytesAsFloat(raw, spec.size);
+        display = spec.size === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+        hex = `0x${Array.from(raw.slice(0, spec.size)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+      } else {
+        const formatted = this.formatScalarValue(
+          raw,
+          spec.size,
+          spec.format || { kind: 'base', encoding: spec.signed ? 'signed' : 'unsigned', name: spec.typeName || '' },
+        );
+        value = formatted.value;
+        display = formatted.display;
+        hex = formatted.hex;
+        exactValue = formatted.exactValue;
+        numericValueExact = formatted.numericValueExact;
+      }
+
+      results.push({
+        expression: spec.expression,
+        value,
+        display,
+        hex,
+        exactValue,
+        numericValueExact,
+        address: resolvedAddresses[index],
+        typeName: spec.typeName,
+      });
     }
     this.fastSamplingFormatMs.record(performance.now() - formatStartedAt);
     return results;
   }
 
-  /** Formats the raw little-endian bytes of one sampled scalar. */
-  private formatFastSample(spec: FastDataSampleSpec, raw: Uint8Array, address?: number): WatchValue {
+  /** Formats XR frames separately so their evolution cannot change the host fast-read path. */
+  private formatProbeSample(spec: FastDataSampleSpec, raw: Uint8Array, address?: number): WatchValue {
     let value: number | string;
     let display: string;
     let hex: string;
@@ -3317,7 +3349,7 @@ case 'readVariableRuntime':
       values: frame.v.flatMap(([index, ok, hexBytes]) => {
         const spec = specs[index];
         if (!spec || !ok) return [];
-        return [this.formatFastSample(spec, Buffer.from(hexBytes, 'hex'))];
+        return [this.formatProbeSample(spec, Buffer.from(hexBytes, 'hex'))];
       }),
     }));
     const data: ProbeSampleBatch = {

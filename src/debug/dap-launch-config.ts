@@ -11,6 +11,7 @@ export interface NormalizedDapLaunchConfig {
   cmsisDapPid?: string;
   cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
+  cmsisDapXrSampling?: boolean;
   flashBeforeDebug: boolean;
   runToEntryPoint?: string | false;
 }
@@ -19,14 +20,16 @@ export class DapLaunchConfigError extends Error {
   readonly errorCode = 'InvalidConfiguration' as const;
 
   constructor(
-    readonly field: 'probe' | 'cmsisDapTransport',
+    readonly field: 'probe' | 'cmsisDapTransport' | 'cmsisDapXrSampling',
     value: unknown,
   ) {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'probe'
       ? 'auto, jlink, or cmsis-dap'
       : 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp';
-    super(`InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
+    super(field === 'cmsisDapXrSampling'
+      ? `InvalidConfiguration: ${field} must be a boolean; received ${received}`
+      : `InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
     this.name = 'DapLaunchConfigError';
     Object.setPrototypeOf(this, DapLaunchConfigError.prototype);
   }
@@ -48,11 +51,15 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     && args.cmsisDapTransport !== 'tcp') {
     throw new DapLaunchConfigError('cmsisDapTransport', args.cmsisDapTransport);
   }
+  if (args.cmsisDapXrSampling !== undefined && typeof args.cmsisDapXrSampling !== 'boolean') {
+    throw new DapLaunchConfigError('cmsisDapXrSampling', args.cmsisDapXrSampling);
+  }
   const config: NormalizedDapLaunchConfig = {
     probe: args.probe === 'jlink' || args.probe === 'cmsis-dap' ? args.probe : 'auto',
     cmsisDapTransport: args.cmsisDapTransport === undefined ? 'auto' : args.cmsisDapTransport,
     flashBeforeDebug: args.flashBeforeDebug !== false,
   };
+  if (typeof args.cmsisDapXrSampling === 'boolean') config.cmsisDapXrSampling = args.cmsisDapXrSampling;
 
   if (config.probe === 'cmsis-dap') {
     const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
@@ -77,6 +84,7 @@ export function applyNormalizedDapLaunchConfig(
   config.cmsisDapPid = targetConfig.cmsisDapPid;
   config.cmsisDapPath = targetConfig.cmsisDapPath;
   config.cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath;
+  config.cmsisDapXrSampling = targetConfig.cmsisDapXrSampling;
   config.flashBeforeDebug = targetConfig.flashBeforeDebug;
   if (targetConfig.runToEntryPoint === undefined) delete config.runToEntryPoint;
   else config.runToEntryPoint = targetConfig.runToEntryPoint;

@@ -228,6 +228,11 @@
                 "description": "Optional CMSIS-DAP USB product ID selector",
                 "default": ""
               },
+              "cmsisDapXrSampling": {
+                "type": "boolean",
+                "description": "Opt in to XR-DAP vendor Timeline sampling. Disabled by default, independent of TCP/HID/WinUSB. Requires compatible XR firmware; automatic RTT text polling pauses only while XR sampling is active.",
+                "default": false
+              },
               "cmsisDapPath": {
                 "type": "string",
                 "description": "Optional CMSIS-DAP device interface path selector; with cmsisDapTransport tcp, the probe address host or host:port (default port 3241)",

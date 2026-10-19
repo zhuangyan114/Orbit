@@ -10,6 +10,8 @@ export interface DebugProbeLaunchConfig {
   cmsisDapPid?: string;
   cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
+  /** Explicit opt-in to XR-DAP vendor sampling; independent of TCP transport. */
+  cmsisDapXrSampling?: boolean;
   flashBeforeDebug?: boolean;
 }
 

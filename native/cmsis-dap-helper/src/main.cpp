@@ -193,6 +193,7 @@ struct Channel {
   FpbState fpbState;
   SeggerRttReader rttReader;
   XrDapSampler xrSampler;
+  bool xrSamplingEnabled = false;
 
   void clearFlashPageBuffer() {
     flashPageBufferValid = false;
@@ -470,7 +471,8 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
   channel.transport->drainInput(std::chrono::milliseconds(100));
   // An XR-DAP probe keeps sampling over USB after a helper that started it
   // died, and then rejects DAP_Connect. TCP probes stop on the new connection.
-  if (device.serial.rfind("XRobot-XRDAP-", 0) == 0) {
+  channel.xrSamplingEnabled = boolField(params, "xrSampling").value_or(false);
+  if (channel.xrSamplingEnabled && device.serial.rfind("XRobot-XRDAP-", 0) == 0) {
     CmsisDapProtocol protocol(channel.transport.get());
     std::vector<uint8_t> response;
     (void)protocol.vendorExchange(xrSubCtrlRequest(kXrSubStop), response,
@@ -572,6 +574,7 @@ std::string handleClose(Channel& channel) {
   channel.opened = false;
   channel.connected = false;
   channel.xrSampler.reset();
+  channel.xrSamplingEnabled = false;
   channel.clearFlashAlgorithmState();
   channel.clearDebugResourceState();
   return resultJson(true, "device closed", "Disconnected", 0);
@@ -2645,7 +2648,7 @@ class SamplingPause {
   // Makes room for request `name` while the probe samples. Returns the reply
   // when vendor READ already answered it.
   std::optional<std::string> prepare(const std::string& name, const JsonValue& params) {
-    if (!channel_.xrSampler.running()) return std::nullopt;
+    if (!channel_.xrSamplingEnabled || !channel_.xrSampler.running()) return std::nullopt;
     const XrSamplingRoute route = xrSamplingRoute(name);
     if (route == XrSamplingRoute::Direct) return std::nullopt;
     if (route == XrSamplingRoute::VendorRead) {
@@ -2686,6 +2689,11 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
 
   std::string result;
   const std::string& name = method->string;
+  if (!channel.xrSamplingEnabled &&
+      (name == "xrInfo" || name == "xrSamplingStart" || name == "xrSamplingRead" || name == "xrSamplingStop")) {
+    return responseEnvelope(*id, resultJson(false, "XR-DAP sampling is disabled; opt in when opening the device",
+                                           channel.state(), 0, "{}", ErrorCodes::kTransportNotSupported));
+  }
   // The probe answers ordinary DAP commands with 0xFF while it samples.
   SamplingPause samplingPause(channel);
   if (std::optional<std::string> served = samplingPause.prepare(name, *params)) {
@@ -5375,6 +5383,17 @@ int runSelfTest() {
     channel.transport = std::move(owned);
     channel.opened = true;
     channel.connected = true;
+    // Without an open-time opt-in, even direct vendor RPCs must send no bytes.
+    for (const std::string method : {"xrInfo", "xrSamplingStart", "xrSamplingRead", "xrSamplingStop"}) {
+      const JsonValue response = JsonParser(dispatch(JsonParser(
+          "{\"id\":0,\"method\":\"" + method + "\",\"params\":{}}").parse(), channel)).parse();
+      const JsonValue* result = response.get("result");
+      expect(result && !boolField(*result, "ok").value_or(true) &&
+                 stringField(*result, "errorCode").value_or("") == ErrorCodes::kTransportNotSupported &&
+                 wire->requests.empty(),
+             ("xr-disabled-blocks-" + method).c_str());
+    }
+    channel.xrSamplingEnabled = true;
     CmsisDapProtocol protocol(channel.transport.get());
     XrItem item;
     item.size = 4;
@@ -5435,7 +5454,7 @@ int runSelfTest() {
   }
 
   std::cout << "{\"selftest\":\"" << (failures == 0 ? "ok" : "fail")
-            << "\",\"cases\":" << 200 << ",\"failures\":" << failures << "}\n"
+            << "\",\"cases\":" << 204 << ",\"failures\":" << failures << "}\n"
             << std::flush;
   return failures == 0 ? 0 : 1;
 }

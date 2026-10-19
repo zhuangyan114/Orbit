@@ -86,7 +86,7 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | `device` | string | `STM32F407VG` | 目标 device；J-Link 用于 DLL 选型，CMSIS-DAP 用于芯片/Flash Algorithm 校验。|
 | `deviceName` | string | 跟随 `device` | 外部 MCU Views 兼容别名；通常无需填写。|
 | `probe` | `auto` / `jlink` / `cmsis-dap` | `auto` | 每个 session 的物理 target owner 类型；`auto` 固定 J-Link 优先。|
-| `cmsisDapTransport` | enum | `auto` | `auto`、`cmsis-dap-v2`/`winusb`、`cmsis-dap`/`hid`。|
+| `cmsisDapTransport` | enum | `auto` | `auto`、`cmsis-dap-v2`/`winusb`、`cmsis-dap`/`hid`、`tcp`（网络探针，地址写在 `cmsisDapPath`，`host[:port]`，默认端口 3241）。|
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。|
 | `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。|
 | `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。|

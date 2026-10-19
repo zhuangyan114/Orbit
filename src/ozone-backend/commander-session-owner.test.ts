@@ -287,7 +287,7 @@ describe('OzoneBackend extension-host ownership guard', () => {
     });
 
     expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
-    if (!result.ok) expect(result.error).toContain('cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, or winusb');
+    if (!result.ok) expect(result.error).toContain('cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp');
     expect(jlink.open).not.toHaveBeenCalled();
     expect(jlink.connect).not.toHaveBeenCalled();
   });

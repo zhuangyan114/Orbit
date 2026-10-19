@@ -25,7 +25,7 @@ export class DapLaunchConfigError extends Error {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'probe'
       ? 'auto, jlink, or cmsis-dap'
-      : 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb';
+      : 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp';
     super(`InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
     this.name = 'DapLaunchConfigError';
     Object.setPrototypeOf(this, DapLaunchConfigError.prototype);
@@ -44,7 +44,8 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     && args.cmsisDapTransport !== 'cmsis-dap-v2'
     && args.cmsisDapTransport !== 'cmsis-dap'
     && args.cmsisDapTransport !== 'hid'
-    && args.cmsisDapTransport !== 'winusb') {
+    && args.cmsisDapTransport !== 'winusb'
+    && args.cmsisDapTransport !== 'tcp') {
     throw new DapLaunchConfigError('cmsisDapTransport', args.cmsisDapTransport);
   }
   const config: NormalizedDapLaunchConfig = {

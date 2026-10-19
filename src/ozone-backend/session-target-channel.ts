@@ -30,6 +30,9 @@ import {
   CmsisDapDpReadResult,
   CmsisDapFlashAlgorithmRpcResult,
   CmsisDapControlRequest,
+  ProbeSamplingItem,
+  ProbeSamplingReadResult,
+  ProbeSamplingStartResult,
   findDefaultHelperPath,
 } from './cmsis-dap-helper-channel';
 import {
@@ -45,7 +48,7 @@ import {
 import { JLinkDLL } from './jlink-dll';
 import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
-import { CmsisDapTransport, DebugProbe, DebugProbePreference } from './types';
+import { CmsisDapTransport, DebugProbe, DebugProbePreference, ProbeSamplingStats } from './types';
 
 export type SessionTargetOwnerKind = 'none' | 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
 export type SessionTargetMode = 'legacy' | 'native' | 'auto';
@@ -71,6 +74,9 @@ export interface SessionTargetConnectConfig extends CppJLinkConnectConfig {
 }
 
 let nextSessionId = 1;
+
+/** XR-DAP INFO feature bit: probe-side periodic sampling. */
+const XR_FEATURE_SAMPLING = 1 << 2;
 
 export interface SessionTargetOwner extends NativeStepExecutor {
   readonly kind: Exclude<SessionTargetOwnerKind, 'none'>;
@@ -106,6 +112,11 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   readonly flashTarget?: FlashTargetDefinition | null;
   getPerformanceDiagnostics?(): Record<string, unknown>;
   getSchedulerSnapshot?(): Record<string, unknown>;
+  /** XR-DAP probe-side sampling; only CMSIS-DAP owners on an XR-DAP probe implement it. */
+  supportsProbeSampling?(): Promise<boolean>;
+  startProbeSampling?(periodUs: number, items: ProbeSamplingItem[]): Promise<CppJLinkResult<ProbeSamplingStartResult>>;
+  readProbeSampling?(): Promise<CppJLinkResult<ProbeSamplingReadResult>>;
+  stopProbeSampling?(): Promise<CppJLinkResult<{ stats?: ProbeSamplingStats }>>;
   dispose(graceful?: boolean): Promise<void>;
 }
 
@@ -270,6 +281,21 @@ export class SessionTargetSelector {
   }
   async readMemoryBatch(reads: Array<{ address: number; size: number }>, options?: CppJLinkReadOptions) {
     return this.call('readMemoryBatch', owner => owner.readMemoryBatch(reads, options));
+  }
+  async supportsProbeSampling(): Promise<boolean> {
+    return !!this.owner?.supportsProbeSampling && await this.owner.supportsProbeSampling();
+  }
+  async startProbeSampling(periodUs: number, items: ProbeSamplingItem[]) {
+    return this.call('startProbeSampling', owner =>
+      owner.startProbeSampling?.(periodUs, items) ?? noProbeSampling<ProbeSamplingStartResult>());
+  }
+  async readProbeSampling() {
+    return this.call('readProbeSampling', owner =>
+      owner.readProbeSampling?.() ?? noProbeSampling<ProbeSamplingReadResult>());
+  }
+  async stopProbeSampling() {
+    return this.call('stopProbeSampling', owner =>
+      owner.stopProbeSampling?.() ?? noProbeSampling<{ stats?: ProbeSamplingStats }>());
   }
   getPerformanceDiagnostics(): Record<string, unknown> {
     return this.owner?.getPerformanceDiagnostics?.() || {
@@ -515,6 +541,8 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private readonly helper: CmsisDapHelperClient;
   private state: 'idle' | 'opened' | 'connected' | 'failed' = 'idle';
   private lastDevice: CmsisDapDeviceInfo | null = null;
+  /** XR-DAP sampling support of the connected probe; null until queried. */
+  private probeSamplingSupport: boolean | null = null;
   private flashTargetDef: FlashTargetDefinition | null = null;
   private timelineBatchLogAt = performance.now();
   private timelineBatchTotals = { requests: 0, reads: 0, bytes: 0, queueMs: 0, rpcMs: 0, helperMs: 0, packets: 0, waitRetries: 0, faultClears: 0 };
@@ -642,6 +670,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         );
       }
       this.state = 'connected';
+      this.probeSamplingSupport = null;
       // Resolve the session device once for data-driven gating (Watch writes).
       // An unregistered device must not fail connect here; flash() re-resolves
       // and reports the structured registry error at flash time.
@@ -979,6 +1008,47 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     log.dap('[cmsis-dap] stopRtt ok=' + result.ok + ' errorCode=' + (result.errorCode || ''));
     return result;
   }
+  /** Probes once per connection for the XR-DAP vendor sampling extension. */
+  async supportsProbeSampling(): Promise<boolean> {
+    if (this.state !== 'connected') return false;
+    if (this.probeSamplingSupport !== null) return this.probeSamplingSupport;
+    const info = await this.helper.request<{ features: number }>('xrInfo', {}, { priority: 'control' })
+      .catch(() => null);
+    const supported = !!info?.ok && ((info.data?.features ?? 0) & XR_FEATURE_SAMPLING) !== 0;
+    // Cache only a definite answer: INFO data, or a probe without the extension.
+    // A transient failure (timeout, cancellation) is asked again next time.
+    if (info?.ok || info?.errorCode === 'TransportNotSupported') this.probeSamplingSupport = supported;
+    log.dll(`[cmsis-dap] probe-side sampling ${supported ? 'available' : 'unavailable'} `
+      + `owner=cmsis-dap transport=${this.lastDevice?.transport || 'unknown'}`
+      + (info && !info.ok ? ` errorCode=${info.errorCode || ''}` : ''));
+    return supported;
+  }
+  async startProbeSampling(periodUs: number, items: ProbeSamplingItem[]) {
+    if (this.state !== 'connected') return this.invalidState<ProbeSamplingStartResult>('xrSamplingStart');
+    return this.controlViaHelper<ProbeSamplingStartResult>('xrSamplingStart', { periodUs, items });
+  }
+  async readProbeSampling(): Promise<CppJLinkResult<ProbeSamplingReadResult>> {
+    if (this.state !== 'connected') return this.invalidState<ProbeSamplingReadResult>('xrSamplingRead');
+    try {
+      return await this.helper.request<ProbeSamplingReadResult>(
+        'xrSamplingRead',
+        {},
+        { priority: 'timeline', coalesceKey: 'probe-sampling-read', label: 'probe sampling read' },
+      );
+    } catch (error) {
+      if (error instanceof NativeSchedulerCancelledError) {
+        return failure<ProbeSamplingReadResult>('CMSIS-DAP xrSamplingRead was cancelled', 'RequestCancelled', {
+          ownerKind: this.kind,
+          method: 'xrSamplingRead',
+        });
+      }
+      return this.helperFailure<ProbeSamplingReadResult>('xrSamplingRead', error);
+    }
+  }
+  async stopProbeSampling() {
+    if (this.state !== 'connected') return this.invalidState<{ stats?: ProbeSamplingStats }>('xrSamplingStop');
+    return this.controlViaHelper<{ stats?: ProbeSamplingStats }>('xrSamplingStop', {});
+  }
   async readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
     if (this.state !== 'connected') return this.invalidState<{ bytes: Uint8Array }>('readRtt');
     let result: CppJLinkResult<CmsisDapRttReadResult>;
@@ -1290,6 +1360,10 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
 
 function success(message: string): CppJLinkResult {
   return { ok: true, message, targetState: 'Disconnected', elapsedMs: 0, data: {} };
+}
+
+function noProbeSampling<T>(): Promise<CppJLinkResult<T>> {
+  return Promise.resolve(failure<T>('selected target owner does not support probe-side sampling', 'UnsupportedCapability'));
 }
 
 function failure<T = Record<string, never>>(

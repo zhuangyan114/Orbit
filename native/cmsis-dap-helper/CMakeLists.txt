@@ -11,6 +11,7 @@ add_executable(orbit-cmsis-dap-helper
   src/json_rpc.cpp
   src/cmsis_dap_hid_transport.cpp
   src/cmsis_dap_winusb_transport.cpp
+  src/cmsis_dap_tcp_transport.cpp
   src/mock_transport.cpp
   src/cmsis_dap_protocol.cpp
   src/cmsis_dap_target.cpp
@@ -20,6 +21,8 @@ add_executable(orbit-cmsis-dap-helper
   src/segger_rtt.cpp
   src/fpb_breakpoint.cpp
   src/trace_control.cpp
+  src/xr_dap_vendor.cpp
+  src/xr_dap_sampler.cpp
 )
 target_compile_features(orbit-cmsis-dap-helper PRIVATE cxx_std_17)
 target_compile_definitions(orbit-cmsis-dap-helper PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -35,7 +38,7 @@ else()
   endif()
 endif()
 
-target_link_libraries(orbit-cmsis-dap-helper PRIVATE hid setupapi winusb)
+target_link_libraries(orbit-cmsis-dap-helper PRIVATE hid setupapi winusb ws2_32)
 
 add_executable(orbit-cmsis-dap-rtt-tests
   src/segger_rtt.cpp
@@ -49,6 +52,24 @@ else()
   target_compile_options(orbit-cmsis-dap-rtt-tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(orbit-cmsis-dap-xr-tests
+  src/cmsis_dap_protocol.cpp
+  src/cmsis_dap_tcp_transport.cpp
+  src/xr_dap_vendor.cpp
+  src/xr_dap_sampler.cpp
+  src/trace_control.cpp
+  src/xr_dap_tests.cpp
+)
+target_compile_features(orbit-cmsis-dap-xr-tests PRIVATE cxx_std_17)
+target_compile_definitions(orbit-cmsis-dap-xr-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(orbit-cmsis-dap-xr-tests PRIVATE ws2_32)
+if(MSVC)
+  target_compile_options(orbit-cmsis-dap-xr-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+  set_property(TARGET orbit-cmsis-dap-xr-tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+else()
+  target_compile_options(orbit-cmsis-dap-xr-tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 set_target_properties(orbit-cmsis-dap-helper PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
@@ -57,7 +78,7 @@ set_target_properties(orbit-cmsis-dap-helper PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/bin"
 )
 
-set_target_properties(orbit-cmsis-dap-rtt-tests PROPERTIES
+set_target_properties(orbit-cmsis-dap-rtt-tests orbit-cmsis-dap-xr-tests PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
   RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"

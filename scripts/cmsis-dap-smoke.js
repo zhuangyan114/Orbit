@@ -131,6 +131,11 @@ async function runMockMatrix() {
   check('selftest: HID cancellation outcomes', selfTest.status === 0,
     selfTest.stdout || selfTest.stderr);
 
+  // XR-DAP vendor encoding, TCP transport and probe sampling unit tests.
+  const xrTests = path.resolve('out', 'native', 'cmsis-dap-helper-build', 'bin', 'orbit-cmsis-dap-xr-tests.exe');
+  const xrResult = spawnSync(xrTests, [], { windowsHide: true, encoding: 'utf8' });
+  check('xr-dap unit tests', xrResult.status === 0, xrResult.stdout || xrResult.stderr || String(xrResult.error));
+
   const hello = await request('hello', { clientProtocol: 1, extensionVersion: 'cmsis-dap-smoke' });
   check('hello', hello.ok && hello.data.protocol === 1, JSON.stringify(hello));
   check('hello capabilities', Array.isArray(hello.data.capabilities)

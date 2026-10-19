@@ -15,6 +15,7 @@
 #include <windows.h>
 
 #include "cmsis_dap_hid_transport.h"
+#include "cmsis_dap_tcp_transport.h"
 #include "cmsis_dap_winusb_transport.h"
 #include "cmsis_dap_protocol.h"
 #include "cmsis_dap_target.h"
@@ -27,6 +28,7 @@
 #include "mock_transport.h"
 #include "segger_rtt.h"
 #include "trace_control.h"
+#include "xr_dap_sampler.h"
 
 namespace cmsis_dap_helper {
 namespace {
@@ -67,6 +69,14 @@ std::optional<uint64_t> uintField(const JsonValue& params, const char* key) {
       value->number < 0 || value->number > static_cast<double>(UINT64_MAX) ||
       value->number != std::floor(value->number)) return std::nullopt;
   return static_cast<uint64_t>(value->number);
+}
+
+std::optional<int64_t> intField(const JsonValue& params, const char* key) {
+  const JsonValue* value = params.get(key);
+  if (!value || value->kind != JsonValue::Kind::Number || !std::isfinite(value->number) ||
+      value->number < -9.0e15 || value->number > 9.0e15 ||
+      value->number != std::floor(value->number)) return std::nullopt;
+  return static_cast<int64_t>(value->number);
 }
 
 std::optional<bool> boolField(const JsonValue& params, const char* key) {
@@ -182,6 +192,7 @@ struct Channel {
   std::vector<uint8_t> flashPageData;
   FpbState fpbState;
   SeggerRttReader rttReader;
+  XrDapSampler xrSampler;
 
   void clearFlashPageBuffer() {
     flashPageBufferValid = false;
@@ -246,6 +257,7 @@ Result ensureDebugPower(Channel& channel, CmsisDapTarget& target,
 std::unique_ptr<CmsisDapTransport> createTransport(const std::string& name, std::string& error) {
   if (name == "hid") return std::make_unique<CmsisDapHidTransport>();
   if (name == "winusb" || name == "cmsis-dap-v2") return std::make_unique<CmsisDapWinUsbTransport>();
+  if (name == "tcp") return std::make_unique<CmsisDapTcpTransport>();
   if (name == "mock") return std::make_unique<MockCmsisDapTransport>();
   error = "transport '" + name + "' is not implemented yet";
   return nullptr;
@@ -317,7 +329,8 @@ std::string handleHello(const JsonValue& params) {
       "\"dapDisconnect\",\"dapTransfer\",\"dapTransferBlock\",\"swDp\",\"memAp\","
       "\"readMemory\",\"readMemoryBatch\",\"readMemoryBlock\",\"writeMemory\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
       "\"reset\",\"stepInstruction\",\"readRegister\",\"hardwareBreakpoints\",\"runToAddress\","
-       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\"]}";
+       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\",\"tcpTransport\","
+       "\"xrDapSampling\"]}";
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
   if (clientProtocol != static_cast<uint64_t>(kProtocolVersion)) {
@@ -455,6 +468,14 @@ std::string handleOpen(const JsonValue& params, Channel& channel) {
   // Clear stale input reports left by a previous session (some firmware does
   // not flush its report buffer on open). Best-effort.
   channel.transport->drainInput(std::chrono::milliseconds(100));
+  // An XR-DAP probe keeps sampling over USB after a helper that started it
+  // died, and then rejects DAP_Connect. TCP probes stop on the new connection.
+  if (device.serial.rfind("XRobot-XRDAP-", 0) == 0) {
+    CmsisDapProtocol protocol(channel.transport.get());
+    std::vector<uint8_t> response;
+    (void)protocol.vendorExchange(xrSubCtrlRequest(kXrSubStop), response,
+                                  std::chrono::milliseconds(500));
+  }
   diag("opened device vid=" + device.vid + " pid=" + device.pid + " product=" + device.product +
        " serial=" + device.serial + " transport=" + chosenTransport + " inputReportLength=" + std::to_string(device.inputReportLength) +
        " outputReportLength=" + std::to_string(device.outputReportLength) +
@@ -550,6 +571,7 @@ std::string handleClose(Channel& channel) {
   channel.transport.reset();
   channel.opened = false;
   channel.connected = false;
+  channel.xrSampler.reset();
   channel.clearFlashAlgorithmState();
   channel.clearDebugResourceState();
   return resultJson(true, "device closed", "Disconnected", 0);
@@ -2333,6 +2355,317 @@ std::string handleSourceStep(const char* operation, const JsonValue& params, Cha
 }
 
 // ---------------------------------------------------------------------------
+// XR-DAP probe-side sampling (vendor commands 0x80..0x85)
+// ---------------------------------------------------------------------------
+
+constexpr std::chrono::milliseconds kXrTimeout(2000);
+constexpr uint32_t kCoreDebugDhcsrAddress = 0xE000EDF0u;
+constexpr uint32_t kDhcsrSHalt = 1u << 17;
+// Upper bound on SUB_READ requests behind one xrSamplingRead.
+constexpr uint64_t kXrMaxReadRounds = 64;
+
+long long elapsedSince(const std::chrono::steady_clock::time_point& started) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+}
+
+std::string hexBytes(const std::vector<uint8_t>& bytes) {
+  static const char digits[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (const uint8_t byte : bytes) {
+    out.push_back(digits[byte >> 4]);
+    out.push_back(digits[byte & 0x0F]);
+  }
+  return out;
+}
+
+std::string byteListJson(const std::vector<uint8_t>& bytes) {
+  std::string out = "[";
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    if (i > 0) out += ",";
+    out += std::to_string(bytes[i]);
+  }
+  return out + "]";
+}
+
+std::string xrStatsJson(const XrDapSampler::Stats& stats) {
+  return "{\"droppedFrames\":" + std::to_string(stats.droppedFrames) +
+         ",\"skippedTicks\":" + std::to_string(stats.skippedTicks) +
+         ",\"suspends\":" + std::to_string(stats.suspends) +
+         ",\"vendorReads\":" + std::to_string(stats.vendorReads) + "}";
+}
+
+// { t: probe µs, v: [[item, ok, "hex"], ...] } per frame.
+std::string xrFramesJson(const std::vector<XrFrame>& frames) {
+  std::string out = "[";
+  for (size_t f = 0; f < frames.size(); ++f) {
+    if (f > 0) out += ",";
+    out += "{\"t\":" + std::to_string(frames[f].timestampUs) + ",\"v\":[";
+    for (size_t v = 0; v < frames[f].values.size(); ++v) {
+      const XrFrameValue& value = frames[f].values[v];
+      if (v > 0) out += ",";
+      out += "[" + std::to_string(value.item) + "," + (value.ok ? "1" : "0") + ",\"" +
+             hexBytes(value.bytes) + "\"]";
+    }
+    out += "]}";
+  }
+  return out + "]";
+}
+
+// One xrSamplingStart item: { size, base, derefs?: number[], finalOffset?, div?, phase?, ap? }.
+bool parseXrItem(const JsonValue& entry, uint16_t id, XrItem& item) {
+  const std::optional<uint64_t> size = uintField(entry, "size");
+  const std::optional<uint64_t> base = uintField(entry, "base");
+  const int64_t finalOffset = intField(entry, "finalOffset").value_or(0);
+  const uint64_t div = uintField(entry, "div").value_or(1);
+  const uint64_t phase = uintField(entry, "phase").value_or(0);
+  const uint64_t ap = uintField(entry, "ap").value_or(0);
+  if (entry.kind != JsonValue::Kind::Object || !size || *size > 8 || !base ||
+      *base > 0xFFFFFFFFull || finalOffset < INT16_MIN || finalOffset > INT16_MAX ||
+      div == 0 || div > 0xFFFF || phase >= div || ap > 0xFF) {
+    return false;
+  }
+  item.id = id;
+  item.size = static_cast<uint8_t>(*size);
+  item.base = static_cast<uint32_t>(*base);
+  item.finalOffset = static_cast<int16_t>(finalOffset);
+  item.div = static_cast<uint16_t>(div);
+  item.phase = static_cast<uint16_t>(phase);
+  item.ap = static_cast<uint8_t>(ap);
+  if (const JsonValue* derefs = entry.get("derefs")) {
+    if (derefs->kind != JsonValue::Kind::Array || derefs->array.size() > kXrMaxDerefs) return false;
+    for (const JsonValue& offset : derefs->array) {
+      if (offset.kind != JsonValue::Kind::Number || offset.number != std::floor(offset.number) ||
+          offset.number < INT16_MIN || offset.number > INT16_MAX) {
+        return false;
+      }
+      item.derefs.push_back(static_cast<int16_t>(offset.number));
+    }
+  }
+  return xrItemValid(item);
+}
+
+std::string handleXrInfo(Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result openResult = channel.ensureOpen();
+  if (!openResult.ok) {
+    return resultJson(false, openResult.message, channel.state(), 0, "{}", openResult.errorCode);
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  XrInfo info;
+  const Result result = channel.xrSampler.queryInfo(protocol, info, kXrTimeout);
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedSince(started), "{}",
+                      result.errorCode);
+  }
+  return resultJson(
+      true, "XR-DAP vendor extension present", channel.state(), elapsedSince(started),
+      "{\"version\":" + std::to_string(info.version) + ",\"features\":" +
+          std::to_string(info.features) + ",\"maxItems\":" + std::to_string(info.maxItems) +
+          ",\"maxDepth\":" + std::to_string(info.maxDepth) + ",\"bufferBytes\":" +
+          std::to_string(info.bufferBytes) + ",\"probeNowUs\":" + std::to_string(info.probeNowUs) +
+          ",\"accessUs\":" + std::to_string(info.accessUs) + "}");
+}
+
+// params: { periodUs, items: [...] } (see parseXrItem).
+std::string handleXrSamplingStart(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result readyResult = channel.ensureReady();
+  if (!readyResult.ok) {
+    return resultJson(false, readyResult.message, channel.state(), 0, "{}", readyResult.errorCode);
+  }
+  const std::optional<uint64_t> periodUs = uintField(params, "periodUs");
+  const JsonValue* itemsValue = params.get("items");
+  if (!periodUs || *periodUs == 0 || *periodUs > 0xFFFFFFFFull || !itemsValue ||
+      itemsValue->kind != JsonValue::Kind::Array || itemsValue->array.empty() ||
+      itemsValue->array.size() > 32) {
+    return resultJson(false, "xrSamplingStart requires periodUs and 1..32 items", channel.state(), 0,
+                      "{}", ErrorCodes::kDapInvalidRequest);
+  }
+  std::vector<XrItem> items(itemsValue->array.size());
+  for (size_t index = 0; index < items.size(); ++index) {
+    if (!parseXrItem(itemsValue->array[index], static_cast<uint16_t>(index), items[index])) {
+      return resultJson(false, "xrSamplingStart item " + std::to_string(index) + " is invalid",
+                        channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
+                        "{\"failedIndex\":" + std::to_string(index) + "}");
+    }
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  XrSubSetReply reply;
+  const Result result = channel.xrSampler.start(protocol, static_cast<uint32_t>(*periodUs),
+                                                std::move(items), reply, kXrTimeout);
+  const std::string estimate = "{\"maxFrameBytes\":" + std::to_string(reply.maxFrameBytes) +
+                               ",\"estFrameUs\":" + std::to_string(reply.estFrameUs) + "}";
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedSince(started), "{}",
+                      result.errorCode, estimate);
+  }
+  const uint32_t period = channel.xrSampler.periodUs();
+  diag("xr sampling started items=" + std::to_string(itemsValue->array.size()) +
+       " periodUs=" + std::to_string(period) + " estFrameUs=" + std::to_string(reply.estFrameUs));
+  return resultJson(true, "probe sampling started", "Running", elapsedSince(started),
+                    "{\"periodUs\":" + std::to_string(period) + ",\"maxFrameBytes\":" +
+                        std::to_string(reply.maxFrameBytes) + ",\"estFrameUs\":" +
+                        std::to_string(reply.estFrameUs) + "}");
+}
+
+std::string handleXrSamplingRead(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result openResult = channel.ensureOpen();
+  if (!openResult.ok) {
+    return resultJson(false, openResult.message, channel.state(), 0, "{}", openResult.errorCode);
+  }
+  const size_t maxRounds =
+      static_cast<size_t>(std::min(uintField(params, "maxRounds").value_or(8), kXrMaxReadRounds));
+  CmsisDapProtocol protocol(channel.transport.get());
+  XrDapSampler::ReadResult read;
+  const Result result = channel.xrSampler.read(protocol, read, maxRounds, kXrTimeout);
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedSince(started), "{}",
+                      result.errorCode, xrStatsJson(channel.xrSampler.stats()));
+  }
+  const auto formatStarted = std::chrono::steady_clock::now();
+  const std::string frames = xrFramesJson(read.frames);
+  // The pairing age also covers the formatting time.
+  const uint64_t ageUs = read.probeNowAgeUs +
+                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - formatStarted).count());
+  return resultJson(true, "probe samples", "Running", elapsedSince(started),
+                    "{\"probeNowUs\":" + std::to_string(read.probeNowUs) +
+                        ",\"probeNowAgeUs\":" + std::to_string(ageUs) +
+                        ",\"pendingBytes\":" + std::to_string(read.pendingBytes) +
+                        ",\"frames\":" + frames +
+                        ",\"stats\":" + xrStatsJson(channel.xrSampler.stats()) + "}");
+}
+
+std::string handleXrSamplingStop(Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const std::string stats = xrStatsJson(channel.xrSampler.stats());
+  if (!channel.transport || !channel.transport->isOpen()) {
+    channel.xrSampler.reset();
+    return resultJson(true, "probe sampling stopped", channel.state(), 0, "{\"stats\":" + stats + "}");
+  }
+  CmsisDapProtocol protocol(channel.transport.get());
+  const Result result = channel.xrSampler.stop(protocol, kXrTimeout);
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedSince(started), "{}",
+                      result.errorCode, stats);
+  }
+  return resultJson(true, "probe sampling stopped", channel.state(), elapsedSince(started),
+                    "{\"stats\":" + stats + "}");
+}
+
+// The {address, size} list a readMemory, readMemoryBatch or getState request
+// would read, or nullopt when any of it does not fit vendor READ.
+std::optional<std::vector<std::pair<uint32_t, uint32_t>>> vendorReadsFor(const std::string& name,
+                                                                         const JsonValue& params) {
+  std::vector<std::pair<uint32_t, uint32_t>> reads;
+  auto add = [&reads](const JsonValue& item) {
+    const std::optional<uint64_t> address = uintField(item, "address");
+    const std::optional<uint64_t> size = uintField(item, "size");
+    if (!address || *address > 0xFFFFFFFFull || !size || *size > 8 ||
+        !xrFitsVendorRead(static_cast<uint32_t>(*address), static_cast<uint32_t>(*size))) {
+      return false;
+    }
+    reads.push_back({static_cast<uint32_t>(*address), static_cast<uint32_t>(*size)});
+    return true;
+  };
+  if (name == "getState") {
+    reads.push_back({kCoreDebugDhcsrAddress, 4});
+  } else if (name == "readMemory") {
+    if (!add(params)) return std::nullopt;
+  } else {
+    const JsonValue* list = params.get("reads");
+    if (!list || list->kind != JsonValue::Kind::Array || list->array.empty() ||
+        list->array.size() > 256) {
+      return std::nullopt;
+    }
+    for (const JsonValue& item : list->array) {
+      if (!add(item)) return std::nullopt;
+    }
+  }
+  return reads;
+}
+
+// Answers a VendorRead-route request through vendor READ with the same result
+// shape as its ordinary handler. Returns nullopt when the ordinary path is
+// needed: the request does not fit, the probe could not read it, or the core
+// is halted (getState then also reads the PC).
+std::optional<std::string> serveByVendorRead(const std::string& name, const JsonValue& params,
+                                             Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto reads = vendorReadsFor(name, params);
+  if (!reads) return std::nullopt;
+  CmsisDapProtocol protocol(channel.transport.get());
+  std::vector<std::vector<uint8_t>> values;
+  const Result result = channel.xrSampler.readScalars(protocol, *reads, values, kXrTimeout);
+  if (!result.ok) {
+    diag("xr read while sampling failed, using the DAP path: " + result.message);
+    return std::nullopt;
+  }
+  const std::string diagnostics = "{\"transport\":\"" + jsonEscape(channel.transport->transportName()) +
+                                  "\",\"xrVendorRead\":true,\"completedReads\":" +
+                                  std::to_string(reads->size()) + "}";
+  if (name == "getState") {
+    const std::vector<uint8_t>& raw = values[0];
+    const uint32_t dhcsr = raw[0] | (raw[1] << 8) | (raw[2] << 16) | (static_cast<uint32_t>(raw[3]) << 24);
+    if (dhcsr & kDhcsrSHalt) return std::nullopt;
+    return resultJson(true, "Cortex-M state read", "Running", elapsedSince(started),
+                      "{\"state\":\"Running\",\"dhcsr\":" + std::to_string(dhcsr) + "}", "",
+                      diagnostics);
+  }
+  auto readJson = [&](size_t i) {
+    return "{\"address\":" + std::to_string((*reads)[i].first) + ",\"size\":" +
+           std::to_string((*reads)[i].second) + ",\"bytes\":" + byteListJson(values[i]) + "}";
+  };
+  if (name == "readMemory") {
+    return resultJson(true, "memory read", channel.state(), elapsedSince(started), readJson(0), "",
+                      diagnostics);
+  }
+  std::string list = "[";
+  for (size_t i = 0; i < reads->size(); ++i) list += (i > 0 ? "," : "") + readJson(i);
+  return resultJson(true, "memory batch read", channel.state(), elapsedSince(started),
+                    "{\"reads\":" + list + "]}", "", diagnostics);
+}
+
+// Restarts probe sampling paused for one request when it goes out of scope,
+// also when the handler throws.
+class SamplingPause {
+ public:
+  explicit SamplingPause(Channel& channel) : channel_(channel) {}
+  SamplingPause(const SamplingPause&) = delete;
+  SamplingPause& operator=(const SamplingPause&) = delete;
+  ~SamplingPause() {
+    if (!paused_ || !channel_.transport || !channel_.transport->isOpen() || !channel_.connected) return;
+    CmsisDapProtocol protocol(channel_.transport.get());
+    channel_.xrSampler.resume(protocol, kXrTimeout);
+  }
+
+  // Makes room for request `name` while the probe samples. Returns the reply
+  // when vendor READ already answered it.
+  std::optional<std::string> prepare(const std::string& name, const JsonValue& params) {
+    if (!channel_.xrSampler.running()) return std::nullopt;
+    const XrSamplingRoute route = xrSamplingRoute(name);
+    if (route == XrSamplingRoute::Direct) return std::nullopt;
+    if (route == XrSamplingRoute::VendorRead) {
+      if (std::optional<std::string> reply = serveByVendorRead(name, params, channel_)) return reply;
+    }
+    CmsisDapProtocol protocol(channel_.transport.get());
+    const bool stop = route == XrSamplingRoute::Stop;
+    const Result result = stop ? channel_.xrSampler.stop(protocol, kXrTimeout)
+                               : channel_.xrSampler.suspend(protocol, kXrTimeout);
+    if (!result.ok) diag("xr sampling pause before " + name + " failed: " + result.message);
+    paused_ = !stop;
+    return std::nullopt;
+  }
+
+ private:
+  Channel& channel_;
+  bool paused_ = false;
+};
+
+// ---------------------------------------------------------------------------
 // Dispatch loop
 // ---------------------------------------------------------------------------
 
@@ -2353,6 +2686,11 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
 
   std::string result;
   const std::string& name = method->string;
+  // The probe answers ordinary DAP commands with 0xFF while it samples.
+  SamplingPause samplingPause(channel);
+  if (std::optional<std::string> served = samplingPause.prepare(name, *params)) {
+    return responseEnvelope(*id, *served);
+  }
   if (name == "hello") {
     result = handleHello(*params);
   } else if (name == "shutdown") {
@@ -2424,6 +2762,14 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
     result = handleSourceStep("stepOverSourceLine", *params, channel, *id);
   } else if (name == "stepOut") {
     result = handleSourceStep("stepOut", *params, channel, *id);
+  } else if (name == "xrInfo") {
+    result = handleXrInfo(channel);
+  } else if (name == "xrSamplingStart") {
+    result = handleXrSamplingStart(*params, channel);
+  } else if (name == "xrSamplingRead") {
+    result = handleXrSamplingRead(*params, channel);
+  } else if (name == "xrSamplingStop") {
+    result = handleXrSamplingStop(channel);
   } else {
     const long long elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -5018,6 +5364,74 @@ int runSelfTest() {
     expect(claim.ok && newOwnerState.initialized && comparatorsCleared &&
                (mock.targetState().fpCtrl & 1u) == 0 && !finalState.halted,
            "dap05-new-owner-clears-stale-fpb-and-restores-running");
+  }
+
+  // While the probe samples, scalar reads go through vendor READ and other
+  // requests run between a sampling stop and restart.
+  {
+    Channel channel;
+    auto owned = std::make_unique<ScriptedTransport>();
+    ScriptedTransport* wire = owned.get();
+    channel.transport = std::move(owned);
+    channel.opened = true;
+    channel.connected = true;
+    CmsisDapProtocol protocol(channel.transport.get());
+    XrItem item;
+    item.size = 4;
+    item.base = 0x20000000;
+    XrSubSetReply reply;
+    wire->scriptedResponses = {{0x83, 0x00, 0x0E, 0x00, 0x20, 0x00, 0x00, 0x00}, {0x84, 0x00}};
+    expect(channel.xrSampler.start(protocol, 1000, {item}, reply, std::chrono::milliseconds(100)).ok &&
+               channel.xrSampler.running(),
+           "xr-sampler-start");
+
+    auto call = [&channel](const std::string& line) {
+      const JsonValue response = JsonParser(dispatch(JsonParser(line).parse(), channel)).parse();
+      const JsonValue* result = response.get("result");
+      return result ? *result : JsonValue{};
+    };
+    std::vector<uint8_t> emptySubRead(kXrSubReadHeader, 0);
+    emptySubRead[0] = 0x85;
+
+    wire->requests.clear();
+    wire->scriptedResponses = {{0x81, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44}};
+    const JsonValue served = call(
+        R"({"id":1,"method":"readMemoryBatch","params":{"reads":[{"address":536870916,"size":4}]}})");
+    expect(boolField(served, "ok").value_or(false) && wire->requests.size() == 1 &&
+               wire->requests[0][0] == kXrCmdRead && channel.xrSampler.running(),
+           "xr-sampling-serves-scalar-reads-without-pausing");
+
+    wire->requests.clear();
+    // DHCSR with S_HALT (bit 17) set.
+    wire->scriptedResponses = {{0x81, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00}};
+    (void)call(R"({"id":2,"method":"getState","params":{}})");
+    expect(wire->requests.size() >= 2 && wire->requests[0][0] == kXrCmdRead &&
+               wire->requests[1] == std::vector<uint8_t>{kXrCmdSubCtrl, kXrSubStop},
+           "xr-sampling-pauses-for-halted-core-state");
+
+    // The halted-state path above ran unscripted DAP traffic; start afresh.
+    channel.xrSampler.reset();
+    wire->scriptedResponses = {{0x83, 0x00, 0x0E, 0x00, 0x20, 0x00, 0x00, 0x00}, {0x84, 0x00}};
+    expect(channel.xrSampler.start(protocol, 1000, {item}, reply, std::chrono::milliseconds(100)).ok,
+           "xr-sampler-restart");
+    wire->requests.clear();
+    wire->scriptedResponses = {{0x84, 0x00}, emptySubRead, {0x05, 0x01, 0x01, 0x77, 0x14, 0xA0, 0x2B},
+                               {0x84, 0x00}};
+    const JsonValue dp = call(R"({"id":3,"method":"dpRead","params":{"reg":0}})");
+    expect(boolField(dp, "ok").value_or(false) && wire->requests.size() == 4 &&
+               wire->requests[0] == std::vector<uint8_t>{kXrCmdSubCtrl, kXrSubStop} &&
+               wire->requests[1][0] == kXrCmdSubRead && wire->requests[2][0] == 0x05 &&
+               wire->requests[3] == std::vector<uint8_t>{kXrCmdSubCtrl, kXrSubStart} &&
+               channel.xrSampler.running(),
+           "xr-sampling-suspends-and-resumes-around-dap-requests");
+
+    wire->requests.clear();
+    wire->scriptedResponses = {{0x84, 0x00}, {0x03, 0x00}};
+    (void)call(R"({"id":4,"method":"disconnect","params":{}})");
+    expect(!wire->requests.empty() &&
+               wire->requests[0] == std::vector<uint8_t>{kXrCmdSubCtrl, kXrSubStop} &&
+               !channel.xrSampler.active(),
+           "xr-sampling-stops-on-disconnect");
   }
 
   std::cout << "{\"selftest\":\"" << (failures == 0 ? "ok" : "fail")

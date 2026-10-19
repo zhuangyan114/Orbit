@@ -133,7 +133,7 @@
     "debuggers": [
       {
         "type": "orbit",
-        "label": "Orbit (J-Link / CMSIS-DAP)",
+        "label": "Orbit (J-Link / CMSIS-DAP / RMLink)",
         "runtime": "node",
         "program": "./dist/debugadapter.js",
         "languages": ["c", "cpp", "asm"],
@@ -146,6 +146,20 @@
           }
         ],
         "configurationSnippets": [
+          {
+            "label": "Orbit: RMLink",
+            "description": "通过 RMLink 连接服务烧录、调试与板端订阅采样。自动选择唯一在线且已配对的设备；多台设备时填写 rmlinkDeviceId。",
+            "body": {
+              "name": "Orbit RMLink",
+              "type": "orbit",
+              "request": "launch",
+              "probe": "rmlink",
+              "device": "${1:STM32F103C8}",
+              "interface": "SWD",
+              "speedKHz": 4000,
+              "flashBeforeDebug": true
+            }
+          },
           {
             "label": "Orbit: 最小调试配置",
             "description": "只需填写芯片型号，ELF/AXF 文件和探针自动查找。",
@@ -192,11 +206,12 @@
               },
               "probe": {
                 "type": "string",
-                "description": "Physical debug probe owner. auto detects J-Link first, then CMSIS-DAP; when both are connected, J-Link is always selected.",
+                "description": "探针后端：rmlink 直接使用 RMLink 连接服务（板端订阅、缓存烧录）；cmsis-dap 使用 USB/虚拟 USB。auto 优先选择 J-Link，其次 CMSIS-DAP。",
                 "enum": [
                   "auto",
                   "jlink",
-                  "cmsis-dap"
+                  "cmsis-dap",
+                  "rmlink"
                 ],
                 "default": "auto"
               },
@@ -382,7 +397,7 @@
               },
               "rmlinkDeviceId": {
                 "type": "string",
-                "description": "Experimental RMLink connection component: paired 12-digit device ID. Enhanced target validation is pending.",
+                "description": "RMLink 的 12 位设备 ID。probe=rmlink 时可省略，由连接服务选择唯一在线且已配对的设备。",
                 "pattern": "^[0-9a-fA-F]{12}$"
               }
             }

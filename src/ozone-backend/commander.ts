@@ -682,9 +682,13 @@ case 'readVariableRuntime':
 
   private async doConnect(config: DebugSessionConfig): Promise<OzoneCommandResult> {
     this.clearNativeStopInfo('new connect');
-    if (config.probe !== undefined && config.probe !== 'auto' && config.probe !== 'jlink' && config.probe !== 'cmsis-dap') {
-      return invalidConfiguration('probe', 'auto, jlink, or cmsis-dap', config.probe);
+    if (config.probe !== undefined && config.probe !== 'auto' && config.probe !== 'jlink' && config.probe !== 'cmsis-dap' && config.probe !== 'rmlink') {
+      return invalidConfiguration('probe', 'auto, jlink, cmsis-dap, or rmlink', config.probe);
     }
+    if(config.rmlinkDeviceId && config.probe==='jlink'){
+      return invalidConfiguration('probe','rmlink when rmlinkDeviceId is specified',config.probe);
+    }
+    if(config.rmlinkDeviceId)config={...config,probe:'rmlink'};
     if (config.cmsisDapTransport !== undefined
       && config.cmsisDapTransport !== 'auto'
       && config.cmsisDapTransport !== 'cmsis-dap-v2'
@@ -714,7 +718,7 @@ case 'readVariableRuntime':
     if (this.state === TargetState.Connected) {
       return { ok: true, data: { state: TargetState.Connected } };
     }
-    if (requestedProbe === 'cmsis-dap' && !this.sessionTarget) {
+    if (requestedProbe !== 'jlink' && !this.sessionTarget) {
       return {
         ok: false,
         errorCode: 'OwnerUnavailable',
@@ -792,7 +796,7 @@ case 'readVariableRuntime':
   }
 
   private async doResolveProbe(config: DebugSessionConfig): Promise<OzoneCommandResult> {
-    if (config.probe === 'jlink' || config.probe === 'cmsis-dap') {
+    if (config.probe === 'jlink' || config.probe === 'cmsis-dap' || config.probe === 'rmlink') {
       return { ok: true, data: { probe: config.probe, policy: 'explicit' } };
     }
     if (!(this.sessionTarget instanceof SessionTargetSelector)) {
@@ -819,7 +823,7 @@ case 'readVariableRuntime':
       const ownerKind = 'ownerKind' in this.sessionTarget
         ? this.sessionTarget.ownerKind
         : this.sessionTarget.kind;
-      if (ownerKind === 'cmsis-dap') return 'cmsis-dap';
+      if (ownerKind === 'cmsis-dap') return this.sessionTarget.supportsSubscriptions ? 'rmlink' : 'cmsis-dap';
       if (ownerKind === 'jlink-native' || ownerKind === 'jlink-legacy') return 'jlink';
       return null;
     }
@@ -2777,7 +2781,7 @@ case 'readVariableRuntime':
       reports?: Array<{ operation: string; address: number; size: number; elapsedMs: number; ok: boolean; errorCode?: string; message?: string }>;
       erasedSectors?: Array<{ number: number; address: number; size: number }>;
     };
-    if (probe === 'cmsis-dap') {
+    if (probe === 'cmsis-dap' || probe === 'rmlink') {
       if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'CMSIS-DAP target owner is unavailable' };
       const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000, verify: verify ?? true };
       const flashResult = 'ownerKind' in this.sessionTarget

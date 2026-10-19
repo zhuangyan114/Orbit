@@ -24,6 +24,36 @@ function batch(first: number, count: number, segment = false) {
 afterEach(async () => { await Promise.all(stores.splice(0).map(s => s.dispose())); await Promise.all(directories.splice(0).map(d => fs.rm(d, { recursive: true, force: true }))); });
 
 describe('Timeline CSV store', () => {
+  it('keeps a short real gap localized when both segments occupy the same display bucket, hot and on disk', async () => {
+    const { store } = await record();
+    store.append(batch(0, 100)); store.append(batch(101, 100, true));
+    const check = (data: any[]) => {
+      expect(data.find(p => p.timestamp === 99)?.startsNewSegment).not.toBe(true);
+      expect(data.find(p => p.timestamp === 101)?.startsNewSegment).toBe(true);
+      expect(data.find(p => p.timestamp === 200)?.startsNewSegment).not.toBe(true);
+      const commands = buildTimelineTraceCommands(data, { tStart: 0, tEnd: 200, plotLeft: 0, plotWidth: 1000, projectY: p => p.value });
+      expect(commands.filter(c => c.command === 'moveTo')).toHaveLength(2);
+      expect(commands.filter(c => c.command === 'lineTo').length).toBeGreaterThanOrEqual(2);
+    };
+    check((await store.query(0, 200, 1))[0].data);
+    await store.end(); check((await store.query(0, 200, 1))[0].data);
+  });
+  it('refines bounded multi-level summaries without widening hundreds of short gaps', async () => {
+    const { store } = await record();
+    for (let start = 0; start < 33000; start += 1000) {
+      store.append([{ expression: 'motor[0]', color: '#123456', currentValue: '0', data: Array.from({ length: 1000 }, (_, j) => {
+        const i = start + j;
+        return { timestamp: i + Math.floor(i / 100), value: 0, display: '0', startsNewSegment: i > 0 && i % 100 === 0 };
+      }) }]);
+      await store.flush();
+    }
+    await store.end();
+    const data = (await store.query(0, 33328, 10))[0].data;
+    expect(data.filter(p => p.startsNewSegment)).toHaveLength(330);
+    expect(data).toHaveLength(660);
+    for (let i = 1; i < data.length; i++) if (data[i].startsNewSegment) expect(data[i].timestamp - data[i - 1].timestamp).toBe(2);
+    expect(buildTimelineTraceCommands(data, { tStart: 0, tEnd: 33328, plotLeft: 0, plotWidth: 1000, projectY: p => p.value }).filter(c => c.command === 'lineTo')).toHaveLength(330);
+  });
   it('retains a whole-record average across sampling rate changes and debug completion', async () => {
     const { store } = await record();
     expect(store.getAverageSampleRateHz()).toBe(0);

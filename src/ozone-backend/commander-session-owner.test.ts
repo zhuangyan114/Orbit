@@ -262,7 +262,26 @@ describe('OzoneBackend extension-host ownership guard', () => {
     });
 
     expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
-    if (!result.ok) expect(result.error).toContain('probe must be one of auto, jlink, or cmsis-dap');
+    if (!result.ok) expect(result.error).toContain('probe must be one of auto, jlink, cmsis-dap, or rmlink');
+    expect(jlink.open).not.toHaveBeenCalled();
+    expect(jlink.connect).not.toHaveBeenCalled();
+  });
+
+  it.each(['foo', 'jlink'])('rejects probe %s with a RMLink device selector before opening a target', async (probe) => {
+    const backend = new OzoneBackend();
+    const jlink = { open: vi.fn(), connect: vi.fn() };
+    (backend as any).jlink = jlink;
+    const result = await backend.execute({
+      cmd: 'connect',
+      config: {
+        probe,
+        rmlinkDeviceId: 'test-probe',
+        device: 'STM32F103C8',
+        interface: 'SWD',
+        speedKHz: 4000,
+      } as any,
+    });
+    expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
     expect(jlink.open).not.toHaveBeenCalled();
     expect(jlink.connect).not.toHaveBeenCalled();
   });

@@ -1,4 +1,4 @@
-export type DebugProbe = 'jlink' | 'cmsis-dap';
+export type DebugProbe = 'jlink' | 'cmsis-dap' | 'rmlink';
 export type DebugProbePreference = DebugProbe | 'auto';
 export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb' | 'tcp';
 

@@ -109,7 +109,7 @@ export class RMLinkClient {
     return this.request('POST', `/sessions/${this.session}/target`, {command, ...parameters});
   }
   async deviceHealth(deviceId) {return this.request('GET',`/devices/${deviceId}/health`);}
-  async flashImage(data, address = 0x08000000, signal, {backend = 'auto',verifyOnHost = false} = {}) {
+  async flashImage(data, address = 0x08000000, signal, {backend = 'auto',verifyOnHost = false,resetAfter=true,timeoutMs=180000} = {}) {
     if (!this.session) throw new Error('RMLink owner lost or session closed');
     if (this.flashPending) throw new Error('Flash upload already running');
     const image=Buffer.from(data), path=`/sessions/${this.session}/flash`;
@@ -122,12 +122,12 @@ export class RMLinkClient {
     signal?.addEventListener('abort',cancel,{once:true});
     try {
       check();started=true;
-      await this.request('POST',path,{action:'begin',address,byte_length:image.length,sha256:createHash('sha256').update(image).digest('hex'),backend,verify_on_host:verifyOnHost});
+      await this.request('POST',path,{action:'begin',address,byte_length:image.length,sha256:createHash('sha256').update(image).digest('hex'),backend,verify_on_host:verifyOnHost,reset_after:resetAfter});
       for(let offset=0;offset<image.length;offset+=4096){check();await this.request('POST',path,{action:'chunk',offset,data:image.subarray(offset,offset+4096).toString('hex')});}
       check();
       // Keep the commit response alive: aborting fetch alone cannot stop the
       // target. A separate cancel request asks the executor to stop safely.
-      return await this.request('POST',path,{action:'commit'},180000);
+      return await this.request('POST',path,{action:'commit'},timeoutMs);
     } catch(error) {
       await cancelRequest;
       if(cancelError)error.cancelRequestError=cancelError;

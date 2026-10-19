@@ -1,0 +1,771 @@
+{
+  "schemaVersion": 1,
+  "packVersion": "1.0.0",
+  "algorithms": {
+    "stm32f103c8": {
+      "fileName": "stm32f103c8.bin",
+      "entries": {
+        "init": 0,
+        "uninit": 256,
+        "eraseSector": 512,
+        "programPage": 768,
+        "verify": 1024,
+        "bkpt": 1280
+      },
+      "staticBase": 0,
+      "pageSize": 1024,
+      "preservesPageBuffer": true,
+      "cpu": "cortex-m3",
+      "defines": [],
+      "verifyReturn": "zero",
+      "eraseChip": 1536,
+      "eraseChipAbi": "rmlink-guarded",
+      "sourceSha256": "f3ab5ebafcd0c50d8cbe219ab59002f6481338c51bb8acc55bd9ea3c6a566ce1",
+      "linkerSha256": "ed7cd3fa7d6272a0a021ea1b2b5f09f5db8e0ff7345f49ce9bddb041c43c2c0f",
+      "binarySha256": "9a229b77906732f070407499b96dfd4bc02d1f8bff9c6cd47eb146216908de6b"
+    },
+    "stm32f407": {
+      "fileName": "stm32f407.bin",
+      "entries": {
+        "init": 0,
+        "uninit": 256,
+        "eraseSector": 512,
+        "programPage": 768,
+        "verify": 1024,
+        "bkpt": 1280
+      },
+      "staticBase": 0,
+      "pageSize": 16384,
+      "preservesPageBuffer": true,
+      "cpu": "cortex-m4",
+      "defines": [],
+      "verifyReturn": "zero",
+      "sourceSha256": "7b25cba15f2bb94f553293c4d415af99e9cd83897a471de00124f859466e4614",
+      "linkerSha256": "867bbe6c42ed993229bf98742f953c7a370c43ae80212c13f65a51b5aa3e2971",
+      "binarySha256": "9ce1f26ed3c40dc07c83213959ae9f75dc98171e2c7da2a022874bf9174d7994"
+    },
+    "stm32f407ig": {
+      "fileName": "stm32f407ig.bin",
+      "entries": {
+        "init": 0,
+        "uninit": 256,
+        "eraseSector": 512,
+        "programPage": 768,
+        "verify": 1024,
+        "bkpt": 1280
+      },
+      "staticBase": 0,
+      "pageSize": 16384,
+      "preservesPageBuffer": true,
+      "cpu": "cortex-m4",
+      "defines": [
+        "ORBIT_F407_FLASH_SIZE_KIB=1024"
+      ],
+      "verifyReturn": "zero",
+      "sourceSha256": "7b25cba15f2bb94f553293c4d415af99e9cd83897a471de00124f859466e4614",
+      "linkerSha256": "867bbe6c42ed993229bf98742f953c7a370c43ae80212c13f65a51b5aa3e2971",
+      "binarySha256": "054799ab164c15176daf5da0dc26d7b2fd52fe6d3696ba0ebd620d8512e2d7dc"
+    },
+    "stm32h723": {
+      "fileName": "stm32h723.bin",
+      "entries": {
+        "init": 0,
+        "uninit": 256,
+        "eraseSector": 512,
+        "programPage": 768,
+        "verify": 1024,
+        "bkpt": 1280
+      },
+      "staticBase": 0,
+      "pageSize": 65536,
+      "preservesPageBuffer": true,
+      "cpu": "cortex-m7",
+      "defines": [],
+      "verifyReturn": "zero",
+      "sourceSha256": "55312ebcc7c93e32d49274c454b17046656cd9b70e2eccf6ab00388285c576c2",
+      "linkerSha256": "7fdd923bdcc50f4c0a027c8c3db9ff13392c24f7042bce70a5a68341a3dadf5c",
+      "binarySha256": "d93ebbf32b6509bf6ee86415d89dd61e4abe10f873c373ee4ab99c632038da87"
+    }
+  },
+  "targets": [
+    {
+      "name": "STM32F103C8T6",
+      "aliases": [
+        "STM32F103C8"
+      ],
+      "dpIdcode": 463475831,
+      "flashBase": 134217728,
+      "flashSize": 65536,
+      "sectors": [
+        {
+          "number": 0,
+          "address": 134217728,
+          "size": 1024
+        },
+        {
+          "number": 1,
+          "address": 134218752,
+          "size": 1024
+        },
+        {
+          "number": 2,
+          "address": 134219776,
+          "size": 1024
+        },
+        {
+          "number": 3,
+          "address": 134220800,
+          "size": 1024
+        },
+        {
+          "number": 4,
+          "address": 134221824,
+          "size": 1024
+        },
+        {
+          "number": 5,
+          "address": 134222848,
+          "size": 1024
+        },
+        {
+          "number": 6,
+          "address": 134223872,
+          "size": 1024
+        },
+        {
+          "number": 7,
+          "address": 134224896,
+          "size": 1024
+        },
+        {
+          "number": 8,
+          "address": 134225920,
+          "size": 1024
+        },
+        {
+          "number": 9,
+          "address": 134226944,
+          "size": 1024
+        },
+        {
+          "number": 10,
+          "address": 134227968,
+          "size": 1024
+        },
+        {
+          "number": 11,
+          "address": 134228992,
+          "size": 1024
+        },
+        {
+          "number": 12,
+          "address": 134230016,
+          "size": 1024
+        },
+        {
+          "number": 13,
+          "address": 134231040,
+          "size": 1024
+        },
+        {
+          "number": 14,
+          "address": 134232064,
+          "size": 1024
+        },
+        {
+          "number": 15,
+          "address": 134233088,
+          "size": 1024
+        },
+        {
+          "number": 16,
+          "address": 134234112,
+          "size": 1024
+        },
+        {
+          "number": 17,
+          "address": 134235136,
+          "size": 1024
+        },
+        {
+          "number": 18,
+          "address": 134236160,
+          "size": 1024
+        },
+        {
+          "number": 19,
+          "address": 134237184,
+          "size": 1024
+        },
+        {
+          "number": 20,
+          "address": 134238208,
+          "size": 1024
+        },
+        {
+          "number": 21,
+          "address": 134239232,
+          "size": 1024
+        },
+        {
+          "number": 22,
+          "address": 134240256,
+          "size": 1024
+        },
+        {
+          "number": 23,
+          "address": 134241280,
+          "size": 1024
+        },
+        {
+          "number": 24,
+          "address": 134242304,
+          "size": 1024
+        },
+        {
+          "number": 25,
+          "address": 134243328,
+          "size": 1024
+        },
+        {
+          "number": 26,
+          "address": 134244352,
+          "size": 1024
+        },
+        {
+          "number": 27,
+          "address": 134245376,
+          "size": 1024
+        },
+        {
+          "number": 28,
+          "address": 134246400,
+          "size": 1024
+        },
+        {
+          "number": 29,
+          "address": 134247424,
+          "size": 1024
+        },
+        {
+          "number": 30,
+          "address": 134248448,
+          "size": 1024
+        },
+        {
+          "number": 31,
+          "address": 134249472,
+          "size": 1024
+        },
+        {
+          "number": 32,
+          "address": 134250496,
+          "size": 1024
+        },
+        {
+          "number": 33,
+          "address": 134251520,
+          "size": 1024
+        },
+        {
+          "number": 34,
+          "address": 134252544,
+          "size": 1024
+        },
+        {
+          "number": 35,
+          "address": 134253568,
+          "size": 1024
+        },
+        {
+          "number": 36,
+          "address": 134254592,
+          "size": 1024
+        },
+        {
+          "number": 37,
+          "address": 134255616,
+          "size": 1024
+        },
+        {
+          "number": 38,
+          "address": 134256640,
+          "size": 1024
+        },
+        {
+          "number": 39,
+          "address": 134257664,
+          "size": 1024
+        },
+        {
+          "number": 40,
+          "address": 134258688,
+          "size": 1024
+        },
+        {
+          "number": 41,
+          "address": 134259712,
+          "size": 1024
+        },
+        {
+          "number": 42,
+          "address": 134260736,
+          "size": 1024
+        },
+        {
+          "number": 43,
+          "address": 134261760,
+          "size": 1024
+        },
+        {
+          "number": 44,
+          "address": 134262784,
+          "size": 1024
+        },
+        {
+          "number": 45,
+          "address": 134263808,
+          "size": 1024
+        },
+        {
+          "number": 46,
+          "address": 134264832,
+          "size": 1024
+        },
+        {
+          "number": 47,
+          "address": 134265856,
+          "size": 1024
+        },
+        {
+          "number": 48,
+          "address": 134266880,
+          "size": 1024
+        },
+        {
+          "number": 49,
+          "address": 134267904,
+          "size": 1024
+        },
+        {
+          "number": 50,
+          "address": 134268928,
+          "size": 1024
+        },
+        {
+          "number": 51,
+          "address": 134269952,
+          "size": 1024
+        },
+        {
+          "number": 52,
+          "address": 134270976,
+          "size": 1024
+        },
+        {
+          "number": 53,
+          "address": 134272000,
+          "size": 1024
+        },
+        {
+          "number": 54,
+          "address": 134273024,
+          "size": 1024
+        },
+        {
+          "number": 55,
+          "address": 134274048,
+          "size": 1024
+        },
+        {
+          "number": 56,
+          "address": 134275072,
+          "size": 1024
+        },
+        {
+          "number": 57,
+          "address": 134276096,
+          "size": 1024
+        },
+        {
+          "number": 58,
+          "address": 134277120,
+          "size": 1024
+        },
+        {
+          "number": 59,
+          "address": 134278144,
+          "size": 1024
+        },
+        {
+          "number": 60,
+          "address": 134279168,
+          "size": 1024
+        },
+        {
+          "number": 61,
+          "address": 134280192,
+          "size": 1024
+        },
+        {
+          "number": 62,
+          "address": 134281216,
+          "size": 1024
+        },
+        {
+          "number": 63,
+          "address": 134282240,
+          "size": 1024
+        }
+      ],
+      "ramRegions": [
+        {
+          "name": "SRAM",
+          "address": 536870912,
+          "size": 20480
+        }
+      ],
+      "loaderRamIndex": 0,
+      "preflight": {
+        "idcodeAddress": 3758366720,
+        "deviceId": 1040,
+        "flashSizeRegisterAddress": 536868832,
+        "expectedFlashSizeKiB": 64
+      },
+      "flashDiagnostics": {
+        "statusAddress": 1073881100,
+        "controlAddress": 1073881104
+      },
+      "algorithm": "stm32f103c8",
+      "flashWordSize": 2,
+      "programAlignment": 2,
+      "eraseTimeoutMs": 5000,
+      "programTimeoutMs": 5000,
+      "profileId": 1,
+      "corePart": 3107,
+      "optionRegisters": [
+        536868864,
+        536868868,
+        536868872,
+        536868876
+      ],
+      "loader": {
+        "address": 536870912,
+        "buffer": 536886272,
+        "stack": 536891392,
+        "stackSize": 4096
+      },
+      "validation": {
+        "rmlink": "pending-hardware"
+      }
+    },
+    {
+      "name": "STM32F407VET6",
+      "aliases": [
+        "STM32F407VE"
+      ],
+      "dpIdcode": 731911287,
+      "flashBase": 134217728,
+      "flashSize": 524288,
+      "sectors": [
+        {
+          "number": 0,
+          "address": 134217728,
+          "size": 16384
+        },
+        {
+          "number": 1,
+          "address": 134234112,
+          "size": 16384
+        },
+        {
+          "number": 2,
+          "address": 134250496,
+          "size": 16384
+        },
+        {
+          "number": 3,
+          "address": 134266880,
+          "size": 16384
+        },
+        {
+          "number": 4,
+          "address": 134283264,
+          "size": 65536
+        },
+        {
+          "number": 5,
+          "address": 134348800,
+          "size": 131072
+        },
+        {
+          "number": 6,
+          "address": 134479872,
+          "size": 131072
+        },
+        {
+          "number": 7,
+          "address": 134610944,
+          "size": 131072
+        }
+      ],
+      "ramRegions": [
+        {
+          "name": "SRAM",
+          "address": 536870912,
+          "size": 131072
+        }
+      ],
+      "loaderRamIndex": 0,
+      "preflight": {
+        "idcodeAddress": 3758366720,
+        "deviceId": 1043,
+        "flashSizeRegisterAddress": 536836642,
+        "expectedFlashSizeKiB": 512
+      },
+      "flashDiagnostics": {
+        "statusAddress": 1073888268,
+        "controlAddress": 1073888272
+      },
+      "algorithm": "stm32f407",
+      "eraseTimeoutMs": 5000,
+      "programTimeoutMs": 5000,
+      "profileId": 2,
+      "corePart": 3108,
+      "optionRegisters": [
+        1073888276
+      ],
+      "loader": {
+        "address": 536870912,
+        "buffer": 536936448,
+        "stack": 537001984,
+        "stackSize": 4096
+      },
+      "validation": {
+        "rmlink": "pending-hardware"
+      }
+    },
+    {
+      "name": "STM32F407IG",
+      "aliases": [
+        "STM32F407IGT6",
+        "STM32F407IGT7",
+        "STM32F407IGH6",
+        "STM32F407IGH7"
+      ],
+      "dpIdcode": 731911287,
+      "flashBase": 134217728,
+      "flashSize": 1048576,
+      "sectors": [
+        {
+          "number": 0,
+          "address": 134217728,
+          "size": 16384
+        },
+        {
+          "number": 1,
+          "address": 134234112,
+          "size": 16384
+        },
+        {
+          "number": 2,
+          "address": 134250496,
+          "size": 16384
+        },
+        {
+          "number": 3,
+          "address": 134266880,
+          "size": 16384
+        },
+        {
+          "number": 4,
+          "address": 134283264,
+          "size": 65536
+        },
+        {
+          "number": 5,
+          "address": 134348800,
+          "size": 131072
+        },
+        {
+          "number": 6,
+          "address": 134479872,
+          "size": 131072
+        },
+        {
+          "number": 7,
+          "address": 134610944,
+          "size": 131072
+        },
+        {
+          "number": 8,
+          "address": 134742016,
+          "size": 131072
+        },
+        {
+          "number": 9,
+          "address": 134873088,
+          "size": 131072
+        },
+        {
+          "number": 10,
+          "address": 135004160,
+          "size": 131072
+        },
+        {
+          "number": 11,
+          "address": 135135232,
+          "size": 131072
+        }
+      ],
+      "ramRegions": [
+        {
+          "name": "SRAM",
+          "address": 536870912,
+          "size": 131072
+        }
+      ],
+      "loaderRamIndex": 0,
+      "preflight": {
+        "idcodeAddress": 3758366720,
+        "deviceId": 1043,
+        "flashSizeRegisterAddress": 536836642,
+        "expectedFlashSizeKiB": 1024
+      },
+      "flashDiagnostics": {
+        "statusAddress": 1073888268,
+        "controlAddress": 1073888272
+      },
+      "algorithm": "stm32f407ig",
+      "eraseTimeoutMs": 5000,
+      "programTimeoutMs": 5000,
+      "profileId": 3,
+      "corePart": 3108,
+      "optionRegisters": [
+        1073888276
+      ],
+      "loader": {
+        "address": 536870912,
+        "buffer": 536936448,
+        "stack": 537001984,
+        "stackSize": 4096
+      },
+      "validation": {
+        "rmlink": "pending-hardware"
+      }
+    },
+    {
+      "name": "STM32H723VGT6",
+      "aliases": [
+        "STM32H723VG"
+      ],
+      "dpIdcode": 1805657207,
+      "flashBase": 134217728,
+      "flashSize": 1048576,
+      "sectors": [
+        {
+          "number": 0,
+          "address": 134217728,
+          "size": 131072
+        },
+        {
+          "number": 1,
+          "address": 134348800,
+          "size": 131072
+        },
+        {
+          "number": 2,
+          "address": 134479872,
+          "size": 131072
+        },
+        {
+          "number": 3,
+          "address": 134610944,
+          "size": 131072
+        },
+        {
+          "number": 4,
+          "address": 134742016,
+          "size": 131072
+        },
+        {
+          "number": 5,
+          "address": 134873088,
+          "size": 131072
+        },
+        {
+          "number": 6,
+          "address": 135004160,
+          "size": 131072
+        },
+        {
+          "number": 7,
+          "address": 135135232,
+          "size": 131072
+        }
+      ],
+      "ramRegions": [
+        {
+          "name": "ITCM RAM",
+          "address": 0,
+          "size": 65536
+        },
+        {
+          "name": "DTCM RAM",
+          "address": 536870912,
+          "size": 131072
+        },
+        {
+          "name": "AXI SRAM",
+          "address": 603979776,
+          "size": 327680
+        },
+        {
+          "name": "SRAM1-3",
+          "address": 805306368,
+          "size": 278528
+        },
+        {
+          "name": "SRAM4",
+          "address": 939524096,
+          "size": 16384
+        },
+        {
+          "name": "Backup RAM",
+          "address": 947912704,
+          "size": 4096
+        }
+      ],
+      "loaderRamIndex": 2,
+      "preflight": {
+        "idcodeAddress": 1543507968,
+        "deviceId": 1155,
+        "flashSizeRegisterAddress": 535947392,
+        "expectedFlashSizeKiB": 1024
+      },
+      "flashDiagnostics": {
+        "statusAddress": 1375739920,
+        "controlAddress": 1375739916
+      },
+      "algorithm": "stm32h723",
+      "flashWordSize": 32,
+      "eraseTimeoutMs": 30000,
+      "programTimeoutMs": 15000,
+      "profileId": 4,
+      "corePart": 3111,
+      "optionRegisters": [
+        1375739932,
+        1375739960
+      ],
+      "loader": {
+        "address": 603979776,
+        "buffer": 604045312,
+        "stack": 604307456,
+        "stackSize": 4096
+      },
+      "validation": {
+        "rmlink": "pending-hardware"
+      }
+    }
+  ]
+}

@@ -2,6 +2,8 @@ const esbuild = require('esbuild');
 const path = require('path');
 
 const isWatch = process.argv.includes('--watch');
+// Regular builds ship React's production runtime; --watch keeps development checks.
+const browserDefines = { 'process.env.NODE_ENV': JSON.stringify(isWatch ? 'development' : 'production') };
 
 /** @type {esbuild.BuildOptions} */
 const extConfig = {
@@ -18,6 +20,7 @@ const extConfig = {
 
 /** @type {esbuild.BuildOptions} */
 const webviewConfig = {
+  define: browserDefines,
   entryPoints: [path.resolve('src/webview/main.tsx')],
   bundle: true,
   outfile: path.resolve('dist/webview.js'),
@@ -31,6 +34,7 @@ const webviewConfig = {
 
 /** @type {esbuild.BuildOptions} */
 const timelineConfig = {
+  define: browserDefines,
   entryPoints: [path.resolve('src/webview/timeline/main.tsx')],
   bundle: true,
   outfile: path.resolve('dist/timeline.js'),
@@ -43,6 +47,7 @@ const timelineConfig = {
 
 /** @type {esbuild.BuildOptions} */
 const watchConfig = {
+  define: browserDefines,
   entryPoints: [path.resolve('src/webview/watch/main.tsx')],
   bundle: true,
   outfile: path.resolve('dist/watch.js'),

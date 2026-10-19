@@ -1,6 +1,7 @@
 import { OzoneBackend } from './ozone-backend/commander';
 import { DapSession, DebugProtocolMessage } from './debug/dap-session';
 import { createAdapterExit } from './debug/adapter-exit';
+import { DapFrameDecoder } from './debug/dap-framing';
 import { ExperimentalCppJLinkChannel } from './ozone-backend/cpp-jlink-channel';
 import { CmsisDapTargetChannel, LegacyJLinkTargetChannel, SessionTargetSelector } from './ozone-backend/session-target-channel';
 import { log } from './utils/logger';
@@ -32,26 +33,16 @@ try {
     log: message => log.dap(message),
   });
 
-  let buffer = '';
-
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk: string) => {
-    buffer += chunk;
-    while (true) {
-      const headerMatch = buffer.match(/^Content-Length: (\d+)\r\n\r\n/);
-      if (!headerMatch) break;
-
-      const contentLength = parseInt(headerMatch[1], 10);
-      const headerEnd = headerMatch[0].length;
-      if (buffer.length < headerEnd + contentLength) break;
-
-      const bodyStr = buffer.substring(headerEnd, headerEnd + contentLength);
-      buffer = buffer.substring(headerEnd + contentLength);
-
-      try {
+  const frames = new DapFrameDecoder();
+  process.stdin.on('data', (chunk: Buffer) => {
+    try {
+      for (const bodyStr of frames.push(chunk)) {
         const message: DebugProtocolMessage = JSON.parse(bodyStr);
         session.handleMessage(message);
-      } catch {}
+      }
+    } catch (error) {
+      log.dap(`[protocol] invalid input: ${error instanceof Error ? error.message : String(error)}`);
+      void exitAfterCleanup(1);
     }
   });
   process.stdin.on('end', () => { void exitAfterCleanup(0); });

@@ -52,6 +52,8 @@ export interface ViewStateServiceOptions {
   eventHub?: EventHub;
   /** High-rate sampler reused from the UI Timeline channel (plan Task 10). */
   sampleSink?: FastSampleSink;
+  /** Apply API edits to the currently selected Watch group (API -> UI sync). */
+  onWatchExpressionsChanged?: (expressions: string[]) => void;
   now?(): number;
 }
 
@@ -97,6 +99,7 @@ export class ViewStateService implements vscode.Disposable {
   private readonly eventHub?: EventHub;
   private readonly sampleSink?: FastSampleSink;
   private readonly nowFn: () => number;
+  private readonly onWatchExpressionsChanged?: (expressions: string[]) => void;
 
   private watchExpressions: string[] = [];
   private timeline: TimelineEntry[] = [];
@@ -111,6 +114,7 @@ export class ViewStateService implements vscode.Disposable {
     this.store = options.store ?? this.nullStore();
     this.eventHub = options.eventHub;
     this.sampleSink = options.sampleSink;
+    this.onWatchExpressionsChanged = options.onWatchExpressionsChanged;
     this.nowFn = options.now ?? (() => Date.now());
     this.hydrate();
   }
@@ -119,10 +123,13 @@ export class ViewStateService implements vscode.Disposable {
 
   /** `orbit.watch.list`: the persisted expressions plus best-effort values. */
   async watchSnapshot(includeValues = true): Promise<WatchSnapshot> {
+    const revision = this.watchRevision;
     let values: ExpressionValue[] = [];
     if (includeValues && this.watchExpressions.length > 0) {
       values = await this.readWatchValues();
     }
+    // Switching Watch groups can replace the list while a read is pending.
+    if (revision !== this.watchRevision) values = [];
     return {
       expressions: [...this.watchExpressions],
       values,
@@ -139,6 +146,7 @@ export class ViewStateService implements vscode.Disposable {
     this.watchExpressions = next;
     this.watchRevision += 1;
     void this.store.update(WATCH_EXPRESSIONS_KEY, next);
+    this.onWatchExpressionsChanged?.([...next]);
     this.publish('watch.changed', { expressions: next });
     return this.watchSnapshot(false);
   }
@@ -153,6 +161,7 @@ export class ViewStateService implements vscode.Disposable {
     this.watchExpressions = next;
     this.watchRevision += 1;
     void this.store.update(WATCH_EXPRESSIONS_KEY, next);
+    this.onWatchExpressionsChanged?.([...next]);
     this.publish('watch.changed', { expressions: next });
     return this.watchSnapshot(false);
   }
@@ -164,13 +173,16 @@ export class ViewStateService implements vscode.Disposable {
     this.watchExpressions = next;
     this.watchRevision += 1;
     void this.store.update(WATCH_EXPRESSIONS_KEY, next);
+    this.onWatchExpressionsChanged?.([...next]);
     this.publish('watch.changed', { expressions: next });
     return this.watchSnapshot(false);
   }
 
   /** Adopt the UI's Watch expression list and persist it (UI -> API sync). */
   setWatchFromUi(expressions: string[]): void {
-    this.watchExpressions = this.normalizeWatchList(expressions);
+    const next = this.normalizeWatchList(expressions);
+    if (next.length === this.watchExpressions.length && next.every((expression, index) => expression === this.watchExpressions[index])) return;
+    this.watchExpressions = next;
     this.watchRevision += 1;
     void this.store.update(WATCH_EXPRESSIONS_KEY, this.watchExpressions);
     this.publish('watch.changed', { expressions: this.watchExpressions });

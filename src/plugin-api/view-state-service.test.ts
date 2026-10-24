@@ -20,7 +20,7 @@ interface TestContext {
   read: Mock<(signals: readonly { alias: string; expression: string }[], ref: SessionRef) => Promise<RuntimeReadValue[]>>;
 }
 
-function makeService(seed?: { watch?: string[]; timeline?: unknown[] }): TestContext {
+function makeService(seed?: { watch?: string[]; timeline?: unknown[] }, onWatchExpressionsChanged?: (expressions: string[]) => void): TestContext {
   const registry = new SessionRegistry();
   const session = { id: 'sess-view', type: 'orbit', name: 'test' };
   registry.onStarted(session as never);
@@ -41,7 +41,7 @@ function makeService(seed?: { watch?: string[]; timeline?: unknown[] }): TestCon
     }));
   });
   const runtime = { readSignals: read } as unknown as RuntimeRouter;
-  const service = new ViewStateService({ registry, runtime, store });
+  const service = new ViewStateService({ registry, runtime, store, onWatchExpressionsChanged });
   return { service, registry, ref: registry.currentRef()!, store, data, read };
 }
 
@@ -90,6 +90,29 @@ describe('ViewStateService watch', () => {
     expect(ctx.read).toHaveBeenCalled();
     expect(snap.items.length).toBe(1);
     expect(snap.items[0].expression).toBe('v');
+  });
+
+  it('syncs API edits into the active UI group without a feedback revision loop', async () => {
+    let service!: ViewStateService;
+    const changed = vi.fn((expressions: string[]) => service.setWatchFromUi(expressions));
+    service = makeService({}, changed).service;
+    expect((await service.replaceWatch(['a'])).revision).toBe(1);
+    expect((await service.addWatch(['b'])).revision).toBe(2);
+    expect((await service.removeWatch(['a'])).revision).toBe(3);
+    expect(changed.mock.calls).toEqual([[['a']], [['a', 'b']], [['b']]]);
+    service.setWatchFromUi(['group2']);
+    expect(changed).toHaveBeenCalledTimes(3);
+    expect((await service.watchSnapshot(false)).expressions).toEqual(['group2']);
+  });
+
+  it('does not pair a new group list with values from a pending old group read', async () => {
+    let resolve!: (values: RuntimeReadValue[]) => void;
+    ctx.service.setWatchFromUi(['old']);
+    ctx.read.mockImplementationOnce(() => new Promise(next => { resolve = next; }));
+    const snapshot = ctx.service.watchSnapshot(true);
+    ctx.service.setWatchFromUi(['new']);
+    resolve([{ alias: 'old', expression: 'old', value: 99, display: '99' }]);
+    expect(await snapshot).toMatchObject({ expressions: ['new'], values: [], items: [] });
   });
 });
 

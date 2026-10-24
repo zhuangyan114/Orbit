@@ -42,6 +42,25 @@ function mapResult(r: any, parentExpr?: string): WatchEntry {
 const CHANGE_HIGHLIGHT_MS = 500;
 
 export function WatchApp() {
+  const [groups, setGroups] = useState<{ id: string; name: string }[]>([]);
+  const [activeGroupId, setActiveGroupId] = useState('watch1');
+  const activeGroupRef = useRef('watch1');
+  const generationRef = useRef(0);
+  const [renamingGroup, setRenamingGroup] = useState<{ id: string; name: string } | null>(null);
+  const renamingGroupRef = useRef<{ id: string; name: string } | null>(null);
+  const postGroupMessage = (message: any) => vscode.postMessage({
+    ...message, groupId: activeGroupRef.current, watchGeneration: generationRef.current,
+  });
+  const startGroupRename = (group: { id: string; name: string }) => {
+    renamingGroupRef.current = { ...group };
+    setRenamingGroup(renamingGroupRef.current);
+  };
+  const finishGroupRename = (save: boolean) => {
+    const edit = renamingGroupRef.current;
+    renamingGroupRef.current = null;
+    setRenamingGroup(null);
+    if (save && edit?.name.trim()) postGroupMessage({ command: 'renameGroup', id: edit.id, name: edit.name.trim() });
+  };
   const [watches, setWatches] = useState<WatchEntry[]>([]);
   const [newExpr, setNewExpr] = useState('');
   const [editingIndex, setEditingIndex] = useState<string | null>(null);
@@ -58,11 +77,33 @@ export function WatchApp() {
   useEffect(() => {
     const handler = (event: MessageEvent) => {
       const msg = event.data;
+      if (msg.command !== 'init' && msg.command !== 'watchGroups'
+        && ((msg.groupId !== undefined && msg.groupId !== activeGroupRef.current)
+          || (msg.watchGeneration !== undefined && msg.watchGeneration !== generationRef.current))) return;
       switch (msg.command) {
         case 'init':
+          activeGroupRef.current = msg.activeGroupId || 'watch1';
+          // A delayed selection response may arrive after double-click started renaming that tab.
+          if (renamingGroupRef.current && renamingGroupRef.current.id !== activeGroupRef.current) {
+            renamingGroupRef.current = null;
+            setRenamingGroup(null);
+          }
+          generationRef.current = msg.watchGeneration ?? 0;
+          setActiveGroupId(activeGroupRef.current);
+          setGroups(msg.groups || [{ id: 'watch1', name: 'watch1' }]);
           prevValuesRef.current.clear();
+          if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+          highlightTimerRef.current = null;
+          setChangedValues(new Set());
+          setEditingIndex(null);
+          setEditValue('');
+          setNewExpr('');
+          watchesRef.current = msg.watches || [];
           setWatches(msg.watches || []);
           setExpanded(new Set((msg.expandedExpressions || []).map((e: unknown) => String(e))));
+          break;
+        case 'watchGroups':
+          setGroups(msg.groups || []);
           break;
         case 'watchResults': {
           const incoming: WatchEntry[] = (msg.results || []).map((r: any) => mapResult(r));
@@ -95,33 +136,36 @@ export function WatchApp() {
         }
         case 'watchValueSet':
           if (msg.ok) {
-            vscode.postMessage({ command: 'evaluateWatches', expressions: [msg.expression] });
+            postGroupMessage({ command: 'evaluateWatches', expressions: [msg.expression] });
           }
           break;
       }
     };
     window.addEventListener('message', handler);
     vscode.postMessage({ command: 'init' });
-    return () => window.removeEventListener('message', handler);
+    return () => {
+      window.removeEventListener('message', handler);
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    };
   }, []);
 
   const addWatch = () => {
     const expr = stripHanCharacters(newExpr).trim();
     if (!expr) return;
-    vscode.postMessage({ command: 'addExpression', expression: expr });
+    postGroupMessage({ command: 'addExpression', expression: expr });
     setNewExpr('');
   };
 
   const removeWatch = (index: number) => {
     const w = watches[index];
     if (w) {
-      vscode.postMessage({ command: 'removeExpression', expression: w.expression });
+      postGroupMessage({ command: 'removeExpression', expression: w.expression });
       setWatches(prev => prev.filter((_, i) => i !== index));
     }
   };
 
   const sendToTimeline = (expression: string) => {
-    vscode.postMessage({ command: 'sendToTimeline', expressions: [expression] });
+    postGroupMessage({ command: 'sendToTimeline', expressions: [expression] });
   };
 
   const startEditing = useCallback((key: string, currentValue: string) => {
@@ -146,7 +190,7 @@ export function WatchApp() {
     if (raw === '') return;
     const value = parseWatchValueInput(raw);
     if (value === null) return;
-    vscode.postMessage({
+    postGroupMessage({
       command: 'setWatchValue',
       expression: entry.expression,
       value,
@@ -162,7 +206,7 @@ export function WatchApp() {
       const next = new Set(prev);
       if (next.has(expression)) next.delete(expression);
       else next.add(expression);
-      vscode.postMessage({ command: 'setExpandedExpressions', expressions: [...next] });
+      postGroupMessage({ command: 'setExpandedExpressions', expressions: [...next] });
       return next;
     });
   };
@@ -279,12 +323,43 @@ export function WatchApp() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontSize: '12px' }}>
+      <div role="tablist" aria-label="Watch 分组" style={{ display: 'flex', flexShrink: 0, overflowX: 'auto',
+        alignItems: 'center', gap: 3, padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
+        {groups.map(group => <div key={group.id} style={{ display: 'flex', flexShrink: 0, alignItems: 'center',
+          borderBottom: group.id === activeGroupId ? '2px solid var(--vscode-focusBorder, #007fd4)' : '2px solid transparent',
+          background: group.id === activeGroupId ? 'var(--vscode-tab-activeBackground, #333)' : 'transparent', borderRadius: '3px 3px 0 0' }}>
+          {renamingGroup?.id === group.id ? <input autoFocus aria-label="分组名称" value={renamingGroup.name}
+            title="回车或失焦保存，Escape 取消" onFocus={event => event.target.select()}
+            onChange={event => {
+              const edit = { id: group.id, name: event.target.value };
+              renamingGroupRef.current = edit;
+              setRenamingGroup(edit);
+            }}
+            onBlur={() => finishGroupRename(true)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); finishGroupRename(true); }
+              if (event.key === 'Escape') { event.preventDefault(); finishGroupRename(false); }
+            }}
+            style={{ ...inputStyle, width: `${Math.min(24, Math.max(7, renamingGroup.name.length + 1))}ch`,
+              padding: '1px 4px', fontSize: 12, borderColor: 'var(--vscode-focusBorder, #007fd4)' }} />
+          : <button type="button" role="tab" aria-selected={group.id === activeGroupId}
+            title={`${group.name}（双击重命名）`} onDoubleClick={() => startGroupRename(group)}
+            onClick={() => postGroupMessage({ command: 'selectGroup', id: group.id })}
+            style={{ ...actionBtnStyle, fontSize: 12, color: 'var(--vscode-foreground, #ccc)', whiteSpace: 'nowrap' }}>{group.name}</button>}
+          <button type="button" aria-label={`删除 ${group.name}`} title={groups.length === 1 ? '至少保留一个 Watch 分组' : `删除 ${group.name}`}
+            disabled={groups.length === 1} onClick={() => postGroupMessage({ command: 'removeGroup', id: group.id })}
+            style={{ ...actionBtnStyle, minWidth: 20, padding: '0 3px', opacity: groups.length === 1 ? 0.3 : 0.7,
+              cursor: groups.length === 1 ? 'default' : 'pointer' }}>×</button>
+        </div>)}
+        <button type="button" aria-label="添加 Watch 分组" title="添加 Watch 分组"
+          onClick={() => postGroupMessage({ command: 'addGroup' })} style={{ ...actionBtnStyle, flexShrink: 0 }}>+</button>
+      </div>
       <div style={{ display: 'flex', gap: '4px', padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
         <input value={newExpr} onChange={e => setNewExpr(stripHanCharacters(e.target.value))}
           onKeyDown={e => { if (e.key === 'Enter') addWatch(); }}
           placeholder="变量名或表达式"
           style={{ flex: 1, ...inputStyle }} />
-        <button onClick={addWatch} style={btnStyle}>+</button>
+        <button aria-label="添加监视变量" onClick={addWatch} style={btnStyle}>+</button>
       </div>
 
       {watches.length > 0 && (

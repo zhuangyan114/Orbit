@@ -312,6 +312,8 @@ DAP 源码还接受下列兼容输入：
 ### 4.1 能力
 
 - 在 `WATCH` Webview 中添加和删除调试表达式。
+- 顶部使用 `watch1`、`watch2` 等分组标签；点击加号新建空组，使用当前最小的空缺编号（例如删除 `watch2` 后再添加仍为 `watch2`），点击标签切换当前变量列表，点击标签旁的 × 删除该组。删除当前组会选中相邻组，至少保留一个分组。
+- 双击分组名可重命名，支持中文；回车或移开焦点保存，Escape 取消，空白名称保留原名。名称随工程保存，改名不改变该组变量、展开状态或采样归属。
 - 展开结构体、数组、指针等返回的子节点。
 - 读取 `display`、类型、地址和错误状态；目标运行时可显示 `Running...` 或使用短期缓存。
 - 叶子数值可编辑。输入支持十进制、科学计数法和完整的十六进制 `0x...` 数字；复合节点不能直接写入。
@@ -320,13 +322,13 @@ DAP 源码还接受下列兼容输入：
 
 ### 4.2 状态保存和路由
 
-Watch 表达式保存为 workspace state 的 `ozoneWatchExpressions`，展开节点保存为 `ozoneWatchExpandedExpressions`。切换视图或重新创建 Webview 后，表达式和展开状态会恢复。
+各 Watch 分组的表达式、展开节点、当前选择和编号保存到工程的 workspace state `ozoneWatchGroups`。已有单列表会自动迁入 `watch1`；切换视图、重新创建 Webview 或重载窗口后恢复所选分组。当前组同时写入兼容键 `ozoneWatchExpressions` 和 `ozoneWatchExpandedExpressions`，Automation API 的 Watch 增删与替换也作用于当前组。
 
 如果存在活动的 `orbit` DAP session（或旧 `ozone` 别名），Watch 读取和写入都通过该 session 路由；不会为同一目标再打开一个 Extension Host owner。没有活动 DAP session 时，扩展侧 Watch provider 才会使用其后端路径。
 
 ### 4.3 刷新和并发
 
-Watch Webview 不可见时，扩展侧轮询不会读取目标。活动 DAP session 会把目标读取切成有限大小的批次，并为控制操作让出优先级；继续、暂停、单步、断点和变量写入不会被 Timeline 低优先级采样绕过。
+Watch 只刷新选中分组的变量，其他组保留配置；切组前已发出的读取或写入结果不会覆盖新组，尚未提交的编辑会取消。Watch Webview 不可见时，扩展侧轮询不会读取目标。活动 DAP session 会把目标读取切成有限大小的批次，并为控制操作让出优先级；继续、暂停、单步、断点和变量写入不会被 Timeline 低优先级采样绕过。
 
 ## 5. Timeline
 

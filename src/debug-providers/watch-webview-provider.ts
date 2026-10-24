@@ -3,13 +3,14 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import { WatchValue } from '../ozone-backend/types';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
 import { isOrbitDebugSessionType } from '../utils/debug-session-type';
+import { normalizeWatchExpressions, WatchGroups, WATCH_GROUPS_STATE_KEY } from './watch-groups';
 
 const WATCH_EXPANDED_STATE_KEY = 'ozoneWatchExpandedExpressions';
 
 export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
-  private _expressions: string[] = [];
-  private _expandedExpressions = new Set<string>();
+  private groups: WatchGroups;
+  private groupGeneration = 0;
   private _onExpressionsChanged: ((exprs: string[]) => void) | null = null;
   onSendToTimeline: ((exprs: string[]) => void) | null = null;
 
@@ -22,20 +23,23 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     private backend: OzoneBackend,
     private canUseDapSession: (session: vscode.DebugSession) => boolean = () => true,
   ) {
-    this._expandedExpressions = new Set(
-      this.context.workspaceState.get<string[]>(WATCH_EXPANDED_STATE_KEY, [])
-        .map(expression => stripHanCharacters(String(expression)).trim())
-        .filter(Boolean),
+    this.groups = new WatchGroups(
+      context.workspaceState.get<unknown>(WATCH_GROUPS_STATE_KEY),
+      context.workspaceState.get<unknown>('ozoneWatchExpressions', []),
+      context.workspaceState.get<unknown>(WATCH_EXPANDED_STATE_KEY, []),
     );
   }
 
   get expressionList(): string[] {
-    return this._expressions;
+    return [...this.groups.active.expressions];
   }
 
   get expandedExpressions(): string[] {
-    return [...this._expandedExpressions];
+    return [...this.groups.active.expandedExpressions];
   }
+
+  get generation(): number { return this.groupGeneration; }
+  get activeGroupId(): string { return this.groups.active.id; }
 
   set onExpressionsChanged(cb: ((exprs: string[]) => void) | null) {
     this._onExpressionsChanged = cb;
@@ -49,78 +53,103 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.getHtml(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage(msg => {
-      switch (msg.command) {
-        case 'init':
-          this.postInit();
-          if (this._expressions.length > 0) {
-            this.evaluateWatches(this._expressions);
-          }
-          break;
-        case 'addExpression':
-          this.addExpression(msg.expression);
-          break;
-        case 'removeExpression':
-          this.removeExpression(msg.expression);
-          break;
-        case 'evaluateWatches':
-          this.evaluateWatches(msg.expressions);
-          break;
-        case 'setWatchValue':
-          this.setWatchValue(msg.expression, msg.value, msg.address, msg.typeName);
-          break;
-        case 'setExpandedExpressions':
-          this.setExpandedExpressions(msg.expressions);
-          break;
-        case 'sendToTimeline':
-          if (this.onSendToTimeline && msg.expressions?.length > 0) {
-            this.onSendToTimeline(msg.expressions);
-          }
-          break;
-      }
-    });
+    webviewView.webview.onDidReceiveMessage(msg => this.handleMessage(msg));
 
     webviewView.onDidDispose(() => {
       this.view = null;
     });
   }
 
+  private handleMessage(msg: any) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.command !== 'init' && msg.groupId !== undefined
+      && (msg.groupId !== this.activeGroupId || msg.watchGeneration !== this.generation)) return;
+    switch (msg.command) {
+      case 'init':
+        this.postInit();
+        if (this.expressionList.length > 0) void this.evaluateWatches(this.expressionList);
+        break;
+      case 'addGroup': this.addGroup(); break;
+      case 'selectGroup': this.selectGroup(msg.id); break;
+      case 'removeGroup': this.removeGroup(msg.id); break;
+      case 'renameGroup': this.renameGroup(msg.id, msg.name); break;
+      case 'addExpression':
+        this.addExpression(msg.expression);
+        break;
+      case 'removeExpression':
+        this.removeExpression(msg.expression);
+        break;
+      case 'evaluateWatches':
+        void this.evaluateWatches(msg.expressions);
+        break;
+      case 'setWatchValue':
+        void this.setWatchValue(msg.expression, msg.value, msg.address, msg.typeName);
+        break;
+      case 'setExpandedExpressions':
+        this.setExpandedExpressions(msg.expressions);
+        break;
+      case 'sendToTimeline':
+        if (this.onSendToTimeline && msg.expressions?.length > 0) this.onSendToTimeline(msg.expressions);
+        break;
+    }
+  }
+
   setExpressions(expressions: string[]) {
-    this._expressions = expressions
-      .map(expression => stripHanCharacters(String(expression)).trim())
-      .filter(Boolean);
-    this.postInit();
-    if (this._onExpressionsChanged) {
-      this._onExpressionsChanged(this._expressions);
-    }
-    if (this._expressions.length > 0) {
-      this.evaluateWatches(this._expressions);
-    }
+    this.groups.active.expressions = normalizeWatchExpressions(expressions);
+    this.publishActiveGroup();
   }
 
   addExpression(expr: string) {
     const sanitized = stripHanCharacters(String(expr || '')).trim();
-    if (!sanitized || this._expressions.includes(sanitized)) return;
-    this._expressions = [...this._expressions, sanitized];
-    this.postInit();
-    if (this._onExpressionsChanged) {
-      this._onExpressionsChanged(this._expressions);
-    }
+    if (!sanitized || this.expressionList.includes(sanitized)) return;
+    this.groups.active.expressions.push(sanitized);
+    this.publishActiveGroup();
   }
 
   removeExpression(expr: string) {
-    this._expressions = this._expressions.filter(e => e !== expr);
-    this.postInit();
-    if (this._onExpressionsChanged) {
-      this._onExpressionsChanged(this._expressions);
-    }
+    if (!this.expressionList.includes(expr)) return;
+    this.groups.active.expressions = this.expressionList.filter(e => e !== expr);
+    this.publishActiveGroup();
   }
 
-  sendWatchResults(results: WatchValue[]) {
-    this.postMessage({ command: 'watchResults', results });
+  addGroup() { this.groups.add(); this.publishActiveGroup(); }
+  selectGroup(id: string) { if (this.groups.select(id)) this.publishActiveGroup(); }
+  removeGroup(id: string) {
+    const previous = this.activeGroupId;
+    if (!this.groups.remove(id)) return;
+    if (previous !== this.activeGroupId) this.publishActiveGroup();
+    else { this.persistGroups(); this.postMessage({ command: 'watchGroups', ...this.groupMetadata() }); }
+  }
+  renameGroup(id: string, name: unknown) {
+    if (!this.groups.rename(id, name)) return;
+    this.persistGroups();
+    this.postMessage({ command: 'watchGroups', ...this.groupMetadata() });
+  }
+  private persistGroups() {
+    void this.context.workspaceState.update(WATCH_GROUPS_STATE_KEY, this.groups.snapshot());
+    // Keep the active group's legacy keys compatible with existing integrations.
+    void this.context.workspaceState.update('ozoneWatchExpressions', this.expressionList);
+    void this.context.workspaceState.update(WATCH_EXPANDED_STATE_KEY, this.expandedExpressions);
+  }
+  private publishActiveGroup() {
+    this.groupGeneration++;
+    this.persistGroups();
+    this.postInit();
+    this._onExpressionsChanged?.(this.expressionList);
+    if (this.expressionList.length > 0) void this.evaluateWatches(this.expressionList);
+  }
+  private groupMetadata() {
+    return { groups: this.groups.snapshot().groups.map(group => ({ id: group.id, name: group.name })),
+      activeGroupId: this.activeGroupId, watchGeneration: this.generation };
+  }
+  sendWatchResults(results: WatchValue[], generation = this.generation) {
+    if (generation !== this.generation) return;
+    this.postMessage({ command: 'watchResults', results, groupId: this.activeGroupId, watchGeneration: generation });
   }
 
   private async evaluateWatches(expressions: string[]) {
+    const generation = this.generation;
+    expressions = normalizeWatchExpressions(expressions);
     let results: WatchValue[] | null = null;
     const session = vscode.debug.activeDebugSession;
     if (session && isOrbitDebugSessionType(session.type)) {
@@ -138,7 +167,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
             expressions,
             expandedExpressions: this.expandedExpressions,
           });
-          if (!this.canUseDapSession(session)) return;
+          if (generation !== this.generation || vscode.debug.activeDebugSession !== session || !this.canUseDapSession(session)) return;
           if (r && r.results) {
             results = r.results as WatchValue[];
           } else {
@@ -164,6 +193,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     if (!results) {
       results = [];
       for (const expr of expressions) {
+        if (generation !== this.generation) return;
         const result = await this.backend.execute({
           cmd: 'evaluateExpression',
           expression: expr,
@@ -177,19 +207,19 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
         }
       }
     }
-    this.postMessage({ command: 'watchResults', results });
+    if (vscode.debug.activeDebugSession !== session) return;
+    if (session && isOrbitDebugSessionType(session.type) && !this.canUseDapSession(session)) return;
+    this.sendWatchResults(results, generation);
   }
 
   private setExpandedExpressions(expressions: unknown) {
-    const next = Array.isArray(expressions)
-      ? expressions.map(e => stripHanCharacters(String(e)).trim()).filter(Boolean)
-      : [];
-    this._expandedExpressions = new Set(next);
-    this.context.workspaceState.update(WATCH_EXPANDED_STATE_KEY, next);
-    if (this._expressions.length > 0) void this.evaluateWatches(this._expressions);
+    this.groups.active.expandedExpressions = normalizeWatchExpressions(expressions);
+    this.persistGroups();
+    if (this.expressionList.length > 0) void this.evaluateWatches(this.expressionList);
   }
 
   private async setWatchValue(expression: string, value: number, address?: number, typeName?: string) {
+    const generation = this.generation;
     let result: any;
     // Route through active DAP session when debugging, same as readWatchValues
     const session = vscode.debug.activeDebugSession;
@@ -199,10 +229,10 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
       } else {
         try {
           const r: any = await session.customRequest('setWatchValue', { expression, value, address, typeName });
-          if (!this.canUseDapSession(session)) return;
+          if (generation !== this.generation || vscode.debug.activeDebugSession !== session || !this.canUseDapSession(session)) return;
           result = r && r.ok !== undefined ? r : { ok: true, data: r };
         } catch (e: any) {
-          if (!this.canUseDapSession(session)) return;
+          if (generation !== this.generation || vscode.debug.activeDebugSession !== session || !this.canUseDapSession(session)) return;
           result = { ok: false, error: e.message || 'DAP setWatchValue failed' };
         }
       }
@@ -211,8 +241,11 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     } else {
       result = { ok: false, error: 'No active Orbit debug session' };
     }
+    if (generation !== this.generation) return;
     this.postMessage({
       command: 'watchValueSet',
+      groupId: this.activeGroupId,
+      watchGeneration: generation,
       expression,
       ok: result.ok,
       error: result.ok ? undefined : result.error,
@@ -228,8 +261,9 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   private postInit() {
     this.postMessage({
       command: 'init',
-      watches: this._expressions.map(e => ({ expression: e })),
-      expandedExpressions: [...this._expandedExpressions],
+      ...this.groupMetadata(),
+      watches: this.expressionList.map(e => ({ expression: e })),
+      expandedExpressions: this.expandedExpressions,
     });
   }
 

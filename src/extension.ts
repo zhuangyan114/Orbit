@@ -142,11 +142,8 @@ export async function activate(context: vscode.ExtensionContext) {
       wp.setExpressions(exprs);
       apiViewState?.setWatchFromUi(exprs);
     };
-    const saved = context.workspaceState.get<string[]>('ozoneWatchExpressions', []);
-    if (saved.length > 0) {
-      wvp.setExpressions(saved);
-      wp.setExpressions(saved);
-    }
+    // The provider restores the selected group, migrating the old single list into watch1.
+    wvp.setExpressions(wvp.expressionList);
 
     const dsm = new DataSamplingManager(b);
     dataSamplingManager = dsm;
@@ -187,7 +184,9 @@ export async function activate(context: vscode.ExtensionContext) {
       persistentExpressions: () => dataSamplingManager?.expressionList ?? [],
     });
     apiFastSampleSink = fastSampleSink;
-    apiViewState = new ViewStateService({ registry: sessionRegistry, runtime: apiRuntime, store: context.workspaceState, eventHub, sampleSink: fastSampleSink });
+    apiViewState = new ViewStateService({ registry: sessionRegistry, runtime: apiRuntime, store: context.workspaceState, eventHub, sampleSink: fastSampleSink,
+      onWatchExpressionsChanged: expressions => wvp.setExpressions(expressions) });
+    apiViewState.setWatchFromUi(wvp.expressionList);
     apiRecording = new RecordingService({
       registry: sessionRegistry,
       runtime: apiRuntime,
@@ -571,11 +570,12 @@ function startWatchPolling() {
         watchPollTimer = setTimeout(loop, baseInterval);
         return;
       }
-      const results = await readWatchValues(expressions, watchWebviewProvider?.expandedExpressions || []);
+      const groupGeneration = watchWebviewProvider.generation;
+      const results = await readWatchValues(expressions, watchWebviewProvider.expandedExpressions);
       if (watchPollTimer === null || generation !== watchPollGeneration) return;
-      if (results.length > 0) {
+      if (results.length > 0 && groupGeneration === watchWebviewProvider.generation) {
         watchProvider?.updateResults(results);
-        watchWebviewProvider?.sendWatchResults(results as any);
+        watchWebviewProvider?.sendWatchResults(results as any, groupGeneration);
       }
     } catch {}
     if (watchPollTimer !== null && generation === watchPollGeneration) {

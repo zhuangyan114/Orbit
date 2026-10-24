@@ -74,13 +74,6 @@
       }
     ],
     "menus": {
-      "view/title": [
-        {
-          "command": "ozone.addWatch",
-          "when": "view == ozoneWatch",
-          "group": "navigation"
-        }
-      ],
       "view/item/context": [
         {
           "command": "ozone.removeWatch",

@@ -17,6 +17,45 @@ vi.mock('vscode', () => ({
 
 import { DataSamplingManager } from './data-sampling-manager';
 
+describe('Timeline automatic colors', () => {
+  function fixture() {
+    state.activeDebugSession = undefined;
+    return new DataSamplingManager({ hasTargetConnection: false, execute: vi.fn() } as any);
+  }
+
+  it('avoids a restored custom color that is close to the old first palette color', () => {
+    const manager = fixture();
+    try {
+      manager.setExpressions([{ expression: 'saved', color: '#4ec9af' }]);
+      manager.addExpression('new');
+      expect(manager.entriesList[0].color).toBe('#4ec9af');
+      expect(manager.entriesList[1].color.toUpperCase()).not.toBe('#4EC9B0');
+    } finally { manager.dispose(); }
+  });
+
+  it('reserves saved colors even when an automatic entry comes first', () => {
+    const manager = fixture();
+    try {
+      manager.setExpressions(['automatic', { expression: 'saved', color: '#4EC9B0' }]);
+      expect(manager.entriesList[0].color).not.toBe('#4EC9B0');
+      expect(manager.entriesList[1].color).toBe('#4EC9B0');
+    } finally { manager.dispose(); }
+  });
+
+  it('uses current custom colors, disabled entries, and more colors than one palette cycle', () => {
+    const manager = fixture();
+    try {
+      manager.addExpression('first');
+      manager.setColor('first', '#569cd5');
+      manager.toggleExpression('first', false);
+      manager.addExpression('second');
+      expect(manager.entriesList[1].color.toUpperCase()).not.toBe('#569CD6');
+      for (let i = 2; i < 24; i++) manager.addExpression('variable' + i);
+      expect(new Set(manager.entriesList.map(e => e.color.toUpperCase())).size).toBe(24);
+    } finally { manager.dispose(); }
+  });
+});
+
 describe('Timeline sampling rejection feedback', () => {
   beforeEach(() => {
     state.warning.mockReset();

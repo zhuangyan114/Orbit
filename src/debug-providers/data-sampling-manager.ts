@@ -10,8 +10,8 @@ import {
   type TimelineHistoryBounds,
 } from '../webview/timeline/timeline-range';
 import { decimateTimelineRange } from '../webview/timeline/timeline-decimation';
+import { pickTimelineColor } from '../webview/timeline/timeline-colors';
 
-const COLORS = ['#4EC9B0', '#569CD6', '#DCDCA4', '#C586C0', '#D16969', '#CE9178', '#6A9955', '#42C6FF', '#B5CEA8', '#FFD700'];
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
 const DEFAULT_SEND_INTERVAL_MS = 16;
 const MIN_INTERVAL_MS = 0.1;
@@ -30,7 +30,6 @@ export class DataSamplingManager {
   private lastSampleTimestampMap = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   private sendTimer: NodeJS.Timeout | null = null;
-  private colorIndex = 0;
   private onSamples: ((snapshots: DataSampleSnapshot[]) => void) | null = null;
   private backend: OzoneBackend;
   private sampleIntervalMs = DEFAULT_SAMPLE_INTERVAL_MS;
@@ -88,8 +87,7 @@ export class DataSamplingManager {
 
   addExpression(expression: string) {
     if (this.entries.some(e => e.expression === expression)) return;
-    const color = COLORS[this.colorIndex % COLORS.length];
-    this.colorIndex++;
+    const color = pickTimelineColor(this.entries.map(entry => entry.color));
     this.entries.push({ expression, enabled: true, color });
     this.dataMap.set(expression, []);
     this.pendingMap.set(expression, []);
@@ -112,14 +110,13 @@ export class DataSamplingManager {
     this.dataMap.clear();
     this.pendingMap.clear();
     this.lastSampleTimestampMap.clear();
-    this.colorIndex = 0;
+    const reservedColors = expressions.flatMap(spec => typeof spec === 'object' && spec?.expression && spec.color ? [spec.color] : []);
     for (const spec of expressions) {
       if (!spec) continue;
       const expr = typeof spec === 'string' ? spec : spec.expression;
       if (!expr) continue;
-      const color = typeof spec === 'string' ? COLORS[this.colorIndex % COLORS.length] : (spec.color || COLORS[this.colorIndex % COLORS.length]);
-      if (typeof spec !== 'string' && !spec.color) this.colorIndex++;
-      else if (typeof spec === 'string') this.colorIndex++;
+      const color = (typeof spec === 'object' && spec.color) || pickTimelineColor(reservedColors);
+      reservedColors.push(color);
       this.entries.push({ expression: expr, enabled: true, color });
       this.dataMap.set(expr, []);
       this.pendingMap.set(expr, []);

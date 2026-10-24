@@ -1,0 +1,55 @@
+{
+  "version": "1.1.7",
+  "date": "2026-10-12",
+  "targetPlatform": "win32-x64",
+  "tests": {
+    "files": 74,
+    "passed": 1043,
+    "skipped": 1
+  },
+  "typecheck": "passed",
+  "extensionBuild": "passed",
+  "nativeBuild": "passed",
+  "cmsisDapMockAndAlgorithm": "passed",
+  "jlinkMock": "passed",
+  "browserSimulation": {
+    "checks": [
+      "The Hz number is right of Save A/B and above the grid, with the exact requested hover title.",
+      "The numeric left edge aligns with the grid and the Hz position stays fixed across digit counts.",
+      "Samples from an inactive tab cannot overwrite the current rate.",
+      "The display returns to zero when samples stop.",
+      "Debug completion switches to the persistent average and hover title without resetting the plot.",
+      "Restored history shows its own average and the average-rate tooltip, without an idle reset."
+    ],
+    "pageErrors": []
+  },
+  "koffiLoadAndCall": "passed",
+  "cmsisDapHelperSelftest": {
+    "selftest": "ok",
+    "cases": 200,
+    "failures": 0
+  },
+  "vsixSha256": "c40135aa399295623eaf8fe6a8ffde9c8f8914f32638c8466094d60f3ccaf70f",
+  "fileHashes": {
+    "dist/extension.js": "41d57dfba542f1c8ad2c013e1209804218b8543b05015cbdc7bbe3cd644e323c",
+    "dist/debugadapter.js": "bf411bc6eb9fd8bb7cb14824620d9c553e67089b128be609d8b38015b9f5f421",
+    "dist/webview.js": "0353b17d3f50b4db930cbf74d2b9c8687bb3363d35c108dbf96aa14ce7c67b52",
+    "dist/timeline.js": "a9cffdabd58e61808c251230a1d7cd2c1ae13dc524b392e8d79204249448f62a",
+    "dist/watch.js": "0946f456c1ed4e0b7471f8917a552fbb42bff8515cb2ebaa63e5b535eeecf81b",
+    "out/native/win32-x64/orbit-jlink-helper.exe": "e9ded9fb645f932fa54bb4089a89fee65c1894f3ce8235035dacdecc45b0b272",
+    "out/native/win32-x64/orbit-cmsis-dap-helper.exe": "328dfde7480f8dde295e9370629b0686c383cb67b53f7e6ea052f5648266c04b",
+    "out/native/win32-x64/orbit-stm32f103c8-flash-algorithm.bin": "199f933f156823c53a62a6e470057d6840fd84306815830a31b056716ce0b979",
+    "out/native/win32-x64/orbit-stm32f407-flash-algorithm.bin": "9ce1f26ed3c40dc07c83213959ae9f75dc98171e2c7da2a022874bf9174d7994",
+    "out/native/win32-x64/orbit-stm32f407ig-flash-algorithm.bin": "054799ab164c15176daf5da0dc26d7b2fd52fe6d3696ba0ebd620d8512e2d7dc",
+    "out/native/win32-x64/orbit-stm32h723-flash-algorithm.bin": "7517fddab3b02ab643239a73b992ce0e40211629a377d7a15ad3b0b188cfeb9f",
+    "resources/orbit-icon-256.png": "00df3fd0251f3606474ad9938b86eb9ad548ba2b7373d7e10b6bacfc0b408c23",
+    "resources/orbit-feature-overview-promo.png": "0a7a9a97c1e1bb39f4f1310b1acd27ae3a15058002d2aaac306c0a99182373ae",
+    "resources/orbit-timeline-promo.png": "7676f0b74b718f6ef61a91c56a49fdab5526d33d58e595338368897243df701f",
+    "resources/orbit-rtt-promo.png": "9f115f83ada2728ffbd2db24bbaa39990d9295b3ee1be51873a79fb447dc1476",
+    "Releases/docs/user-guide.md": "75049b4256be5c1875d84be5b3c1281680122bd0144fae64823755561628b4da"
+  },
+  "checkedPublicRepositoryLinks": 19,
+  "hardwareValidation": "not performed",
+  "installedExtensionValidation": "not performed",
+  "marketplacePublication": "not performed"
+}

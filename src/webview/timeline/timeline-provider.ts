@@ -89,10 +89,9 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     store.onError = error => { tab.info.error = error; tab.info.incomplete = true; this.postTabs(); void vscode.window.showWarningMessage('Timeline 记录不完整：' + error); };
     tab.sampleRate = new TimelineSampleRate();
     this.tabs.set(store.id, tab); this.liveId = store.id;
-    if (this.activeId === 'debug-template') this.activeId = store.id;
     this.tabs.delete('debug-template');
-    this.postTabs();
-    if (this.activeId === store.id) this.activateTab(store.id);
+    // Select the new record inside Timeline without revealing/focusing its VS Code panel.
+    this.activateTab(store.id);
   }
   private finishLive() {
     if (!this.liveId) return;

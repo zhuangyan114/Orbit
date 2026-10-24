@@ -25,6 +25,7 @@ import type { TimelineTab } from '../../timeline/timeline-model';
 import { calculateBufferedRange } from './timeline-range';
 import { clampTimelineTimePerDiv, MAX_TIMELINE_TIME_PER_DIV_MS, parseTimelineTimePerDiv, TIMELINE_TIME_PRESETS_MS } from './timeline-time-scale';
 import { TIMELINE_SAMPLE_RATE_STALE_MS } from './timeline-sample-rate';
+import { TIMELINE_COLORS } from './timeline-colors';
 
 type DataPoint = TimelineDataPoint;
 type SampleSnapshot = TimelineSampleSnapshot;
@@ -974,6 +975,7 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
   onSetColor: (expr: string, color: string) => void;
 }) {
   const [pendingInputs, setPendingInputs] = useState<Record<string, string>>({});
+  const [colorExpression, setColorExpression] = useState<string | null>(null);
 
   const getDisplay = (e: Entry): string => {
     if (e.expression in pendingInputs) return pendingInputs[e.expression];
@@ -1017,14 +1019,13 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
           <input type="checkbox" checked={e.enabled}
             onChange={ev => onToggle(e.expression, ev.target.checked)}
             style={{ cursor: 'pointer', flexShrink: 0 }} />
-          <div style={{
+          <button type="button" aria-label={`设置 ${e.expression} 颜色`}
+            title="选择曲线颜色" aria-expanded={colorExpression === e.expression}
+            style={{
             width: 16, height: 16, borderRadius: 3, cursor: 'pointer',
-            flexShrink: 0, background: e.color,
+            flexShrink: 0, background: e.color, padding: 0,
             border: '1px solid var(--vscode-sideBar-border, #555)',
-          }} onClick={() => document.getElementById(`cp-${CSS.escape(e.expression)}`)?.click()} />
-          <input id={`cp-${CSS.escape(e.expression)}`} type="color" value={e.color}
-            onChange={ev => onSetColor(e.expression, ev.target.value)}
-            style={{ display: 'none' }} />
+          }} onClick={() => setColorExpression(current => current === e.expression ? null : e.expression)} />
           <span style={{
             flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             color: e.enabled ? 'var(--vscode-sideBar-foreground, #ccc)' : 'var(--vscode-descriptionForeground, #888)',
@@ -1072,6 +1073,26 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
             />
             <span style={{ fontSize: 9, color: 'var(--vscode-descriptionForeground, #888)' }}>/div</span>
           </div>
+          {colorExpression === e.expression && <div role="group" aria-label={`${e.expression} 颜色选择`}
+            onKeyDown={ev => { if (ev.key === 'Escape') setColorExpression(null); }}
+            style={{ width: '100%', padding: 6, boxSizing: 'border-box', borderRadius: 3,
+              background: 'var(--vscode-editorWidget-background, #252526)',
+              border: '1px solid var(--vscode-sideBar-border, #555)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6 }}>
+              <input type="color" value={e.color} aria-label={`${e.expression} 自定义颜色`}
+                onChange={ev => onSetColor(e.expression, ev.target.value)}
+                style={{ width: 27, height: 23, padding: 0, border: 'none', cursor: 'pointer', background: 'transparent' }} />
+              <span style={{ flex: 1, fontFamily: 'monospace', fontSize: 10 }}>{e.color.toUpperCase()}</span>
+              <button type="button" aria-label="关闭颜色选择" style={iconBtnStyle} onClick={() => setColorExpression(null)}>×</button>
+            </div>
+            <div aria-label="常用颜色" style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', gap: 5 }}>
+              {TIMELINE_COLORS.map(color => <button key={color} type="button" title={color}
+                aria-label={`使用颜色 ${color}`} aria-pressed={e.color.toUpperCase() === color}
+                onClick={() => onSetColor(e.expression, color)}
+                style={{ height: 18, minWidth: 0, padding: 0, borderRadius: 3, background: color, cursor: 'pointer',
+                  border: e.color.toUpperCase() === color ? '2px solid var(--vscode-focusBorder, #fff)' : '1px solid rgba(128,128,128,0.5)' }} />)}
+            </div>
+          </div>}
         </div>
       ))}
     </div>

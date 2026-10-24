@@ -61,7 +61,7 @@ describe('Timeline record and debug configuration isolation', () => {
   });
   it('inherits saved debug variables/colors and changes the entire left list on tab switch', async () => {
     const csv = await imported(); const live = debugStart();
-    expect((provider as any).activeId).toBe(csv.tab.id);
+    expect((provider as any).activeId).toBe(live.info.id);
     expect(live.view.entries[0].expression).toBe('live_motor'); expect(live.view.entries[0].color).toBe('#ABCDEF');
     await (provider as any).handleMessage({ command: 'selectTab', tabId: live.info.id });
     const active = state.messages.filter(m => m.command === 'activate').at(-1);
@@ -80,7 +80,8 @@ describe('Timeline record and debug configuration isolation', () => {
     const live = debugStart(); expect(live.view.entries[0].color).toBe('#ABCDEF');
   });
   it('records hidden live samples without appending or publishing into imported history', async () => {
-    const csv = await imported(); const live = debugStart(); state.messages = [];
+    const csv = await imported(); const live = debugStart();
+    await (provider as any).handleMessage({ command: 'selectTab', tabId: csv.tab.id }); state.messages = [];
     manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: 1700000000100, value: 5, display: '5' }] }]);
     expect(live.store.acceptedRows).toBe(1);
     expect((provider as any).tabs.get(csv.tab.id).store.acceptedRows).toBe(2);
@@ -110,6 +111,7 @@ describe('Timeline record and debug configuration isolation', () => {
   });
   it('rejects stale range replies after switching tabs before bounds or data are sent', async () => {
     const csv = await imported(); const live = debugStart();
+    await (provider as any).handleMessage({ command: 'selectTab', tabId: csv.tab.id });
     const tab = (provider as any).tabs.get(csv.tab.id);
     let resolve!: (value: any) => void;
     tab.store.query = () => new Promise(r => { resolve = r; });
@@ -117,6 +119,26 @@ describe('Timeline record and debug configuration isolation', () => {
     await (provider as any).handleMessage({ command: 'selectTab', tabId: live.info.id }); state.messages = [];
     resolve([]); await pending;
     expect(state.messages.filter(m => m.command === 'rangeSamples')).toHaveLength(0);
+  });
+  it('selects the latest debug record without revealing the Timeline panel, including while hidden', async () => {
+    const previous = debugStart();
+    state.terminate(state.session);
+    const show = vi.fn();
+    (provider as any).view.visible = false;
+    (provider as any).view.show = show;
+    state.messages = [];
+    const live = debugStart();
+    expect(previous.info.kind).toBe('history');
+    expect((provider as any).activeId).toBe(live.info.id);
+    expect(state.messages.filter(m => m.command === 'activate').at(-1)).toMatchObject({
+      tab: { id: live.info.id, kind: 'live' }, autoFollow: true,
+    });
+    expect(show).not.toHaveBeenCalled();
+    await (provider as any).handleMessage({ command: 'selectTab', tabId: previous.info.id });
+    state.messages = [];
+    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: 1700000000100, value: 5, display: '5' }] }]);
+    expect((provider as any).activeId).toBe(previous.info.id);
+    expect(state.messages.filter(m => m.command === 'activate')).toHaveLength(0);
   });
   it('discards unsaved records on reload while retaining debug variables and colors', async () => {
     const live = debugStart();

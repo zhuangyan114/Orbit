@@ -25,7 +25,7 @@ import type { TimelineTab } from '../../timeline/timeline-model';
 import { calculateBufferedRange } from './timeline-range';
 import { clampTimelineTimePerDiv, MAX_TIMELINE_TIME_PER_DIV_MS, parseTimelineTimePerDiv, TIMELINE_TIME_PRESETS_MS } from './timeline-time-scale';
 import { TIMELINE_SAMPLE_RATE_STALE_MS } from './timeline-sample-rate';
-import { TIMELINE_COLORS } from './timeline-colors';
+import { TimelineColorPicker } from './timeline-color-picker';
 
 type DataPoint = TimelineDataPoint;
 type SampleSnapshot = TimelineSampleSnapshot;
@@ -976,6 +976,24 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
 }) {
   const [pendingInputs, setPendingInputs] = useState<Record<string, string>>({});
   const [colorExpression, setColorExpression] = useState<string | null>(null);
+  const colorPickerRef = useRef<HTMLDivElement>(null);
+  const colorButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (colorExpression === null) return;
+    const dismissOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      // Let another color button switch pickers, and avoid moving rows before an outside click completes.
+      if (target instanceof Element && target.closest('[data-timeline-color-trigger]')) return;
+      if (!colorPickerRef.current?.contains(target) && !colorButtonRef.current?.contains(target)) setColorExpression(null);
+    };
+    const dismissEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setColorExpression(null); };
+    document.addEventListener('click', dismissOutside);
+    document.addEventListener('keydown', dismissEscape);
+    return () => {
+      document.removeEventListener('click', dismissOutside);
+      document.removeEventListener('keydown', dismissEscape);
+    };
+  }, [colorExpression]);
 
   const getDisplay = (e: Entry): string => {
     if (e.expression in pendingInputs) return pendingInputs[e.expression];
@@ -1020,6 +1038,8 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
             onChange={ev => onToggle(e.expression, ev.target.checked)}
             style={{ cursor: 'pointer', flexShrink: 0 }} />
           <button type="button" aria-label={`设置 ${e.expression} 颜色`}
+            data-timeline-color-trigger=""
+            ref={colorExpression === e.expression ? colorButtonRef : undefined}
             title="选择曲线颜色" aria-expanded={colorExpression === e.expression}
             style={{
             width: 16, height: 16, borderRadius: 3, cursor: 'pointer',
@@ -1073,25 +1093,13 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
             />
             <span style={{ fontSize: 9, color: 'var(--vscode-descriptionForeground, #888)' }}>/div</span>
           </div>
-          {colorExpression === e.expression && <div role="group" aria-label={`${e.expression} 颜色选择`}
-            onKeyDown={ev => { if (ev.key === 'Escape') setColorExpression(null); }}
+          {colorExpression === e.expression && <div ref={colorPickerRef} role="group" aria-label={`${e.expression} 颜色选择`}
             style={{ width: '100%', padding: 6, boxSizing: 'border-box', borderRadius: 3,
-              background: 'var(--vscode-editorWidget-background, #252526)',
-              border: '1px solid var(--vscode-sideBar-border, #555)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6 }}>
-              <input type="color" value={e.color} aria-label={`${e.expression} 自定义颜色`}
-                onChange={ev => onSetColor(e.expression, ev.target.value)}
-                style={{ width: 27, height: 23, padding: 0, border: 'none', cursor: 'pointer', background: 'transparent' }} />
-              <span style={{ flex: 1, fontFamily: 'monospace', fontSize: 10 }}>{e.color.toUpperCase()}</span>
-              <button type="button" aria-label="关闭颜色选择" style={iconBtnStyle} onClick={() => setColorExpression(null)}>×</button>
-            </div>
-            <div aria-label="常用颜色" style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', gap: 5 }}>
-              {TIMELINE_COLORS.map(color => <button key={color} type="button" title={color}
-                aria-label={`使用颜色 ${color}`} aria-pressed={e.color.toUpperCase() === color}
-                onClick={() => onSetColor(e.expression, color)}
-                style={{ height: 18, minWidth: 0, padding: 0, borderRadius: 3, background: color, cursor: 'pointer',
-                  border: e.color.toUpperCase() === color ? '2px solid var(--vscode-focusBorder, #fff)' : '1px solid rgba(128,128,128,0.5)' }} />)}
-            </div>
+              background: 'var(--vscode-editorWidget-background, var(--vscode-sideBar-background, #1e1e1e))',
+              color: 'var(--vscode-editorWidget-foreground, var(--vscode-foreground, #ccc))',
+              border: '1px solid var(--vscode-widget-border, var(--vscode-sideBar-border, #555))' }}>
+            <TimelineColorPicker expression={e.expression} color={e.color}
+              onChange={color => onSetColor(e.expression, color)} onClose={() => setColorExpression(null)} />
           </div>}
         </div>
       ))}

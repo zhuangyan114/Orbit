@@ -208,7 +208,11 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     if (live) {
       live.view.entries = entries; live.store!.syncChannels(entries);
       if (this.activeId === live.info.id) this.postMessage({ command: 'entries', entries, tabId: live.info.id, recordId: live.info.recordId });
-    } else { this.refreshTemplate(); if (this.activeId === 'debug-template') this.activateTab('debug-template'); }
+    } else {
+      this.refreshTemplate();
+      // Editing a template is an entries update, not a tab switch: activation remounts the picker.
+      if (this.activeId === 'debug-template') this.postMessage({ command: 'entries', entries, tabId: 'debug-template', recordId: '' });
+    }
     this.debugDefaults.entries = entries;
     void this.context.workspaceState.update(STATE_KEY, this.debugDefaults);
     void this.context.workspaceState.update('ozoneDataSamplingExpressions', entries.map(e => ({ expression: e.expression, color: e.color })));
@@ -378,6 +382,8 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       --error-fg: var(--vscode-errorForeground, #f48771);
       --description-fg: var(--vscode-descriptionForeground, #888888);
     }
+    body.vscode-dark, body.vscode-high-contrast { color-scheme: dark; }
+    body.vscode-light, body.vscode-high-contrast-light { color-scheme: light; }
     body { margin: 0; padding: 0; font-family: var(--vscode-font-family, sans-serif); background: var(--bg); color: var(--fg); font-size: 12px; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
     #root { height: 100%; display: flex; flex-direction: column; }
   </style>

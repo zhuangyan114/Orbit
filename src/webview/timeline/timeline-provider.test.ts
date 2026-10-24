@@ -41,6 +41,20 @@ async function imported() {
 function debugStart() { state.session = { id: 'new', name: '新调试', type: 'orbit' }; state.start(state.session); return (provider as any).tabs.get((provider as any).liveId); }
 
 describe('Timeline record and debug configuration isolation', () => {
+  it('updates template colors without reactivating and unmounting the color picker', async () => {
+    await (provider as any).handleMessage({ command: 'init' });
+    state.messages = [];
+    for (const color of ['#569CD6', '#123456', '#42D9F3']) {
+      await (provider as any).handleMessage({
+        command: 'setColor', tabId: 'debug-template', recordId: '', expression: 'live_motor', color,
+      });
+      expect(state.messages.filter(m => m.command === 'activate')).toHaveLength(0);
+      expect(state.messages.filter(m => m.command === 'entries').at(-1)).toMatchObject({
+        tabId: 'debug-template', recordId: '', entries: [expect.objectContaining({ expression: 'live_motor', color })],
+      });
+      expect(saved.get('ozoneDataSamplingExpressions')).toEqual([{ expression: 'live_motor', color }]);
+    }
+  });
   it('delivers real rangeSamples replies from an initially empty live record', async () => {
     const live = debugStart();
     const request = { command: 'loadRange', tabId: live.info.id, recordId: live.info.recordId, requestId: 1, generation: 1, resolutionKey: 1, targetBuckets: 20, start: 0, end: 20 };

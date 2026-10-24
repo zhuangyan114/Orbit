@@ -12,6 +12,7 @@ import {
 import { parseElf32LoadSegments } from '../ozone-backend/cmsis-dap-flasher';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
+import { ProbeTimelineSampler } from './probe-timeline-sampler';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
 import { normalizeDapLaunchConfig } from './dap-launch-config';
 import { parseConstantExpression } from '../utils/constant-expression';
@@ -295,8 +296,23 @@ export class DapSession extends EventEmitter {
   private dataSamplingIntervalMs = 0.2;
   private dataSamplingSendIntervalMs = 16;
   private dataSamplingNextSampleMs = 0;
+  /** Bumped by every sampling start/stop; stale async completions compare against it. */
+  private dataSamplingGeneration = 0;
   private readonly dataSamplingCommitMs = new BoundedMetric(8_192);
   private readonly dataSamplingCounts = { attempts: 0, gateDeferred: 0, readsCompleted: 0, samplesAccepted: 0, samplesSent: 0 };
+  /** XR-DAP probe-side Timeline sampling; inactive while this session polls from the host. */
+  private readonly probeSampler = new ProbeTimelineSampler({
+    execute: command => this.backend.execute(command),
+    nowMs: () => this.nowMs(),
+    timelineNowMs: hostMs => this.timelineNowMs(hostMs),
+    isTargetRunning: () => this.targetRunning,
+    beginTargetRead: () => this.beginTargetRead(),
+    endTargetRead: () => this.endTargetRead(),
+    accept: (value, timestamp) => this.acceptDataSample(value, timestamp, true),
+    fallBackToHost: () => this.scheduleDataSamplingLoop(),
+    counts: this.dataSamplingCounts,
+    commitMs: this.dataSamplingCommitMs,
+  });
   private dataSamplingSummaryAt = 0;
   private dataSamplingSummaryAccepted = 0;
   private dataSamplingSummarySent = 0;
@@ -1373,7 +1389,10 @@ export class DapSession extends EventEmitter {
           }
         }
 
-        if (this.rttStarted) {
+        // Host-polled Timeline sampling starves background RTT reads through the
+        // scheduler; probe-side sampling leaves the queue idle, so pause RTT
+        // explicitly rather than stopping the probe for every RTT read.
+        if (this.rttStarted && !this.probeSampler.active) {
           const readResult = await this.backend.execute({
             cmd: 'readRtt',
             bufferIndex: this.rttBufferIndex,
@@ -2042,7 +2061,9 @@ export class DapSession extends EventEmitter {
           ? 'CMSIS-DAP v2 / WinUSB'
           : connectedDevice?.transport === 'hid'
             ? 'CMSIS-DAP v1 / HID'
-            : `CMSIS-DAP / ${connectedDevice?.transport || '未知传输'}`;
+            : connectedDevice?.transport === 'tcp'
+              ? 'CMSIS-DAP / TCP'
+              : `CMSIS-DAP / ${connectedDevice?.transport || '未知传输'}`;
       }
       const deviceDetails = ownerKind === 'cmsis-dap'
         ? [connectedDevice?.product, connectedDevice?.serial ? `SN=${connectedDevice.serial}` : '']
@@ -4920,6 +4941,7 @@ export class DapSession extends EventEmitter {
       : (Array.isArray(args.expressions) ? args.expressions.map((expression: string) => ({ expression, color: '#4EC9B0' })) : []);
 
     this.stopDataSampling();
+    const generation = this.dataSamplingGeneration;
     if (entries.length === 0) {
       this.sendResponse(msg, { ok: true, planned: [] });
       return;
@@ -4952,21 +4974,36 @@ export class DapSession extends EventEmitter {
     }
     this.dataSamplingIntervalMs = this.clampNumber(args.sampleIntervalMs, 0.2, 0.1, 10000);
     this.dataSamplingSendIntervalMs = this.clampNumber(args.sendIntervalMs, 16, 1, 10000);
+
+    // An XR-DAP probe samples on its own clock; otherwise this session polls.
+    // A stop during any await above also stops the sampler.
+    const probeIntervalMs = args.probeSampling === false
+      ? null
+      : await this.probeSampler.start(specs, this.dataSamplingIntervalMs);
+    if (generation !== this.dataSamplingGeneration) {
+      this.sendResponse(msg, { ok: false, planned: plan }, false, 'Data sampling was stopped while starting');
+      return;
+    }
+    if (probeIntervalMs !== null) this.dataSamplingIntervalMs = probeIntervalMs;
+    const source = probeIntervalMs !== null ? 'probe' : 'host';
+
     const now = this.nowMs();
     this.dataSamplingNextSampleMs = now;
     this.dataSamplingActive = true;
     const rejected = plan.filter(item => !item.spec).map(item => item.expression);
     log.dap(
       `[timeline] start fast=${this.dataSamplingEntries.map(entry => entry.expression).join(',')}`
-      + ` rejected=${rejected.join(',') || 'none'} sampleMs=${this.dataSamplingIntervalMs} sendMs=${this.dataSamplingSendIntervalMs}`,
+      + ` rejected=${rejected.join(',') || 'none'} sampleMs=${this.dataSamplingIntervalMs} sendMs=${this.dataSamplingSendIntervalMs}`
+      + ` source=${source}`,
     );
     this.startDataSamplingFlushTimer();
-    this.scheduleDataSamplingLoop();
+    if (source === 'host') this.scheduleDataSamplingLoop();
     this.sendResponse(msg, {
       ok: true,
       planned: plan,
       activeExpressions: this.dataSamplingEntries.map(entry => entry.expression),
       intervalMs: this.dataSamplingIntervalMs,
+      source,
     });
   }
 
@@ -5045,34 +5082,43 @@ export class DapSession extends EventEmitter {
       const commitStartedAt = this.nowMs();
       const values = result.data as WatchValue[];
       const timestamp = this.timelineNowMs();
-      const gapThresholdMs = Math.max(
-        this.dataSamplingIntervalMs * 3,
-        this.dataSamplingSendIntervalMs * 2,
-      );
-      for (const value of values) {
-        if (!value || value.error) continue;
-        if (typeof value.value !== 'number' || !Number.isFinite(value.value)) continue;
-        const pending = this.dataSamplingPending.get(value.expression);
-        if (!pending) continue;
-        const lastTimestamp = this.dataSamplingLastTimestamp.get(value.expression);
-        const startsNewSegment = !this.dataSamplingSeenExpressions.has(value.expression)
-          || (lastTimestamp !== undefined && timestamp - lastTimestamp > gapThresholdMs);
-        pending.push({
-          timestamp,
-          value: value.value,
-          display: value.display,
-          ...(startsNewSegment ? { startsNewSegment: true } : {}),
-        });
-        this.dataSamplingCounts.samplesAccepted++;
-        this.dataSamplingSeenExpressions.add(value.expression);
-        this.dataSamplingLastTimestamp.set(value.expression, timestamp);
-        this.dataSamplingLastDisplay.set(value.expression, value.display);
-      }
+      for (const value of values) this.acceptDataSample(value, timestamp, false);
       this.dataSamplingCommitMs.record(this.nowMs() - commitStartedAt);
       return true;
     } finally {
       this.endTargetRead();
     }
+  }
+
+  /**
+   * Queues one sampled value for the next Timeline flush. With `monotonic`, a
+   * point earlier than the previous one is moved up to it: probe frames sampled
+   * just before a Timeline pause can be read after it, and the pause-adjusted
+   * clock would place them behind points already plotted.
+   */
+  private acceptDataSample(value: WatchValue, timestamp: number, monotonic: boolean) {
+    if (!value || value.error) return;
+    if (typeof value.value !== 'number' || !Number.isFinite(value.value)) return;
+    const pending = this.dataSamplingPending.get(value.expression);
+    if (!pending) return;
+    const gapThresholdMs = Math.max(
+      this.dataSamplingIntervalMs * 3,
+      this.dataSamplingSendIntervalMs * 2,
+    );
+    const lastTimestamp = this.dataSamplingLastTimestamp.get(value.expression);
+    if (monotonic && lastTimestamp !== undefined && timestamp < lastTimestamp) timestamp = lastTimestamp;
+    const startsNewSegment = !this.dataSamplingSeenExpressions.has(value.expression)
+      || (lastTimestamp !== undefined && timestamp - lastTimestamp > gapThresholdMs);
+    pending.push({
+      timestamp,
+      value: value.value,
+      display: value.display,
+      ...(startsNewSegment ? { startsNewSegment: true } : {}),
+    });
+    this.dataSamplingCounts.samplesAccepted++;
+    this.dataSamplingSeenExpressions.add(value.expression);
+    this.dataSamplingLastTimestamp.set(value.expression, timestamp);
+    this.dataSamplingLastDisplay.set(value.expression, value.display);
   }
 
   private flushDataSampling() {
@@ -5105,10 +5151,12 @@ export class DapSession extends EventEmitter {
 
   private stopDataSampling() {
     this.dataSamplingActive = false;
+    this.dataSamplingGeneration++;
     if (this.dataSamplingTimer) {
       clearImmediate(this.dataSamplingTimer);
       this.dataSamplingTimer = null;
     }
+    this.probeSampler.stop();
     if (this.dataSamplingSendTimer) {
       clearInterval(this.dataSamplingSendTimer);
       this.dataSamplingSendTimer = null;

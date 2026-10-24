@@ -202,13 +202,14 @@
               },
               "cmsisDapTransport": {
                 "type": "string",
-                "description": "CMSIS-DAP transport preference; auto prefers v2 WinUSB and falls back to HID",
+                "description": "CMSIS-DAP transport preference; auto prefers v2 WinUSB and falls back to HID; tcp connects to a network probe given by cmsisDapPath",
                 "enum": [
                   "auto",
                   "cmsis-dap-v2",
                   "cmsis-dap",
                   "hid",
-                  "winusb"
+                  "winusb",
+                  "tcp"
                 ],
                 "default": "auto"
               },
@@ -229,7 +230,7 @@
               },
               "cmsisDapPath": {
                 "type": "string",
-                "description": "Optional CMSIS-DAP device interface path selector",
+                "description": "Optional CMSIS-DAP device interface path selector; with cmsisDapTransport tcp, the probe address host or host:port (default port 3241)",
                 "default": ""
               },
               "cmsisDapFlashAlgorithmPath": {

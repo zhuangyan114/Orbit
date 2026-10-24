@@ -113,6 +113,26 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 `winusb` 与 `cmsis-dap-v2` 等价；显式选择 v2 时不会退到 HID。当前 v2 只读验收时钟为 1000 kHz，未执行 erase/program/verify；初次验证可使用 `flashBeforeDebug: false`。如果同时接着 J-Link，需要 `probe: "cmsis-dap"` 才能固定使用 DAPLink。
 
+#### 网络探针（TCP）
+
+`cmsisDapTransport: "tcp"` 通过 TCP 连接网络 CMSIS-DAP 探针，`cmsisDapPath` 填探针地址 `host` 或 `host:port`，不写端口时用 3241；IPv6 写成 `[addr]:port`。帧格式与 OpenOCD cmsis-dap 的 `tcp` 后端相同（`"DAP\0"` + 长度 + 类型的 8 字节帧头，后面是一个 CMSIS-DAP 包），所以也能连接实现了这种帧格式的其他探针或转发程序。`auto` 不会扫描网络，网络探针必须显式选 `tcp`。
+
+```jsonc
+"probe": "cmsis-dap",
+"cmsisDapTransport": "tcp",
+"cmsisDapPath": "192.168.0.108",
+"flashBeforeDebug": false
+```
+
+#### 探针端采样（XR-DAP）
+
+探针实现了 [XR-DAP](https://github.com/Jiu-xiao/XRDAP-ESP) 厂商扩展（CMSIS-DAP 厂商命令 0x80–0x85）时，Timeline 自动改由探针按固定周期读取变量：Orbit 把各通道的地址和指针链交给探针，探针用自己的定时器采样、打上微秒时间戳并缓存，Orbit 每 10 ms 批量取回。采样节拍和时间戳不受 USB/网络往返和电脑调度影响，Wi-Fi 下也能保持设定的采样率。连接时 helper 发一次 0x80 INFO 判断是否支持；不支持的探针（普通 DAPLink 等）照旧由电脑轮询，行为不变。USB、TCP 和 HID 都可用。
+
+- 探针采样期间，Watch 的标量读取和运行态查询改用厂商 READ 命令，不打断采样；单步、暂停、继续、断点、写变量、RTT 等其他请求由 helper 先停止采样、执行完再恢复，停止期间探针缓存里的帧保留。
+- 探针采样期间暂停 RTT 文本读取，停止采样后恢复；电脑轮询时 RTT 同样让位于 Timeline。
+- 探针估计跟不上 `orbit.timelineSampleIntervalMs` 时，helper 自动放宽到探针能保持的周期，Timeline 显示实际周期。
+- 当前固件每次最多 32 个通道、指针链偏移在 0–32767 字节内；超出时整组退回电脑轮询。
+
 CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`flashBeforeDebug: false` 完全跳过烧录（包括 Restart），仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
 
 当前 CMSIS-DAP 内置 Flash 目标：
@@ -228,10 +248,10 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 
 | `device` | string | `STM32F407VG` | 实际使用的目标设备名；J-Link 原样交给 DLL 与 `JLink.exe` 选型（必须是已安装 J-Link 软件认识的名称，例如 `STM32H723VG`），CMSIS-DAP 用于 Flash Algorithm 和芯片校验（走内置注册表）。 |
 | `deviceName` | string | 跟随 `device` | 兼容别名；通常无需填写，同时供外部 MCU Debug Views 使用。若只提供旧字段 `deviceName`，它也可顶替 `device`。 |
 | `probe` | `auto` / `jlink` / `cmsis-dap` | `auto` | 当前 session 的唯一物理 owner 类型。`auto` 先检测 J-Link、再检测 CMSIS-DAP；两者同时存在时固定选择 J-Link。 |
-| `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1。 |
+| `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` / `tcp` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1；`tcp` 连接 `cmsisDapPath` 指定的网络探针。 |
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。 |
 | `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。 |
-| `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。 |
+| `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选；`cmsisDapTransport: "tcp"` 时为探针地址 `host[:port]`，默认端口 3241。 |
 | `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、来源和许可已确认的 Flash Algorithm binary/manifest。 |
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF 路径；用于可选烧录、符号和 DWARF。 |
 | `svdFile` | path | 自动解析 | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径；显式值优先级最高。 |
@@ -362,6 +382,7 @@ Timeline 通道可以直接在 Timeline 中添加，也可以在 Watch 行的操
 - 采样率根据原始点的时间戳计算：每通道为有效相邻采样间隔数除以相应时间跨度，再取有统计值通道的平均，不把通道数相加。历史平均累计同一段内的间隔和持续时间，排除断段之间的暂停；视口、曲线开关和绘图降采样不改变整份记录的平均值。
 - 目标停止时不生成新的 Timeline 采样点；恢复运行后从新的实时读取继续，不回填停止期间的时间槽。
 - 活动 DAP session 使用 J-Link Native/Legacy 或 CMSIS-DAP 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
+- XR-DAP 探针由探针端定时采样（见 2.3 节“探针端采样”），时间戳来自探针时钟，换算到 Orbit 时间轴时误差约为半个往返时间；其他探针由电脑轮询。
 - 不是每个表达式都能进入快速采样计划。无法解析为当前快速采样格式的表达式会被计划拒绝，不应把它当作“曲线为零”。
 - `orbit.timelineSampleIntervalMs` 是目标采样目标，不是硬件保证的实际采样频率。
 - `orbit.timelineSendIntervalMs` 只控制发送到 Webview 的节奏，不等于目标采样间隔。

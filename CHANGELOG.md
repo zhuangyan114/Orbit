@@ -2,6 +2,11 @@
 
 按版本从新到旧排列。具体板卡、探针和验证范围以对应的[验收记录](docs/api/orbit-automation-hardware-acceptance.md)为准。
 
+## 未发布
+
+- CMSIS-DAP 新增 `cmsisDapTransport: "tcp"`：经 TCP 连接网络探针，`cmsisDapPath` 填 `host[:port]`（默认 3241），帧格式与 OpenOCD cmsis-dap `tcp` 后端相同。
+- Timeline 支持 XR-DAP 探针端采样：探针实现 XR-DAP 厂商扩展时由探针定时采样并带时间戳缓存，Orbit 批量取回；不支持的探针仍由电脑轮询。采样期间 Watch 标量读取和运行态查询不打断采样，控制命令由 helper 暂停并恢复采样。
+
 ## 1.1.7 — 2026-10-12
 
 - TIMELINE 在保存按钮右侧、坐标格上方显示整数 Hz，数值左边缘对齐坐标格，单位位置在四位数以内保持固定；悬停提示“实时采样率”。

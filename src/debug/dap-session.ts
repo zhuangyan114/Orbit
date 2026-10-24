@@ -191,6 +191,7 @@ export class DapSession extends EventEmitter {
   private seq = 1;
   private stopGeneration = 0;
   private pollTimer: NodeJS.Timeout | null = null;
+  private pollGeneration = 0;
   private connectionMonitorTimer: NodeJS.Timeout | null = null;
   private rttPollTimer: NodeJS.Timeout | null = null;
   private rttPollGeneration = 0;
@@ -1072,33 +1073,42 @@ export class DapSession extends EventEmitter {
 
   private startPolling() {
     this.stopPolling();
+    const generation = this.pollGeneration;
+    const isCurrentPoll = () => this.pollTimer !== null
+      && generation === this.pollGeneration && !this.isSessionTerminating();
     log.dap(`startPolling: started, ${this.watchExpressions.length} watch expressions`);
     const pollLoop = async () => {
-      if (this.pollTimer === null) return;
+      if (!isCurrentPoll()) return;
       try {
-        if (this.pollTimer === null) return;
-        const stateResult = await this.queryTargetState('run-poll');
-        if (stateResult.ok && stateResult.data === 'halted') {
-          this.markStoppedForUi();
-          this.sendEvent('stopped', {
-            reason: this.lastHaltReason,
-            threadId: 1,
-            allThreadsStopped: true,
-          });
-          this.stopPolling();
-          if (this.watchExpressions.length > 0) {
-            setTimeout(() => {
-              void this.readWatchExpressions(this.watchExpressions, false)
-                .then(results => this.sendWatchUpdate(results))
-                .catch(err => log.dap(`pollLoop: deferred watch read error ${err}`));
-            }, 150);
+        // Watch writes temporarily halt/run the target inside the control barrier.
+        // Neither that halt nor a state reply spanning control work is a UI stop.
+        if (!this.controlInProgress) {
+          const readEpoch = this.readCancelEpoch;
+          const stateResult = await this.queryTargetState('run-poll');
+          if (!isCurrentPoll()) return;
+          if (!this.controlInProgress && readEpoch === this.readCancelEpoch
+            && stateResult.ok && stateResult.data === 'halted') {
+            this.markStoppedForUi();
+            this.sendEvent('stopped', {
+              reason: this.lastHaltReason,
+              threadId: 1,
+              allThreadsStopped: true,
+            });
+            this.stopPolling();
+            if (this.watchExpressions.length > 0) {
+              setTimeout(() => {
+                void this.readWatchExpressions(this.watchExpressions, false)
+                  .then(results => this.sendWatchUpdate(results))
+                  .catch(err => log.dap(`pollLoop: deferred watch read error ${err}`));
+              }, 150);
+            }
+            return;
           }
-          return;
         }
       } catch (err) {
-        log.dap(`startPolling: error ${err}`);
+        if (isCurrentPoll()) log.dap(`startPolling: error ${err}`);
       }
-      if (this.pollTimer !== null) {
+      if (isCurrentPoll()) {
         this.pollTimer = setTimeout(pollLoop, 200);
       }
     };
@@ -1306,8 +1316,9 @@ export class DapSession extends EventEmitter {
   }
 
   private stopPolling() {
+    this.pollGeneration++;
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
   }

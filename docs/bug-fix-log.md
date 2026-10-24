@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### Bug：Watch 写入后 VS Code 误显示暂停并导致 Timeline 停采
+
+- **日期**: 2026-10-24
+- **问题描述**: 运行中修改 Watch 变量后，VS Code 调试 UI 显示暂停，Timeline 停止更新，但目标代码仍在运行、Watch 仍能刷新；按 F5 后恢复。
+- **根因分析**: `DapSession.startPolling()` 的 200 ms 状态轮询没有避开变量写入的 control 临界区，也没有校验异步响应的读取代次和轮询代次。后端 Watch 写入会临时 halt、写内存，再在 `finally` 中恢复运行；轮询若读到临时 `halted` 或收到跨控制操作的过期响应，就会误发 DAP `stopped`、将 `targetRunning` 设为 false 并停止轮询。CPU 已恢复运行时这份状态仍未恢复，Timeline 因依赖 `targetRunning` 而停采，强制实时 Watch 读取则仍可继续。旧轮询在停止、重启或 dispose 后晚到的响应也可能发布过期暂停状态。
+- **修改方案**: 控制操作期间跳过运行状态查询；查询返回后同时检查 control 状态、`readCancelEpoch`、`pollGeneration` 和会话终止状态。停止轮询时失效旧代次，阻止旧响应发布事件或重新创建定时器。保持现有 Watch 写入的安全停核/恢复流程、单 owner 和控制屏障；真正的断点或恢复运行失败仍由后续有效轮询上报暂停。
+- **涉及文件**: `src/debug/dap-session.ts:194,1074,1318` - 轮询代次、控制临界区与异步结果校验；`src/debug/dap-session-run-poll.test.ts:72` - 15 项写入与轮询竞态、错误和生命周期回归。
+- **验证结果**: 自动化使用实际 `OzoneBackend` Watch 写入逻辑和模拟目标访问，修复前最初 10 项测试有 9 项失败，复现“目标 running、UI 暂停、Watch 可读、Timeline 无新点”；修复后新增 15 项测试全部通过，全量 Vitest 75 文件、1062 项通过、1 项跳过。类型检查、扩展/native 构建、CMSIS-DAP mock/Flash Algorithm 校验、J-Link mock、CMSIS-DAP helper selftest（200/200）及差异检查通过。用户明确授权写入日志并提交；**尚未执行已安装扩展与真实硬件验收**，不将自动化复现和 mock 通过视为真机验证。
+
 ### Bug：CMSIS-DAP 调试 STM32F407IG 时 128 KiB 扇区擦除被误判为 RAM 布局非法
 
 - **日期**: 2026-10-02

@@ -13,6 +13,9 @@ import { TimelineRecordStore } from '../../timeline/timeline-store';
 import { TimelineTemporaryCache } from '../../timeline/timeline-cache';
 import { log } from '../../utils/logger';
 import { TimelineSampleRate } from './timeline-sample-rate';
+import { loadActiveSymbolCatalog } from '../../debug-providers/symbol-catalog-loader';
+import type { SymbolCatalog } from '../../symbols/symbol-catalog';
+import type { SymbolPickerPanel } from '../../debug-providers/symbol-picker-panel';
 
 const STATE_KEY = 'ozoneTimelineState';
 interface RecordTab { info: TimelineTab; store?: TimelineRecordStore; view: TimelineViewState; session?: vscode.DebugSession; archiveDirectory?: string; revision: number; queryGeneration?: number; sampleRate?: TimelineSampleRate; }
@@ -36,7 +39,9 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   private lifetimeAbort = new AbortController();
   private storageSummaryAt = 0;
 
-  constructor(private context: vscode.ExtensionContext, private sampleManager: DataSamplingManager) {
+  constructor(private context: vscode.ExtensionContext, private sampleManager: DataSamplingManager,
+    private canUseDapSession: (session: vscode.DebugSession) => boolean = () => true,
+    private symbolPicker?: SymbolPickerPanel) {
     const saved = context.workspaceState.get<TimelineViewState>(STATE_KEY);
     this.debugDefaults = saved && validTimelineView(saved) ? structuredClone(saved) : structuredClone(DEFAULT_TIMELINE_VIEW);
     this.directory = this.cache.directory;
@@ -101,6 +106,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     const ending = tab.store.end();
     this.finalizers.add(ending);
     void ending.then(() => { this.finalizers.delete(ending); tab.info.incomplete = !tab.store!.meta.complete; tab.info.error = tab.store!.error; this.postTabs(); });
+    this.refreshTemplate();
     this.postTabs();
     this.postMessage({ command: 'sampleRate', tabId: tab.info.id, recordId: tab.info.recordId, averageSampleRateHz: tab.store.getAverageSampleRateHz() });
   }
@@ -149,6 +155,21 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (tab.info.id !== this.activeId) return;
+    if (msg.command === 'openSymbolPicker') {
+      await this.openSymbolPicker(tab);
+      return;
+    }
+    if (msg.command === 'addExpressions' && Array.isArray(msg.expressions)) {
+      if (this.isDebugTab(tab)) {
+        this.sampleManager.addExpressions(msg.expressions.filter((expression: unknown): expression is string => typeof expression === 'string' && expression.length <= 4096));
+        this.refreshEntries();
+        return;
+      }
+      for (const expression of new Set(msg.expressions)) {
+        await this.handleMessage({ ...msg, command: 'addExpression', expression });
+      }
+      return;
+    }
     switch (msg.command) {
       case 'loadRange': await this.sendRange(tab, msg); break;
       case 'measure': {
@@ -201,6 +222,42 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
   private isDebugTab(tab: RecordTab) { return tab.info.kind === 'live' || tab.info.kind === 'template'; }
+  private recordedSymbolCatalog(tab: RecordTab): SymbolCatalog {
+    return { source: 'recording',
+      roots: [...new Map((tab.store?.channels || []).map(channel => [channel.expression, channel])).values()]
+        .map(channel => ({ id: `channel-${channel.id}`, expression: channel.expression, file: '当前记录', size: 0, typeOffset: 'recorded', pointerDepth: 0 })),
+      types: { recorded: { name: '已记录数值', kind: 'recorded', byteSize: 0 } },
+    };
+  }
+  private async openSymbolPicker(tab: RecordTab) {
+    const revision = tab.revision;
+    const debug = this.isDebugTab(tab);
+    await this.symbolPicker?.open({
+      mode: 'timeline', title: `选择变量 → Timeline · ${tab.info.name}`,
+      existing: tab.view.entries.filter(entry => debug || entry.enabled).map(entry => entry.expression),
+      loadCatalog: () => debug ? loadActiveSymbolCatalog(this.canUseDapSession) : Promise.resolve(this.recordedSymbolCatalog(tab)),
+      canOpen: () => !this.disposed && tab.revision === revision && this.tabs.get(tab.info.id) === tab && tab.info.id === this.activeId,
+      commit: (expressions, removedExpressions = []) => {
+        if (this.disposed) return;
+        if (debug) {
+          // Apply one sampling update; debug defaults outlive an archived recording.
+          this.sampleManager.updateExpressions(expressions, removedExpressions); this.refreshEntries();
+          return;
+        }
+        if (this.tabs.get(tab.info.id) !== tab) return;
+        const removed = new Set(removedExpressions);
+        for (const entry of tab.view.entries) if (removed.has(entry.expression)) entry.enabled = false;
+        for (const expression of expressions) {
+          const channel = [...(tab.store?.channels || [])].reverse().find(item => item.expression === expression);
+          if (!channel) continue;
+          const entry = tab.view.entries.find(item => item.expression === expression);
+          if (entry) entry.enabled = true;
+          else tab.view.entries.push(createTimelineEntry({ ...channel, enabled: true }));
+        }
+        if (tab.info.id === this.activeId) this.postMessage({ command: 'entries', entries: tab.view.entries, tabId: tab.info.id, recordId: tab.info.recordId });
+      },
+    });
+  }
   private beginFreshRecord(session?: vscode.DebugSession) { this.finishLive(); this.activeId = 'debug-template'; this.beginRecord(session); }
   refreshEntries() {
     const live = this.liveId ? this.tabs.get(this.liveId) : undefined;

@@ -7,6 +7,7 @@ import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { SvdBackgroundDownloader } from './debug/svd-background-downloader';
 import { findElfFiles } from './ozone-backend/flasher';
+import { SymbolPickerPanel } from './debug-providers/symbol-picker-panel';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
 import { AutomationApiLifecycle } from './plugin-api/automation-api-lifecycle';
 import { EventHub } from './plugin-api/event-hub';
@@ -136,7 +137,9 @@ export async function activate(context: vscode.ExtensionContext) {
     const wp = new WatchProvider();
     watchProvider = wp;
 
-    const wvp = new WatchWebviewProvider(context, backend, isUsableWatchSession);
+    const symbolPicker = new SymbolPickerPanel(context);
+    context.subscriptions.push(symbolPicker);
+    const wvp = new WatchWebviewProvider(context, backend, isUsableWatchSession, symbolPicker);
     watchWebviewProvider = wvp;
     wvp.onExpressionsChanged = (exprs) => {
       wp.setExpressions(exprs);
@@ -160,7 +163,7 @@ export async function activate(context: vscode.ExtensionContext) {
       try { dsm.setExpressions(dsSaved); } catch { dsm.setExpressions([]); }
     }
 
-    const tl = new TimelineWebviewProvider(context, dsm);
+    const tl = new TimelineWebviewProvider(context, dsm, isUsableWatchSession, symbolPicker);
     timelineProvider = tl;
 
     // Bounded automation event ring and the exact DebugSession registry with

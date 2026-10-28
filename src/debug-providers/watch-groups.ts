@@ -33,6 +33,7 @@ export class WatchGroups {
       ? candidate!.activeId! : groups[0].id };
   }
   get active(): WatchGroup { return this.state.groups.find(group => group.id === this.state.activeId)!; }
+  contains(group: WatchGroup): boolean { return this.state.groups.includes(group); }
   snapshot(): WatchGroupsState { return structuredClone(this.state); }
   select(id: string): boolean {
     if (id === this.state.activeId || !this.state.groups.some(group => group.id === id)) return false;

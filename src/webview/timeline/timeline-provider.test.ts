@@ -16,7 +16,7 @@ vi.mock('vscode', () => ({
 }));
 import { TimelineWebviewProvider } from './timeline-provider';
 
-let base: string, provider: TimelineWebviewProvider, manager: any, saved: Map<string, any>;
+let base: string, provider: TimelineWebviewProvider, manager: any, saved: Map<string, any>, picker: any;
 beforeEach(async () => {
   base = await fs.mkdtemp(path.join(os.tmpdir(), 'orbit-tabs-'));
   state.messages = []; state.session = undefined; state.warning.mockReset();
@@ -25,7 +25,8 @@ beforeEach(async () => {
   saved = new Map([['ozoneTimelineState', { ...DEFAULT_TIMELINE_VIEW, entries: [createTimelineEntry({ expression: 'live_motor', color: '#ABCDEF', yPerDiv: 20 })] }]]);
   manager = { entriesList: [{ expression: 'live_motor', color: '#123456', enabled: true }], setColor: vi.fn((expression: string, color: string) => { manager.entriesList.find((e: any) => e.expression === expression).color = color; }), setExpressions: vi.fn((entries: any[]) => { manager.entriesList = entries.map(e => ({ ...e, enabled: true })); }), setRetainHistory: vi.fn(), clearData: vi.fn(), setOnSamples: (cb: any) => { manager.samples = cb; }, addExpression: vi.fn(), removeExpression: vi.fn(), toggleExpression: vi.fn() };
   const context = { workspaceState: { get: (key: string) => saved.get(key), update: async (key: string, value: any) => { saved.set(key, structuredClone(value)); } }, globalStorageUri: { fsPath: base }, subscriptions: [], extensionUri: '' };
-  provider = new TimelineWebviewProvider(context as any, manager);
+  picker = { open: vi.fn(async () => {}) };
+  provider = new TimelineWebviewProvider(context as any, manager, undefined, picker);
   (provider as any).view = { visible: true, webview: { postMessage: (msg: any) => state.messages.push(structuredClone(msg)) } };
 });
 afterEach(async () => { vi.useRealTimers(); await provider.dispose(); await fs.rm(base, { recursive: true, force: true }); });
@@ -41,6 +42,70 @@ async function imported() {
 function debugStart() { state.session = { id: 'new', name: '新调试', type: 'orbit' }; state.start(state.session); return (provider as any).tabs.get((provider as any).liveId); }
 
 describe('Timeline record and debug configuration isolation', () => {
+  it('submits a live symbol multi-selection to the sampler as one batch', async () => {
+    manager.addExpressions = vi.fn();
+    await (provider as any).handleMessage({ command: 'addExpressions', tabId: 'debug-template', recordId: '', expressions: ['speed', 'count', null] });
+    expect(manager.addExpressions).toHaveBeenCalledOnce();
+    expect(manager.addExpressions).toHaveBeenCalledWith(['speed', 'count']);
+    expect(manager.addExpression).not.toHaveBeenCalled();
+  });
+  it('browses recorded channels without a live DAP session or changing the sampler', async () => {
+    const live = debugStart();
+    state.terminate(state.session); state.session = undefined;
+    state.messages = [];
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: live.info.id, recordId: live.info.recordId });
+    const request = picker.open.mock.calls[0][0];
+    expect(await request.loadCatalog()).toMatchObject({
+      source: 'recording', roots: [expect.objectContaining({ expression: 'live_motor', file: '当前记录' })],
+    });
+    expect(manager.entriesList.map((entry: any) => entry.expression)).toEqual(['live_motor']);
+  });
+  it('cancels pending shared picker opening after tab reactivation', async () => {
+    const live = debugStart();
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: live.info.id, recordId: live.info.recordId });
+    const request = picker.open.mock.calls[0][0];
+    expect(request.canOpen()).toBe(true);
+    await (provider as any).handleMessage({ command: 'selectTab', tabId: live.info.id });
+    expect(request.canOpen()).toBe(false);
+  });
+  it('keeps an offline debug template available after stop and preserves its new selection outside the archived record', async () => {
+    const live = debugStart();
+    manager.updateExpressions = vi.fn();
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: live.info.id, recordId: live.info.recordId });
+    const request = picker.open.mock.calls[0][0];
+    state.terminate(state.session); state.session = undefined;
+    expect((provider as any).tabs.has('debug-template')).toBe(true);
+    request.commit(['next_session_variable']);
+    expect(manager.updateExpressions).toHaveBeenCalledWith(['next_session_variable'], []);
+    expect(live.view.entries.map((entry: any) => entry.expression)).toEqual(['live_motor']);
+  });
+  it('applies picker additions and removals in one sampler batch and refreshes saved debug entries', async () => {
+    manager.updateExpressions = vi.fn((additions: string[], removals: string[]) => {
+      manager.entriesList = manager.entriesList.filter((entry: any) => !removals.includes(entry.expression));
+      manager.entriesList.push(...additions.map(expression => ({ expression, enabled: true, color: '#123456' })));
+    });
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: 'debug-template', recordId: '' });
+    picker.open.mock.calls[0][0].commit(['speed'], ['live_motor']);
+    expect(manager.updateExpressions).toHaveBeenCalledOnce();
+    expect(manager.updateExpressions).toHaveBeenCalledWith(['speed'], ['live_motor']);
+    expect(saved.get('ozoneDataSamplingExpressions').map((entry: any) => entry.expression)).toEqual(['speed']);
+    expect(manager.removeExpression).not.toHaveBeenCalled(); expect(manager.setExpressions).toHaveBeenCalledTimes(1);
+  });
+  it('hides unchecked historical channels without deleting recorded data or changing the sampler', async () => {
+    const csv = await imported();
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: csv.tab.id, recordId: csv.tab.recordId });
+    const request = picker.open.mock.calls[0][0];
+    expect(request.existing).toEqual(['csv_voltage']); request.commit([], ['csv_voltage']);
+    const tab = (provider as any).tabs.get(csv.tab.id);
+    expect(tab.view.entries[0]).toMatchObject({ expression: 'csv_voltage', enabled: false, color: '#FF0000', yPerDiv: 5 });
+    expect(tab.store.channels).toHaveLength(1); expect(tab.store.acceptedRows).toBe(2);
+    expect(state.messages.filter(m => m.command === 'entries').at(-1).entries[0].enabled).toBe(false);
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: csv.tab.id, recordId: csv.tab.recordId });
+    const reopened = picker.open.mock.calls[1][0]; expect(reopened.existing).toEqual([]);
+    reopened.commit(['csv_voltage']); expect(tab.view.entries[0].enabled).toBe(true);
+    expect(manager.removeExpression).not.toHaveBeenCalled(); expect(manager.addExpression).not.toHaveBeenCalled();
+    expect(manager.setExpressions).toHaveBeenCalledTimes(1);
+  });
   it('updates template colors without reactivating and unmounting the color picker', async () => {
     await (provider as any).handleMessage({ command: 'init' });
     state.messages = [];

@@ -25,14 +25,72 @@ function createProvider(isCurrentSession: (session: any) => boolean = () => true
     },
   } as any;
   const backend = { hasTargetConnection: false, execute: vi.fn() } as unknown as OzoneBackend;
-  const provider = new WatchWebviewProvider(context, backend, isCurrentSession);
+  const picker = { open: vi.fn(async () => {}) };
+  const provider = new WatchWebviewProvider(context, backend, isCurrentSession, picker as any);
   (provider as any).view = { webview: { postMessage } };
-  return { provider, postMessage, saved, context, backend };
+  return { provider, postMessage, saved, context, backend, picker };
 }
 
 afterEach(() => { vscodeState.activeDebugSession = undefined; });
 
 describe('WatchWebviewProvider groups', () => {
+  it('adds a symbol selection as one group update without dropping later items', () => {
+    const { provider } = createProvider();
+    const changed = vi.fn(); provider.onExpressionsChanged = changed;
+    (provider as any).handleMessage({ command: 'addExpressions', expressions: ['motor', 'motor.speed', 'motor', ' counter中文 '],
+      groupId: provider.activeGroupId, watchGeneration: provider.generation });
+    expect(provider.expressionList).toEqual(['motor', 'motor.speed', 'counter']);
+    expect(changed).toHaveBeenCalledOnce();
+    expect(provider.generation).toBe(1);
+  });
+  it('cancels a pending picker opening after switching groups, and commits visible selections into their original group', async () => {
+    const { provider, picker, saved } = createProvider();
+    await (provider as any).openSymbolPicker();
+    const request = (picker.open.mock.calls as any)[0][0];
+    expect(request.canOpen()).toBe(true);
+    provider.addGroup();
+    expect(request.canOpen()).toBe(false);
+    request.commit(['speed', 'count']);
+    expect(provider.expressionList).toEqual([]);
+    expect((saved.get('ozoneWatchGroups') as any).groups[0].expressions).toEqual(['speed', 'count']);
+    provider.selectGroup('watch1');
+    expect(provider.expressionList).toEqual(['speed', 'count']);
+  });
+  it('does not revive a deleted Watch group or add its selections into a reused group id', async () => {
+    const { provider, picker } = createProvider();
+    await (provider as any).openSymbolPicker();
+    const request = (picker.open.mock.calls as any)[0][0];
+    provider.addGroup(); provider.removeGroup('watch1'); provider.addGroup();
+    expect(provider.activeGroupId).toBe('watch1');
+    request.commit(['old']); expect(provider.expressionList).toEqual([]);
+  });
+  it('reopens the global picker with saved variables already checked', async () => {
+    const { provider, picker } = createProvider();
+    await (provider as any).openSymbolPicker();
+    (picker.open.mock.calls as any)[0][0].commit(['speed']);
+    await (provider as any).openSymbolPicker();
+    expect((picker.open.mock.calls as any)[1][0].existing).toEqual(['speed']);
+  });
+  it('applies additions and unchecked existing variables once and preserves variables absent from the catalog', async () => {
+    const { provider, picker, saved } = createProvider(undefined, { ozoneWatchExpressions: ['old', 'manual + 1'] });
+    await (provider as any).openSymbolPicker();
+    const changed = vi.fn(); provider.onExpressionsChanged = changed;
+    (picker.open.mock.calls as any)[0][0].commit(['new'], ['old']);
+    expect(provider.expressionList).toEqual(['manual + 1', 'new']);
+    expect(saved.get('ozoneWatchExpressions')).toEqual(['manual + 1', 'new']);
+    expect(changed).toHaveBeenCalledOnce(); expect(changed).toHaveBeenCalledWith(['manual + 1', 'new']);
+    await (provider as any).openSymbolPicker();
+    expect((picker.open.mock.calls as any)[1][0].existing).toEqual(['manual + 1', 'new']);
+  });
+  it('applies deselection only to the original Watch group after switching groups', async () => {
+    const { provider, picker, saved } = createProvider(undefined, { ozoneWatchExpressions: ['old', 'keep'] });
+    await (provider as any).openSymbolPicker();
+    provider.addGroup(); provider.addExpression('old');
+    const changed = vi.fn(); provider.onExpressionsChanged = changed;
+    (picker.open.mock.calls as any)[0][0].commit([], ['old']);
+    expect(provider.expressionList).toEqual(['old']); expect(changed).not.toHaveBeenCalled();
+    expect((saved.get('ozoneWatchGroups') as any).groups[0].expressions).toEqual(['keep']);
+  });
   it('renames only the label without resetting values, selection or polling generation', () => {
     const { provider, postMessage, saved } = createProvider();
     provider.addExpression('counter');

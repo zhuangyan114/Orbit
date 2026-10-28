@@ -23,6 +23,22 @@ describe('Timeline automatic colors', () => {
     return new DataSamplingManager({ hasTargetConnection: false, execute: vi.fn() } as any);
   }
 
+  it('adds a multi-selection with one sampling reconfiguration and preserves existing data', () => {
+    const manager = fixture();
+    try {
+      manager.addExpression('existing');
+      const points = manager.getAllData('existing'); points.push({ timestamp: 10, value: 3, display: '3' });
+      const sync = vi.spyOn(manager as any, 'syncSamplingMode');
+      const changed = vi.fn(); manager.onExpressionsChanged = changed;
+      manager.addExpressions(['a', 'b', 'a', 'existing', ' 中文 ']);
+      expect(manager.expressionList).toEqual(['existing', 'a', 'b']);
+      expect(manager.getAllData('existing')).toBe(points);
+      expect(manager.getAllData('existing')).toHaveLength(1);
+      expect(sync).toHaveBeenCalledOnce();
+      expect(changed).toHaveBeenCalledOnce();
+    } finally { manager.dispose(); }
+  });
+
   it('avoids a restored custom color that is close to the old first palette color', () => {
     const manager = fixture();
     try {
@@ -30,6 +46,27 @@ describe('Timeline automatic colors', () => {
       manager.addExpression('new');
       expect(manager.entriesList[0].color).toBe('#4ec9af');
       expect(manager.entriesList[1].color.toUpperCase()).not.toBe('#4EC9B0');
+    } finally { manager.dispose(); }
+  });
+  it('applies picker additions and removals in one sampling update without clearing retained points or colors', () => {
+    const manager = fixture();
+    try {
+      manager.addExpressions(['remove', 'keep']);
+      manager.setColor('keep', '#123456'); manager.toggleExpression('keep', false);
+      const points = manager.getAllData('keep'); points.push({ timestamp: 10, value: 3, display: '3' });
+      const sync = vi.spyOn(manager as any, 'syncSamplingMode');
+      const changed = vi.fn(); manager.onExpressionsChanged = changed;
+      manager.updateExpressions(['new', 'new'], ['remove']);
+      expect(manager.expressionList).toEqual(['keep', 'new']);
+      expect(manager.getAllData('keep')).toBe(points); expect(manager.getAllData('keep')).toHaveLength(1);
+      expect(manager.entriesList[0]).toMatchObject({ expression: 'keep', color: '#123456', enabled: false });
+      expect((manager as any).dataMap.has('remove')).toBe(false);
+      expect((manager as any).pendingMap.has('remove')).toBe(false);
+      expect(sync).toHaveBeenCalledOnce(); expect(changed).toHaveBeenCalledOnce();
+      manager.updateExpressions([], ['keep', 'new']);
+      expect(manager.expressionList).toEqual([]); expect(sync).toHaveBeenCalledTimes(2);
+      manager.updateExpressions([], ['missing']);
+      expect(sync).toHaveBeenCalledTimes(2);
     } finally { manager.dispose(); }
   });
 
@@ -69,6 +106,24 @@ describe('Timeline sampling rejection feedback', () => {
     const manager = new DataSamplingManager(backend as any);
     return { backend, session, manager };
   }
+
+  it('routes a picker delta through one DAP sampling request and stops sampling when the last entry is removed', async () => {
+    const { manager, session, backend } = fixture(vi.fn(async () => ({ ok: true })));
+    try {
+      manager.addExpressions(['old', 'keep']); await Promise.resolve();
+      session.customRequest.mockClear();
+      manager.updateExpressions(['new'], ['old']); await Promise.resolve();
+      expect(session.customRequest).toHaveBeenCalledOnce();
+      expect(session.customRequest).toHaveBeenCalledWith('dataSamplingStart', expect.objectContaining({
+        entries: [expect.objectContaining({ expression: 'keep' }), expect.objectContaining({ expression: 'new' })],
+      }));
+      session.customRequest.mockClear();
+      manager.updateExpressions([], ['keep', 'new']); await Promise.resolve();
+      expect(session.customRequest).toHaveBeenCalledOnce();
+      expect(session.customRequest).toHaveBeenCalledWith('dataSamplingStop', {});
+      expect(backend.execute).not.toHaveBeenCalled();
+    } finally { manager.dispose(); }
+  });
 
   it('reports rejected expressions while keeping the supported remote sampler active', async () => {
     const { manager, session, backend } = fixture(vi.fn(async () => ({

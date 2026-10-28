@@ -151,7 +151,7 @@ export function WatchApp() {
 
   const addWatch = () => {
     const expr = stripHanCharacters(newExpr).trim();
-    if (!expr) return;
+    if (!expr) { postGroupMessage({ command: 'openSymbolPicker' }); return; }
     postGroupMessage({ command: 'addExpression', expression: expr });
     setNewExpr('');
   };
@@ -357,9 +357,9 @@ export function WatchApp() {
       <div style={{ display: 'flex', gap: '4px', padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
         <input value={newExpr} onChange={e => setNewExpr(stripHanCharacters(e.target.value))}
           onKeyDown={e => { if (e.key === 'Enter') addWatch(); }}
-          placeholder="变量名或表达式"
-          style={{ flex: 1, ...inputStyle }} />
-        <button aria-label="添加监视变量" onClick={addWatch} style={btnStyle}>+</button>
+          placeholder="变量名或表达式（留空选择）"
+          style={{ flex: 1, minWidth: 0, ...inputStyle }} />
+        <button aria-label="添加监视变量" title="添加变量；留空打开变量选择" onClick={addWatch} style={btnStyle}>+</button>
       </div>
 
       {watches.length > 0 && (
@@ -381,7 +381,7 @@ export function WatchApp() {
       <div style={{ flex: 1, overflow: 'auto' }}>
         {watches.length === 0 ? (
           <div style={{ opacity: 0.5, textAlign: 'center', padding: '20px', color: 'var(--vscode-descriptionForeground, #888)' }}>
-            输入变量名后点击 + 添加监视
+            点击 + 选择变量，或输入表达式后添加
           </div>
         ) : (
           watches.map((w, i) => renderRow(w, String(i), 0))

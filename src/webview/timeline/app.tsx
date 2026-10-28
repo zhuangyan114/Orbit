@@ -26,6 +26,8 @@ import { calculateBufferedRange } from './timeline-range';
 import { clampTimelineTimePerDiv, MAX_TIMELINE_TIME_PER_DIV_MS, parseTimelineTimePerDiv, TIMELINE_TIME_PRESETS_MS } from './timeline-time-scale';
 import { TIMELINE_SAMPLE_RATE_STALE_MS } from './timeline-sample-rate';
 import { TimelineColorPicker } from './timeline-color-picker';
+import { stripHanCharacters } from '../../utils/watch-expression-validation';
+import { readTimelineTheme } from './timeline-theme';
 
 type DataPoint = TimelineDataPoint;
 type SampleSnapshot = TimelineSampleSnapshot;
@@ -108,6 +110,15 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
   timePerDivRef.current = timePerDiv;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [renderTick, setRenderTick] = useState(0);
+  const themeRef = useRef<ReturnType<typeof readTimelineTheme> | null>(null);
+  useEffect(() => {
+    const refresh = () => { themeRef.current = readTimelineTheme(); setRenderTick(value => value + 1); };
+    refresh();
+    const observer = new MutationObserver(refresh);
+    observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'style', 'data-vscode-color-theme'] });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+    return () => observer.disconnect();
+  }, []);
   const [newExpr, setNewExpr] = useState('');
   const [autoFollow, setAutoFollow] = useState(boot.autoFollow ?? true);
   const autoFollowRef = useRef(boot.autoFollow ?? true);
@@ -381,7 +392,8 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     const active = entries.filter(e => e.enabled);
 
     // -- grid background --
-    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    const theme = themeRef.current ?? readTimelineTheme();
+    ctx.fillStyle = theme.background;
     ctx.fillRect(margin.left, margin.top, plotW, plotH);
 
     const centerX = margin.left + divW * (H_DIV / 2);
@@ -390,7 +402,8 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     const drawSubLines = (start: number, len: number, step: number, isHorizontal: boolean) => {
       for (let i = 1; i < step; i++) {
         const offset = len / step * i;
-        ctx.strokeStyle = 'rgba(128,128,128,0.06)';
+        ctx.strokeStyle = theme.grid;
+        ctx.globalAlpha = theme.highContrast ? 0.4 : 0.12;
         ctx.lineWidth = 1;
         ctx.beginPath();
         if (isHorizontal) {
@@ -401,6 +414,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
           ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH);
         }
         ctx.stroke();
+        ctx.globalAlpha = 1;
       }
     };
 
@@ -409,7 +423,8 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     for (let i = 0; i < V_DIV; i++) drawSubLines(margin.top + divH * i, divH, SUB_DIV, true);
 
     // division grid lines (more visible)
-    ctx.strokeStyle = 'rgba(128,128,128,0.4)';
+    ctx.strokeStyle = theme.grid;
+    ctx.globalAlpha = theme.highContrast ? 1 : 0.6;
     ctx.lineWidth = 0.5;
     for (let i = 0; i <= H_DIV; i++) {
       const x = margin.left + divW * i;
@@ -423,13 +438,14 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     }
 
     // center axes (thicker, brighter)
-    ctx.strokeStyle = 'rgba(200,200,200,0.6)';
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = theme.label;
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(margin.left, centerY); ctx.lineTo(margin.left + plotW, centerY); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(centerX, margin.top); ctx.lineTo(centerX, margin.top + plotH); ctx.stroke();
 
     // -- X-axis labels (centered on horizontal axis, shifted down) --
-    ctx.fillStyle = '#999';
+    ctx.fillStyle = theme.label;
     ctx.font = '10px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
@@ -486,7 +502,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
       if (time === null) continue;
       const x = margin.left + (time - tStart) / (tEnd - tStart) * plotW;
       if (x < margin.left || x > margin.left + plotW) continue;
-      ctx.save(); ctx.strokeStyle = label === 'A' ? '#FFD166' : '#79C0FF'; ctx.fillStyle = ctx.strokeStyle;
+      ctx.save(); ctx.strokeStyle = label === 'A' ? theme.cursorA : theme.cursorB; ctx.fillStyle = ctx.strokeStyle;
       ctx.lineWidth = 1.5; ctx.setLineDash([6, 3]); ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH); ctx.stroke();
       ctx.font = 'bold 12px sans-serif'; ctx.fillText(label, x + 4, margin.top + 12); ctx.restore();
     }
@@ -500,15 +516,15 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
         const label = 'Δt = ' + (distance >= 1000 ? (distance / 1000).toFixed(3) + ' s' : distance.toFixed(3) + ' ms');
         const y = margin.top + 34;
         ctx.save();
-        ctx.strokeStyle = 'rgba(220,220,220,0.8)'; ctx.lineWidth = 1; ctx.setLineDash([]);
+        ctx.strokeStyle = theme.foreground; ctx.lineWidth = 1; ctx.setLineDash([]);
         ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y);
         ctx.moveTo(x1, y - 4); ctx.lineTo(x1, y + 4);
         ctx.moveTo(x2, y - 4); ctx.lineTo(x2, y + 4); ctx.stroke();
         ctx.font = '11px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
         const halfWidth = ctx.measureText(label).width / 2 + 6;
         const center = Math.max(margin.left + halfWidth, Math.min(margin.left + plotW - halfWidth, (x1 + x2) / 2));
-        ctx.fillStyle = 'rgba(30,30,30,0.9)'; ctx.fillRect(center - halfWidth, y - 9, halfWidth * 2, 18);
-        ctx.fillStyle = '#ddd'; ctx.fillText(label, center, y); ctx.restore();
+        ctx.fillStyle = theme.tooltip; ctx.fillRect(center - halfWidth, y - 9, halfWidth * 2, 18);
+        ctx.fillStyle = theme.tooltipForeground; ctx.fillText(label, center, y); ctx.restore();
       }
     }
     // -- crosshair (mouse hover) --
@@ -516,7 +532,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
       const cx = mousePos.x;
       if (cx >= margin.left && cx <= margin.left + plotW) {
         ctx.save();
-        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.strokeStyle = theme.foreground;
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 3]);
         ctx.beginPath();
@@ -560,8 +576,8 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
   }, []);
 
   const addExpr = () => {
-    const expr = newExpr.trim();
-    if (!expr) return;
+    const expr = stripHanCharacters(newExpr).trim();
+    if (!expr) { sendMessage({ command: 'openSymbolPicker' }); return; }
     sendMessage({ command: 'addExpression', expression: expr });
     setNewExpr('');
   };
@@ -849,7 +865,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Toolbar
         debugEditable={debugEditable}
-        newExpr={newExpr} onNewExpr={setNewExpr} onAdd={addExpr}
+        newExpr={newExpr} onNewExpr={value => setNewExpr(stripHanCharacters(value))} onAdd={addExpr}
         onClear={clearAll} onZoomIn={zoomIn} onZoomOut={zoomOut}
         timePerDiv={timePerDiv} autoFollow={autoFollow} onToggleFollow={onToggleFollow}
         onSetTimePerDiv={onSetTimePerDiv}
@@ -887,7 +903,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
               left: showHoverTooltipOnLeft ? undefined : mousePos.x + 14,
               right: showHoverTooltipOnLeft ? canvasWidth - mousePos.x + 14 : undefined,
               top: mousePos.y - 8,
-              background: 'rgba(30,30,30,0.92)', border: '1px solid var(--vscode-sideBar-border, #555)',
+              background: 'var(--vscode-editorHoverWidget-background, var(--vscode-editor-background))', border: '1px solid var(--vscode-editorHoverWidget-border, var(--vscode-sideBar-border, #555))',
               borderRadius: 4, padding: '4px 8px', fontSize: 11,
               pointerEvents: 'none', whiteSpace: 'nowrap', zIndex: 10,
               boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
@@ -895,7 +911,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
               {hoverVals.map(v => (
                 <div key={v.label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ color: v.color, fontWeight: 'bold' }}>{v.label}</span>
-                  <span style={{ color: '#fff', fontFamily: 'monospace' }}>{v.value}</span>
+                  <span style={{ color: 'var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground))', fontFamily: 'monospace' }}>{v.value}</span>
                 </div>
               ))}
             </div>
@@ -933,8 +949,8 @@ function Toolbar({ debugEditable, newExpr, onNewExpr, onAdd, onClear, onZoomIn, 
     }}>
       <input value={newExpr} onChange={e => onNewExpr(e.target.value)}
         onKeyDown={e => { if (e.key === 'Enter') onAdd(); if (e.key === ' ') e.preventDefault(); }}
-        placeholder="变量名" style={inputStyle} />
-      <button onClick={onAdd} style={btnStyle}>+</button>
+        placeholder="变量名（留空选择）" style={{ ...inputStyle, width: 140 }} />
+      <button aria-label="添加采样变量" title="添加变量；留空打开变量选择" onClick={onAdd} style={btnStyle}>+</button>
       <div style={{ flex: 1 }} />
       <button onClick={onZoomOut} disabled={timePerDiv >= MAX_TIMELINE_TIME_PER_DIV_MS} style={iconBtnStyle} title="放大时间">−</button>
       <input type="text" inputMode="decimal"
@@ -947,7 +963,7 @@ function Toolbar({ debugEditable, newExpr, onNewExpr, onAdd, onClear, onZoomIn, 
         }}
         style={{
           ...miniInputStyle, width: 55, textAlign: 'center', fontSize: 10,
-          color: '#fff',
+          color: 'var(--vscode-input-foreground, #ccc)',
         }}
         title="输入时间/div（ms 或 s，最大 100s）"
       />

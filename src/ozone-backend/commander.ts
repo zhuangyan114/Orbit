@@ -9,7 +9,7 @@ import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
-import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress } from './jlink-symbols';
+import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress, buildSymbolCatalog } from './jlink-symbols';
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -594,6 +594,9 @@ case 'readVariableRuntime':
             data: { name: symbol.name, address: symbol.address, size: symbol.size, type: symbol.type, exact },
           };
         }
+        case 'getSymbolCatalog':
+          if (!this.elfPath || this.symbols.length === 0) return { ok: false, error: '请先启动 Orbit 调试并加载 ELF 符号' };
+          return { ok: true, data: buildSymbolCatalog(this.symbols, this.dwarfInfo) };
         case 'searchSymbols': {
           if (!this.elfPath || this.symbols.length === 0) {
             return {

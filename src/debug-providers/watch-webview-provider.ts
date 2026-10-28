@@ -4,6 +4,8 @@ import { WatchValue } from '../ozone-backend/types';
 import { stripHanCharacters } from '../utils/watch-expression-validation';
 import { isOrbitDebugSessionType } from '../utils/debug-session-type';
 import { normalizeWatchExpressions, WatchGroups, WATCH_GROUPS_STATE_KEY } from './watch-groups';
+import { loadActiveSymbolCatalog } from './symbol-catalog-loader';
+import type { SymbolPickerPanel } from './symbol-picker-panel';
 
 const WATCH_EXPANDED_STATE_KEY = 'ozoneWatchExpandedExpressions';
 
@@ -22,6 +24,7 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     private context: vscode.ExtensionContext,
     private backend: OzoneBackend,
     private canUseDapSession: (session: vscode.DebugSession) => boolean = () => true,
+    private symbolPicker?: SymbolPickerPanel,
   ) {
     this.groups = new WatchGroups(
       context.workspaceState.get<unknown>(WATCH_GROUPS_STATE_KEY),
@@ -76,6 +79,12 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
       case 'addExpression':
         this.addExpression(msg.expression);
         break;
+      case 'addExpressions':
+        this.setExpressions([...this.expressionList, ...normalizeWatchExpressions(msg.expressions)]);
+        break;
+      case 'openSymbolPicker':
+        void this.openSymbolPicker();
+        break;
       case 'removeExpression':
         this.removeExpression(msg.expression);
         break;
@@ -97,6 +106,24 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
   setExpressions(expressions: string[]) {
     this.groups.active.expressions = normalizeWatchExpressions(expressions);
     this.publishActiveGroup();
+  }
+
+  private async openSymbolPicker() {
+    const generation = this.generation;
+    const group = this.groups.active;
+    await this.symbolPicker?.open({
+      mode: 'watch', title: `选择变量 → Watch · ${group.name}`, existing: [...group.expressions],
+      loadCatalog: () => loadActiveSymbolCatalog(this.canUseDapSession),
+      canOpen: () => this.groups.active === group && generation === this.generation,
+      commit: (expressions, removedExpressions = []) => {
+        // Apply the delta to the original group, keeping unrelated expressions intact.
+        if (!this.groups.contains(group)) return;
+        const removed = new Set(removedExpressions);
+        group.expressions = normalizeWatchExpressions([...group.expressions.filter(expression => !removed.has(expression)), ...expressions]);
+        if (this.groups.active === group) this.publishActiveGroup();
+        else this.persistGroups();
+      },
+    });
   }
 
   addExpression(expr: string) {
@@ -286,6 +313,8 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
     }
     body { margin: 0; padding: 0; font-family: var(--vscode-font-family, sans-serif); background: var(--bg); color: var(--fg); font-size: 12px; overflow: hidden; }
     #root { height: 100vh; display: flex; flex-direction: column; }
+    body.vscode-dark, body.vscode-high-contrast { color-scheme: dark; }
+    body.vscode-light, body.vscode-high-contrast-light { color-scheme: light; }
     .watch-row:hover .watch-actions { opacity: 1 !important; }
     .watch-row:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.06)); border-left: 2px solid var(--vscode-focusBorder, #007acc); }
     .watch-row { border-left: 2px solid transparent; transition: background 0.1s, border-color 0.1s; }

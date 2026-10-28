@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../utils/logger';
+import type { SymbolCatalog } from '../symbols/symbol-catalog';
 
 function findArmTool(toolName: string): string {
   const pathDirs = (process.env.Path || process.env.PATH || '').split(';');
@@ -97,6 +98,7 @@ export interface DwarfField {
   name: string;
   typeOffset: string;
   byteOffset: number;
+  bitSize?: number;
 }
 
 export interface DwarfEnumerator {
@@ -118,9 +120,62 @@ export interface DwarfTypeInfo {
 export interface DwarfInfo {
   varToType: Map<string, string>;
   typeDefs: Map<string, DwarfTypeInfo>;
+  globals?: DwarfGlobalVariable[];
   localVariables?: DwarfLocalVariable[];
   cfaRows?: DwarfCfaRow[];
   _diag?: string;
+}
+
+export interface DwarfGlobalVariable {
+  name: string;
+  typeOffset: string;
+  address: number;
+  file: string;
+}
+
+function collectGlobalVariables(dies: any[]): DwarfGlobalVariable[] {
+  const globals: DwarfGlobalVariable[] = [];
+  const byOffset = new Map<string, any>();
+  const index = (die: any) => { byOffset.set(die.offset, die); for (const child of die.children || []) index(child); };
+  for (const die of dies) index(die);
+  const attributes = (die: any, seen = new Set<string>()): Record<string, string> => {
+    if (!die || seen.has(die.offset)) return {};
+    seen.add(die.offset);
+    const inherited = byOffset.get(die.attrs.DW_AT_specification || die.attrs.DW_AT_abstract_origin);
+    return { ...attributes(inherited, seen), ...die.attrs };
+  };
+  const visit = (die: any, file: string) => {
+    if (die.tag === 'DW_TAG_compile_unit') {
+      const name = die.attrs.DW_AT_name || '';
+      file = path.win32.isAbsolute(name) ? name : path.win32.join(die.attrs.DW_AT_comp_dir || '', name);
+    }
+    const attrs = die.tag === 'DW_TAG_variable' ? attributes(die) : die.attrs;
+    const address = String(attrs.DW_AT_location || '').match(/DW_OP_addr:\s*(?:0x)?([\da-fA-F]+)/);
+    if (die.tag === 'DW_TAG_variable' && address && attrs.DW_AT_name && attrs.DW_AT_type) {
+      globals.push({ name: attrs.DW_AT_name, typeOffset: attrs.DW_AT_type,
+        address: parseInt(address[1], 16), file });
+    }
+    for (const child of die.children || []) visit(child, file);
+  };
+  for (const die of dies) visit(die, '');
+  return globals;
+}
+
+export function buildSymbolCatalog(symbols: SymbolInfo[], dwarf: DwarfInfo): SymbolCatalog {
+  const counts = new Map<string, number>();
+  const variables = symbols.filter(symbol => /^[bBdDrRsSgGvV]$/.test(symbol.type));
+  for (const symbol of variables) counts.set(symbol.name, (counts.get(symbol.name) || 0) + 1);
+  const metadata = new Map((dwarf.globals || []).map(variable => [`${variable.name}:${variable.address}`, variable]));
+  return {
+    roots: variables.map((symbol, index) => {
+      const info = metadata.get(`${symbol.name}:${symbol.address}`);
+      return { id: `symbol-${index}`, expression: symbol.name, address: symbol.address, size: symbol.size,
+        file: info?.file || '其他符号', typeOffset: info?.typeOffset || dwarf.varToType.get(symbol.name) || '', pointerDepth: 0,
+        ...((counts.get(symbol.name) || 0) > 1 ? { unavailable: '同名静态变量暂不支持按文件区分，请使用唯一变量名' } : {}),
+      };
+    }).sort((a, b) => a.file.localeCompare(b.file) || a.expression.localeCompare(b.expression, undefined, { numeric: true })),
+    types: Object.fromEntries(dwarf.typeDefs),
+  };
 }
 
 export interface DwarfLocalVariable {
@@ -325,6 +380,7 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
     diagParts.push(`len=${stdout.length}, dwTagCount=${(stdout.match(/\(DW_TAG_\w+\)/g) || []).length}`);
 
     const { dies } = parseDwarfOutput(stdout);
+    const globals = collectGlobalVariables(dies);
     diagParts.push(`dies=${dies.length}`);
     if (dies.length > 0) {
       const topLevel = dies.filter((d: any) => d.depth === 0 || d.depth === 1);
@@ -366,6 +422,7 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
               name: child.attrs.DW_AT_name,
               typeOffset: child.attrs.DW_AT_type || '',
               byteOffset: offset,
+              ...(child.attrs.DW_AT_bit_size ? { bitSize: parseInt(child.attrs.DW_AT_bit_size, 10) } : {}),
             });
           }
         }
@@ -440,20 +497,17 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
       }
 
       if (die.tag === 'DW_TAG_array_type') {
-        let arraySize = 0;
-        for (const child of die.children) {
-          if (child.tag === 'DW_TAG_subrange_type' && child.attrs.DW_AT_upper_bound) {
-            const ub = parseInt(child.attrs.DW_AT_upper_bound, 10);
-            arraySize = Math.max(arraySize, ub + 1);
-          }
-        }
-        typeDefs.set(die.offset, {
-          name: '',
-          byteSize: 0,
-          kind: 'array',
-          typeOffset: die.attrs.DW_AT_type,
-          arrayCount: arraySize,
+        const dimensions = die.children.filter((child: any) => child.tag === 'DW_TAG_subrange_type').map((child: any) => {
+          const count = child.attrs.DW_AT_count;
+          const upper = child.attrs.DW_AT_upper_bound;
+          return count !== undefined ? parseInt(count, 10) : upper !== undefined ? parseInt(upper, 10) + 1 : 0;
         });
+        let elementOffset = die.attrs.DW_AT_type;
+        for (let index = Math.max(0, dimensions.length - 1); index >= 0; index--) {
+          const offset = index === 0 ? die.offset : `${die.offset}:dimension${index}`;
+          typeDefs.set(offset, { name: '', byteSize: 0, kind: 'array', typeOffset: elementOffset, arrayCount: dimensions[index] || 0 });
+          elementOffset = offset;
+        }
       }
     }
 
@@ -471,7 +525,9 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
     });
     const localMetadata = parseDwarfLocalMetadata(stdout, framesOutput);
     diagParts.push(`locals=${localMetadata.localVariables?.length || 0}, cfaRows=${localMetadata.cfaRows?.length || 0}`);
-    return { varToType, typeDefs, ...localMetadata, _diag: diagParts.join(' | ') };
+    // Local variables with the same name must not overwrite the global's type.
+    for (const variable of globals) varToType.set(variable.name, variable.typeOffset);
+    return { varToType, typeDefs, globals, ...localMetadata, _diag: diagParts.join(' | ') };
   } catch (e: any) {
     diagParts.push(`ERROR: ${e.message}`);
   }

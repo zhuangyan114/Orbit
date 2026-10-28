@@ -1730,6 +1730,12 @@ export class DapSession extends EventEmitter {
           return this.sendResponse(msg);
         case 'dataSample':
           return this.handleDataSample(msg);
+        case 'getSymbolCatalog': {
+          // ELF metadata only: no target read, halt or second backend/owner.
+          if (this.isSessionTerminating()) return this.sendResponse(msg, { ok: false, error: '调试会话已结束' });
+          const result = await this.backend.execute({ cmd: 'getSymbolCatalog' });
+          return this.sendResponse(msg, result);
+        }
         case 'dataSamplingStart':
           return this.handleDataSamplingStart(msg);
         case 'dataSamplingStop':

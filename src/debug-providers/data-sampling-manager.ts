@@ -11,6 +11,7 @@ import {
 } from '../webview/timeline/timeline-range';
 import { decimateTimelineRange } from '../webview/timeline/timeline-decimation';
 import { pickTimelineColor } from '../webview/timeline/timeline-colors';
+import { stripHanCharacters } from '../utils/watch-expression-validation';
 
 const DEFAULT_SAMPLE_INTERVAL_MS = 0.2;
 const DEFAULT_SEND_INTERVAL_MS = 16;
@@ -86,23 +87,42 @@ export class DataSamplingManager {
   }
 
   addExpression(expression: string) {
-    if (this.entries.some(e => e.expression === expression)) return;
-    const color = pickTimelineColor(this.entries.map(entry => entry.color));
-    this.entries.push({ expression, enabled: true, color });
-    this.dataMap.set(expression, []);
-    this.pendingMap.set(expression, []);
-    this.lastSampleTimestampMap.delete(expression);
+    this.addExpressions([expression]);
+  }
+
+  addExpressions(expressions: string[]) {
+    this.updateExpressions(expressions, []);
+  }
+
+  /** Apply a picker delta once, preserving all retained entries and their sample buffers. */
+  updateExpressions(expressions: string[], removedExpressions: string[]) {
+    let changed = false;
+    const removed = new Set(removedExpressions.map(input => stripHanCharacters(input).trim()).filter(Boolean));
+    if (removed.size) this.entries = this.entries.filter(entry => {
+      if (!removed.has(entry.expression)) return true;
+      this.dataMap.delete(entry.expression);
+      this.pendingMap.delete(entry.expression);
+      this.lastSampleTimestampMap.delete(entry.expression);
+      changed = true;
+      return false;
+    });
+    for (const input of expressions) {
+      const expression = stripHanCharacters(input).trim();
+      if (!expression || this.entries.some(e => e.expression === expression)) continue;
+      const color = pickTimelineColor(this.entries.map(entry => entry.color));
+      this.entries.push({ expression, enabled: true, color });
+      this.dataMap.set(expression, []);
+      this.pendingMap.set(expression, []);
+      this.lastSampleTimestampMap.delete(expression);
+      changed = true;
+    }
+    if (!changed) return;
     void this.syncSamplingMode();
     if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
   }
 
   removeExpression(expression: string) {
-    this.entries = this.entries.filter(e => e.expression !== expression);
-    this.dataMap.delete(expression);
-    this.pendingMap.delete(expression);
-    this.lastSampleTimestampMap.delete(expression);
-    void this.syncSamplingMode();
-    if (this.onExpressionsChanged) this.onExpressionsChanged(this.entries.map(e => ({ expression: e.expression, color: e.color })));
+    this.updateExpressions([], [expression]);
   }
 
   setExpressions(expressions: ({ expression: string; color?: string } | string)[]) {

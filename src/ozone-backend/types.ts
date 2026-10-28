@@ -1,8 +1,9 @@
-export type DebugProbe = 'jlink' | 'cmsis-dap';
+export type DebugProbe = 'jlink' | 'cmsis-dap' | 'rmlink';
 export type DebugProbePreference = DebugProbe | 'auto';
-export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb';
+export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb' | 'tcp';
 
 export interface DebugProbeLaunchConfig {
+  rmlinkDeviceId?: string;
   probe?: DebugProbePreference;
   cmsisDapTransport?: CmsisDapTransport;
   cmsisDapSerial?: string;
@@ -10,6 +11,8 @@ export interface DebugProbeLaunchConfig {
   cmsisDapPid?: string;
   cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
+  /** Explicit opt-in to XR-DAP vendor sampling; independent of TCP transport. */
+  cmsisDapXrSampling?: boolean;
   flashBeforeDebug?: boolean;
 }
 
@@ -110,6 +113,44 @@ export interface FastDataSampleSpec {
   };
 }
 
+/** XR-DAP probe sampling counters reported by the helper. */
+export interface ProbeSamplingStats {
+  /** Frames lost to probe buffer overflow. */
+  droppedFrames: number;
+  /** Ticks the probe skipped because SWD could not keep the period. */
+  skippedTicks: number;
+  /** Requests that paused sampling. */
+  suspends: number;
+  /** Requests served through vendor READ while sampling. */
+  vendorReads: number;
+}
+
+/** Result of `startProbeSampling`. */
+export interface ProbeSamplingStarted {
+  /** Period the probe uses; the helper lengthens one the probe cannot keep. */
+  periodUs: number;
+  estFrameUs: number;
+  maxFrameBytes: number;
+  /** Pass to `stopProbeSampling`; a stop for an older run is ignored. */
+  run: number;
+}
+
+/** One probe-side sampling tick: the values read in that tick, in probe time. */
+export interface ProbeSampleFrame {
+  timestampUs: number;
+  values: WatchValue[];
+}
+
+export interface ProbeSampleBatch {
+  /** Probe clock paired with the host clock: probeNowUs was current probeNowAgeUs before the reply. */
+  probeNowUs: number;
+  probeNowAgeUs: number;
+  /** Bytes still buffered on the probe; non-zero means read again at once. */
+  pendingBytes: number;
+  frames: ProbeSampleFrame[];
+  stats: ProbeSamplingStats;
+}
+
 export interface FastDataSamplePlanItem {
   expression: string;
   spec?: FastDataSampleSpec;
@@ -202,6 +243,10 @@ export type OzoneCommand =
   }
   | { cmd: 'prepareFastDataSampling'; expressions: string[] }
   | { cmd: 'readFastDataSampling'; specs: FastDataSampleSpec[]; priority?: 'watch' | 'timeline' }
+  | { cmd: 'startProbeSampling'; specs: FastDataSampleSpec[]; periodUs: number }
+  | { cmd: 'readProbeSampling' }
+  /** `run` is the value startProbeSampling returned; a stale run's stop is ignored. */
+  | { cmd: 'stopProbeSampling'; run?: number }
   | { cmd: 'getPerformanceDiagnostics' }
   | { cmd: 'getSchedulerSnapshot' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }

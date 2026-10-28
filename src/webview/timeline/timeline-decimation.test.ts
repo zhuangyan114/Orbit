@@ -84,4 +84,10 @@ describe('decimateTimelineRange', () => {
       point(5, 110),
     ]);
   });
+  it('retains the end of a constant segment before a gap inside a bucket', () => {
+    const points = Array.from({ length: 200 }, (_, i) => point(i < 100 ? i : i + 1, 0, i === 100));
+    const result = decimateTimelineRange(points, 0, 200, 1);
+    expect(result.map(p => p.timestamp)).toEqual([0, 99, 101, 200]);
+    expect(result[2].startsNewSegment).toBe(true);
+  });
 });

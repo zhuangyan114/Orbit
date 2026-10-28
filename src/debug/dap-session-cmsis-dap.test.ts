@@ -68,6 +68,57 @@ function setBreakpointsRequest(seq: number, sourcePath: string, lines: number[])
 }
 
 describe('DapSession CMSIS-DAP control routing', () => {
+  it('F5 with probe=rmlink connects before Flash and passes the same backend without probe discovery',async()=>{
+    const calls:Array<{cmd:string;config?:unknown;probe?:unknown}>=[];
+    const session=new DapSession({execute:async(command:any)=>{
+      calls.push(command);
+      if(command.cmd==='connect')return {ok:true,data:{ownerKind:'cmsis-dap'},diagnostics:{deviceId:'50787d15a924'}};
+      if(command.cmd==='flash')return {ok:true,data:{message:'verified by RMLink'}};
+      if(command.cmd==='getTargetState')return {ok:true,data:'halted'};
+      return {ok:true,data:{}};
+    },configureNativeSteps:()=>{}} as unknown as OzoneBackend);
+    const messages:DebugProtocolMessage[]=[];session.on('send',message=>messages.push(message));
+    try{
+      await (session as any).handleLaunch({type:'request',seq:1,command:'launch',arguments:{
+        probe:'rmlink',device:'STM32F103C8',program:'firmware.elf',rttLogEnabled:false,
+      }});
+      expect(calls.find(c=>c.cmd==='connect')?.config).toMatchObject({probe:'rmlink',speedKHz:4000});
+      expect(calls.findIndex(c=>c.cmd==='flash')).toBeGreaterThan(calls.findIndex(c=>c.cmd==='connect'));
+      expect(calls.find(c=>c.cmd==='flash')?.probe).toBe('rmlink');
+      expect(calls.some(c=>c.cmd==='resolveProbe')).toBe(false);
+      expect(calls.find(c=>c.cmd==='runToEntryPoint')).toMatchObject({symbol:'main',reset:true});
+      expect(messages.find(m=>m.request_seq===1)?.success).toBe(true);
+      expect(messages.some(m=>m.body?.output?.includes('RMLink / 连接服务'))).toBe(true);
+    }finally{(session as any).stopConnectionMonitor();(session as any).stopRttLogPolling();}
+  });
+  it('identifies the selected RMLink service path and device instead of reporting an unknown transport', async () => {
+    const execute = vi.fn(async (command: { cmd: string }) => {
+      if (command.cmd === 'connect') return { ok: true, data: { ownerKind: 'cmsis-dap' } };
+      if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
+      return { ok: true, data: {} };
+    });
+    const session = new DapSession({ execute, configureNativeSteps: () => {} } as unknown as OzoneBackend);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
+    try {
+      await (session as any).handleLaunch({
+        type: 'request', seq: 1, command: 'launch', arguments: {
+          probe: 'cmsis-dap', device: 'STM32F103C8', rmlinkDeviceId: '50787d15a924',
+          flashBeforeDebug: false, runToEntryPoint: false, rttLogEnabled: false,
+        },
+      });
+      expect(messages.find(message => message.event === 'output'
+        && message.body?.output?.includes('调试路径:'))?.body.output)
+        .toContain('RMLink / 连接服务（板端订阅、缓存烧录） (owner=cmsis-dap) | ID=50787d15a924');
+      expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+        cmd: 'connect', config: expect.objectContaining({ rmlinkDeviceId: '50787d15a924' }),
+      }));
+    } finally {
+      (session as any).stopConnectionMonitor();
+      (session as any).stopRttLogPolling();
+    }
+  });
+
   it('responds to configurationDone before publishing the initial stopped event', async () => {
     const session = new DapSession({} as OzoneBackend);
     const messages: DebugProtocolMessage[] = [];

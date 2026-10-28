@@ -83,7 +83,12 @@ export function decimateTimelineRange(
     const bucket = span === 0
       ? 0
       : Math.min(bucketCount - 1, Math.floor(((point.timestamp - start) / span) * bucketCount));
-    if (currentBucket !== -1 && (bucket !== currentBucket || point.startsNewSegment)) flushBucket();
+    if (currentBucket !== -1 && (bucket !== currentBucket || point.startsNewSegment)) {
+      flushBucket();
+      // The last real point before a gap is mandatory too. Constant segments
+      // otherwise collapse to a single moveTo and vanish at coarse zoom.
+      if (point.startsNewSegment) emitIndex(index - 1);
+    }
     if (bucket !== currentBucket || point.startsNewSegment) currentBucket = bucket;
     if (index === firstVisible || point.startsNewSegment) mandatoryIndex = index;
     if (minIndex < 0 || point.value < points[minIndex].value) minIndex = index;

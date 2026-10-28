@@ -16,9 +16,10 @@ import { TimelineSampleRate } from './timeline-sample-rate';
 import { loadActiveSymbolCatalog } from '../../debug-providers/symbol-catalog-loader';
 import type { SymbolCatalog } from '../../symbols/symbol-catalog';
 import type { SymbolPickerPanel } from '../../debug-providers/symbol-picker-panel';
+import { prepareTimelineLiveSamples } from './timeline-live';
 
 const STATE_KEY = 'ozoneTimelineState';
-interface RecordTab { info: TimelineTab; store?: TimelineRecordStore; view: TimelineViewState; session?: vscode.DebugSession; archiveDirectory?: string; revision: number; queryGeneration?: number; sampleRate?: TimelineSampleRate; }
+interface RecordTab { info: TimelineTab; store?: TimelineRecordStore; view: TimelineViewState; session?: vscode.DebugSession; archiveDirectory?: string; revision: number; queryGeneration?: number; queryResolutionKey?: number; sampleRate?: TimelineSampleRate; }
 
 export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
@@ -38,6 +39,8 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   private jobs = new Set<Promise<unknown>>();
   private lifetimeAbort = new AbortController();
   private storageSummaryAt = 0;
+  private rangeMetrics = { since: Date.now(), requests: 0, maxMs: 0, points: 0 };
+  private renderMetricsAt = 0;
 
   constructor(private context: vscode.ExtensionContext, private sampleManager: DataSamplingManager,
     private canUseDapSession: (session: vscode.DebugSession) => boolean = () => true,
@@ -82,6 +85,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         void vscode.window.showInformationMessage('Timeline 标签已达 32 个，最早的后台历史页已关闭；仅手动保存的 CSV 可再次打开。');
       } else { void vscode.window.showWarningMessage('Timeline 标签已满，请关闭历史页'); return; }
     }
+    const followDebugRecord = this.activeId === 'debug-template' || !!this.tabs.get(this.activeId)?.session;
     this.finishLive();
     this.sampleManager.clearData();
     const store = new TimelineRecordStore(this.directory, session?.name || '实时记录');
@@ -91,7 +95,11 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     const view = { ...structuredClone(this.debugDefaults), autoFollow: true, viewportEndMs: undefined, cursorA_ms: null, cursorB_ms: null, entries: this.makeEntries() };
     store.view = view; store.syncChannels(view.entries);
     const tab: RecordTab = { info: { id: store.id, recordId: store.id, name: store.meta.name, kind: 'live', incomplete: false }, store, view, session, archiveDirectory: this.archiveDirectory(session?.workspaceFolder), revision: 0 };
-    store.onError = error => { tab.info.error = error; tab.info.incomplete = true; this.postTabs(); void vscode.window.showWarningMessage('Timeline 记录不完整：' + error); };
+    store.onError = error => {
+      tab.info.error = error; tab.info.incomplete = true;
+      log.dap(`[timeline] storage failed recordId=${store.id} error=${error} metrics=${JSON.stringify(store.getMetrics())}`);
+      this.postTabs(); void vscode.window.showWarningMessage('Timeline 记录不完整：' + error);
+    };
     tab.sampleRate = new TimelineSampleRate();
     this.tabs.set(store.id, tab); this.liveId = store.id;
     this.tabs.delete('debug-template');
@@ -171,6 +179,15 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     switch (msg.command) {
+      case 'renderMetrics': {
+        if (Date.now() - this.renderMetricsAt < 9000 || ![msg.frames, msg.slowFrames, msg.maxDrawMs].every(v => typeof v === 'number' && Number.isFinite(v) && v >= 0)) break;
+        this.renderMetricsAt = Date.now();
+        log.dap(`[timeline] render summary frames=${msg.frames} slowFrames=${msg.slowFrames} maxDrawMs=${msg.maxDrawMs.toFixed(2)}`);
+        if (msg.delivery && ['notifications', 'maxNotificationGapMs', 'maxNotificationTransitMs', 'rangeReplies', 'maxRangeReplyMs', 'maxFrameWaitMs', 'dataFrames', 'maxDataFrameGapMs', 'longTasks', 'maxLongTaskMs', 'hiddenNotifications'].every(key => typeof msg.delivery[key] === 'number' && Number.isFinite(msg.delivery[key]) && msg.delivery[key] >= 0)) {
+          log.dap(`[timeline] delivery summary ${JSON.stringify(msg.delivery)}`);
+        }
+        break;
+      }
       case 'loadRange': await this.sendRange(tab, msg); break;
       case 'measure': {
         if (!tab.store || !Number.isFinite(msg.time) || !Number.isSafeInteger(msg.requestId)) break;
@@ -331,8 +348,11 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     }
     if (tab.store.error?.startsWith('采样时钟回退')) { this.beginFreshRecord(tab.session); const replacement = this.liveId ? this.tabs.get(this.liveId) : undefined; replacement?.store?.append(snapshots); return; }
     if (this.view?.visible && this.activeId === tab.info.id && accepted.length) {
-      // Only notify the current view. Host history is already stored regardless of visibility.
-      this.postMessage({ command: 'samples', tabId: tab.info.id, recordId: tab.info.recordId, historyBounds: tab.store.bounds, snapshots: [], sampleRateHz: tab.sampleRate?.getHz() ?? 0 });
+      // Deliver the current display tail without an extra range-query round trip.
+      // Hidden/history views still read the complete record on demand.
+      this.postMessage({ command: 'samples', tabId: tab.info.id, recordId: tab.info.recordId, sentAtMs: Date.now(), historyBounds: tab.store.bounds,
+        generation: tab.queryGeneration, resolutionKey: tab.queryResolutionKey,
+        snapshots: prepareTimelineLiveSamples(accepted, tab.queryResolutionKey), sampleRateHz: tab.sampleRate?.getHz() ?? 0 });
     }
   }
   private isCurrent(tab: RecordTab, revision: number) { return !this.disposed && this.view?.visible === true && this.activeId === tab.info.id && this.tabs.get(tab.info.id) === tab && tab.revision === revision; }
@@ -342,14 +362,24 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     if (this.activeRequestCount >= 4) { this.postMessage({ command: 'rangeSamples', ...request, tabId: tab.info.id, recordId: tab.info.recordId, range: null, snapshots: [] }); return; }
     this.activeRequestCount++;
     const revision = tab.revision;
+    const began = Date.now();
     tab.queryGeneration = request.generation;
+    tab.queryResolutionKey = request.resolutionKey;
     try {
       const range = intersectTimelineRange(request, tab.store.bounds);
       const snapshots = range ? await tab.store.query(range.start, range.end, Math.min(2048, Math.max(1, Math.floor(8192 / Math.max(1, tab.store.channels.length))), request.targetBuckets), false, () => this.isCurrent(tab, revision) && tab.queryGeneration === request.generation) : [];
+      this.rangeMetrics.points += snapshots.reduce((n, s) => n + s.data.length, 0);
       if (this.isCurrent(tab, revision)) this.postMessage({ command: 'rangeSamples', ...request, tabId: tab.info.id, recordId: tab.info.recordId, historyBounds: tab.store.bounds, range, snapshots });
     } catch (error) {
       if (this.isCurrent(tab, revision)) this.postMessage({ command: 'rangeSamples', ...request, tabId: tab.info.id, recordId: tab.info.recordId, range: null, snapshots: [], error: String(error) });
-    } finally { this.activeRequestCount--; }
+    } finally {
+      this.activeRequestCount--;
+      const m = this.rangeMetrics; m.requests++; m.maxMs = Math.max(m.maxMs, Date.now() - began);
+      if (Date.now() - m.since >= 10000) {
+        log.dap(`[timeline] range summary requests=${m.requests} maxMs=${m.maxMs} points=${m.points} active=${this.activeRequestCount}`);
+        this.rangeMetrics = { since: Date.now(), requests: 0, maxMs: 0, points: 0 };
+      }
+    }
   }
   private async openCsv(source?: string) {
     if (this.importing) throw new Error('已有 CSV 正在读取，请等待完成');

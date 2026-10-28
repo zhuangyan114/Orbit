@@ -1,3 +1,4 @@
+import sharedTargetPack from './target-pack.json';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -106,154 +107,18 @@ export interface FlashTargetDefinition {
 }
 
 /** STM32F103C8T6: DS5319, RM0008 and PM0075 medium-density FPEC. */
-export const STM32F103C8T6: FlashTargetDefinition = Object.freeze({
-  name: 'STM32F103C8T6',
-  aliases: ['STM32F103C8'],
-  dpIdcode: 0x1BA01477,
-  flashBase: 0x08000000,
-  flashSize: 64 * 1024,
-  sectors: Array.from({ length: 64 }, (_, number) => ({
-    number, address: 0x08000000 + number * 0x400, size: 0x400,
-  })),
-  ramRegions: [{ name: 'SRAM', address: 0x20000000, size: 20 * 1024 }],
-  loaderRamIndex: 0,
-  preflight: {
-    idcodeAddress: 0xE0042000,
-    // DEV_ID identifies the medium-density family, not the package.
-    deviceId: 0x410,
-    flashSizeRegisterAddress: 0x1FFFF7E0,
-    expectedFlashSizeKiB: 64,
-  },
-  flashDiagnostics: { statusAddress: 0x4002200C, controlAddress: 0x40022010 },
-  algorithm: 'stm32f103c8',
-  // FPEC programs one halfword at a time. Coalesce adjacent ELF loads before
-  // padding with erased bytes so each halfword is programmed only once.
-  flashWordSize: 2,
-  programAlignment: 2,
-  eraseTimeoutMs: 5000,
-  programTimeoutMs: 5000,
-});
-
-export const STM32F407VET6: FlashTargetDefinition = Object.freeze({
-  name: 'STM32F407VET6',
-  // STM32F407VE is the common density/package prefix used by project files;
-  // it is accepted only as the unqualified name of this exact 512 KiB target.
-  aliases: ['STM32F407VE'],
-  dpIdcode: 0x2BA01477,
-  flashBase: 0x08000000,
-  flashSize: 512 * 1024,
-  sectors: [
-    { number: 0, address: 0x08000000, size: 0x4000 },
-    { number: 1, address: 0x08004000, size: 0x4000 },
-    { number: 2, address: 0x08008000, size: 0x4000 },
-    { number: 3, address: 0x0800C000, size: 0x4000 },
-    { number: 4, address: 0x08010000, size: 0x10000 },
-    { number: 5, address: 0x08020000, size: 0x20000 },
-    { number: 6, address: 0x08040000, size: 0x20000 },
-    { number: 7, address: 0x08060000, size: 0x20000 },
-  ],
-  ramRegions: [
-    // The normal SRAM window used by the loader. CCM RAM is deliberately not
-    // modeled because it is not accessible by every debug/loader path.
-    { name: 'SRAM', address: 0x20000000, size: 128 * 1024 },
-  ],
-  loaderRamIndex: 0,
-  preflight: {
-    idcodeAddress: 0xE0042000,
-    deviceId: 0x413,
-    flashSizeRegisterAddress: 0x1FFF7A22,
-    expectedFlashSizeKiB: 512,
-  },
-  flashDiagnostics: {
-    statusAddress: 0x40023C0C,
-    controlAddress: 0x40023C10,
-  },
-  algorithm: 'stm32f407',
-  eraseTimeoutMs: 5000,
-  programTimeoutMs: 5000,
-});
-
-/** STM32F407IG package variants share the RM0090 1 MiB Flash layout. */
-export const STM32F407IG: FlashTargetDefinition = Object.freeze({
-  ...STM32F407VET6,
-  name: 'STM32F407IG',
-  aliases: ['STM32F407IGT6', 'STM32F407IGT7', 'STM32F407IGH6', 'STM32F407IGH7'],
-  flashSize: 1024 * 1024,
-  sectors: [
-    ...STM32F407VET6.sectors,
-    { number: 8, address: 0x08080000, size: 0x20000 },
-    { number: 9, address: 0x080A0000, size: 0x20000 },
-    { number: 10, address: 0x080C0000, size: 0x20000 },
-    { number: 11, address: 0x080E0000, size: 0x20000 },
-  ],
-  preflight: {
-    ...STM32F407VET6.preflight,
-    expectedFlashSizeKiB: 1024,
-  },
-  // A separate density-specific image retains the VE loader's 512 KiB limit.
-  algorithm: 'stm32f407ig',
-});
-
-export const STM32H723VGT6: FlashTargetDefinition = Object.freeze({
-  name: 'STM32H723VGT6',
-  // STM32H723VG is the density/package prefix used by project files; it is
-  // accepted only as the unqualified name of this exact 1 MiB target.
-  aliases: ['STM32H723VG'],
-  // SW-DP v2 DPIDR read back on STM32H723VGT6 hardware during P7-1.
-  dpIdcode: 0x6BA02477,
-  flashBase: 0x08000000,
-  flashSize: 1024 * 1024,
-  // 8 uniform 128 KiB sectors (RM0468, single bank).
-  sectors: [
-    { number: 0, address: 0x08000000, size: 0x20000 },
-    { number: 1, address: 0x08020000, size: 0x20000 },
-    { number: 2, address: 0x08040000, size: 0x20000 },
-    { number: 3, address: 0x08060000, size: 0x20000 },
-    { number: 4, address: 0x08080000, size: 0x20000 },
-    { number: 5, address: 0x080A0000, size: 0x20000 },
-    { number: 6, address: 0x080C0000, size: 0x20000 },
-    { number: 7, address: 0x080E0000, size: 0x20000 },
-  ],
-  // RAM map per RM0468/AN5419. P7-2 confirmed DTCM/D2/D3 are writable over
-  // the debug AP on STM32H723VGT6; keep the existing write-error path if a
-  // later board cannot reach a region.
-  ramRegions: [
-    { name: 'ITCM RAM', address: 0x00000000, size: 64 * 1024 },
-    { name: 'DTCM RAM', address: 0x20000000, size: 128 * 1024 },
-    { name: 'AXI SRAM', address: 0x24000000, size: 320 * 1024 },
-    { name: 'SRAM1-3', address: 0x30000000, size: 272 * 1024 },
-    { name: 'SRAM4', address: 0x38000000, size: 16 * 1024 },
-    { name: 'Backup RAM', address: 0x38800000, size: 4 * 1024 },
-  ],
-  // The loader runs from AXI SRAM, matching ecosystem convention and keeping
-  // it clear of DTCM access uncertainty over the debug AP.
-  loaderRamIndex: 2,
-  preflight: {
-    // DBGMCU_IDCODE at the H7 DBGMCU block; DEV_ID 0x483 covers the RM0468
-    // family (H723/H725/H730/H733).
-    idcodeAddress: 0x5C001000,
-    deviceId: 0x483,
-    flashSizeRegisterAddress: 0x1FF1E880,
-    expectedFlashSizeKiB: 1024,
-  },
-  // H723 CR1/SR1 are adjacent words with the opposite order from STM32F4
-  // (CR1 at the lower address); the helper's diagnostic block read starts at
-  // whichever address is lower.
-  flashDiagnostics: {
-    statusAddress: 0x52002010,
-    controlAddress: 0x5200200C,
-  },
-  algorithm: 'stm32h723',
-  // 256-bit ECC flash word. Adjacent PT_LOAD ranges that share a 32-byte
-  // row (typical CubeMX .text/.data LMA split) must be programmed once.
-  flashWordSize: 32,
-  // 128 KiB sector erase measured ~1.11 s on P7-4; keep generous host
-  // defaults under FLASH_ALGORITHM_TIMEOUT_MAX_MS (helper ceiling).
-  eraseTimeoutMs: 30000,
-  programTimeoutMs: 15000,
-});
-
-const FLASH_TARGETS: readonly FlashTargetDefinition[] = [STM32F407VET6, STM32F407IG, STM32H723VGT6, STM32F103C8T6];
+// Model and density boundaries come from the same package as RMLink.
+const FLASH_TARGETS: readonly FlashTargetDefinition[] = [...sharedTargetPack.targets]
+  .sort((a,b)=>Number(a.profileId===1)-Number(b.profileId===1)); // retain legacy enumeration order
+function sharedTarget(name: string): FlashTargetDefinition {
+  const target = FLASH_TARGETS.find(t => t.name === name);
+  if (!target) throw new Error(`Shared target package is missing ${name}`);
+  return Object.freeze(target);
+}
+export const STM32F103C8T6 = sharedTarget('STM32F103C8T6');
+export const STM32F407VET6 = sharedTarget('STM32F407VET6');
+export const STM32F407IG = sharedTarget('STM32F407IG');
+export const STM32H723VGT6 = sharedTarget('STM32H723VGT6');
 
 /** All registered flash targets, in registration order. */
 export function listFlashTargets(): readonly FlashTargetDefinition[] {
@@ -680,54 +545,11 @@ export interface BuiltinFlashAlgorithmMetadata {
 }
 
 /** Built-in RAM Flash Algorithms referenced by FlashTargetDefinition.algorithm. */
-const BUILTIN_FLASH_ALGORITHMS: ReadonlyMap<string, BuiltinFlashAlgorithmMetadata> = new Map([
-  [
-    'stm32f103c8',
-    Object.freeze({
-      fileName: 'orbit-stm32f103c8-flash-algorithm.bin',
-      entries: DEFAULT_ALGORITHM_ENTRIES,
-      staticBase: 0,
-      pageSize: 0x400,
-      preservesPageBuffer: true,
-    } satisfies BuiltinFlashAlgorithmMetadata),
-  ],
-  [
-    'stm32f407',
-    Object.freeze({
-      fileName: 'orbit-stm32f407-flash-algorithm.bin',
-      entries: DEFAULT_ALGORITHM_ENTRIES,
-      staticBase: 0,
-      // The built-in algorithm accepts up to 64 KiB per ProgramPage. A 16 KiB
-      // buffer matches STM32F4's smallest erase sector and avoids paying the
-      // CMSIS-DAP register/RAM-upload overhead once per 1 KiB slice.
-      pageSize: 0x4000,
-      preservesPageBuffer: true,
-    } satisfies BuiltinFlashAlgorithmMetadata),
-  ],
-  [
-    'stm32f407ig',
-    Object.freeze({
-      fileName: 'orbit-stm32f407ig-flash-algorithm.bin',
-      entries: DEFAULT_ALGORITHM_ENTRIES,
-      staticBase: 0,
-      pageSize: 0x4000,
-      preservesPageBuffer: true,
-    } satisfies BuiltinFlashAlgorithmMetadata),
-  ],
-  [
-    'stm32h723',
-    Object.freeze({
-      fileName: 'orbit-stm32h723-flash-algorithm.bin',
-      entries: DEFAULT_ALGORITHM_ENTRIES,
-      staticBase: 0,
-      // 64 KiB per ProgramPage, the host-side page cap. Each call is padded
-      // by the algorithm to whole 256-bit flash words; two calls cover one
-      // 128 KiB H723 sector.
-      pageSize: 0x10000,
-      preservesPageBuffer: true,
-    } satisfies BuiltinFlashAlgorithmMetadata),
-  ],
-]);
+const BUILTIN_FLASH_ALGORITHMS: ReadonlyMap<string, BuiltinFlashAlgorithmMetadata> = new Map(
+  Object.entries(sharedTargetPack.algorithms).map(([name, metadata]) => [name, {
+    ...metadata, fileName: `orbit-${name}-flash-algorithm.bin`,
+  }]),
+);
 
 function builtinFlashAlgorithmPath(fileName: string): string {
   const relative = path.join('out', 'native', 'win32-x64', fileName);

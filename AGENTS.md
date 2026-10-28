@@ -20,8 +20,8 @@
 - `npm run typecheck` runs `tsc --noEmit`; `npm test` runs Vitest.
 - `npm run build:native` builds `out/native/win32-x64/orbit-jlink-helper.exe`.
 - `npm run test:cpp-channel:mock` exercises the helper channel against the mock DLL. It is not hardware validation.
-- `npm run build:native` also builds `out/native/win32-x64/orbit-cmsis-dap-helper.exe`; `npm run test:cmsis-dap:mock` and `npm run test:cmsis-dap:algorithm` cover the CMSIS-DAP protocol/helper and Flash Algorithm paths. They are not hardware validation.
-- Watch/Timeline and stopped-state DAP changes have focused coverage in `src/debug/dap-session-realtime-variables.test.ts`, `src/debug/dap-session-scopes.test.ts`, `src/ozone-backend/native-scheduler.test.ts`, and `src/utils/watch-expression-validation.test.ts`; run the focused tests before the full suite when iterating on those paths.
+- `npm run build:native` also builds `out/native/win32-x64/orbit-cmsis-dap-helper.exe`; `npm run test:cmsis-dap:mock` and `npm run test:cmsis-dap:algorithm` cover the CMSIS-DAP protocol/helper and Flash Algorithm paths; the mock run also executes `orbit-cmsis-dap-xr-tests` (XR-DAP vendor encoding, TCP transport, probe sampling). They are not hardware validation.
+- Watch/Timeline and stopped-state DAP changes have focused coverage in `src/debug/dap-session-realtime-variables.test.ts`, `src/debug/dap-session-scopes.test.ts`, `src/ozone-backend/native-scheduler.test.ts`, and `src/utils/watch-expression-validation.test.ts`; XR-DAP probe-side Timeline sampling in `src/debug/probe-clock.test.ts`, `src/debug/probe-timeline-sampler.test.ts`, and `src/debug/dap-session-probe-sampling.test.ts`; run the focused tests before the full suite when iterating on those paths.
 - `npm run watch`, `npm run dev`, and `npm run mcp` respectively watch bundles, launch Extension Development Host, and start the local MCP client.
 - Do not run target-mutating hardware commands without explicit user authorization.
 

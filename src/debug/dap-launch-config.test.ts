@@ -2,6 +2,34 @@ import { describe, expect, it } from 'vitest';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 describe('DAP launch probe configuration', () => {
+  it('selects the public RMLink owner explicitly without automatic flash',()=>{
+    expect(normalizeDapLaunchConfig({rmlinkDeviceId:'50787D15A924'})).toMatchObject({
+      rmlinkDeviceId:'50787d15a924',probe:'rmlink',flashBeforeDebug:false,runToEntryPoint:'main',
+    });
+    expect(()=>normalizeDapLaunchConfig({rmlinkDeviceId:'bad'})).toThrow('rmlinkDeviceId');
+    expect(()=>normalizeDapLaunchConfig({rmlinkDeviceId:'50787d15a924',probe:'jlink'})).toThrow();
+  });
+  it('requires an explicit boolean opt-in for XR without coupling it to TCP', () => {
+    expect(normalizeDapLaunchConfig({ probe: 'cmsis-dap', cmsisDapTransport: 'tcp' }))
+      .not.toHaveProperty('cmsisDapXrSampling');
+    for (const enabled of [false, true]) {
+      const config: Record<string, unknown> = {};
+      applyNormalizedDapLaunchConfig(config, normalizeDapLaunchConfig({ cmsisDapXrSampling: enabled }));
+      expect(config.cmsisDapXrSampling).toBe(enabled);
+    }
+    expect(() => normalizeDapLaunchConfig({ cmsisDapXrSampling: 'true' })).toThrowError(/cmsisDapXrSampling/);
+  });
+  it('selects the RMLink service explicitly with the normal F5 Flash default',()=>{
+    expect(normalizeDapLaunchConfig({probe:'rmlink'})).toMatchObject({probe:'rmlink',flashBeforeDebug:true,runToEntryPoint:'main'});
+    expect(normalizeDapLaunchConfig({probe:'rmlink',runToEntryPoint:false})).toMatchObject({runToEntryPoint:false});
+    expect(normalizeDapLaunchConfig({probe:'rmlink',runToEntryPoint:' app_main '})).toMatchObject({runToEntryPoint:'app_main'});
+    expect(normalizeDapLaunchConfig({probe:'rmlink',rmlinkDeviceId:'50787D15A924',flashBeforeDebug:false})).toMatchObject({
+      probe:'rmlink',rmlinkDeviceId:'50787d15a924',flashBeforeDebug:false,
+    });
+    const final:Record<string,unknown>={};
+    applyNormalizedDapLaunchConfig(final,normalizeDapLaunchConfig({probe:'rmlink'}));
+    expect(normalizeDapLaunchConfig(final)).toEqual(normalizeDapLaunchConfig({probe:'rmlink'}));
+  });
   it('defaults to deterministic auto probe discovery and enables flashing', () => {
     expect(normalizeDapLaunchConfig({})).toEqual({
       probe: 'auto',
@@ -61,19 +89,19 @@ describe('DAP launch probe configuration', () => {
 
   it('rejects an explicitly invalid probe instead of falling back to J-Link', () => {
     expect(() => normalizeDapLaunchConfig({ probe: 'cmsis_dap' })).toThrowError(
-      'InvalidConfiguration: probe must be one of auto, jlink, or cmsis-dap; received "cmsis_dap"',
+      'InvalidConfiguration: probe must be one of auto, jlink, cmsis-dap, or rmlink; received "cmsis_dap"',
     );
     expect(() => normalizeDapLaunchConfig({ probe: 'CMSIS-DAP' })).toThrowError(
-      'InvalidConfiguration: probe must be one of auto, jlink, or cmsis-dap; received "CMSIS-DAP"',
+      'InvalidConfiguration: probe must be one of auto, jlink, cmsis-dap, or rmlink; received "CMSIS-DAP"',
     );
     expect(() => normalizeDapLaunchConfig({ probe: 'foo' })).toThrowError(
-      'InvalidConfiguration: probe must be one of auto, jlink, or cmsis-dap; received "foo"',
+      'InvalidConfiguration: probe must be one of auto, jlink, cmsis-dap, or rmlink; received "foo"',
     );
   });
 
   it('rejects an explicitly invalid CMSIS-DAP transport instead of falling back to auto', () => {
     expect(() => normalizeDapLaunchConfig({ cmsisDapTransport: 'usb' })).toThrowError(
-      'InvalidConfiguration: cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, or winusb; received "usb"',
+      'InvalidConfiguration: cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp; received "usb"',
     );
   });
 

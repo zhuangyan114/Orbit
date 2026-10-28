@@ -115,11 +115,18 @@ function summarize(rows: readonly TimelineRow[]): TimelineRow[] {
   for (const row of rows) { const group = groups.get(row.channelId) ?? []; group.push(row); groups.set(row.channelId, group); }
   const result: TimelineRow[] = [];
   for (const group of groups.values()) {
-    let min = group[0], max = group[0];
-    let broken = false;
-    for (const row of group) { if (row.value < min.value) min = row; if (row.value > max.value) max = row; if (row.segmentId !== group[0].segmentId) broken = true; }
-    const chosen = [...new Set([group[0], min, max, group[group.length - 1]])].sort((a, b) => a.timestamp - b.timestamp);
-    for (const row of chosen) result.push({ ...row, ...(broken ? { startsNewSegment: true } : {}) });
+    const segments = new Map<number, TimelineRow[]>();
+    for (const row of group) { const segment = segments.get(row.segmentId) ?? []; segment.push(row); segments.set(row.segmentId, segment); }
+    const extrema = (points: TimelineRow[]) => {
+      let min = points[0], max = points[0];
+      for (const row of points) { if (row.value < min.value) min = row; if (row.value > max.value) max = row; }
+      return [...new Set([points[0], min, max, points[points.length - 1]])].sort((a, b) => a.timestamp - b.timestamp);
+    };
+    const chosen = [...segments.values()].flatMap(extrema);
+    // Keep summaries bounded even for pathological alternating gaps. A parent
+    // cannot repair missing boundaries: refine such nodes during display reads.
+    const refine = chosen.length > 256 || group.some(p => p.summaryNeedsRefine);
+    for (const row of refine ? extrema(group) : chosen) result.push({ ...row, summaryVersion: 2, summaryNeedsRefine: refine });
   }
   return result.sort((a, b) => a.timestamp - b.timestamp || a.channelId - b.channelId);
 }
@@ -417,7 +424,7 @@ export class TimelineRecordStore {
     if (![start, end, buckets].every(Number.isFinite) || end < start || buckets < 1) return [];
     if (!isCurrentQuery()) throw new Error('Timeline 查询已取消');
     const groups = new Map<number, TimelineRow[]>();
-    const envelopes = new Map<number, Map<number, { first: TimelineRow; last: TimelineRow; min: TimelineRow; max: TimelineRow; broken: boolean }>>();
+    const envelopes = new Map<number, Map<string, { first: TimelineRow; last: TimelineRow; min: TimelineRow; max: TimelineRow }>>();
     let rawCount = 0;
     const accept = (rows: readonly TimelineRow[]) => {
       for (const row of rows) if (row.timestamp >= start && row.timestamp <= end) {
@@ -427,9 +434,10 @@ export class TimelineRecordStore {
         } else {
           const bucket = end === start ? 0 : Math.min(buckets - 1, Math.floor((row.timestamp - start) / (end - start) * buckets));
           const channel = envelopes.get(row.channelId) ?? new Map();
-          const current = channel.get(bucket);
-          if (!current) channel.set(bucket, { first: row, last: row, min: row, max: row, broken: false });
-          else { current.last = row; if (row.value < current.min.value) current.min = row; if (row.value > current.max.value) current.max = row; current.broken ||= row.segmentId !== current.first.segmentId || !!row.startsNewSegment; }
+          const key = bucket + ':' + row.segmentId;
+          const current = channel.get(key);
+          if (!current) channel.set(key, { first: row, last: row, min: row, max: row });
+          else { current.last = row; if (row.value < current.min.value) current.min = row; if (row.value > current.max.value) current.max = row; }
           envelopes.set(row.channelId, channel);
         }
       }
@@ -454,7 +462,13 @@ export class TimelineRecordStore {
           if (node.to <= from || node.from >= to) return;
           if (current > 0 && node.from > cursor) await visitLevel(current - 1, cursor, Math.min(node.from, to));
           if (current > 0 && (node.start < start || node.end > end)) await visitLevel(current - 1, Math.max(from, node.from), Math.min(to, node.to));
-          else accept(await this.readPayload(node, current, raw || (current === 0 && node.end - node.start > resolution * 2)));
+          else {
+            const payload = await this.readPayload(node, current, raw || (current === 0 && node.end - node.start > resolution * 2));
+            if (!raw && payload.some(p => p.summaryNeedsRefine || (p.startsNewSegment && p.summaryVersion !== 2))) {
+              if (current > 0) await visitLevel(current - 1, Math.max(from, node.from), Math.min(to, node.to));
+              else accept(await this.readPayload(node, 0, true));
+            } else accept(payload);
+          }
           cursor = Math.max(cursor, node.to);
         });
         if (current > 0 && cursor < to) await visitLevel(current - 1, cursor, to);
@@ -466,7 +480,7 @@ export class TimelineRecordStore {
     if (!isCurrentQuery()) throw new Error('Timeline 查询已取消');
     if (!raw) for (const [channelId, channel] of envelopes) {
       const rows: TimelineRow[] = [];
-      for (const bucket of channel.values()) for (const row of new Set([bucket.first, bucket.min, bucket.max, bucket.last])) rows.push(bucket.broken ? { ...row, startsNewSegment: true } : row);
+      for (const bucket of channel.values()) for (const row of new Set([bucket.first, bucket.min, bucket.max, bucket.last])) rows.push(row);
       groups.set(channelId, rows);
     }
     const snapshots: DataSampleSnapshot[] = [];

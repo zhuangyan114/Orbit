@@ -4,7 +4,8 @@
  * Original MIT-licensed STM32F103C8T6 RAM loader, built for Cortex-M3.
  * Register facts/sequences: PM0075 Rev 2 sections 2.3 and 3; RM0008 RCC.
  * Only the documented 64 KiB main Flash is supported. No option-byte writes,
- * mass erase, vendor source, or third-party algorithm image is included.
+ * vendor source or third-party algorithm image is included. RMLink adds a
+ * guarded whole-declared-main-Flash erase; partial images use EraseSector.
  */
 #define FLASH_BASE 0x08000000u
 #define FLASH_END 0x08010000u
@@ -14,6 +15,7 @@
 #define FLASH_SR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x0Cu))
 #define FLASH_CR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x10u))
 #define FLASH_AR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x14u))
+#define FLASH_WRPR (*(volatile uint32_t *)(FLASH_REG_BASE + 0x20u))
 #define RCC_CR (*(volatile uint32_t *)0x40021000u)
 #define RCC_CR_HSION (1u << 0)
 #define RCC_CR_HSIRDY (1u << 1)
@@ -24,6 +26,7 @@
 #define FLASH_SR_ERROR_MASK (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)
 #define FLASH_CR_PG (1u << 0)
 #define FLASH_CR_PER (1u << 1)
+#define FLASH_CR_MER (1u << 2)
 #define FLASH_CR_STRT (1u << 6)
 #define FLASH_CR_LOCK (1u << 7)
 /* Clear PG/PER/MER/OPTPG/OPTER/STRT before selecting only PG or PER. */
@@ -121,6 +124,31 @@ int EraseSector(uint32_t adr) {
   // Registers cannot be written while BSY is set (PM0075 section 2.3.3).
   if (result != 1) clear_mode();
   return result;
+}
+
+/* PM0075 Rev 2, section 2.3.3: MER erases user pages, not the information block.
+ * The F103C8 profile must already have checked identity and declared capacity.
+ * Three exact arguments prevent a partial-range call from selecting mass erase.
+ */
+__attribute__((section(".text.eraseChip"), noinline, used))
+int EraseChip(uint32_t adr, uint32_t length, uint32_t guard) {
+  mask_interrupts();
+  if (adr != FLASH_BASE || length != FLASH_END-FLASH_BASE || guard != 0x524D4C4Bu) return 3;
+  if ((FLASH_WRPR & 0xFFFFu) != 0xFFFFu) return 2;
+  if (wait_busy() != 0) return 1;
+  clear_status();
+  const int unlocked=unlock_flash();
+  if (unlocked != 0) return unlocked;
+  clear_mode();
+  FLASH_CR |= FLASH_CR_MER;
+  FLASH_CR |= FLASH_CR_STRT;
+  __asm volatile("dsb\nnop\nnop" ::: "memory");
+  const int result=wait_ready();
+  if (result != 1) clear_mode();
+  if (result != 0) return result;
+  for (uint32_t at=FLASH_BASE; at<FLASH_END; at+=4u)
+    if (*(volatile const uint32_t *)at != 0xFFFFFFFFu) return 3;
+  return 0;
 }
 
 __attribute__((section(".text.programPage"), noinline, used))

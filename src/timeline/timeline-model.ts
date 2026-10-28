@@ -21,7 +21,11 @@ export interface TimelineMeta {
   complete: boolean;
   exportRange?: { startMs: number; endMs: number };
 }
-export interface TimelineRow extends TimelineDataPoint { channelId: number; segmentId: number; sequence?: number; }
+export interface TimelineRow extends TimelineDataPoint {
+  channelId: number; segmentId: number; sequence?: number;
+  /** Rebuildable summary metadata; raw CSV remains unchanged. */
+  summaryVersion?: 2; summaryNeedsRefine?: boolean;
+}
 export interface TimelineTab {
   id: string;
   recordId: string;

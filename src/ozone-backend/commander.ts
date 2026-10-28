@@ -4,7 +4,9 @@ import {
   DebugProbe,
   StackFrame, MemoryBlock, TargetState, WatchValue,
   FastDataSamplePlanItem, FastDataSampleSpec,
+  ProbeSampleBatch, ProbeSampleFrame, ProbeSamplingStarted,
 } from './types';
+import { probeSamplingItems } from './probe-sampling-plan';
 import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
 import { JLinkDLL } from './jlink-dll';
@@ -15,6 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../utils/logger';
 import { BoundedMetric } from '../utils/bounded-metric';
+import type { CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import {
   CppJLinkResult,
   NativeStepExecutor,
@@ -111,6 +114,10 @@ export class OzoneBackend {
   private readonly fastSamplingReadMs = new BoundedMetric(8_192);
   private readonly fastSamplingFormatMs = new BoundedMetric(8_192);
   private readonly fastSamplingCounts = { captures: 0, batchRequests: 0, fallbackReads: 0, cacheHits: 0 };
+  /** Specs of the running probe-side sampling, indexed like the probe items. */
+  private probeSamplingSpecs: FastDataSampleSpec[] = [];
+  /** Identifies the latest probe sampling start; set before its helper call is queued. */
+  private probeSamplingRun = 0;
   private planCacheHit = 0;
   private planCacheMiss = 0;
   private planCacheInvalidation = 0;
@@ -125,6 +132,29 @@ export class OzoneBackend {
 
   get currentState(): TargetState {
     return this.state;
+  }
+
+  get supportsProbeSubscriptions() { return this.sessionTarget?.supportsSubscriptions===true; }
+  async subscribeProbeSamples(kind:'memory_series'|'memory_snapshot',specs:FastDataSampleSpec[],periodUs:number,
+      onSample:(sample:CaptureSample)=>void):Promise<()=>Promise<void>> {
+    const target=this.sessionTarget;
+    if(!target?.subscribe || !target.onCapture)throw new Error('Probe subscriptions unavailable');
+    const fields:NonNullable<SubscriptionConfig['fields']>=specs.map(spec=>{
+      if(![1,2,4].includes(spec.size))throw new Error('RMLink supports 8/16/32-bit scalar fields');
+      if(spec.pointerChain?.length) {
+        return {address:spec.pointerChain[0].pointerAddress,offsets:spec.pointerChain.slice(1).map(s=>s.offset),byte_length:spec.size as 1|2|4};
+      }
+      return {address:spec.pointerAddress??spec.address,
+        offsets:spec.pointerAddress===undefined?[]:[spec.pointeeOffset??0],byte_length:spec.size as 1|2|4};
+    });
+    const expectedKind=kind==='memory_series'?1:2;
+    let expectedCapture:number|undefined;
+    const detach=target.onCapture(sample=>{if(sample.kind===expectedKind && sample.captureId===expectedCapture)onSample(sample);});
+    try {
+      const handle=await target.subscribe(kind,{fields,period_us:periodUs});
+      expectedCapture=handle.capture_id;
+      return async()=>{detach();await target.unsubscribe?.(handle.subscription_id);};
+    }catch(error){detach();throw error;}
   }
 
   get hasTargetConnection(): boolean {
@@ -440,6 +470,12 @@ case 'readVariableRuntime':
           return { ok: true, data: this.prepareFastDataSampling(command.expressions) };
         case 'readFastDataSampling':
           return { ok: true, data: await this.readFastDataSampling(command.specs, command.priority) };
+        case 'startProbeSampling':
+          return await this.startProbeSampling(command.specs, command.periodUs);
+        case 'readProbeSampling':
+          return await this.readProbeSampling();
+        case 'stopProbeSampling':
+          return await this.stopProbeSampling(command.run);
         case 'getPerformanceDiagnostics':
           return {
             ok: true,
@@ -649,16 +685,21 @@ case 'readVariableRuntime':
 
   private async doConnect(config: DebugSessionConfig): Promise<OzoneCommandResult> {
     this.clearNativeStopInfo('new connect');
-    if (config.probe !== undefined && config.probe !== 'auto' && config.probe !== 'jlink' && config.probe !== 'cmsis-dap') {
-      return invalidConfiguration('probe', 'auto, jlink, or cmsis-dap', config.probe);
+    if (config.probe !== undefined && config.probe !== 'auto' && config.probe !== 'jlink' && config.probe !== 'cmsis-dap' && config.probe !== 'rmlink') {
+      return invalidConfiguration('probe', 'auto, jlink, cmsis-dap, or rmlink', config.probe);
     }
+    if(config.rmlinkDeviceId && config.probe==='jlink'){
+      return invalidConfiguration('probe','rmlink when rmlinkDeviceId is specified',config.probe);
+    }
+    if(config.rmlinkDeviceId)config={...config,probe:'rmlink'};
     if (config.cmsisDapTransport !== undefined
       && config.cmsisDapTransport !== 'auto'
       && config.cmsisDapTransport !== 'cmsis-dap-v2'
       && config.cmsisDapTransport !== 'cmsis-dap'
       && config.cmsisDapTransport !== 'hid'
-      && config.cmsisDapTransport !== 'winusb') {
-      return invalidConfiguration('cmsisDapTransport', 'auto, cmsis-dap-v2, cmsis-dap, hid, or winusb', config.cmsisDapTransport);
+      && config.cmsisDapTransport !== 'winusb'
+      && config.cmsisDapTransport !== 'tcp') {
+      return invalidConfiguration('cmsisDapTransport', 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp', config.cmsisDapTransport);
     }
     let requestedProbe: DebugProbe;
     if (config.probe === undefined || config.probe === 'auto') {
@@ -680,7 +721,7 @@ case 'readVariableRuntime':
     if (this.state === TargetState.Connected) {
       return { ok: true, data: { state: TargetState.Connected } };
     }
-    if (requestedProbe === 'cmsis-dap' && !this.sessionTarget) {
+    if (requestedProbe !== 'jlink' && !this.sessionTarget) {
       return {
         ok: false,
         errorCode: 'OwnerUnavailable',
@@ -758,7 +799,7 @@ case 'readVariableRuntime':
   }
 
   private async doResolveProbe(config: DebugSessionConfig): Promise<OzoneCommandResult> {
-    if (config.probe === 'jlink' || config.probe === 'cmsis-dap') {
+    if (config.probe === 'jlink' || config.probe === 'cmsis-dap' || config.probe === 'rmlink') {
       return { ok: true, data: { probe: config.probe, policy: 'explicit' } };
     }
     if (!(this.sessionTarget instanceof SessionTargetSelector)) {
@@ -785,7 +826,7 @@ case 'readVariableRuntime':
       const ownerKind = 'ownerKind' in this.sessionTarget
         ? this.sessionTarget.ownerKind
         : this.sessionTarget.kind;
-      if (ownerKind === 'cmsis-dap') return 'cmsis-dap';
+      if (ownerKind === 'cmsis-dap') return this.sessionTarget.supportsSubscriptions ? 'rmlink' : 'cmsis-dap';
       if (ownerKind === 'jlink-native' || ownerKind === 'jlink-legacy') return 'jlink';
       return null;
     }
@@ -2743,7 +2784,7 @@ case 'readVariableRuntime':
       reports?: Array<{ operation: string; address: number; size: number; elapsedMs: number; ok: boolean; errorCode?: string; message?: string }>;
       erasedSectors?: Array<{ number: number; address: number; size: number }>;
     };
-    if (probe === 'cmsis-dap') {
+    if (probe === 'cmsis-dap' || probe === 'rmlink') {
       if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'CMSIS-DAP target owner is unavailable' };
       const options: CmsisDapFlashOptions = { signal, algorithmPath, clockHz: speedKHz * 1000, verify: verify ?? true };
       const flashResult = 'ownerKind' in this.sessionTarget
@@ -3267,6 +3308,99 @@ case 'readVariableRuntime':
     }
     this.fastSamplingFormatMs.record(performance.now() - formatStartedAt);
     return results;
+  }
+
+  /** Formats XR frames separately so their evolution cannot change the host fast-read path. */
+  private formatProbeSample(spec: FastDataSampleSpec, raw: Uint8Array, address?: number): WatchValue {
+    let value: number | string;
+    let display: string;
+    let hex: string;
+    let exactValue: string | undefined;
+    let numericValueExact: boolean | undefined;
+    if (spec.isFloat) {
+      value = this.readBytesAsFloat(raw, spec.size);
+      display = spec.size === 8 ? `${value.toExponential(6)}` : `${value.toFixed(6)}`;
+      hex = `0x${Array.from(raw.slice(0, spec.size)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+    } else {
+      const formatted = this.formatScalarValue(
+        raw,
+        spec.size,
+        spec.format || { kind: 'base', encoding: spec.signed ? 'signed' : 'unsigned', name: spec.typeName || '' },
+      );
+      value = formatted.value;
+      display = formatted.display;
+      hex = formatted.hex;
+      exactValue = formatted.exactValue;
+      numericValueExact = formatted.numericValueExact;
+    }
+    return {
+      expression: spec.expression,
+      value,
+      display,
+      hex,
+      exactValue,
+      numericValueExact,
+      address,
+      typeName: spec.typeName,
+    };
+  }
+
+  private async startProbeSampling(specs: FastDataSampleSpec[], periodUs: number): Promise<OzoneCommandResult> {
+    const target = this.sessionTarget;
+    if (!this.isCmsisDapOwner() || !target?.startProbeSampling || !(await target.supportsProbeSampling?.())) {
+      return { ok: false, errorCode: 'UnsupportedCapability', error: 'probe-side sampling needs an XR-DAP CMSIS-DAP probe' };
+    }
+    const items = probeSamplingItems(specs);
+    if (!items) {
+      return { ok: false, errorCode: 'UnsupportedCapability', error: 'an expression does not fit the XR-DAP item encoding' };
+    }
+    const run = ++this.probeSamplingRun;
+    const result = await target.startProbeSampling(Math.max(1, Math.round(periodUs)), items);
+    if (!result.ok || !result.data) {
+      return { ok: false, errorCode: result.errorCode || 'ProbeSamplingFailed', error: result.message };
+    }
+    if (run === this.probeSamplingRun) this.probeSamplingSpecs = specs;
+    const data: ProbeSamplingStarted = { ...result.data, run };
+    return { ok: true, data };
+  }
+
+  /** Reads buffered probe frames and formats each value like a fast-sampling read. */
+  private async readProbeSampling(): Promise<OzoneCommandResult> {
+    const target = this.sessionTarget;
+    const specs = this.probeSamplingSpecs;
+    if (!target?.readProbeSampling || specs.length === 0) {
+      return { ok: false, errorCode: 'InvalidState', error: 'probe-side sampling is not running' };
+    }
+    const result = await target.readProbeSampling();
+    if (!result.ok || !result.data) {
+      return { ok: false, errorCode: result.errorCode || 'ProbeSamplingFailed', error: result.message };
+    }
+    const frames: ProbeSampleFrame[] = result.data.frames.map(frame => ({
+      timestampUs: frame.t,
+      values: frame.v.flatMap(([index, ok, hexBytes]) => {
+        const spec = specs[index];
+        if (!spec || !ok) return [];
+        return [this.formatProbeSample(spec, Buffer.from(hexBytes, 'hex'))];
+      }),
+    }));
+    const data: ProbeSampleBatch = {
+      probeNowUs: result.data.probeNowUs,
+      probeNowAgeUs: result.data.probeNowAgeUs,
+      pendingBytes: result.data.pendingBytes,
+      frames,
+      stats: result.data.stats,
+    };
+    return { ok: true, data };
+  }
+
+  private async stopProbeSampling(run?: number): Promise<OzoneCommandResult> {
+    // A newer start already replaced the subscription this stop refers to.
+    if (run !== undefined && run !== this.probeSamplingRun) return { ok: true, data: { stale: true } };
+    this.probeSamplingSpecs = [];
+    const target = this.sessionTarget;
+    if (!target?.stopProbeSampling) return { ok: true, data: {} };
+    const result = await target.stopProbeSampling();
+    return result.ok ? { ok: true, data: result.data ?? {} } : { ok: false, errorCode: result.errorCode, error: result.message };
   }
 
   private checkedFastSampleAddress(base: number, offset: number, size: number): number | null {
@@ -4101,6 +4235,10 @@ case 'readVariableRuntime':
     if (info.kind === 'array') {
       const elemName = this.formatDwarfTypeName(info.typeOffset, visited);
       const suffix = info.arrayCount && info.arrayCount > 0 ? `[${info.arrayCount}]` : '[]';
+      if(this.dwarfInfo.typeDefs.get(info.typeOffset||'')?.kind==='array') {
+        const bracket=elemName.indexOf('[');
+        if(bracket>=0)return elemName.slice(0,bracket)+suffix+elemName.slice(bracket);
+      }
       return `${elemName || 'unknown'}${suffix}`;
     }
 

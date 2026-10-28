@@ -497,19 +497,39 @@ export async function parseDwarfTypeInfo(elfPath: string): Promise<DwarfInfo> {
       }
 
       if (die.tag === 'DW_TAG_array_type') {
-        const dimensions = die.children.filter((child: any) => child.tag === 'DW_TAG_subrange_type').map((child: any) => {
-          const count = child.attrs.DW_AT_count;
-          const upper = child.attrs.DW_AT_upper_bound;
-          return count !== undefined ? parseInt(count, 10) : upper !== undefined ? parseInt(upper, 10) + 1 : 0;
+        const constant=(value:unknown):number|null=>{
+          if(typeof value!=='string' || !/^(?:0x[0-9a-f]+|\d+)$/i.test(value))return null;
+          const n=Number(value);return Number.isSafeInteger(n) && n>=0?n:null;
+        };
+        const dimensions=die.children.filter((child:any)=>child.tag==='DW_TAG_subrange_type').map((child:any)=>{
+          const lower=child.attrs.DW_AT_lower_bound===undefined?0:constant(child.attrs.DW_AT_lower_bound);
+          const upper=constant(child.attrs.DW_AT_upper_bound),count=constant(child.attrs.DW_AT_count);
+          // Only concrete zero-based C dimensions are addressable. Dynamic or
+          // absent bounds stay empty instead of silently accepting an index.
+          if(lower!==0)return 0;
+          return count??(upper===null?0:Number.isSafeInteger(upper+1)?upper+1:0);
         });
-        let elementOffset = die.attrs.DW_AT_type;
-        for (let index = Math.max(0, dimensions.length - 1); index >= 0; index--) {
-          const offset = index === 0 ? die.offset : `${die.offset}:dimension${index}`;
-          typeDefs.set(offset, { name: '', byteSize: 0, kind: 'array', typeOffset: elementOffset, arrayCount: dimensions[index] || 0 });
-          elementOffset = offset;
+        if(!dimensions.length || dimensions.length>16)dimensions.splice(0,dimensions.length,0);
+        let element=die.attrs.DW_AT_type;
+        // One GCC DIE can hold all subranges of T[10][16]. Represent each
+        // dimension as a nested array, preserving ordinary planner/viewer paths.
+        for(let i=dimensions.length-1;i>=0;i--) {
+          const key=i===0?die.offset:`${die.offset}:dimension${i}`;
+          typeDefs.set(key,{name:'',byteSize:0,kind:'array',typeOffset:element,arrayCount:dimensions[i]});
+          element=key;
         }
       }
     }
+
+    const sizeOf=(offset:string|undefined,seen:Set<string>):number=>{
+      if(!offset || seen.has(offset) || seen.size>=64)return 0;
+      const info=typeDefs.get(offset);if(!info)return 0;
+      const next=new Set(seen);next.add(offset);
+      if(['typedef','const','volatile','restrict'].includes(info.kind))return sizeOf(info.typeOffset,next);
+      const size=info.kind==='array'?(info.arrayCount||0)*sizeOf(info.typeOffset,next):info.byteSize;
+      return Number.isSafeInteger(size) && size>0 && size<=0xffffffff?size:0;
+    };
+    for(const [offset,info] of typeDefs)if(info.kind==='array')info.byteSize=sizeOf(offset,new Set());
 
     const framesOutput = await new Promise<string>((resolve) => {
       execFile(OBJDUMP_EXE, [

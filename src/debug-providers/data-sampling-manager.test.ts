@@ -110,19 +110,64 @@ describe('Timeline sampling rejection feedback', () => {
   it('routes a picker delta through one DAP sampling request and stops sampling when the last entry is removed', async () => {
     const { manager, session, backend } = fixture(vi.fn(async () => ({ ok: true })));
     try {
-      manager.addExpressions(['old', 'keep']); await Promise.resolve();
+      manager.addExpressions(['old', 'keep']); await (manager as any).remoteTransition;
       session.customRequest.mockClear();
-      manager.updateExpressions(['new'], ['old']); await Promise.resolve();
+      manager.updateExpressions(['new'], ['old']); await (manager as any).remoteTransition;
       expect(session.customRequest).toHaveBeenCalledOnce();
       expect(session.customRequest).toHaveBeenCalledWith('dataSamplingStart', expect.objectContaining({
         entries: [expect.objectContaining({ expression: 'keep' }), expect.objectContaining({ expression: 'new' })],
       }));
       session.customRequest.mockClear();
-      manager.updateExpressions([], ['keep', 'new']); await Promise.resolve();
+      manager.updateExpressions([], ['keep', 'new']); await (manager as any).remoteTransition;
       expect(session.customRequest).toHaveBeenCalledOnce();
       expect(session.customRequest).toHaveBeenCalledWith('dataSamplingStop', {});
       expect(backend.execute).not.toHaveBeenCalled();
     } finally { manager.dispose(); }
+  });
+
+  it('does not let a late expression update stop the newer remote sampler', async () => {
+    let release!: () => void, starts = 0, remoteActive = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const commands: string[] = [];
+    const { manager, session } = fixture(vi.fn(async (command: string) => {
+      commands.push(command);
+      if (command === 'dataSamplingStart') {
+        if (++starts === 1) await gate;
+        remoteActive = true;
+      } else if (command === 'dataSamplingStop') remoteActive = false;
+      return { ok: true };
+    }));
+    const m = manager as any;
+    m.samplingGeneration = 1;
+    const first = m.startRemoteSampling(session, 1);
+    await Promise.resolve();
+    m.samplingGeneration = 2;
+    const newest = m.startRemoteSampling(session, 2);
+    release();
+    await Promise.all([first, newest]);
+    expect(remoteActive).toBe(true);
+    expect(commands.at(-1)).toBe('dataSamplingStart');
+    manager.dispose();
+  });
+
+  it('stops an in-flight startup when the last expression is removed', async () => {
+    let release!: () => void, active = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const { manager, session } = fixture(vi.fn(async (command: string) => {
+      if (command === 'dataSamplingStart') { await gate; active = true; }
+      else if (command === 'dataSamplingStop') active = false;
+      return { ok: true };
+    }));
+    const m = manager as any;
+    const first = m.startRemoteSampling(session, 0);
+    await Promise.resolve();
+    m.samplingGeneration++;
+    const stopping = m.stopRemoteSampling();
+    release();
+    await Promise.all([first, stopping]);
+    expect(active).toBe(false);
+    expect(m.remoteSampling).toBe(false);
+    manager.dispose();
   });
 
   it('reports rejected expressions while keeping the supported remote sampler active', async () => {
@@ -161,6 +206,7 @@ describe('Timeline sampling rejection feedback', () => {
     const pending = new Promise((_, fail) => { reject = fail; });
     const { manager, session } = fixture(vi.fn(() => pending));
     const starting = (manager as any).startRemoteSampling(session, 0);
+    await Promise.resolve();
     const current = mode === 'session' ? { type: 'orbit' } : session;
     if (mode === 'generation') (manager as any).samplingGeneration++;
     state.activeDebugSession = current;

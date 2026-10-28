@@ -181,6 +181,26 @@ Result CmsisDapProtocol::exchange(const std::vector<uint8_t>& command, uint8_t e
   return Result::success();
 }
 
+Result CmsisDapProtocol::vendorExchange(const std::vector<uint8_t>& command,
+                                        std::vector<uint8_t>& response,
+                                        std::chrono::milliseconds timeout) {
+  response.clear();
+  if (!transport_) {
+    return Result::error(ErrorCodes::kInternalError, "no transport bound to protocol layer");
+  }
+  if (command.empty() || command[0] < 0x80) {
+    return Result::error(ErrorCodes::kDapInvalidRequest, "vendor command id must be 0x80..0xFF");
+  }
+  const Result writeResult = transport_->writePacket(command.data(), command.size(), timeout);
+  if (!writeResult.ok) return writeResult;
+  std::vector<uint8_t> buffer(transport_->payloadCapacity());
+  size_t length = 0;
+  const Result readResult = transport_->readPacket(buffer.data(), buffer.size(), length, timeout);
+  if (!readResult.ok) return readResult;
+  response.assign(buffer.data(), buffer.data() + length);
+  return Result::success();
+}
+
 Result CmsisDapProtocol::queryInfoItem(uint8_t itemId, std::vector<uint8_t>& payload,
                                        std::chrono::milliseconds timeout) {
   payload.clear();

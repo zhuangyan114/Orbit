@@ -38,6 +38,7 @@ export class DataSamplingManager {
   private remoteSession: vscode.DebugSession | null = null;
   private remoteSampling = false;
   private samplingGeneration = 0;
+  private remoteTransition: Promise<void> = Promise.resolve();
   private readonly disposables: vscode.Disposable[] = [];
 
   onExpressionsChanged: ((exprs: { expression: string; color: string }[]) => void) | null = null;
@@ -208,7 +209,18 @@ export class DataSamplingManager {
     if (!this.timer) this.startSampling();
   }
 
-  private async startRemoteSampling(session: vscode.DebugSession, generation: number) {
+  private enqueueRemoteTransition(action: () => Promise<void>): Promise<void> {
+    const task = this.remoteTransition.then(action);
+    this.remoteTransition = task.catch(() => {});
+    return task;
+  }
+
+  private startRemoteSampling(session: vscode.DebugSession, generation: number) {
+    return this.enqueueRemoteTransition(() => this.startRemoteSamplingSerial(session, generation));
+  }
+
+  private async startRemoteSamplingSerial(session: vscode.DebugSession, generation: number) {
+    if (generation !== this.samplingGeneration || vscode.debug.activeDebugSession !== session) return;
     try {
       const response: any = await session.customRequest('dataSamplingStart', {
         entries: this.entries.map(e => ({ expression: e.expression, color: e.color })),
@@ -243,7 +255,11 @@ export class DataSamplingManager {
     }
   }
 
-  private async stopRemoteSampling() {
+  private stopRemoteSampling() {
+    return this.enqueueRemoteTransition(() => this.stopRemoteSamplingSerial());
+  }
+
+  private async stopRemoteSamplingSerial() {
     if (!this.remoteSampling || !this.remoteSession) return;
     const session = this.remoteSession;
     this.remoteSampling = false;

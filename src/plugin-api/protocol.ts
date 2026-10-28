@@ -301,7 +301,7 @@ export type SessionPhase =
 export type TargetStateKind = 'unknown' | 'disconnected' | 'running' | 'halted' | 'resetting';
 
 /** OpenRPC ProbeKind (launch configuration probe selection). */
-export type ProbeKind = 'jlink' | 'cmsis-dap';
+export type ProbeKind = 'jlink' | 'cmsis-dap' | 'rmlink';
 
 /** OpenRPC TransportKind (owner transport / CMSIS-DAP interface). */
 export type TransportKind = 'native' | 'legacy' | 'hid' | 'winusb';

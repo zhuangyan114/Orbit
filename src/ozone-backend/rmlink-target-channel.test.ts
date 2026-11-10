@@ -1,4 +1,5 @@
-import { describe,it,expect } from 'vitest';
+import { describe,it,expect,vi } from 'vitest';
+import { log } from '../utils/logger';
 import { RMLinkTargetChannel } from './rmlink-target-channel';
 import { SessionTargetSelector } from './session-target-channel';
 import type { RMLinkClient } from '../../clients/rmlink/rmlink-client.mjs';
@@ -145,5 +146,31 @@ describe('RMLink public-service owner',()=>{
       expect(model.flashSignal).toBe(cancellation.signal);
       expect(owner.usingNative).toBe(true);
     }finally{await owner.dispose();await rm(directory,{recursive:true,force:true});}
+  });
+  it('persists service Flash failure progress before owner disposal without replaying the image',async()=>{
+    const directory=await mkdtemp(join(tmpdir(),'rmlink-flash-failure-'));
+    const elf=Buffer.alloc(0x104);elf.set([0x7f,0x45,0x4c,0x46,1,1,1]);
+    elf.writeUInt16LE(2,16);elf.writeUInt16LE(40,18);elf.writeUInt32LE(1,20);
+    elf.writeUInt32LE(0x34,28);elf.writeUInt16LE(32,42);elf.writeUInt16LE(1,44);
+    for(const [offset,value] of [[0,1],[4,0x100],[8,0x08000000],[12,0x08000000],[16,4],[20,4],[24,5],[28,4]])elf.writeUInt32LE(value,0x34+offset);
+    const path=join(directory,'fixture.elf');await writeFile(path,elf);
+    const progress={phase:'failed',probe_error:10,probe_error_address:0xe000edf0,
+      programmed_bytes:0,erased_pages:0,probe_elapsed_us:5000000,probe_stage_us:{loader:5000000}};
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    model.flashError=Object.assign(new Error('Probe Flash ended in failed, error=10'),{
+      errorCode:'FlashFailed',httpStatus:500,details:{progress},
+    });
+    const record=vi.spyOn(log,'dll').mockImplementation(()=>{});
+    try {
+      await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+      const result=await owner.flash(path,'STM32F103C8');
+      expect(result).toMatchObject({ok:false,errorCode:'FlashFailed',diagnostics:{elfPath:path,device:'STM32F103C8',httpStatus:500,progress}});
+      expect(record).toHaveBeenCalledWith(expect.stringContaining('"probe_error":10'),{persist:true});
+      expect(record.mock.calls[0][0]).toContain('"probe_error_address":3758157296');
+      expect(model.images).toHaveLength(1);expect(model.opened).toBe(1);expect(model.closed).toBe(0);
+      expect(owner.usingNative).toBe(true);
+      await owner.dispose();expect(model.closed).toBe(1);
+      expect(result.diagnostics?.progress).toEqual(progress);
+    }finally{record.mockRestore();await owner.dispose();await rm(directory,{recursive:true,force:true});}
   });
 });

@@ -44,18 +44,22 @@ export function configureLogger(options: LoggerOptions = {}) {
   }
 }
 
-function write(cat: LogCategory, tag: string, msg: string) {
+function write(cat: LogCategory, tag: string, msg: string, persist = false) {
   if (!configured) configureLogger();
   if (!loggingEnabled) return;
   ensureLogDirectory();
-  const line = new Date().toISOString().slice(11, 23) + ' [' + tag + '] ' + msg + '\n';
+  const timestamp = new Date().toISOString();
+  const line = timestamp.slice(11, 23) + ' [' + tag + '] ' + msg + '\n';
   try { fs.appendFileSync(logFiles[cat], line); } catch {}
+  if (persist) {
+    try { fs.appendFileSync(path.join(LOG_DIR, `${cat}-history.log`), `${timestamp} [${tag}] ${msg}\n`); } catch {}
+  }
   process.stderr.write(line);
 }
 
 export const log = {
   step: (msg: string) => write('step', 'Step', msg),
   eval: (msg: string) => write('eval', 'Eval', msg),
-  dll: (msg: string) => write('dll', 'DLL', msg),
+  dll: (msg: string, options?: { persist?: boolean }) => write('dll', 'DLL', msg, options?.persist),
   dap: (msg: string) => write('dap', 'DAP', msg),
 };

@@ -195,9 +195,12 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
         return this.success({success:true,message:'RMLink service programmed and fully verified the image',
           reports:[],erasedSectors:sectors,target,diagnostics:result});
     }catch(error){
-      const failure=error as {name?:string;errorCode?:string;code?:string;ownerLost?:boolean};
+      const failure=error as {name?:string;errorCode?:string;code?:string;ownerLost?:boolean;httpStatus?:number;details?:{progress?:Record<string,unknown>}};
       if(failure.ownerLost)this.connected=false;
-      return this.failure(String(error),failure.errorCode==='FlashCancelled' || failure.name==='AbortError'?'RequestCancelled':failure.ownerLost?'NativeOwnerLost':failure.errorCode || failure.code || 'OutcomeUnknown');
+      const errorCode=failure.errorCode==='FlashCancelled' || failure.name==='AbortError'?'RequestCancelled':failure.ownerLost?'NativeOwnerLost':failure.errorCode || failure.code || 'OutcomeUnknown';
+      const diagnostics={elfPath,device,httpStatus:failure.httpStatus,progress:failure.details?.progress};
+      log.dll(`[rmlink] flash failed ${JSON.stringify({errorCode,error:String(error),...diagnostics})}`,{persist:true});
+      return {...this.failure<CmsisDapFlashResult>(String(error),errorCode),diagnostics};
     }finally{this.flashing=false;}
   }
   async stepIntoInstruction():Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {

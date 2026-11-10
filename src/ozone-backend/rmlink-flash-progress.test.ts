@@ -8,6 +8,30 @@ const sectors = [0, 1, 2, 3, 4].map(number => ({
 }));
 
 describe('RMLink Flash progress', () => {
+  it('logs retry, fallback and progress rollback once, including recovery first seen at completion', () => {
+    const messages: string[] = [];
+    const report = createRMLinkFlashProgressReporter(0x08000000, 131072, sectors, message => messages.push(message));
+    const recovery = {
+      ram_retries: 2, retry_address: 0x20010020, retry_attempt: 2, downgraded: true,
+      requested_clock_hz: 8000000, active_clock_hz: 4000000, fallback_clock_hz: 4000000,
+      sector_address: 0x08010000, sector_size: 65536, erase_operations: 6, elapsed_us: 1140000,
+    };
+    report({ phase: 'program', programmed_bytes: 81920 });
+    report({ phase: 'erase', programmed_bytes: 65536, erased_pages: 5, probe_recovery: recovery });
+    report({ phase: 'erase', programmed_bytes: 65536, erased_pages: 5, probe_recovery: recovery });
+    report({ phase: 'complete', verified: true, probe_recovery: recovery });
+    expect(messages.filter(message => message.startsWith('RAM 缓冲恢复已重试'))).toHaveLength(1);
+    expect(messages).toContain('烧录恢复已降频 8.0 MHz → 4.0 MHz');
+    expect(messages).toContain('恢复扇区 0x08010000 至 0x0801FFFF，重新擦除并从扇区起点写入');
+    expect(messages).toContain('写入进度回退至 65536/131072 字节，正在恢复当前扇区');
+    expect(messages).toContain('重新擦除中... 0x08010000 至 0x0801FFFF，已擦除 5/5 个扇区');
+    expect(messages).toContain('恢复汇总，RAM 重传 2 次，实际擦除 6 次，用时 1.140s');
+    const finalMessages: string[] = [];
+    const finalReport = createRMLinkFlashProgressReporter(0x08000000, 131072, sectors, message => finalMessages.push(message));
+    finalReport({ phase: 'complete', verified: true, probe_recovery: recovery });
+    expect(finalMessages).toContain('烧录恢复已降频 8.0 MHz → 4.0 MHz');
+  });
+
   it('shows live sector ranges and measured completion timings without duplicate snapshots', () => {
     const messages: string[] = [];
     const report = createRMLinkFlashProgressReporter(0x08000000, 131072, sectors, message => messages.push(message));

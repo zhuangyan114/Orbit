@@ -166,7 +166,7 @@ describe('RMLink public-service owner',()=>{
       const result=await owner.flash(path,'STM32F103C8');
       expect(result).toMatchObject({ok:false,errorCode:'FlashFailed',diagnostics:{elfPath:path,device:'STM32F103C8',httpStatus:500,progress}});
       expect(record).toHaveBeenCalledWith(expect.stringContaining('"probe_error":10'),{persist:true});
-      expect(record.mock.calls[0][0]).toContain('"probe_error_address":3758157296');
+      expect(record).toHaveBeenCalledWith(expect.stringContaining('"probe_error_address":3758157296'),{persist:true});
       expect(model.images).toHaveLength(1);expect(model.opened).toBe(1);expect(model.closed).toBe(0);
       expect(owner.usingNative).toBe(true);
       await owner.dispose();expect(model.closed).toBe(1);

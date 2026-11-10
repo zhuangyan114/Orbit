@@ -1893,6 +1893,12 @@ export class DapSession extends EventEmitter {
     }
   }
 
+  private sendFlashProgress(message: string): void {
+    if (this.isSessionTerminating()) return;
+    log.dap(`[cmsis-dap] [flash] ${message}`);
+    this.sendEvent('output', { category: 'console', output: `${message}\n` });
+  }
+
   private async handleLaunch(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
@@ -2095,6 +2101,7 @@ export class DapSession extends EventEmitter {
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
           probe: resolvedProbe,
           flashBeforeDebug: targetConfig.flashBeforeDebug,
+          onProgress: message => this.sendFlashProgress(message),
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,
         }));
@@ -3164,6 +3171,7 @@ export class DapSession extends EventEmitter {
             this.sendEvent('output', { category: 'console', output: `Restart: flashing ${this._elfPath}...\n` });
             const flashResult = await this.backend.execute({
               cmd: 'flash', elfPath: this._elfPath, device: this._device,
+              onProgress: message => this.sendFlashProgress(message),
               interface: this._interface as 'SWD' | 'JTAG', speedKHz: this._speedKHz,
               probe: this._probe,
               flashBeforeDebug: this._flashEnabled,
@@ -4442,6 +4450,7 @@ export class DapSession extends EventEmitter {
         try {
           flashResult = await this.backend.execute({
             cmd: 'flash',
+            onProgress: message => this.sendFlashProgress(message),
             elfPath,
             device: this._device,
             interface: this._interface as 'SWD' | 'JTAG',

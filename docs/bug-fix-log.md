@@ -11,6 +11,16 @@
 
 ## 修改记录
 
+### 功能 · RMLink 与 CMSIS-DAP 详细烧录日志
+
+- 日期为 2026-11-10。用户确认 RMLink 已验收，并明确要求普通 DAP 待验收也先记录、提交。
+- 需求为显示烧录阶段、实际地址、进度及耗时。RMLink 使用连接服务缓存和最终 COMMIT 结果，普通 CMSIS-DAP 使用既有 FlashOperationReport。每个调试会话共用已选 owner，观察回调失败不影响操作结果。
+- 修改涉及 clients/rmlink/rmlink-client.*、src/ozone-backend/rmlink-flash-progress.ts 及测试、rmlink-target-channel.ts 及测试、cmsis-dap-flasher.ts 及测试、session-target-channel.ts、commander.ts、types.ts、src/debug/dap-session.ts 和 dap-session-cmsis-dap.test.ts。
+- 自动化结果为 SDK 10 项通过，Orbit 1269 项通过、1 项跳过，类型检查、构建、native CMSIS-DAP mock、算法验证及现有 J-Link mock 回归通过。
+- RMLink Wi-Fi / cc68c7a5995c / STM32F407IG / SWD 4 MHz 实测 131072 字节烧录、完整比较及同会话独立回读通过，5 个擦除扇区和阶段耗时在控制台可见，用户已确认。普通 DAP HID/WinUSB 仍待实板与用户验收。
+- 原始证据在 D:/STM32/RMLink/artifacts/logs/detailed-flash-logging-2026-11-10T13-52-16-801Z 与 detailed-dap-logging-2026-11-10T14-15-12-543Z。完整记录见 RMLink 的 docs/fix-log/2026-11-10-detailed-flash-progress.md。
+- 用户另报 H723 在 131072/262144 字节处返回 error=8，故障地址 0x24016AC0，作为后续独立故障处理。
+
 ### Bug：Watch 写入后 VS Code 误显示暂停并导致 Timeline 停采
 
 - **日期**: 2026-10-24

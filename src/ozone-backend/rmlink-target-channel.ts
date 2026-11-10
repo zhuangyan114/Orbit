@@ -9,6 +9,7 @@ import { log } from '../utils/logger';
 import {readFile} from 'node:fs/promises';
 import {parseElf32LoadSegments,calculateEraseSectors,coalesceFlashProgramRanges,resolveFlashTarget,CmsisDapFlashOptions,CmsisDapFlashResult,FlashTargetDefinition} from './cmsis-dap-flasher';
 import type { CmsisDapRunToAddressResult } from './cmsis-dap-helper-channel';
+import { createRMLinkFlashProgressReporter } from './rmlink-flash-progress';
 
 export class RMLinkTargetChannel implements SessionTargetOwner {
   readonly kind = 'cmsis-dap' as const;
@@ -175,8 +176,17 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
           const jobs:Array<Record<string,unknown>>=[];
           for(let i=0;i<images.length;i++) {
             const group=images[i];
-            const job=await this.client.flashImage(group.image,group.address,options.signal,{resetAfter:i===images.length-1,timeoutMs:660000});
+            const reportProgress=createRMLinkFlashProgressReporter(group.address,group.size,
+              sectors.filter(sector=>sector.address>=group.address && sector.address<group.address+group.size),
+              message=>{
+                log.dll(`[cmsis-dap] [rmlink] ${message}`);
+                try {options.onProgress?.(message);} catch {}
+              });
+            const job=await this.client.flashImage(group.image,group.address,options.signal,{
+              resetAfter:i===images.length-1,timeoutMs:660000,onProgress:reportProgress,
+            });
             if(job.verified!==true)throw new Error('Flash did not report a complete image verification');
+            reportProgress({...job,phase:'complete'});
             jobs.push(job);
           }
           return {...jobs[jobs.length-1],verified:true,jobs};

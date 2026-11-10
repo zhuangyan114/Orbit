@@ -225,6 +225,7 @@ export type OzoneCommand =
     /** Advisory verification request; owners that can skip it honor `false`. */
     verify?: boolean;
     cmsisDapFlashAlgorithmPath?: string;
+    onProgress?: (message: string) => void;
   }
   | { cmd: 'readVariableRuntime'; name: string }
   | { cmd: 'loadSymbols'; elfPath: string }

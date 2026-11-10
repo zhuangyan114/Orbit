@@ -859,6 +859,10 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         },
       }, elfPath, device, {
         ...options,
+        onProgress: message => {
+          log.dll(`[cmsis-dap] ${message}`);
+          options.onProgress?.(message);
+        },
         onOperation: report => {
           log.dll(`[cmsis-dap] flash operation=${report.operation} address=0x${report.address.toString(16)} `
             + `size=${report.size} elapsedMs=${report.elapsedMs} ok=${report.ok} `

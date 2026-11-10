@@ -501,7 +501,7 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
       .toThrow(/SRAM/);
   });
 
-  it('runs only the intersecting erase sectors after every preflight succeeds', async () => {
+  it.each([false, true])('logs intersecting erase/program/verify ranges after preflight (observer throws=%s)', async observerThrows => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-cmsis-flash-test-'));
     try {
       const elfPath = path.join(tempDir, 'image.elf');
@@ -512,6 +512,7 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
       algorithm[0x501] = 0xBE;
       fs.writeFileSync(algorithmPath, algorithm);
       const calls: Array<{ operation: string; address: number; size: number; stackSize: number; staticBase: number; reusePageBuffer: boolean; flashStatusAddress?: number; flashControlAddress?: number; ramBase?: number; ramSize?: number }> = [];
+      const progress: string[] = [];
       const transport = {
         async readDp(reg: number) {
           return reg === 0
@@ -525,12 +526,17 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
         },
         async runAlgorithm(request: { operation: string; targetAddress: number; size: number; stackSize: number; staticBase: number; reusePageBuffer: boolean; flashStatusAddress?: number; flashControlAddress?: number; ramBase?: number; ramSize?: number }) {
           calls.push({ operation: request.operation, address: request.targetAddress, size: request.size, stackSize: request.stackSize, staticBase: request.staticBase, reusePageBuffer: request.reusePageBuffer, flashStatusAddress: request.flashStatusAddress, flashControlAddress: request.flashControlAddress, ramBase: request.ramBase, ramSize: request.ramSize });
-          return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: 0x20000502, dhcsr: 0x00030003 } };
+          return { ok: true, message: 'algorithm complete', elapsedMs: request.operation === 'eraseSector' ? 1140 : 12,
+            data: { returnCode: 0, pc: 0x20000502, dhcsr: 0x00030003 } };
         },
       };
       const result = await flashCmsisDapElf(transport, elfPath, 'STM32F407VET6', {
         algorithmPath,
         pageSize: 4,
+        onProgress: message => {
+          progress.push(message);
+          if (observerThrows) throw new Error('logging observer failed');
+        },
       }, STM32F407VET6);
       expect(result.success).toBe(true);
       expect(calls.map(call => call.operation)).toEqual([
@@ -545,6 +551,15 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
       expect(calls.every(call => call.flashStatusAddress === 0x40023C0C
         && call.flashControlAddress === 0x40023C10)).toBe(true);
       expect(calls.every(call => call.ramBase === 0x20000000 && call.ramSize === 128 * 1024)).toBe(true);
+      expect(progress).toContain('擦除中... 0x08000000 至 0x08003FFF');
+      expect(progress).toContain('已擦除 0x08000000 至 0x08003FFF，用时 1.140s');
+      expect(progress).toContain('已擦除 0x08004000 至 0x08007FFF，用时 1.140s');
+      expect(progress).toContain('写入中... 0x08003FFC 至 0x08003FFF');
+      expect(progress).toContain('已写入 0x08004000 至 0x08004003，用时 0.012s');
+      expect(progress).toContain('已校验 0x08004000 至 0x08004003，用时 0.012s');
+      expect(progress.indexOf('擦除中... 0x08000000 至 0x08003FFF'))
+        .toBeLessThan(progress.indexOf('已擦除 0x08000000 至 0x08003FFF，用时 1.140s'));
+      expect(progress.at(-1)).toMatch(/^烧录完成，共写入 8 字节，用时 \d+\.\d{3}s（总计）$/);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -631,14 +646,17 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
         },
       };
 
+      const progress: string[] = [];
       const result = await flashCmsisDapElf(transport, elfPath, 'STM32F407VET6', {
         algorithmPath: manifestPath,
         verify: false,
+        onProgress: message => progress.push(message),
       }, STM32F407VET6);
 
       expect(result.success).toBe(true);
       expect(calls.some(call => call.operation === 'verify')).toBe(false);
       expect(result.reports.some(report => report.operation === 'verify')).toBe(false);
+      expect(progress.some(message => message.includes('校验'))).toBe(false);
       expect(calls.map(call => call.operation)).toContain('programPage');
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -722,9 +740,14 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
           return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: 0x20000500, dhcsr: 0x00030003 } };
         },
       };
-      const result = await flashCmsisDapElf(transport, elfPath, 'STM32F407VET6', { algorithmPath: manifestPath }, STM32F407VET6);
+      const progress: string[] = [];
+      const result = await flashCmsisDapElf(transport, elfPath, 'STM32F407VET6', {
+        algorithmPath: manifestPath, onProgress: message => progress.push(message),
+      }, STM32F407VET6);
       expect(result.success).toBe(true);
       expect(calls).toEqual(['init', 'eraseSector', 'programPage', 'uninit']);
+      expect(progress).toContain('校验中... 0x08000000 至 0x08000003');
+      expect(progress.some(message => message.startsWith('已校验 0x08000000 至 0x08000003，用时 '))).toBe(true);
       expect(result.reports.find(report => report.operation === 'verify')).toMatchObject({
         ok: true,
         message: 'complete Flash read-back comparison passed',
@@ -776,6 +799,7 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
       fs.writeFileSync(algorithmPath, algorithm);
       let programCalls = 0;
       const operations: string[] = [];
+      const progress: string[] = [];
       const result = await flashCmsisDapElf({
         async readDp() { return { ok: true, value: STM32F407VET6.dpIdcode }; },
         async readMemory(address: number) {
@@ -790,10 +814,13 @@ describe('STM32F407VET6 CMSIS-DAP flash model', () => {
           }
           return { ok: true, message: 'algorithm complete', data: { returnCode: 0, pc: 0x20000500, dhcsr: 0x00030003 } };
         },
-      }, elfPath, 'STM32F407VET6', { algorithmPath }, STM32F407VET6);
+      }, elfPath, 'STM32F407VET6', { algorithmPath, onProgress: message => progress.push(message) }, STM32F407VET6);
       expect(result.success).toBe(false);
       expect(result.errorCode).toBe('OutcomeUnknown');
       expect(programCalls).toBe(1);
+      expect(progress.some(message => message.startsWith('写入失败 0x08000000 至 0x08000003'))).toBe(true);
+      expect(progress.at(-1)).toContain('烧录失败');
+      expect(progress.some(message => message.startsWith('已写入') || message.startsWith('烧录完成'))).toBe(false);
       expect(operations).toEqual(['init', 'eraseSector', 'programPage']);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });

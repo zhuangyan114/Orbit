@@ -68,27 +68,32 @@ function setBreakpointsRequest(seq: number, sourcePath: string, lines: number[])
 }
 
 describe('DapSession CMSIS-DAP control routing', () => {
-  it('F5 with probe=rmlink connects before Flash and passes the same backend without probe discovery',async()=>{
+  it.each(['rmlink','cmsis-dap'] as const)('F5 with probe=%s forwards Flash progress through the connected owner',async probe=>{
     const calls:Array<{cmd:string;config?:unknown;probe?:unknown}>=[];
     const session=new DapSession({execute:async(command:any)=>{
       calls.push(command);
       if(command.cmd==='connect')return {ok:true,data:{ownerKind:'cmsis-dap'},diagnostics:{deviceId:'50787d15a924'}};
-      if(command.cmd==='flash')return {ok:true,data:{message:'verified by RMLink'}};
+      if(command.cmd==='flash'){
+        command.onProgress?.('擦除中... 0x08000000 至 0x080003FF');
+        return {ok:true,data:{message:'verified by the connected owner'}};
+      }
       if(command.cmd==='getTargetState')return {ok:true,data:'halted'};
       return {ok:true,data:{}};
     },configureNativeSteps:()=>{}} as unknown as OzoneBackend);
     const messages:DebugProtocolMessage[]=[];session.on('send',message=>messages.push(message));
     try{
       await (session as any).handleLaunch({type:'request',seq:1,command:'launch',arguments:{
-        probe:'rmlink',device:'STM32F103C8',program:'firmware.elf',rttLogEnabled:false,
+        probe,device:'STM32F103C8',program:'firmware.elf',flashBeforeDebug:true,rttLogEnabled:false,
       }});
-      expect(calls.find(c=>c.cmd==='connect')?.config).toMatchObject({probe:'rmlink',speedKHz:4000});
+      expect(calls.find(c=>c.cmd==='connect')?.config).toMatchObject({probe,speedKHz:4000});
       expect(calls.findIndex(c=>c.cmd==='flash')).toBeGreaterThan(calls.findIndex(c=>c.cmd==='connect'));
-      expect(calls.find(c=>c.cmd==='flash')?.probe).toBe('rmlink');
+      expect(calls.find(c=>c.cmd==='flash')?.probe).toBe(probe);
+      expect(messages).toContainEqual(expect.objectContaining({event:'output',body:{category:'console',output:'擦除中... 0x08000000 至 0x080003FF\n'}}));
       expect(calls.some(c=>c.cmd==='resolveProbe')).toBe(false);
       expect(calls.find(c=>c.cmd==='runToEntryPoint')).toMatchObject({symbol:'main',reset:true});
       expect(messages.find(m=>m.request_seq===1)?.success).toBe(true);
-      expect(messages.some(m=>m.body?.output?.includes('RMLink / 连接服务'))).toBe(true);
+      const expectedPath=probe==='rmlink'?'RMLink / 连接服务':'CMSIS-DAP /';
+      expect(messages.some(m=>m.body?.output?.includes(expectedPath))).toBe(true);
     }finally{(session as any).stopConnectionMonitor();(session as any).stopRttLogPolling();}
   });
   it('identifies the selected RMLink service path and device instead of reporting an unknown transport', async () => {

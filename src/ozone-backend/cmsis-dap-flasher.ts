@@ -744,6 +744,7 @@ export interface CmsisDapFlashOptions {
   /** When false, skip the verify algorithm/read-back step after programming. */
   verify?: boolean;
   onOperation?: (report: FlashOperationReport) => void;
+  onProgress?: (message: string) => void;
 }
 
 export interface CmsisDapFlashResult {
@@ -830,16 +831,38 @@ export async function flashCmsisDapElf(
   options: CmsisDapFlashOptions = {},
   target: FlashTargetDefinition,
 ): Promise<CmsisDapFlashResult> {
+  const started = performance.now();
   const reports: FlashOperationReport[] = [];
   let erasedSectors: FlashSector[] = [];
+  const operationLabels: Record<FlashAlgorithmOperation, { pending: string; complete: string }> = {
+    init: { pending: '烧录算法初始化', complete: '烧录算法初始化完成' },
+    uninit: { pending: '烧录算法退出', complete: '烧录算法退出完成' },
+    eraseSector: { pending: '擦除', complete: '已擦除' },
+    programPage: { pending: '写入', complete: '已写入' },
+    verify: { pending: '校验', complete: '已校验' },
+  };
+  const progress = (message: string) => {
+    // A logging observer must not change the result of a target operation.
+    try { options.onProgress?.(message); } catch {}
+  };
+  const duration = (elapsedMs: number) => `用时 ${(elapsedMs / 1000).toFixed(3)}s`;
+  const addressRange = (address: number, size: number) => size > 0
+    ? ` 0x${address.toString(16).toUpperCase().padStart(8, '0')} 至 0x${(address + size - 1).toString(16).toUpperCase().padStart(8, '0')}`
+    : '';
   const report = (value: FlashOperationReport) => {
     reports.push(value);
     options.onOperation?.(value);
+    const label = operationLabels[value.operation];
+    const location = addressRange(value.address, value.size);
+    progress(value.ok
+      ? `${label.complete}${location}，${duration(value.elapsedMs)}`
+      : `${label.pending}失败${location}，${duration(value.elapsedMs)}，${value.errorCode || 'AlgorithmError'}，${value.message || '操作失败'}`);
   };
   const failed = (error: unknown): CmsisDapFlashResult => {
     const flashError = error instanceof CmsisDapFlashError
       ? error
       : new CmsisDapFlashError('AlgorithmError', error instanceof Error ? error.message : String(error));
+    progress(`烧录失败，${duration(performance.now() - started)}（总计），${flashError.code}，${flashError.message}`);
     return {
       success: false,
       message: flashError.message,
@@ -903,6 +926,9 @@ export async function flashCmsisDapElf(
     const verify = options.verify !== false;
     let skipUninit = false;
 
+    progress(`准备烧录 ${target.name}，共 ${erasedSectors.length} 个擦除扇区`);
+    progress('目标预检查中...');
+    const preflightStarted = performance.now();
     const dp = await transport.readDp(0);
     if (!dp.ok || dp.value === undefined) throwReadFailure('SW-DP IDCODE preflight', dp);
     if ((dp.value >>> 0) !== target.dpIdcode) {
@@ -926,6 +952,8 @@ export async function flashCmsisDapElf(
         `Flash capacity mismatch: expected ${target.preflight.expectedFlashSizeKiB} KiB, got ${flashSizeKiB} KiB`,
         { expectedKiB: target.preflight.expectedFlashSizeKiB, actualKiB: flashSizeKiB });
     }
+
+    progress(`目标预检查完成，${duration(performance.now() - preflightStarted)}`);
 
     const run = async (
       operation: FlashAlgorithmOperation,
@@ -962,6 +990,7 @@ export async function flashCmsisDapElf(
         ramSize: layout.region.size,
       };
       let result: CmsisDapFlashRpcResult;
+      progress(`${operationLabels[operation].pending}中...${addressRange(address, size)}`);
       try {
         result = await transport.runAlgorithm(request);
       } catch (error) {
@@ -1052,6 +1081,7 @@ export async function flashCmsisDapElf(
             continue;
           }
           const started = Date.now();
+          progress(`校验中...${addressRange(range.address, range.bytes.length)}`);
           const read = await transport.readMemory(range.address, range.bytes.length);
           const actual = asBytes(read.bytes);
           let mismatch = !read.ok || actual.length !== range.bytes.length;
@@ -1084,6 +1114,8 @@ export async function flashCmsisDapElf(
         }
       }
     }
+    const programmedBytes = programRanges.reduce((total, range) => total + range.bytes.length, 0);
+    progress(`烧录完成，共写入 ${programmedBytes} 字节，${duration(performance.now() - started)}（总计）`);
     return {
       success: true,
       message: `CMSIS-DAP Flash successful: ${path.basename(elfPath)}`,

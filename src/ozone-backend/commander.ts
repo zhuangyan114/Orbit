@@ -843,7 +843,8 @@ case 'readVariableRuntime':
 
   private async doRunToEntryPoint(symbolName: string, reset: boolean): Promise<OzoneCommandResult> {
     const symbol = symbolName.trim();
-    if (!this.isCmsisDapOwner() || !this.sessionTarget || !this.sessionTarget.runToAddress) {
+    if (!this.isCmsisDapOwner()) return this.doJLinkRunToEntryPoint(symbol, reset);
+    if (!this.sessionTarget || !this.sessionTarget.runToAddress) {
       return this.unsupportedSessionCapability('runToEntryPoint');
     }
 
@@ -903,6 +904,122 @@ case 'readVariableRuntime':
         state: TargetState.Halted,
       },
     };
+  }
+
+  private async doJLinkRunToEntryPoint(symbol: string, reset: boolean): Promise<OzoneCommandResult> {
+    const ownerKind = this.sessionTarget
+      ? ('ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind)
+      : 'jlink-legacy';
+    const fail = (errorCode: string, message: string): OzoneCommandResult => ({
+      ok: false, errorCode, error: `${errorCode}: ${message}`,
+      targetState: this.state === TargetState.Halted ? 'Halted' : 'Unknown',
+      diagnostics: { ownerKind, symbol },
+    });
+    this.clearNativeStopInfo('J-Link startup stop requested');
+    const control = async (operation: 'reset' | 'halt' | 'run'): Promise<OzoneCommandResult> => {
+      if (this.sessionTarget) {
+        const result = await this.sessionTarget[operation]();
+        if (!result.ok) return this.sessionOwnerFailure(result, 'TargetControlFailed');
+      } else {
+        const ok = operation === 'reset' ? await this.targetReset()
+          : operation === 'run' ? await this.targetRun() : await this.targetHalt();
+        if (!ok) return fail('TargetControlFailed', `startup ${operation} failed`);
+      }
+      this.state = operation === 'run' ? TargetState.Running : TargetState.Halted;
+      return { ok: true, data: operation };
+    };
+    const entry = findSymbol(this.symbols, symbol);
+    if (!entry || !Number.isInteger(entry.address) || entry.address < 0 || entry.address > 0xFFFFFFFF) {
+      const recovery = await control('halt');
+      if (!recovery.ok) return recovery;
+      return fail('EntryPointUnavailable', `symbol "${symbol}" was not found in the loaded ELF`);
+    }
+    const entryAddress = (entry.address >>> 0) & ~1;
+    log.step(`startup-stop owner=${ownerKind} symbol=${symbol} entryAddress=0x${entryAddress.toString(16)} reset=${reset}`);
+    if (reset) {
+      const resetResult = await control('reset');
+      if (!resetResult.ok) return resetResult;
+    }
+    const haltResult = await control('halt');
+    if (!haltResult.ok) return haltResult;
+
+    // Reuse a user breakpoint at the entry; only remove a slot we allocated.
+    const existingSlot = this.currentBreakpointSlots().findIndex(address => address != null && (address & ~1) === entryAddress);
+    let slot: number | null = existingSlot >= 0 ? existingSlot : null;
+    if (slot === null && this.sessionTarget) {
+      const reserved = await this.sessionTarget.setBreakpoint(entryAddress);
+      if (!reserved.ok) return this.sessionOwnerFailure(reserved, 'BreakpointResourceExhausted');
+      if (!reserved.data || !Number.isInteger(reserved.data.id) || reserved.data.id < 0 || reserved.data.id >= 6) {
+        return fail('MalformedResponse', 'entry breakpoint returned an invalid slot');
+      }
+      slot = reserved.data.id;
+      this.sessionBreakpointSlots[slot] = entryAddress;
+    } else if (slot === null) {
+      slot = await this.targetSetBreakpoint(entryAddress);
+    }
+    if (slot === null) return fail('BreakpointResourceExhausted', 'no hardware breakpoint slot is available for the entry');
+    let result: OzoneCommandResult = fail('StartupEntryNotReached', `timed out waiting for ${symbol}`);
+    let targetMayBeRunning = true;
+    try {
+      const runResult = await control('run');
+      if (!runResult.ok) {
+        result = runResult;
+      } else {
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          let halted: boolean;
+          if (this.sessionTarget) {
+            const stateResult = await this.sessionTarget.getState();
+            if (!stateResult.ok) {
+              result = this.sessionOwnerFailure(stateResult, 'TargetStateReadFailed');
+              break;
+            }
+            halted = stateResult.data?.state === 'Halted';
+          } else {
+            halted = await this.targetIsHalted();
+          }
+          if (halted) {
+            const syncResult = await control('halt');
+            if (!syncResult.ok) {
+              result = syncResult;
+              break;
+            }
+            targetMayBeRunning = false;
+            let pc: number | null;
+            if (this.sessionTarget) {
+              const read = await this.sessionTarget.readRegister(REG_INDEXES.PC);
+              if (!read.ok) {
+                result = this.sessionOwnerFailure(read, 'RegisterReadFailed');
+                break;
+              }
+              pc = read.data?.value ?? null;
+            } else {
+              pc = await this.targetReadRegister(REG_INDEXES.PC);
+            }
+            result = pc !== null && (pc & ~1) === entryAddress
+              ? { ok: true, data: { symbol, entryAddress, pc: pc & ~1, state: TargetState.Halted, cleanupOk: true } }
+              : fail('StartupEntryNotReached', `stopped at ${pc === null ? 'unknown PC' : `0x${pc.toString(16)}`} before ${symbol}`);
+            break;
+          }
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
+      }
+    } finally {
+      // A timeout or transport error must not leave the target running with a
+      // temporary entry breakpoint. Never clear a reused user-owned slot.
+      if (targetMayBeRunning) {
+        const recovery = await control('halt');
+        if (!recovery.ok && (result.ok || result.errorCode !== 'NativeOwnerLost')) result = recovery;
+      }
+      if (existingSlot < 0 && this.sessionTarget) {
+        const cleanup = await this.sessionTarget.clearBreakpoint(slot);
+        if (cleanup.ok) this.sessionBreakpointSlots[slot] = null;
+        else if (result.ok) result = this.sessionOwnerFailure(cleanup, 'BreakpointCleanupFailed');
+      } else if (existingSlot < 0 && !(await this.targetClearBreakpoint(slot)) && result.ok) {
+        result = fail('BreakpointCleanupFailed', 'could not remove the temporary entry breakpoint');
+      }
+    }
+    return result;
   }
 
   private ownerControlResult(

@@ -284,6 +284,7 @@ export class DapSession extends EventEmitter {
   private _cmsisDapFlashAlgorithmPath = '';
   /** Last ELF this session actually programmed. Restart compares against it. */
   private _lastFlashedFirmware: FlashedFirmwareIdentity | undefined;
+  private _loadedFirmware: FlashedFirmwareIdentity | undefined;
   private dataSamplingActive = false;
   private probeSamplingStop:(()=>Promise<void>)|null=null;
   private probeSamplingCleanup:Promise<void>=Promise.resolve();
@@ -1975,12 +1976,7 @@ export class DapSession extends EventEmitter {
       this.xrSamplingEnabled = resolvedProbe === 'cmsis-dap' && !targetConfig.rmlinkDeviceId
         && !this.backend.supportsProbeSubscriptions && targetConfig.cmsisDapXrSampling === true;
       this._flashEnabled = flashEnabled;
-      if (resolvedProbe === 'cmsis-dap' || resolvedProbe === 'rmlink') {
-        const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
-        this._runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
-      } else {
-        this._runToEntryPoint = false;
-      }
+      this._runToEntryPoint = targetConfig.runToEntryPoint ?? 'main';
       this._cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath || '';
       this.phase = elfPath && this._flashEnabled ? 'flashing' : 'connecting';
       log.dap(`Launch: device=${device} rtos=${this._rtos || '(none)'} elf=${elfPath}`);
@@ -2119,7 +2115,11 @@ export class DapSession extends EventEmitter {
       this.startConnectionMonitor();
 
       let loadResult: OzoneCommandResult | undefined;
-      if (elfPath) loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
+      if (elfPath) {
+        const identity = readFirmwareIdentity(elfPath);
+        loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath });
+        if (loadResult.ok) this._loadedFirmware = identity;
+      }
 
       if (this.rttLogEnabled && this.rttControlBlockAddress === undefined) {
         const symbolResult = await this.backend.execute({ cmd: 'resolveSymbol', name: '_SEGGER_RTT' });
@@ -2148,7 +2148,7 @@ export class DapSession extends EventEmitter {
         log.dap(`[rtt] control block address=0x${this.rttControlBlockAddress.toString(16)} source=config`);
       }
 
-      if (this._probe === 'cmsis-dap' && this._flashEnabled && this._runToEntryPoint !== false) {
+      if (this._flashEnabled && this._runToEntryPoint !== false) {
         if (!elfPath || !loadResult?.ok) {
           const haltResult = await this.backend.execute({ cmd: 'halt' });
           if (!haltResult.ok) {
@@ -3130,6 +3130,7 @@ export class DapSession extends EventEmitter {
       this.stopPolling();
       this.setTargetRunning(false);
 
+      let restoreOnExit: Array<{ file: string; line: number }> = [];
       try {
         const savedBps: Array<{ file: string; line: number }> = [];
         for (const [key] of this.breakpoints) {
@@ -3139,9 +3140,11 @@ export class DapSession extends EventEmitter {
           }
         }
 
+        const currentFirmware = readFirmwareIdentity(this._elfPath);
+        const firmwareUnchanged = sameFirmwareIdentity(currentFirmware,
+          this._flashEnabled ? this._lastFlashedFirmware : this._loadedFirmware);
         if (this._elfPath && this._flashEnabled) {
-          const currentFirmware = readFirmwareIdentity(this._elfPath);
-          if (sameFirmwareIdentity(currentFirmware, this._lastFlashedFirmware)) {
+          if (firmwareUnchanged) {
             log.dap(`Restart: flash skipped reason=same-firmware path=${this._elfPath}`);
             this.sendEvent('output', {
               category: 'console',
@@ -3211,7 +3214,27 @@ export class DapSession extends EventEmitter {
             await new Promise<void>(r => setTimeout(r, 500));
           }
         }
-        if (this._probe === 'cmsis-dap' && this._runToEntryPoint !== false) {
+        if (this._elfPath && !firmwareUnchanged) {
+          const loadResult = await this.backend.execute({ cmd: 'loadSymbols', elfPath: this._elfPath });
+          if (!loadResult.ok) {
+            this._lastFlashedFirmware = undefined;
+            this.sendCommandFailure(msg, loadResult, 'EntryPointUnavailable');
+            return;
+          }
+          this._loadedFirmware = currentFirmware;
+          this.resetVariableHandles();
+        }
+        const restoreBreakpoints = this._probe !== 'cmsis-dap' || (!firmwareUnchanged && savedBps.length > 0);
+        if (restoreBreakpoints) {
+          const clearResult = await this.backend.execute({ cmd: 'clearAllBreakpoints' });
+          if (!clearResult.ok) {
+            this.sendCommandFailure(msg, clearResult, 'BreakpointCleanupFailed');
+            return;
+          }
+          this.forgetAllBreakpoints();
+          restoreOnExit = savedBps;
+        }
+        if (!firmwareUnchanged && this._runToEntryPoint !== false) {
           const startupResult = await this.backend.execute({
             cmd: 'runToEntryPoint',
             symbol: this._runToEntryPoint,
@@ -3223,32 +3246,67 @@ export class DapSession extends EventEmitter {
           }
         } else {
           const resetResult = await this.backend.execute({ cmd: 'reset' });
-          if (!resetResult.ok && this._probe === 'cmsis-dap') {
+          if (!resetResult.ok) {
             this.sendCommandFailure(msg, resetResult, 'TargetControlFailed');
             return;
           }
           const haltResult = await this.backend.execute({ cmd: 'halt' });
-          if (!haltResult.ok && this._probe === 'cmsis-dap') {
+          if (!haltResult.ok) {
             this.sendCommandFailure(msg, haltResult, 'TargetControlFailed');
             return;
           }
-          await new Promise<void>(r => setTimeout(r, 200));
-        }
-        if (this._probe !== 'cmsis-dap') {
-          await this.backend.execute({ cmd: 'clearAllBreakpoints' });
-          this.forgetAllBreakpoints();
+          if (!firmwareUnchanged) await new Promise<void>(r => setTimeout(r, 200));
         }
 
-        if (this._probe !== 'cmsis-dap') {
+        if (restoreBreakpoints) {
+          restoreOnExit = [];
           for (const bp of savedBps) {
             const result = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
             if (result.ok) {
               const data = result.data as any;
               this.rememberBreakpoint(`${bp.file}:${bp.line}`, data.id, typeof data.address === 'number' ? data.address : undefined);
+            } else {
+              this.sendCommandFailure(msg, result, 'BreakpointRestoreFailed');
+              return;
             }
           }
         }
 
+        if (firmwareUnchanged) {
+          const runResult = await this.backend.execute({ cmd: 'run' });
+          if (!runResult.ok) {
+            this.sendCommandFailure(msg, runResult, 'TargetControlFailed');
+            return;
+          }
+          if (this.isSessionTerminating()) return;
+          const runData = runResult.data as { state?: string; breakpointHitBeforeRunningObserved?: boolean } | undefined;
+          const hitBreakpoint = runData?.state === 'Halted' && runData.breakpointHitBeforeRunningObserved === true;
+          if (!hitBreakpoint) {
+            const stateResult = await this.queryTargetState('restart-run-confirm');
+            if (!stateResult.ok || stateResult.data !== TargetState.Running) {
+              this.sendCommandFailure(msg, stateResult.ok ? {
+                ok: false, errorCode: 'TargetStateInvalid',
+                error: `TargetStateInvalid: restart run returned ${stateResult.data}`,
+                targetState: String(stateResult.data),
+              } : stateResult, 'TargetStateReadFailed');
+              return;
+            }
+            if (this.isSessionTerminating()) return;
+          }
+          this.setTargetRunning(true);
+          this.advanceReadCancelEpoch();
+          this.lastHaltReason = 'breakpoint';
+          if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
+          this.sendResponse(msg);
+          this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
+          if (hitBreakpoint) {
+            this.markStoppedForUi();
+            this.sendEvent('stopped', { reason: 'breakpoint', threadId: 1, allThreadsStopped: true });
+          } else {
+            this.startPolling();
+          }
+          return;
+        }
         this.markStoppedForUi();
         this.lastHaltReason = 'entry';
         if (this.rttLogEnabled) {
@@ -3257,7 +3315,21 @@ export class DapSession extends EventEmitter {
         this.sendResponse(msg);
         this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
       } finally {
-        this.endControl();
+        try {
+          if (!this.isSessionTerminating()) {
+            for (const bp of restoreOnExit) {
+              const restored = await this.backend.execute({ cmd: 'setBreakpoint', file: bp.file, line: bp.line });
+              if (restored.ok) {
+                const data = restored.data as { id: number; address?: number };
+                this.rememberBreakpoint(`${bp.file}:${bp.line}`, data.id, data.address);
+              } else {
+                log.dap(`Restart: breakpoint restore failed file=${bp.file} line=${bp.line} error=${restored.error}`);
+              }
+            }
+          }
+        } finally {
+          this.endControl();
+        }
       }
     });
   }

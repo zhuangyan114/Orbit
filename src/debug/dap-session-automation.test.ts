@@ -182,7 +182,7 @@ describe('DapSession automation control core reuse', () => {
       body: { state: 'halted', stopReason: 'entry', pc: '0x8000480' },
     });
     expect(eventsOf(messages, 'stopped')[0]?.body).toMatchObject({ reason: 'entry', threadId: 1 });
-    expect((backend as any).calls).toEqual(['stopRtt', 'reset', 'halt', 'clearAllBreakpoints', 'readRegister']);
+    expect((backend as any).calls).toEqual(['stopRtt', 'clearAllBreakpoints', 'reset', 'halt', 'readRegister']);
   });
 
   it('stepOver runs through handleStep and reports the step halt', async () => {

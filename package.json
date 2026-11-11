@@ -282,7 +282,7 @@
               },
               "flashBeforeDebug": {
                 "type": "boolean",
-                "description": "Flash and verify the current ELF through the selected J-Link or CMSIS-DAP owner before debugging. Restart skips reflash when that ELF is unchanged.",
+                "description": "启动前通过所选探针烧录并校验 ELF。重启时 ELF 未变化则跳过烧录并直接运行；变化后重新烧录并停在 runToEntryPoint。",
                 "default": true
               },
               "runToEntryPoint": {
@@ -298,7 +298,7 @@
                     ]
                   }
                 ],
-                "description": "CMSIS-DAP startup symbol to stop at after Launch or Restart; false disables run-to-entry",
+                "description": "J-Link、CMSIS-DAP 和 RMLink 烧录后的停靠函数，默认 main。重启时仅程序变化后停靠；程序未变化则直接运行。false 禁用入口停靠。",
                 "default": "main"
               },
               "rtos": {

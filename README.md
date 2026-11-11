@@ -109,6 +109,8 @@
 
 **默认启动前会烧录固件。** 只想调试板子里现有的程序时，加上 `"flashBeforeDebug": false`，并确保 ELF 与板上固件一致。
 
+J-Link、DAPLink 和 RMLink 烧录后默认停在 `main`。可在 `launch.json` 中用 `"runToEntryPoint": "app_main"` 指定其他入口函数，或用 `false` 禁用入口停靠。点击重启时，ELF 内容未变化则复位后直接运行，仍会响应用户断点；ELF 变化后重新烧录并停在配置的入口。`flashBeforeDebug: false` 始终跳过烧录。
+
 通常不需要填写 `program`：Orbit 会依次在 `build/Debug`、`build/Release`、`build` 中自动查找 ELF/AXF。工程里有多个固件，或输出到其他目录时，也可以用 `program` 手动指定。
 
 默认优先选择 J-Link；两种探针都插着、但你想用 DAPLink 时，加上 `"probe": "cmsis-dap"`。CMSIS-DAP 默认优先 v2 WinUSB，也兼容 v1 HID。更多配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。

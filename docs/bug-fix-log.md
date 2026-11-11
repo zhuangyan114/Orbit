@@ -11,6 +11,16 @@
 
 ## 修改记录
 
+### Bug：统一烧录后的入口停靠，并按固件变化决定重启行为
+
+- **日期**: 2026-11-11
+- **问题描述**: J-Link 烧录后停在复位入口，未与 DAPLink、RMLink 默认停在 `main` 的行为保持一致；重启跳过未变化固件的烧录后，仍会再次停在入口。
+- **根因分析**: launch 配置归一化、会话启动及后端入口停靠逻辑仅接受 CMSIS-DAP/RMLink；重启的 ELF 内容比较只控制是否烧录，没有控制后续停靠或运行。
+- **修改方案**: 三种探针共用 `runToEntryPoint`，默认为 `main`，支持自定义函数及 `false`。J-Link 通过已选 owner 设置临时硬件断点、运行并确认 PC，保留用户断点，覆盖超时恢复和清理错误。重启时按 ELF 内容判断：未变化则复位后运行；变化则按配置烧录、重载符号并停靠，同时更新断点地址。`flashBeforeDebug: false` 始终跳过烧录。运行失败、状态确认失败和 owner 丢失返回失败响应。
+- **涉及文件**: `src/debug/dap-launch-config.ts:73`、`src/debug/dap-session.ts:1979,2153,3128`、`src/ozone-backend/commander.ts:844,909`；对应 launch、startup、CMSIS-DAP、automation 回归测试，以及 `package.json`、`README.md`。
+- **验证结果**: 全量 Vitest 96 个文件、1306 项通过、1 项跳过；类型检查、扩展与 native 构建、J-Link/CMSIS-DAP mock、Flash Algorithm 校验、CMSIS-DAP helper selftest（204 项）及差异检查通过。一次默认并发全量运行出现测试 worker 异常退出，保留日志后以最多 2 个 worker 重跑通过。
+- **用户验收**: 用户于 2026-11-11 明确确认手动验证通过，并授权写入及提交。提供的日志为 STM32F407IG、J-Link native C++ helper（owner=`jlink-native`）、`D:\STM32\RoboMaster\27_Sao_Bin\UP\build\Debug\frame.elf`，一次启动报告总用时 1.458 s；本次 agent 未另行操作硬件。
+
 ### 功能 · RMLink 与 CMSIS-DAP 详细烧录日志
 
 - 日期为 2026-11-10。用户确认 RMLink 已验收，并明确要求普通 DAP 待验收也先记录、提交。

@@ -70,10 +70,8 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
   }
   if (typeof args.cmsisDapXrSampling === 'boolean') config.cmsisDapXrSampling = args.cmsisDapXrSampling;
 
-  if (config.probe === 'cmsis-dap' || config.probe === 'rmlink') {
-    const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
-    config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
-  }
+  const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
+  config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
 
   for (const field of ['cmsisDapSerial', 'cmsisDapVid', 'cmsisDapPid', 'cmsisDapPath', 'cmsisDapFlashAlgorithmPath'] as const) {
     const value = typeof args[field] === 'string' ? args[field].trim() : '';

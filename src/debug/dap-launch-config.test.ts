@@ -35,6 +35,7 @@ describe('DAP launch probe configuration', () => {
       probe: 'auto',
       cmsisDapTransport: 'auto',
       flashBeforeDebug: true,
+      runToEntryPoint: 'main',
     });
   });
 
@@ -67,13 +68,12 @@ describe('DAP launch probe configuration', () => {
     });
   });
 
-  it('defaults CMSIS-DAP startup stops to main without changing J-Link behavior', () => {
-    expect(normalizeDapLaunchConfig({ probe: 'cmsis-dap' })).toMatchObject({
-      probe: 'cmsis-dap',
-      runToEntryPoint: 'main',
-    });
-    expect(normalizeDapLaunchConfig({ probe: 'jlink', runToEntryPoint: 'ignored' }))
-      .not.toHaveProperty('runToEntryPoint');
+  it.each(['auto', 'jlink', 'cmsis-dap', 'rmlink'])('defaults %s startup stops to main and preserves a custom entry', probe => {
+    expect(normalizeDapLaunchConfig({ probe })).toMatchObject({ runToEntryPoint: 'main' });
+    expect(normalizeDapLaunchConfig({ probe, runToEntryPoint: ' app_main ' }))
+      .toMatchObject({ runToEntryPoint: 'app_main' });
+    expect(normalizeDapLaunchConfig({ probe, runToEntryPoint: false }))
+      .toMatchObject({ runToEntryPoint: false });
   });
 
   it('accepts a trimmed CMSIS-DAP entry symbol or explicit disable', () => {

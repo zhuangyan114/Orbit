@@ -2004,6 +2004,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
         if (command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
         if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
         if (command.cmd === 'flash') return { ok: true, data: { message: 'verified' } };
+        if (command.cmd === 'loadSymbols') return { ok: true, data: 'symbols loaded' };
         if (command.cmd === 'runToEntryPoint') {
           return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
         }
@@ -2043,9 +2044,9 @@ describe('DapSession CMSIS-DAP control routing', () => {
       const backend = {
         execute: async (command: { cmd: string }) => {
           calls.push(command.cmd);
-          if (command.cmd === 'runToEntryPoint') {
-            return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
-          }
+          if (command.cmd === 'reset' || command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
+          if (command.cmd === 'run') return { ok: true, data: { state: 'Running' } };
+          if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
           return { ok: false, error: `unexpected ${command.cmd}` };
         },
       } as unknown as OzoneBackend;
@@ -2063,16 +2064,18 @@ describe('DapSession CMSIS-DAP control routing', () => {
 
       await (session as any).handleRestart(request(8, 'restart'));
 
-      expect(calls.filter(command => command === 'flash' || command === 'runToEntryPoint'))
-        .toEqual(['runToEntryPoint']);
+      expect(calls.filter(command => ['flash', 'runToEntryPoint', 'reset', 'run'].includes(command)))
+        .toEqual(['reset', 'run']);
       const output = messages.filter(message => message.type === 'event' && message.event === 'output')
         .map(message => String(message.body?.output || '')).join('');
       expect(output).toMatch(/firmware unchanged, skipping flash/i);
       const response = messages.find(message => message.type === 'response' && message.command === 'restart');
       const stopped = messages.filter(message => message.type === 'event' && message.event === 'stopped');
       expect(response).toMatchObject({ success: true });
-      expect(stopped).toHaveLength(1);
-      expect(stopped[0]).toMatchObject({ body: { reason: 'entry', threadId: 1 } });
+      expect(stopped).toHaveLength(0);
+      expect(messages.find(message => message.event === 'continued'))
+        .toMatchObject({ body: { threadId: 1, allThreadsContinued: true } });
+      (session as any).stopPolling();
     } finally {
       fs.rmSync(path.dirname(elfPath), { recursive: true, force: true });
     }
@@ -2088,6 +2091,9 @@ describe('DapSession CMSIS-DAP control routing', () => {
           if (command.cmd === 'connect') return { ok: true, data: { state: 'Connected' } };
           if (command.cmd === 'flash') return { ok: true, data: { message: 'verified' } };
           if (command.cmd === 'loadSymbols') return { ok: true, data: 'symbols loaded' };
+          if (command.cmd === 'reset' || command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
+          if (command.cmd === 'run') return { ok: true, data: { state: 'Running' } };
+          if (command.cmd === 'getTargetState') return { ok: true, data: 'running' };
           if (command.cmd === 'runToEntryPoint') {
             return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
           }
@@ -2108,8 +2114,9 @@ describe('DapSession CMSIS-DAP control routing', () => {
 
       calls.length = 0;
       await (session as any).handleRestart(request(21, 'restart'));
-      expect(calls.filter(command => command === 'flash' || command === 'runToEntryPoint'))
-        .toEqual(['runToEntryPoint']);
+      expect(calls.filter(command => ['flash', 'runToEntryPoint', 'reset', 'run'].includes(command)))
+        .toEqual(['reset', 'run']);
+      (session as any).stopPolling();
     } finally {
       fs.rmSync(path.dirname(elfPath), { recursive: true, force: true });
     }
@@ -2125,6 +2132,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
           if (command.cmd === 'halt') return { ok: true, data: { state: 'Halted' } };
           if (command.cmd === 'getTargetState') return { ok: true, data: 'halted' };
           if (command.cmd === 'flash') return { ok: true, data: { message: 'verified' } };
+          if (command.cmd === 'loadSymbols') return { ok: true, data: 'symbols loaded' };
           if (command.cmd === 'runToEntryPoint') {
             return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
           }
@@ -2166,6 +2174,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
       const backend = {
         execute: async (command: { cmd: string }) => {
           calls.push(command.cmd);
+          if (command.cmd === 'loadSymbols') return { ok: true, data: 'symbols loaded' };
           if (command.cmd === 'runToEntryPoint') {
             return { ok: true, data: { state: 'Halted', pc: 0x08003a2c, cleanupOk: true } };
           }

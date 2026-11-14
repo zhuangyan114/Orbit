@@ -11,6 +11,18 @@
 
 ## 修改记录
 
+### Bug：RMLink 数据流结束后重新勾选 Timeline 仍显示 0 Hz
+
+- **日期**：2026-11-14。
+- **用户确认**：用户报告“timeline0hz，重新勾选仍然0hz，重启调试后恢复正常”；修复后明确确认“现在很稳定了，遮挡后也能恢复，连续采样50min没有问题，写入并提交”。遮挡恢复和连续采样 50 分钟为用户手动验收，未据此推断零缺帧、精确采样率或每次恢复耗时。
+- **问题描述**：后台已重新创建采样并持续收帧，Orbit 却没有新的本地消费者；重启调试才恢复。现场为 RMLink Wi-Fi / `cc68c7a5995c`，唯一 target owner 为 `cmsis-dap`，适配器来自当前开发工作区。
+- **根因分析**：`subscribeSerial()` 只在 `streamTask` 为空时打开流；SDK 异步迭代正常 EOF 后仍保留已完成的 Promise，重新勾选也不会重开。异常分支还直接把独立数据流失败设为 `connected=false`，误判仍可用的控制 owner 丢失。后台日志在重勾选期间已有新 `capture_id` 和持续收帧；原 DAP 日志被调试重启覆盖，EOF 路径另由新增回归复现。
+- **修改方案**：读任务结束时在 `finally` 中按 `AbortController` 身份清理任务及句柄，旧任务不能清掉新任务；先保存任务再进入读循环，下一次明确订阅可在原控制 owner 上重开本地流。控制和心跳请求继续确认真正的 owner 失联。增加有界的订阅及流生命周期日志，不逐帧打印，不创建第二个 owner，不自动重放订阅。
+- **涉及文件**：`src/ozone-backend/rmlink-target-channel.ts:104`、`src/ozone-backend/rmlink-target-channel.ts:149`；回归测试 `src/ozone-backend/rmlink-target-channel.test.ts:43`。
+- **自动化与构建**：新增 EOF 和异常两条回归在旧实现上均失败，修复后相关 3 文件／60 项通过；全量 Vitest 96 文件／1308 项通过、1 项跳过，类型检查、完整构建与差异检查通过。原本的真实控制失联测试仍通过。
+- **实板与用户验收**：构建后的适配器交付至当前开发插件目录，须在下一次调试启动时加载；用户随后确认遮挡恢复及 50 分钟连续采样正常。agent 没有为本次验证额外执行目标烧录、复位或变量写入，也没有另行采集一份 50 分钟验收数据。
+- **证据**：`D:/STM32/RMLink/artifacts/diagnostics/timeline-zero-retry-20261114/` 保存旧实现失败、修复后测试、构建和现场日志；`D:/STM32/RMLink/artifacts/diagnostics/timeline-recovery-acceptance-20261114/` 保存用户确认。后台配套修复的 239 项主机测试与安装收据位于 `D:/STM32/RMLink/artifacts/diagnostics/capture-restart-20261113/`。正式分项记录见 RMLink 的 `docs/fix-log/2026-11-14-capture-stream-retry.md` 和 `docs/fix-log/2026-11-14-timeline-zero-retry.md`。
+
 ### Bug：统一烧录后的入口停靠，并按固件变化决定重启行为
 
 - **日期**: 2026-11-11

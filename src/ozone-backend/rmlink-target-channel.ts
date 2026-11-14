@@ -106,9 +106,14 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     if(this.flashing)throw new Error('Flash operation owns the target');
     const r=await this.client.subscribe(kind,config);
     this.activeCaptures.set(r.subscription_id,r.capture_id);
+    log.dll(`[rmlink] subscribed kind=${kind} subscription=${r.subscription_id} capture=${r.capture_id}`);
     if(!this.streamTask) {
       const abort=new AbortController();this.streamAbort=abort;
-      this.streamTask=(async()=>{
+      // Store the task before entering the reader, including a reader that
+      // throws immediately. Completed data readers must not block a later
+      // explicit subscription from reopening the stream on the same owner.
+      this.streamTask=Promise.resolve().then(async()=>{
+        log.dll(`[rmlink] capture stream opened subscriptions=${JSON.stringify([...this.activeCaptures])}`);
         try { for await(const record of this.client.stream({signal:abort.signal})) {
           const sample=record.sample;
           if(this.activeCaptures.get(sample.subscriptionId)!==sample.captureId)continue;
@@ -121,8 +126,16 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
           for(const listener of this.listeners) {
             try{listener(sample);}catch{this.listeners.delete(listener);}
           }
-        } } catch(error) { if(!abort.signal.aborted){log.dll(`[rmlink] capture stream lost: ${String(error)}`);this.connected=false;} }
-      })();
+        }
+          if(!abort.signal.aborted)log.dll('[rmlink] capture stream ended; control owner retained');
+        } catch(error) {
+          if(!abort.signal.aborted)log.dll(`[rmlink] capture stream lost: ${String(error)}; control owner retained`);
+        } finally {
+          // Control/heartbeat requests establish whether the owner was lost.
+          // EOF on this independent data stream alone cannot decide that.
+          if(this.streamAbort===abort){this.streamTask=null;this.streamAbort=null;}
+        }
+      });
     }
     return r;
   }
@@ -134,9 +147,9 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     },{priority:'control'});
   }
   private async stopCaptureStream() {
-    const task=this.streamTask;this.streamAbort?.abort();
+    const task=this.streamTask,abort=this.streamAbort;abort?.abort();
     if(task)await task;
-    this.streamTask=null;this.streamAbort=null;
+    if(this.streamAbort===abort){this.streamTask=null;this.streamAbort=null;}
   }
   async startRtt(controlBlockAddress?:number) {
     if(controlBlockAddress===undefined)return this.failure('RTT control block address required','InvalidConfiguration');

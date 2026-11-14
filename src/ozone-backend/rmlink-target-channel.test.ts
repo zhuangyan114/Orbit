@@ -40,6 +40,40 @@ class ClientModel {
   }
 }
 describe('RMLink public-service owner',()=>{
+  it.each(['eof','error'] as const)('reopens a finished %s capture stream on a new subscription while keeping the control owner',async(ending)=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    let endFirst!:()=>void;
+    const firstEnding=new Promise<void>(resolve=>endFirst=resolve);
+    let nextCapture=0;
+    model.subscribe=async(kind?:string)=>({subscription_id:kind==='memory_series'?1:3,capture_id:++nextCapture});
+    model.stream=async function*({signal}:{signal:AbortSignal}) {
+      this.streamOpens++;
+      if(this.streamOpens===1) {
+        await firstEnding;
+        if(ending==='error')throw new Error('capture data socket lost');
+        return;
+      }
+      yield {sample:{subscriptionId:1,kind:1,captureId:2,revision:1,sequence:0,timestampUs:1n,
+        durationUs:0,validBitmap:1,flags:0,values:[123]}} as any;
+      await new Promise<void>(resolve=>{
+        if(signal.aborted)resolve();else signal.addEventListener('abort',()=>resolve(),{once:true});
+      });
+    };
+    const received:any[]=[];owner.onCapture(sample=>received.push(sample));
+    try {
+      await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+      await owner.startRtt(0x20000400);await new Promise(resolve=>setImmediate(resolve));
+      endFirst();await new Promise(resolve=>setImmediate(resolve));
+      // Data transport termination is independent of target-control ownership.
+      expect((await owner.getState()).ok).toBe(true);
+      expect(owner.usingNative).toBe(true);
+      await owner.subscribe('memory_series',{addresses:[0x20000100]});
+      await new Promise(resolve=>setImmediate(resolve));
+      expect(model.streamOpens).toBe(2);
+      expect(received).toMatchObject([{subscriptionId:1,captureId:2,values:[123]}]);
+      expect(model.opened).toBe(1);expect(model.closed).toBe(0);
+    }finally{endFirst();await owner.dispose();}
+  });
   it('runs to an entry address through the same public service owner',async()=>{
     const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
     await owner.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});

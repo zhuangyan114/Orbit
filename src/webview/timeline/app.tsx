@@ -31,6 +31,7 @@ import { readTimelineTheme } from './timeline-theme';
 import { TimelineHoverLayer } from './timeline-hover-layer';
 import { useTimelineVariableDrag } from './timeline-variable-drag';
 import { GroupTabs } from '../group-tabs';
+import { placeTimelineCursor, type TimelineCursors } from './timeline-cursors';
 
 type DataPoint = TimelineDataPoint;
 type SampleSnapshot = TimelineSampleSnapshot;
@@ -112,6 +113,11 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
   const [cursorB, setCursorB] = useState<number | null>(boot.cursorB_ms ?? null);
   const cursorRef = useRef({ A: cursorA, B: cursorB });
   cursorRef.current = { A: cursorA, B: cursorB };
+  const updateCursors = (next: TimelineCursors) => {
+    cursorRef.current = next;
+    setCursorA(next.A);
+    setCursorB(next.B);
+  };
   const cursorDragRef = useRef<'A' | 'B' | null>(null);
   const [rangeError, setRangeError] = useState(boot.tab.error ?? '');
   const [sampleRateHz, setSampleRateHz] = useState<number>(boot.sampleRateHz ?? 0);
@@ -857,15 +863,26 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
     if (!rect || clientY < rect.top + 8 || clientY > rect.bottom - 28 || rect.width <= 24) return null;
     const start = tEndRef.current - timePerDivRef.current * H_DIV;
     const hits = Object.entries(cursorRef.current)
-      .filter(([, time]) => time !== null)
+      .filter(([, time]) => time !== null && time >= start && time <= tEndRef.current)
       .map(([label, time]) => ({ label, distance: Math.abs(clientX - rect.left - 12 - (time! - start) / (timePerDivRef.current * H_DIV) * (rect.width - 24)) }))
       .filter(hit => hit.distance <= 8)
       .sort((a, b) => a.distance - b.distance);
     return (hits[0]?.label as 'A' | 'B' | undefined) ?? null;
   };
 
+  const clearCursors = () => {
+    finishGestureRef.current();
+    updateCursors({ A: null, B: null });
+    saveState();
+  };
+
   // A click places a cursor; movement past the threshold pans the viewport.
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.button === 1) {
+      e.preventDefault();
+      clearCursors();
+      return;
+    }
     if (e.button !== 0 || capturedPointerRef.current !== null) return;
     e.preventDefault();
     capturedPointerRef.current = e.pointerId;
@@ -882,6 +899,12 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    // With the left button held, a middle-button press arrives as pointermove.
+    if ((e.buttons & 4) !== 0) {
+      e.preventDefault();
+      if (capturedPointerRef.current !== null || cursorRef.current.A !== null || cursorRef.current.B !== null) clearCursors();
+      return;
+    }
     if (capturedPointerRef.current !== null && e.pointerId !== capturedPointerRef.current) return;
     const now = performance.now(), responsiveness = responsivenessRef.current;
     responsiveness.pointerMoves++;
@@ -891,7 +914,7 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
       const rect = canvasRef.current!.getBoundingClientRect();
       const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left - 12) / (rect.width - 24)));
       const time = tEndRef.current - timePerDivRef.current * H_DIV * (1 - fraction);
-      if (cursorDragRef.current === 'A') setCursorA(time); else setCursorB(time);
+      updateCursors({ ...cursorRef.current, [cursorDragRef.current]: time });
       computeHover(e.clientX, e.clientY);
       return;
     }
@@ -933,8 +956,13 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
       const fraction = (e.clientX - rect.left - 12) / (rect.width - 24);
       if (fraction >= 0 && fraction <= 1 && e.clientY >= rect.top + 8 && e.clientY <= rect.bottom - 28) {
         const time = tEndRef.current - timePerDivRef.current * H_DIV * (1 - fraction);
-        if (cursorRef.current.A === null) setCursorA(time);
-        else if (cursorRef.current.B === null) setCursorB(time);
+        const next = placeTimelineCursor(cursorRef.current, time, {
+          start: tEndRef.current - timePerDivRef.current * H_DIV,
+          end: tEndRef.current,
+        });
+        if (next !== cursorRef.current) {
+          updateCursors(next);
+        }
       }
     }
     capturedPointerRef.current = null;
@@ -965,7 +993,8 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
       computeHover(e.clientX, e.clientY);
       return;
     }
-    if (cursor === 'A') setCursorA(null); else setCursorB(null);
+    updateCursors({ ...cursorRef.current, [cursor]: null });
+    saveState();
     cursorDragRef.current = null;
     pointerDownRef.current = false;
     isDraggingRef.current = false;
@@ -1054,6 +1083,7 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
             onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
             onPointerUp={finishPointerGesture} onPointerLeave={handlePointerLeave}
             onPointerCancel={() => finishPointerGesture()} onLostPointerCapture={() => finishPointerGesture()}
+            onAuxClick={e => { if (e.button === 1) e.preventDefault(); }}
             onContextMenu={handleContextMenu}
           />
           <div ref={hoverHostRef} style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }} />

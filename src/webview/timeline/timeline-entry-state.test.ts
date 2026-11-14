@@ -2,6 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { createTimelineEntry, mergeTimelineEntryRefresh } from './timeline-entry-state';
 
 describe('Timeline entry refresh state', () => {
+  it('retains dragged order while refreshing, removing, and adding entries', () => {
+    const current = ['third', 'first', 'removed', 'second'].map(expression => createTimelineEntry({ expression, color: '#123456' }));
+    const updates = ['first', 'second', 'third', 'added'].map(expression => ({ expression, color: '#654321' }));
+    const refreshed = mergeTimelineEntryRefresh(current, updates);
+    expect(refreshed.map(entry => entry.expression)).toEqual(['third', 'first', 'second', 'added']);
+    expect(refreshed.every(entry => entry.color === '#654321')).toBe(true);
+  });
+
   it('uses provider state for a newly added entry', () => {
     expect(createTimelineEntry({
       expression: 'added',

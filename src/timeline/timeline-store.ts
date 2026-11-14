@@ -535,7 +535,7 @@ export class TimelineRecordStore {
   }
   captureSnapshot(range: TimelineHistoryBounds | null, view: TimelineViewState): TimelineSaveSnapshot {
     return { cutoff: this.acceptedRows, channels: structuredClone(this.channels),
-      meta: { ...this.meta, exportRange: range ? { startMs: range.start, endMs: range.end } : undefined },
+      meta: { ...structuredClone(this.meta), exportRange: range ? { startMs: range.start, endMs: range.end } : undefined },
       view: structuredClone(view), tail: this.hot.slice(this.hotStart).filter(row => (row.sequence ?? 0) > this.writtenRows), fence: this.flush() };
   }
   async save(destination: string, range: TimelineHistoryBounds | null, view: TimelineViewState, signal?: AbortSignal, captured?: TimelineSaveSnapshot) {
@@ -609,6 +609,9 @@ export class TimelineRecordStore {
         else if (line.startsWith('# meta=')) {
           const m = JSON.parse(line.slice(7)); if (m.timeUnit !== 'ms' || typeof m.name !== 'string' || !Number.isFinite(Date.parse(m.timeOriginUtc))) throw new Error('CSV 记录配置不合法');
           if (m.debugStartedAtUtc !== undefined && (typeof m.debugStartedAtUtc !== 'string' || !Number.isFinite(Date.parse(m.debugStartedAtUtc)))) throw new Error('CSV 调试开始时间不合法');
+          if (m.debugSessions !== undefined && (!Array.isArray(m.debugSessions) || m.debugSessions.some((session: any) =>
+            !session || typeof session.name !== 'string' || typeof session.startedAtUtc !== 'string'
+            || !Number.isFinite(Date.parse(session.startedAtUtc)) || !Number.isFinite(session.startMs)))) throw new Error('CSV 调试分界不合法');
           store.meta = { ...m, originalRecordId: m.originalRecordId ?? m.recordId, recordId: store.id, source: 'import', complete: m.complete !== false };
         } else if (line.startsWith('# channels=')) { const c = JSON.parse(line.slice(11)); if (!Array.isArray(c) || c.length > 1024) throw new Error('CSV 通道数不合法'); c.forEach(addChannel); }
         else if (line.startsWith('# orbit.channel=')) addChannel(JSON.parse(line.slice(16)));

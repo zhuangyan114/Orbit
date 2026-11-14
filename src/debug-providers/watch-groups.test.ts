@@ -2,6 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { WatchGroups } from './watch-groups';
 
 describe('Watch groups', () => {
+  it('persists tab order without changing the active group or its contents', () => {
+    const groups = new WatchGroups(undefined, ['a']);
+    groups.add(); groups.active.expressions = ['b'];
+    groups.add();
+    expect(groups.reorder('watch1', 2)).toBe(true);
+    const restored = new WatchGroups(groups.snapshot());
+    expect(restored.snapshot().groups.map(group => group.id)).toEqual(['watch2', 'watch3', 'watch1']);
+    expect(restored.active.id).toBe('watch3');
+    restored.select('watch1'); expect(restored.active.expressions).toEqual(['a']);
+    expect(restored.reorder('watch1', 9)).toBe(false);
+    expect(restored.reorder('missing', 0)).toBe(false);
+  });
   it('migrates the old list and expansions into watch1 and normalizes expressions', () => {
     const groups = new WatchGroups(undefined, [' p6啊 ', '中文', 'a[0]->x', 'p6'], [' root中文.child ', '中文']);
     expect(groups.active).toEqual({ id: 'watch1', name: 'watch1', expressions: ['p6', 'a[0]->x'], expandedExpressions: ['root.child'] });

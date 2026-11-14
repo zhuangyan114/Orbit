@@ -76,6 +76,12 @@ export class WatchWebviewProvider implements vscode.WebviewViewProvider {
       case 'selectGroup': this.selectGroup(msg.id); break;
       case 'removeGroup': this.removeGroup(msg.id); break;
       case 'renameGroup': this.renameGroup(msg.id, msg.name); break;
+      case 'reorderGroup':
+        if (this.groups.reorder(msg.id, msg.index)) {
+          this.persistGroups();
+          this.postMessage({ command: 'watchGroups', ...this.groupMetadata() });
+        }
+        break;
       case 'addExpression':
         this.addExpression(msg.expression);
         break;

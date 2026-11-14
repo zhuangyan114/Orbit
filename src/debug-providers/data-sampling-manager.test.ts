@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ activeDebugSession: undefined as any, warning: vi.fn() }));
+const state = vi.hoisted(() => ({ activeDebugSession: undefined as any, warning: vi.fn(), terminate: undefined as any }));
 vi.mock('vscode', () => ({
   debug: {
     get activeDebugSession() { return state.activeDebugSession; },
     onDidChangeActiveDebugSession: () => ({ dispose() {} }),
-    onDidTerminateDebugSession: () => ({ dispose() {} }),
+    onDidTerminateDebugSession: (callback: any) => { state.terminate = callback; return { dispose() {} }; },
     onDidReceiveDebugSessionCustomEvent: () => ({ dispose() {} }),
   },
   workspace: {
@@ -106,6 +106,87 @@ describe('Timeline sampling rejection feedback', () => {
     const manager = new DataSamplingManager(backend as any);
     return { backend, session, manager };
   }
+
+  it('samples only checked group expressions and discards late samples after unchecking', async () => {
+    const { manager, session, backend } = fixture(vi.fn(async () => ({ ok: true })));
+    const received = vi.fn(); manager.setOnSamples(received);
+    try {
+      manager.setSamplingExpressions([]);
+      manager.setExpressions(['enabled', 'disabled']);
+      await (manager as any).remoteTransition;
+      expect(session.customRequest).not.toHaveBeenCalledWith('dataSamplingStart', expect.anything());
+      manager.setSamplingExpressions(['enabled', 'enabled']);
+      await (manager as any).remoteTransition;
+      expect(manager.samplingExpressionList).toEqual(['enabled']);
+      expect(session.customRequest).toHaveBeenLastCalledWith('dataSamplingStart', expect.objectContaining({
+        entries: [expect.objectContaining({ expression: 'enabled' })],
+      }));
+      const snapshots = ['enabled', 'disabled'].map(expression => ({ expression, data: [{ timestamp: 1, value: 1, display: '1' }] }));
+      (manager as any).acceptRemoteSamples(snapshots);
+      expect(received.mock.calls[0][0].map((snapshot: any) => snapshot.expression)).toEqual(['enabled']);
+      manager.setSamplingExpressions([]);
+      (manager as any).acceptRemoteSamples(snapshots);
+      await (manager as any).remoteTransition;
+      expect(received).toHaveBeenCalledOnce();
+      expect(session.customRequest).toHaveBeenLastCalledWith('dataSamplingStop', {});
+      expect(manager.expressionList).toEqual(['enabled', 'disabled']);
+      expect(backend.execute).not.toHaveBeenCalled();
+    } finally { manager.dispose(); }
+  });
+
+  it('does not restart sampling in a terminated session while it is still the active VS Code session', async () => {
+    const { manager, session } = fixture(vi.fn(async () => ({ ok: true })));
+    try {
+      manager.addExpression('value'); await (manager as any).remoteTransition;
+      session.customRequest.mockClear();
+      state.terminate(session);
+      await (manager as any).remoteTransition;
+      expect(session.customRequest).not.toHaveBeenCalledWith('dataSamplingStart', expect.anything());
+      expect((manager as any).remoteSampling).toBe(false);
+    } finally { manager.dispose(); }
+  });
+
+  it('drops an in-flight local read when its group is unchecked', async () => {
+    state.activeDebugSession = undefined;
+    const manager = new DataSamplingManager({ hasTargetConnection: true, execute: vi.fn() } as any);
+    vi.spyOn(manager as any, 'startSampling').mockImplementation(() => {});
+    vi.spyOn(manager as any, 'isHalted').mockResolvedValue(false);
+    let release!: (values: any[]) => void;
+    const read = new Promise<any[]>(resolve => { release = resolve; });
+    vi.spyOn(manager as any, 'readValues').mockReturnValue(read);
+    try {
+      manager.setExpressions(['value']);
+      await (manager as any).remoteTransition;
+      const pending = (manager as any).sample();
+      await Promise.resolve();
+      manager.setSamplingExpressions([]);
+      release([{ value: 42, display: '42' }]);
+      await pending;
+      expect(manager.getAllData('value')).toEqual([]);
+      expect((manager as any).pendingMap.get('value')).toEqual([]);
+    } finally { manager.dispose(); }
+  });
+
+  it('stops a delayed sampling startup after the group is unchecked', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let active = false;
+    const { manager } = fixture(vi.fn(async (command: string) => {
+      if (command === 'dataSamplingStart') { await gate; active = true; }
+      if (command === 'dataSamplingStop') active = false;
+      return { ok: true };
+    }));
+    try {
+      manager.setSamplingExpressions(['value']);
+      manager.addExpression('value');
+      await Promise.resolve(); await Promise.resolve();
+      manager.setSamplingExpressions([]);
+      release();
+      await (manager as any).remoteTransition;
+      expect(active).toBe(false);
+      expect((manager as any).remoteSampling).toBe(false);
+    } finally { manager.dispose(); }
+  });
 
   it('routes a picker delta through one DAP sampling request and stops sampling when the last entry is removed', async () => {
     const { manager, session, backend } = fixture(vi.fn(async () => ({ ok: true })));

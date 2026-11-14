@@ -10,6 +10,11 @@ export interface TimelineViewState {
   cursorB_ms?: number | null;
   entries: TimelineEntryState[];
 }
+export interface TimelineDebugSession {
+  name: string;
+  startedAtUtc: string;
+  startMs: number;
+}
 export interface TimelineMeta {
   recordId: string;
   originalRecordId?: string;
@@ -17,6 +22,7 @@ export interface TimelineMeta {
   timeUnit: 'ms';
   timeOriginUtc: string;
   debugStartedAtUtc?: string;
+  debugSessions?: TimelineDebugSession[];
   source: 'debug' | 'import';
   complete: boolean;
   exportRange?: { startMs: number; endMs: number };
@@ -33,6 +39,8 @@ export interface TimelineTab {
   kind: 'live' | 'history' | 'template';
   incomplete: boolean;
   error?: string;
+  samplingEnabled?: boolean;
+  running?: boolean;
 }
 export const DEFAULT_TIMELINE_VIEW: TimelineViewState = { autoFollow: true, timePerDiv: 100, entries: [] };
 

@@ -23,7 +23,7 @@ beforeEach(async () => {
   state.info.mockReset(); state.saveDialog.mockReset(); state.quickPick.mockReset();
   state.folders = [{ name: '工程', uri: { fsPath: path.join(base, 'project'), scheme: 'file' } }];
   saved = new Map([['ozoneTimelineState', { ...DEFAULT_TIMELINE_VIEW, entries: [createTimelineEntry({ expression: 'live_motor', color: '#ABCDEF', yPerDiv: 20 })] }]]);
-  manager = { entriesList: [{ expression: 'live_motor', color: '#123456', enabled: true }], setColor: vi.fn((expression: string, color: string) => { manager.entriesList.find((e: any) => e.expression === expression).color = color; }), setExpressions: vi.fn((entries: any[]) => { manager.entriesList = entries.map(e => ({ ...e, enabled: true })); }), setRetainHistory: vi.fn(), clearData: vi.fn(), setOnSamples: (cb: any) => { manager.samples = cb; }, addExpression: vi.fn(), removeExpression: vi.fn(), toggleExpression: vi.fn() };
+  manager = { entriesList: [{ expression: 'live_motor', color: '#123456', enabled: true }], setColor: vi.fn((expression: string, color: string) => { manager.entriesList.find((e: any) => e.expression === expression).color = color; }), setExpressions: vi.fn((entries: any[]) => { manager.entriesList = entries.map(e => ({ ...e, enabled: true })); }), setSamplingExpressions: vi.fn(), setRetainHistory: vi.fn(), clearData: vi.fn(), setOnSamples: (cb: any) => { manager.samples = cb; }, addExpression: vi.fn(), removeExpression: vi.fn(), toggleExpression: vi.fn() };
   const context = { workspaceState: { get: (key: string) => saved.get(key), update: async (key: string, value: any) => { saved.set(key, structuredClone(value)); } }, globalStorageUri: { fsPath: base }, subscriptions: [], extensionUri: '' };
   picker = { open: vi.fn(async () => {}) };
   provider = new TimelineWebviewProvider(context as any, manager, undefined, picker);
@@ -39,15 +39,122 @@ async function imported() {
   await (provider as any).handleMessage({ command: 'openCsv' });
   return state.messages.filter(m => m.command === 'activate').at(-1);
 }
-function debugStart() { state.session = { id: 'new', name: '新调试', type: 'orbit' }; state.start(state.session); return (provider as any).tabs.get((provider as any).liveId); }
+function debugStart() { void (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline1', enabled: true }); state.session = { id: 'new', name: '新调试', type: 'orbit' }; state.start(state.session); return (provider as any).tabs.get('timeline1'); }
 
 describe('Timeline record and debug configuration isolation', () => {
-  it('submits a live symbol multi-selection to the sampler as one batch', async () => {
-    manager.addExpressions = vi.fn();
-    await (provider as any).handleMessage({ command: 'addExpressions', tabId: 'debug-template', recordId: '', expressions: ['speed', 'count', null] });
-    expect(manager.addExpressions).toHaveBeenCalledOnce();
-    expect(manager.addExpressions).toHaveBeenCalledWith(['speed', 'count']);
-    expect(manager.addExpression).not.toHaveBeenCalled();
+  it('starts with sampling unchecked and gates recording immediately when the group is toggled', async () => {
+    state.session = { id: 'disabled', name: '调试', type: 'orbit' }; state.start(state.session);
+    const tab = (provider as any).tabs.get('timeline1');
+    const samples = [{ expression: 'live_motor', color: '#ABCDEF', currentValue: '1', data: [{ timestamp: 1000, value: 1, display: '1' }] }];
+    manager.samples(samples);
+    expect(tab.info.samplingEnabled).toBe(false);
+    expect(tab.store).toBeUndefined();
+    expect(manager.setSamplingExpressions).toHaveBeenLastCalledWith([]);
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline1', enabled: true });
+    manager.samples(samples);
+    expect(tab.store.acceptedRows).toBe(1);
+    expect(manager.setSamplingExpressions).toHaveBeenLastCalledWith(['live_motor']);
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline1', enabled: false });
+    manager.samples(samples);
+    expect(tab.store.acceptedRows).toBe(1);
+    expect(manager.setSamplingExpressions).toHaveBeenLastCalledWith([]);
+  });
+
+  it('records checked groups independently and shares duplicate expressions through one sampler', async () => {
+    const first = debugStart();
+    await (provider as any).handleMessage({ command: 'addGroup' });
+    const second = (provider as any).tabs.get('timeline2');
+    provider.addExpressions(['live_motor', 'second']);
+    expect(second.info.samplingEnabled).toBe(false);
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline2', enabled: true });
+    expect(manager.entriesList.map((entry: any) => entry.expression)).toEqual(['live_motor', 'second']);
+    const samples = ['live_motor', 'second'].map(expression => ({ expression, color: '#123456', currentValue: '1', data: [{ timestamp: 1000, value: 1, display: '1' }] }));
+    manager.samples(samples);
+    expect(first.store.acceptedRows).toBe(1);
+    expect(second.store.acceptedRows).toBe(2);
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline2', enabled: false });
+    manager.samples(samples.map(snapshot => ({ ...snapshot, data: [{ timestamp: 1010, value: 2, display: '2' }] })));
+    expect(first.store.acceptedRows).toBe(2);
+    expect(second.store.acceptedRows).toBe(2);
+    expect(manager.setSamplingExpressions).toHaveBeenLastCalledWith(['live_motor']);
+    await (provider as any).handleMessage({ command: 'selectTab', tabId: 'timeline2' });
+    expect(second.info.samplingEnabled).toBe(false);
+  });
+
+  it('restores group names, order, selection, checkboxes, and variables after reload', async () => {
+    await (provider as any).handleMessage({ command: 'addGroup' });
+    provider.addExpressions(['second']);
+    await (provider as any).handleMessage({ command: 'renameGroup', tabId: 'timeline2', name: '  云台  ' });
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline2', enabled: true });
+    await (provider as any).handleMessage({ command: 'reorderGroup', tabId: 'timeline2', index: 0 });
+    const groups = saved.get('ozoneTimelineGroups');
+    expect(groups.groups.map((group: any) => group.id)).toEqual(['timeline2', 'timeline1']);
+    await provider.dispose();
+    const context = { workspaceState: { get: (key: string) => saved.get(key), update: async (key: string, value: any) => { saved.set(key, structuredClone(value)); } }, subscriptions: [] };
+    provider = new TimelineWebviewProvider(context as any, manager);
+    expect((provider as any).activeId).toBe('timeline2');
+    expect([...((provider as any).tabs.keys())]).toEqual(['timeline2', 'timeline1']);
+    const tab = (provider as any).tabs.get('timeline2');
+    expect(tab.info).toMatchObject({ name: '云台', samplingEnabled: true, recordId: '' });
+    expect(tab.view.entries.map((entry: any) => entry.expression)).toEqual(['second']);
+  });
+
+  it('stops a removed group and rejects a picker commit after its identifier is reused', async () => {
+    await (provider as any).handleMessage({ command: 'addGroup' });
+    provider.addExpressions(['second']);
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: 'timeline2', recordId: '' });
+    const request = picker.open.mock.calls[0][0];
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline2', enabled: true });
+    await (provider as any).handleMessage({ command: 'closeTab', tabId: 'timeline2' });
+    expect(manager.setSamplingExpressions).toHaveBeenLastCalledWith([]);
+    await (provider as any).handleMessage({ command: 'addGroup' });
+    request.commit(['stale']);
+    expect((provider as any).tabs.get('timeline2').view.entries).toEqual([]);
+  });
+
+  it('marks every channel after a restart even when their first samples arrive in separate batches', async () => {
+    const tab = debugStart(); provider.addExpressions(['aux']);
+    manager.samples(['live_motor', 'aux'].map(expression => ({ expression, color: '#123456', currentValue: '1', data: [{ timestamp: 1000, value: 1, display: '1' }] })));
+    state.terminate(state.session);
+    state.session = { id: 'next', name: '下一次', type: 'orbit' }; state.start(state.session);
+    manager.samples([{ expression: 'live_motor', color: '#123456', currentValue: '2', data: [{ timestamp: 2000, value: 2, display: '2' }] }]);
+    manager.samples([{ expression: 'aux', color: '#123456', currentValue: '3', data: [{ timestamp: 2001, value: 3, display: '3' }] }]);
+    const aux = (await tab.store.query(0, 2000, 100, true)).find((snapshot: any) => snapshot.expression === 'aux');
+    expect(aux.data[1]).toMatchObject({ startsNewSegment: true, segmentId: 2 });
+    expect(tab.store.meta.debugSessions).toHaveLength(2);
+  });
+  it('preserves saved variable order on sampler refresh and new debug records', async () => {
+    manager.entriesList.push({ expression: 'second', color: '#654321', enabled: true });
+    provider.refreshEntries();
+    const entries = [...(provider as any).tabs.get('timeline1').view.entries].reverse();
+    await (provider as any).handleMessage({
+      command: 'saveState', tabId: 'timeline1', recordId: '',
+      state: { ...DEFAULT_TIMELINE_VIEW, entries },
+    });
+    manager.entriesList.push({ expression: 'added', color: '#abcdef', enabled: true });
+    provider.refreshEntries();
+    expect((provider as any).tabs.get('timeline1').view.entries.map((entry: any) => entry.expression)).toEqual(['second', 'live_motor', 'added']);
+    const live = debugStart();
+    expect(live.view.entries.map((entry: any) => entry.expression)).toEqual(['second', 'live_motor', 'added']);
+    expect(saved.get('ozoneTimelineState').entries.map((entry: any) => entry.expression)).toEqual(['second', 'live_motor', 'added']);
+  });
+
+  it('does not restart the sampler when only the variable display order changes', async () => {
+    provider.addExpressions(['second']);
+    const before = manager.setExpressions.mock.calls.length;
+    const tab = (provider as any).tabs.get('timeline1');
+    await (provider as any).handleMessage({ command: 'saveState', tabId: tab.info.id, recordId: tab.info.recordId,
+      state: { ...tab.view, entries: [...tab.view.entries].reverse() } });
+    expect(manager.setExpressions).toHaveBeenCalledTimes(before);
+    expect(tab.view.entries.map((entry: any) => entry.expression)).toEqual(['second', 'live_motor']);
+  });
+
+  it('submits a group symbol multi-selection to the sampler as one batch', async () => {
+    const before = manager.setExpressions.mock.calls.length;
+    await (provider as any).handleMessage({ command: 'addExpressions', tabId: 'timeline1', recordId: '', expressions: ['speed', 'count', null] });
+    expect(manager.setExpressions).toHaveBeenCalledTimes(before + 1);
+    expect(manager.entriesList.map((entry: any) => entry.expression)).toEqual(['live_motor', 'speed', 'count']);
+    expect(manager.setSamplingExpressions).toHaveBeenLastCalledWith([]);
   });
   it('browses recorded channels without a live DAP session or changing the sampler', async () => {
     const live = debugStart();
@@ -68,28 +175,22 @@ describe('Timeline record and debug configuration isolation', () => {
     await (provider as any).handleMessage({ command: 'selectTab', tabId: live.info.id });
     expect(request.canOpen()).toBe(false);
   });
-  it('keeps an offline debug template available after stop and preserves its new selection outside the archived record', async () => {
+  it('keeps the same editable group available after stop and applies picker additions to that group', async () => {
     const live = debugStart();
-    manager.updateExpressions = vi.fn();
     await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: live.info.id, recordId: live.info.recordId });
     const request = picker.open.mock.calls[0][0];
     state.terminate(state.session); state.session = undefined;
-    expect((provider as any).tabs.has('debug-template')).toBe(true);
     request.commit(['next_session_variable']);
-    expect(manager.updateExpressions).toHaveBeenCalledWith(['next_session_variable'], []);
-    expect(live.view.entries.map((entry: any) => entry.expression)).toEqual(['live_motor']);
+    expect((provider as any).tabs.get('timeline1')).toBe(live);
+    expect(live.view.entries.map((entry: any) => entry.expression)).toEqual(['live_motor', 'next_session_variable']);
+    expect(saved.get('ozoneTimelineGroups').groups[0].view.entries.map((entry: any) => entry.expression)).toEqual(['live_motor', 'next_session_variable']);
   });
   it('applies picker additions and removals in one sampler batch and refreshes saved debug entries', async () => {
-    manager.updateExpressions = vi.fn((additions: string[], removals: string[]) => {
-      manager.entriesList = manager.entriesList.filter((entry: any) => !removals.includes(entry.expression));
-      manager.entriesList.push(...additions.map(expression => ({ expression, enabled: true, color: '#123456' })));
-    });
-    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: 'debug-template', recordId: '' });
+    const before = manager.setExpressions.mock.calls.length;
+    await (provider as any).handleMessage({ command: 'openSymbolPicker', tabId: 'timeline1', recordId: '' });
     picker.open.mock.calls[0][0].commit(['speed'], ['live_motor']);
-    expect(manager.updateExpressions).toHaveBeenCalledOnce();
-    expect(manager.updateExpressions).toHaveBeenCalledWith(['speed'], ['live_motor']);
+    expect(manager.setExpressions).toHaveBeenCalledTimes(before + 1);
     expect(saved.get('ozoneDataSamplingExpressions').map((entry: any) => entry.expression)).toEqual(['speed']);
-    expect(manager.removeExpression).not.toHaveBeenCalled(); expect(manager.setExpressions).toHaveBeenCalledTimes(1);
   });
   it('hides unchecked historical channels without deleting recorded data or changing the sampler', async () => {
     const csv = await imported();
@@ -111,11 +212,11 @@ describe('Timeline record and debug configuration isolation', () => {
     state.messages = [];
     for (const color of ['#569CD6', '#123456', '#42D9F3']) {
       await (provider as any).handleMessage({
-        command: 'setColor', tabId: 'debug-template', recordId: '', expression: 'live_motor', color,
+        command: 'setColor', tabId: 'timeline1', recordId: '', expression: 'live_motor', color,
       });
       expect(state.messages.filter(m => m.command === 'activate')).toHaveLength(0);
       expect(state.messages.filter(m => m.command === 'entries').at(-1)).toMatchObject({
-        tabId: 'debug-template', recordId: '', entries: [expect.objectContaining({ expression: 'live_motor', color })],
+        tabId: 'timeline1', recordId: '', entries: [expect.objectContaining({ expression: 'live_motor', color })],
       });
       expect(saved.get('ozoneDataSamplingExpressions')).toEqual([{ expression: 'live_motor', color }]);
     }
@@ -137,18 +238,24 @@ describe('Timeline record and debug configuration isolation', () => {
     expect(raw.data[45].value).toBe(500);
   });
 
-  it('selects the new live record on debug restart while retaining the previous history', async () => {
+  it('continues the same group and record across debug sessions with explicit disconnected segments', async () => {
     const first = debugStart();
-    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: 1700000000100, value: 5, display: '5' }] }]);
+    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [1000, 1010].map(timestamp => ({ timestamp, value: 5, display: '5' })) }]);
+    const recordId = first.info.recordId;
     state.terminate(state.session);
-    state.session = { id: 'restart', name: '重启调试', type: 'orbit' };
+    state.session = { id: 'second', name: '第二轮', type: 'orbit' };
+    state.messages = [];
     state.start(state.session);
-    const current = (provider as any).tabs.get((provider as any).liveId);
-    expect(current.info.id).not.toBe(first.info.id);
-    expect((provider as any).activeId).toBe(current.info.id);
-    expect(state.messages.filter(m => m.command === 'activate').at(-1).tab.id).toBe(current.info.id);
-    expect((provider as any).tabs.get(first.info.id).info.kind).toBe('history');
-    expect(first.store.acceptedRows).toBe(1);
+    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '6', data: [0, 10].map(timestamp => ({ timestamp, value: 6, display: '6' })) }]);
+    expect((provider as any).tabs.get('timeline1')).toBe(first);
+    expect((provider as any).tabs.size).toBe(1);
+    expect(first.info.recordId).toBe(recordId);
+    expect(first.store.acceptedRows).toBe(4);
+    expect(first.store.meta.debugSessions).toMatchObject([{ name: '新调试', startMs: 0 }, { name: '第二轮', startMs: 11 }]);
+    const data = (await first.store.query(0, 100, 100, true))[0].data;
+    expect(data.map((point: any) => point.timestamp)).toEqual([0, 10, 11, 21]);
+    expect(data[2].startsNewSegment).toBe(true);
+    expect(state.messages.filter(message => message.command === 'activate')).toHaveLength(0);
   });
   it('delivers real rangeSamples replies from an initially empty live record', async () => {
     const live = debugStart();
@@ -171,7 +278,7 @@ describe('Timeline record and debug configuration isolation', () => {
   });
   it('inherits saved debug variables/colors and changes the entire left list on tab switch', async () => {
     const csv = await imported(); const live = debugStart();
-    expect((provider as any).activeId).toBe(live.info.id);
+    expect((provider as any).activeId).toBe(csv.tab.id);
     expect(live.view.entries[0].expression).toBe('live_motor'); expect(live.view.entries[0].color).toBe('#ABCDEF');
     await (provider as any).handleMessage({ command: 'selectTab', tabId: live.info.id });
     const active = state.messages.filter(m => m.command === 'activate').at(-1);
@@ -196,9 +303,10 @@ describe('Timeline record and debug configuration isolation', () => {
     expect(live.store.acceptedRows).toBe(1);
     expect((provider as any).tabs.get(csv.tab.id).store.acceptedRows).toBe(2);
     expect(state.messages.filter(m => m.command === 'samples')).toHaveLength(0);
-    state.terminate(state.session); expect(live.info.kind).toBe('history');
+    state.terminate(state.session); expect(live.info.running).toBe(false);
     state.session = { id: 'next', name: '下一次', type: 'orbit' }; state.start(state.session);
-    expect((provider as any).liveId).not.toBe(live.info.id);
+    expect((provider as any).tabs.get('timeline1')).toBe(live);
+    expect((provider as any).activeId).toBe(csv.tab.id);
   });
   it('adding a recorded variable on history only changes that page and never starts debug sampling', async () => {
     const csv = await imported();
@@ -230,7 +338,7 @@ describe('Timeline record and debug configuration isolation', () => {
     resolve([]); await pending;
     expect(state.messages.filter(m => m.command === 'rangeSamples')).toHaveLength(0);
   });
-  it('selects the latest debug record without revealing the Timeline panel, including while hidden', async () => {
+  it('continues the existing debug group while hidden without revealing or remounting the Timeline panel', async () => {
     const previous = debugStart();
     state.terminate(state.session);
     const show = vi.fn();
@@ -238,17 +346,13 @@ describe('Timeline record and debug configuration isolation', () => {
     (provider as any).view.show = show;
     state.messages = [];
     const live = debugStart();
-    expect(previous.info.kind).toBe('history');
+    expect(live).toBe(previous);
     expect((provider as any).activeId).toBe(live.info.id);
-    expect(state.messages.filter(m => m.command === 'activate').at(-1)).toMatchObject({
-      tab: { id: live.info.id, kind: 'live' }, autoFollow: true,
-    });
+    expect(state.messages.filter(message => message.command === 'activate')).toHaveLength(0);
     expect(show).not.toHaveBeenCalled();
-    await (provider as any).handleMessage({ command: 'selectTab', tabId: previous.info.id });
-    state.messages = [];
     manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: 1700000000100, value: 5, display: '5' }] }]);
-    expect((provider as any).activeId).toBe(previous.info.id);
-    expect(state.messages.filter(m => m.command === 'activate')).toHaveLength(0);
+    expect(live.store.acceptedRows).toBe(1);
+    expect(state.messages.filter(message => message.command === 'samples')).toHaveLength(0);
   });
   it('discards unsaved records on reload while retaining debug variables and colors', async () => {
     const live = debugStart();
@@ -265,24 +369,26 @@ describe('Timeline record and debug configuration isolation', () => {
     provider = new TimelineWebviewProvider(context as any, manager);
     (provider as any).view = { visible: true, webview: { postMessage: (msg: any) => state.messages.push(structuredClone(msg)) } };
     await (provider as any).handleMessage({ command: 'init' });
-    expect((provider as any).tabs.has(live.info.id)).toBe(false);
+    expect((provider as any).tabs.get(live.info.id).store).toBeUndefined();
+    expect((provider as any).tabs.get(live.info.id).info.recordId).toBe('');
     expect((provider as any).tabs.size).toBe(1);
     expect(saved.get('ozoneTimelineOpenRecords')).toBeUndefined();
-    const template = (provider as any).tabs.get('debug-template');
+    const template = (provider as any).tabs.get('timeline1');
     expect(template.view.entries[0]).toMatchObject({ expression: 'live_motor', color: '#ABCDEF' });
   });
-  it('a live tab cannot be closed; ending it preserves history', async () => {
-    const live = debugStart(); await (provider as any).handleMessage({ command: 'closeTab', tabId: live.info.id });
+  it('keeps the final group and its data available after the debug session ends', async () => {
+    const live = debugStart();
+    await (provider as any).handleMessage({ command: 'closeTab', tabId: live.info.id });
     expect((provider as any).tabs.has(live.info.id)).toBe(true);
     manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [0, 10, 30].map(timestamp => ({ timestamp, value: 5, display: '5' })) }]);
-    state.terminate(state.session); await live.store.end();
-    expect(live.info.kind).toBe('history');
-    expect(state.messages.find(m => m.command === 'sampleRate' && m.tabId === live.info.id)).toMatchObject({
-      recordId: live.info.recordId, averageSampleRateHz: 2 * 1000 / 30,
+    state.terminate(state.session);
+    expect(live.info).toMatchObject({ kind: 'live', running: false });
+    expect(state.messages.find(message => message.command === 'sampleRate' && message.tabId === live.info.id)).toMatchObject({
+      recordId: live.info.recordId, sampleRateHz: 0, averageSampleRateHz: 2 * 1000 / 30,
     });
     await (provider as any).handleMessage({ command: 'selectTab', tabId: live.info.id });
-    expect(state.messages.filter(m => m.command === 'activate').at(-1)).toMatchObject({
-      tab: { kind: 'history' }, sampleRateHz: null, averageSampleRateHz: 2 * 1000 / 30,
+    expect(state.messages.filter(message => message.command === 'activate').at(-1)).toMatchObject({
+      tab: { kind: 'live', running: false }, averageSampleRateHz: 2 * 1000 / 30,
     });
     expect(await fs.stat(path.join(state.folders[0].uri.fsPath, '.vscode', 'timeline')).catch(() => null)).toBeNull();
   });
@@ -293,8 +399,9 @@ describe('Timeline record and debug configuration isolation', () => {
     const second = { name: '调试工程', uri: { fsPath: path.join(base, 'second-project'), scheme: 'file' } };
     state.folders.push(second);
     state.session = { id: 'new', name: '调试名称不作为文件名', type: 'orbit', workspaceFolder: second };
+    await (provider as any).handleMessage({ command: 'setSamplingEnabled', tabId: 'timeline1', enabled: true });
     state.start(state.session);
-    let live = (provider as any).tabs.get((provider as any).liveId);
+    let live = (provider as any).tabs.get('timeline1');
     vi.setSystemTime(new Date(2026, 9, 4, 13, 39, 0));
     manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: Date.now(), value: 5, display: '5' }] }]);
     const destination = path.join(second.uri.fsPath, '.vscode', 'timeline', '2026-10-04_13-37-48-123.csv');
@@ -305,7 +412,7 @@ describe('Timeline record and debug configuration isolation', () => {
     expect(content).toContain('"debugStartedAtUtc":"' + started.toISOString() + '"');
     expect(content).toContain('0,0,5,1');
     await (provider as any).handleMessage({ command: 'clearData', tabId: live.info.id, recordId: live.info.recordId });
-    live = (provider as any).tabs.get((provider as any).liveId);
+    live = (provider as any).tabs.get('timeline1');
     // Cancel the second save: neither a new timestamp nor an automatic archive is created.
     state.saveDialog.mockResolvedValue(undefined);
     await (provider as any).handleMessage({ command: 'saveCsv', tabId: live.info.id, recordId: live.info.recordId, scope: 'all' });
@@ -313,6 +420,25 @@ describe('Timeline record and debug configuration isolation', () => {
     expect(await fs.readdir(path.dirname(destination))).toEqual([path.basename(destination)]);
     await provider.dispose();
     expect(await fs.readFile(destination, 'utf8')).toBe(content);
+  });
+  it('saves the captured record if a fresh record begins while the save dialog is open', async () => {
+    const tab = debugStart();
+    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '5', data: [{ timestamp: 1000, value: 5, display: '5' }] }]);
+    const oldStore = tab.store;
+    const destination = path.join(base, 'captured.csv');
+    let choose!: (uri: any) => void;
+    state.saveDialog.mockImplementation(() => new Promise(resolve => { choose = resolve; }));
+    const saving = (provider as any).handleMessage({ command: 'saveCsv', tabId: tab.info.id, recordId: tab.info.recordId, scope: 'all' });
+    await vi.waitFor(() => expect(state.saveDialog).toHaveBeenCalledOnce());
+    await (provider as any).handleMessage({ command: 'clearData', tabId: tab.info.id, recordId: tab.info.recordId });
+    expect(tab.store).not.toBe(oldStore);
+    manager.samples([{ expression: 'live_motor', color: '#ABCDEF', currentValue: '6', data: [{ timestamp: 2000, value: 6, display: '6' }] }]);
+    choose({ fsPath: destination }); await saving;
+    const restored = await TimelineRecordStore.open(base, destination);
+    try {
+      const samples = await restored.query(0, 100, 100, true);
+      expect(samples[0].data.map(point => point.value)).toEqual([5]);
+    } finally { await restored.dispose(); }
   });
   it('recovers only CSV files in workspace .vscode/timeline and keeps imported source files', async () => {
     const csv = await imported();

@@ -5,10 +5,10 @@ import * as os from 'os';
 import { DataSamplingManager } from '../../debug-providers/data-sampling-manager';
 import type { DataSampleSnapshot } from '../../ozone-backend/types';
 import { intersectTimelineRange, parseTimelineRangeLoadRequest } from './timeline-range';
-import { createTimelineEntry } from './timeline-entry-state';
+import { createTimelineEntry, mergeTimelineEntryRefresh } from './timeline-entry-state';
 import { isOrbitDebugSessionType } from '../../utils/debug-session-type';
 import { stripHanCharacters } from '../../utils/watch-expression-validation';
-import { DEFAULT_TIMELINE_VIEW, validTimelineView, type TimelineTab, type TimelineViewState } from '../../timeline/timeline-model';
+import { DEFAULT_TIMELINE_VIEW, validTimelineView, type TimelineDebugSession, type TimelineTab, type TimelineViewState } from '../../timeline/timeline-model';
 import { TimelineRecordStore } from '../../timeline/timeline-store';
 import { TimelineTemporaryCache } from '../../timeline/timeline-cache';
 import { log } from '../../utils/logger';
@@ -17,16 +17,36 @@ import { loadActiveSymbolCatalog } from '../../debug-providers/symbol-catalog-lo
 import type { SymbolCatalog } from '../../symbols/symbol-catalog';
 import type { SymbolPickerPanel } from '../../debug-providers/symbol-picker-panel';
 import { prepareTimelineLiveSamples } from './timeline-live';
+import { pickTimelineColor } from './timeline-colors';
 
 const STATE_KEY = 'ozoneTimelineState';
-interface RecordTab { info: TimelineTab; store?: TimelineRecordStore; view: TimelineViewState; session?: vscode.DebugSession; archiveDirectory?: string; revision: number; queryGeneration?: number; queryResolutionKey?: number; sampleRate?: TimelineSampleRate; }
+const GROUPS_STATE_KEY = 'ozoneTimelineGroups';
+interface TimelineGroupsState {
+  version: 1;
+  activeId: string;
+  groups: { id: string; name: string; samplingEnabled: boolean; view: TimelineViewState }[];
+}
+interface RecordTab {
+  info: TimelineTab;
+  store?: TimelineRecordStore;
+  view: TimelineViewState;
+  session?: vscode.DebugSession;
+  archiveDirectory?: string;
+  revision: number;
+  queryGeneration?: number;
+  queryResolutionKey?: number;
+  sampleRate?: TimelineSampleRate;
+  pendingSession?: Omit<TimelineDebugSession, 'startMs'>;
+  segmentExpressions?: Set<string>;
+  timestampOffset?: number;
+}
 
 export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
   private tabs = new Map<string, RecordTab>();
-  private activeId = 'debug-template';
-  private liveId: string | null = null;
-  private debugDefaults: TimelineViewState;
+  private activeId = 'timeline1';
+  private debugGroupId = 'timeline1';
+  private syncingSampler = false;
   private directory: string;
   private cache = new TimelineTemporaryCache();
   private sessionStarts = new WeakMap<vscode.DebugSession, string>();
@@ -46,77 +66,122 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     private canUseDapSession: (session: vscode.DebugSession) => boolean = () => true,
     private symbolPicker?: SymbolPickerPanel) {
     const saved = context.workspaceState.get<TimelineViewState>(STATE_KEY);
-    this.debugDefaults = saved && validTimelineView(saved) ? structuredClone(saved) : structuredClone(DEFAULT_TIMELINE_VIEW);
+    const defaults = saved && validTimelineView(saved) ? structuredClone(saved) : structuredClone(DEFAULT_TIMELINE_VIEW);
     this.directory = this.cache.directory;
     // Drop the old cache descriptors; unsaved records never survive a host reload.
     void context.workspaceState.update('ozoneTimelineOpenRecords', undefined);
-    const inherited = this.sampleManager.entriesList.length ? this.sampleManager.entriesList : this.debugDefaults.entries;
-    const restored = inherited.map(entry => ({ expression: entry.expression, color: this.debugDefaults.entries.find(e => e.expression === entry.expression)?.color ?? entry.color }));
-    if (restored.some((entry, i) => entry.expression !== this.sampleManager.entriesList[i]?.expression || entry.color !== this.sampleManager.entriesList[i]?.color)) this.sampleManager.setExpressions(restored);
-    this.refreshTemplate();
+    this.sampleManager.setSamplingExpressions([]);
+    const savedGroups = context.workspaceState.get<TimelineGroupsState>(GROUPS_STATE_KEY);
+    if (savedGroups?.version === 1 && Array.isArray(savedGroups.groups)) {
+      for (const group of savedGroups.groups.slice(0, 32)) {
+        if (!group || typeof group.id !== 'string' || !/^timeline[1-9]\d*$/.test(group.id)
+          || !Number.isSafeInteger(Number(group.id.slice(8))) || this.tabs.has(group.id) || !validTimelineView(group.view)) continue;
+        this.tabs.set(group.id, { info: { id: group.id, recordId: '', name: typeof group.name === 'string' && group.name.trim() ? group.name.trim().slice(0, 128) : group.id,
+          kind: 'template', samplingEnabled: group.samplingEnabled === true, incomplete: false }, view: structuredClone(group.view), revision: 0 });
+      }
+    }
+    if (!this.tabs.size) {
+      const rawLegacy = context.workspaceState.get<unknown>('ozoneDataSamplingExpressions', []);
+      const legacy: TimelineViewState['entries'] = [];
+      for (const item of Array.isArray(rawLegacy) ? rawLegacy : []) {
+        const expression = stripHanCharacters(typeof item === 'string' ? item : String(item?.expression ?? '')).trim();
+        if (!expression || expression.length > 4096 || legacy.some(entry => entry.expression === expression)) continue;
+        const color = typeof item?.color === 'string' && /^#[0-9a-f]{6}$/i.test(item.color) ? item.color : pickTimelineColor(legacy.map(entry => entry.color));
+        legacy.push(createTimelineEntry({ expression, color }));
+        if (legacy.length === 1024) break;
+      }
+      const inherited = this.sampleManager.entriesList.length ? this.sampleManager.entriesList : legacy.length ? legacy : defaults.entries;
+      defaults.entries = mergeTimelineEntryRefresh(defaults.entries, inherited.map(entry => ({ ...entry,
+        color: defaults.entries.find(existing => existing.expression === entry.expression)?.color ?? entry.color })));
+      this.tabs.set('timeline1', { info: { id: 'timeline1', recordId: '', name: 'timeline1', kind: 'template', samplingEnabled: false, incomplete: false }, view: defaults, revision: 0 });
+    }
+    this.activeId = this.tabs.has(savedGroups?.activeId ?? '') ? savedGroups!.activeId : this.tabs.keys().next().value!;
+    this.debugGroupId = this.activeId;
+    this.syncSampling();
+    this.persistGroups();
     this.sampleManager.setRetainHistory(false);
     this.sampleManager.setOnSamples(snapshots => this.sendSamples(snapshots));
     context.subscriptions.push(
       vscode.debug.onDidStartDebugSession(session => { if (isOrbitDebugSessionType(session.type)) this.beginRecord(session); }),
       vscode.debug.onDidTerminateDebugSession(session => {
         this.endedSessions.add(session);
-        const live = this.liveId ? this.tabs.get(this.liveId) : undefined;
-        if (live && live.session === session) this.finishLive();
+        this.finishLive(session);
       }),
     );
     const current = vscode.debug.activeDebugSession;
     if (current && isOrbitDebugSessionType(current.type)) this.beginRecord(current);
   }
-  private makeEntries() {
-    return this.sampleManager.entriesList.map(e => createTimelineEntry({ ...e, ...this.debugDefaults.entries.find(s => s.expression === e.expression), color: e.color }));
+  private debugTabs() { return [...this.tabs.values()].filter(tab => this.isDebugTab(tab)); }
+  private persistGroups() {
+    const groups = this.debugTabs().map(tab => ({ id: tab.info.id, name: tab.info.name, samplingEnabled: tab.info.samplingEnabled === true, view: structuredClone(tab.view) }));
+    void this.context.workspaceState.update(GROUPS_STATE_KEY, { version: 1, activeId: this.debugGroupId, groups });
+    const active = this.tabs.get(this.debugGroupId);
+    if (active) void this.context.workspaceState.update(STATE_KEY, structuredClone(active.view));
+    const entries = [...new Map(groups.flatMap(group => group.view.entries).map(entry => [entry.expression, { expression: entry.expression, color: entry.color }])).values()];
+    void this.context.workspaceState.update('ozoneDataSamplingExpressions', entries);
   }
-  private refreshTemplate() {
-    const entries = this.makeEntries();
-    this.tabs.set('debug-template', { info: { id: 'debug-template', recordId: '', name: '调试变量', kind: 'template', incomplete: false }, view: { ...structuredClone(this.debugDefaults), entries }, revision: 0 });
+  private syncSampling() {
+    const groups = this.debugTabs();
+    const entries = [...new Map(groups.flatMap(tab => tab.view.entries).map(entry => [entry.expression, { expression: entry.expression, color: entry.color }])).values()];
+    const sampled = [...new Set(groups.filter(tab => tab.info.samplingEnabled).flatMap(tab => tab.view.entries.map(entry => entry.expression)))];
+    this.syncingSampler = true;
+    try {
+      this.sampleManager.setSamplingExpressions(sampled);
+      const current = new Map(this.sampleManager.entriesList.map(entry => [entry.expression, entry.color]));
+      if (current.size !== entries.length || entries.some(entry => entry.color !== current.get(entry.expression))) {
+        this.sampleManager.setExpressions(entries);
+      }
+    } finally { this.syncingSampler = false; }
   }
-  private beginRecord(session?: vscode.DebugSession) {
-    if (this.disposed || (session && this.endedSessions.has(session))) return;
-    const live = this.liveId ? this.tabs.get(this.liveId) : undefined;
-    if (live && live.session === session) return;
-    if (this.tabs.size >= 32) {
-      const oldest = [...this.tabs.values()].find(tab => tab.info.kind === 'history' && tab.info.id !== this.activeId);
-      if (oldest) {
-        this.tabs.delete(oldest.info.id); this.releaseTab(oldest);
-        void vscode.window.showInformationMessage('Timeline 标签已达 32 个，最早的后台历史页已关闭；仅手动保存的 CSV 可再次打开。');
-      } else { void vscode.window.showWarningMessage('Timeline 标签已满，请关闭历史页'); return; }
-    }
-    const followDebugRecord = this.activeId === 'debug-template' || !!this.tabs.get(this.activeId)?.session;
-    this.finishLive();
-    this.sampleManager.clearData();
-    const store = new TimelineRecordStore(this.directory, session?.name || '实时记录');
-    const startedAt = session ? this.sessionStarts.get(session) ?? new Date().toISOString() : new Date().toISOString();
-    if (session) this.sessionStarts.set(session, startedAt);
-    store.meta.debugStartedAtUtc = startedAt;
-    const view = { ...structuredClone(this.debugDefaults), autoFollow: true, viewportEndMs: undefined, cursorA_ms: null, cursorB_ms: null, entries: this.makeEntries() };
-    store.view = view; store.syncChannels(view.entries);
-    const tab: RecordTab = { info: { id: store.id, recordId: store.id, name: store.meta.name, kind: 'live', incomplete: false }, store, view, session, archiveDirectory: this.archiveDirectory(session?.workspaceFolder), revision: 0 };
+  private ensureStore(tab: RecordTab) {
+    if (tab.store) return;
+    const store = new TimelineRecordStore(this.directory, tab.info.name);
+    store.meta.debugStartedAtUtc = tab.pendingSession?.startedAtUtc ?? new Date().toISOString();
+    store.meta.debugSessions = [];
+    store.view = tab.view;
+    store.syncChannels(tab.view.entries);
+    tab.store = store;
+    tab.info.recordId = store.id;
+    tab.info.kind = 'live';
+    tab.archiveDirectory = this.archiveDirectory(tab.session?.workspaceFolder);
+    tab.sampleRate = new TimelineSampleRate();
+    this.attachStoreErrors(tab);
+    if (this.activeId === tab.info.id) this.activateTab(tab.info.id);
+  }
+  private attachStoreErrors(tab: RecordTab) {
+    const store = tab.store!;
     store.onError = error => {
       tab.info.error = error; tab.info.incomplete = true;
       log.dap(`[timeline] storage failed recordId=${store.id} error=${error} metrics=${JSON.stringify(store.getMetrics())}`);
       this.postTabs(); void vscode.window.showWarningMessage('Timeline 记录不完整：' + error);
     };
-    tab.sampleRate = new TimelineSampleRate();
-    this.tabs.set(store.id, tab); this.liveId = store.id;
-    this.tabs.delete('debug-template');
-    // Select the new record inside Timeline without revealing/focusing its VS Code panel.
-    this.activateTab(store.id);
   }
-  private finishLive() {
-    if (!this.liveId) return;
-    const tab = this.tabs.get(this.liveId); this.liveId = null;
-    if (!tab?.store) return;
-    tab.info.kind = 'history'; tab.view.autoFollow = false;
-    const ending = tab.store.end();
-    this.finalizers.add(ending);
-    void ending.then(() => { this.finalizers.delete(ending); tab.info.incomplete = !tab.store!.meta.complete; tab.info.error = tab.store!.error; this.postTabs(); });
-    this.refreshTemplate();
+  private beginRecord(session?: vscode.DebugSession) {
+    if (this.disposed || (session && this.endedSessions.has(session))) return;
+    const startedAt = session ? this.sessionStarts.get(session) ?? new Date().toISOString() : new Date().toISOString();
+    if (session) this.sessionStarts.set(session, startedAt);
+    for (const tab of this.debugTabs()) {
+      if (tab.session !== session || (!tab.store && !tab.pendingSession)) {
+        tab.session = session;
+        tab.pendingSession = { name: session?.name || '本地采样', startedAtUtc: startedAt };
+        tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
+        tab.sampleRate = new TimelineSampleRate();
+      }
+      tab.info.running = !!session;
+      if (tab.info.samplingEnabled) this.ensureStore(tab);
+    }
     this.postTabs();
-    this.postMessage({ command: 'sampleRate', tabId: tab.info.id, recordId: tab.info.recordId, averageSampleRateHz: tab.store.getAverageSampleRateHz() });
+  }
+  private finishLive(session: vscode.DebugSession) {
+    for (const tab of this.debugTabs()) {
+      if (tab.session !== session) continue;
+      tab.session = undefined;
+      tab.info.running = false;
+      tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
+      this.postMessage({ command: 'sampleRate', tabId: tab.info.id, recordId: tab.info.recordId,
+        sampleRateHz: 0, averageSampleRateHz: tab.store?.getAverageSampleRateHz() ?? null });
+    }
+    this.postTabs();
   }
   resolveWebviewView(webviewView: vscode.WebviewView) {
     this.view = webviewView;
@@ -136,14 +201,58 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (msg.command === 'selectTab') { this.activateTab(msg.tabId); return; }
+    if (msg.command === 'addGroup') {
+      if (this.tabs.size >= 32) throw new Error('最多同时打开 32 个标签，请先关闭历史标签');
+      let index = 1;
+      while (this.tabs.has('timeline' + index)) index++;
+      const id = 'timeline' + index;
+      this.tabs.set(id, { info: { id, recordId: '', name: id, kind: 'template', samplingEnabled: false, incomplete: false },
+        view: structuredClone(DEFAULT_TIMELINE_VIEW), revision: 0 });
+      this.activateTab(id);
+      this.beginRecord(vscode.debug.activeDebugSession && isOrbitDebugSessionType(vscode.debug.activeDebugSession.type) ? vscode.debug.activeDebugSession : undefined);
+      return;
+    }
+    if (msg.command === 'renameGroup') {
+      const renamed = this.tabs.get(msg.tabId);
+      if (!renamed || typeof msg.name !== 'string' || !msg.name.trim()) return;
+      renamed.info.name = msg.name.trim().slice(0, 128);
+      if (renamed.store) renamed.store.meta.name = renamed.info.name;
+      this.persistGroups(); this.postTabs();
+      return;
+    }
+    if (msg.command === 'reorderGroup') {
+      const ordered = [...this.tabs.entries()];
+      const index = ordered.findIndex(([id]) => id === msg.tabId);
+      if (index < 0 || !Number.isInteger(msg.index) || msg.index < 0 || msg.index >= ordered.length) return;
+      const [tab] = ordered.splice(index, 1);
+      ordered.splice(msg.index, 0, tab);
+      this.tabs = new Map(ordered);
+      this.persistGroups(); this.postTabs();
+      return;
+    }
+    if (msg.command === 'setSamplingEnabled') {
+      const sampled = this.tabs.get(msg.tabId);
+      if (!sampled || !this.isDebugTab(sampled) || typeof msg.enabled !== 'boolean') return;
+      sampled.info.samplingEnabled = msg.enabled;
+      sampled.segmentExpressions = new Set(sampled.view.entries.map(entry => entry.expression));
+      sampled.sampleRate = new TimelineSampleRate();
+      this.syncSampling(); this.persistGroups();
+      const session = vscode.debug.activeDebugSession;
+      if (msg.enabled && session && isOrbitDebugSessionType(session.type)) this.beginRecord(session);
+      this.postTabs();
+      if (!msg.enabled) this.postMessage({ command: 'sampleRate', tabId: sampled.info.id, recordId: sampled.info.recordId, sampleRateHz: 0 });
+      return;
+    }
     if (msg.command === 'openCsv') { await this.openCsv(); return; }
     if (msg.command === 'recoverRecord') { await this.recoverRecord(); return; }
     if (msg.command === 'closeTab') {
       const tab = this.tabs.get(msg.tabId);
-      if (!tab || tab.info.kind === 'live' || tab.info.kind === 'template') return;
+      if (!tab || (this.isDebugTab(tab) && this.debugTabs().length === 1)) return;
       this.tabs.delete(msg.tabId);
       this.releaseTab(tab);
-      if (this.activeId === msg.tabId) this.activateTab(this.liveId ?? this.tabs.keys().next().value ?? 'debug-template');
+      if (this.debugGroupId === msg.tabId) this.debugGroupId = this.debugTabs()[0].info.id;
+      this.syncSampling(); this.persistGroups();
+      if (this.activeId === msg.tabId) this.activateTab(this.debugGroupId);
       this.postTabs(); return;
     }
     const tab = this.tabs.get(msg.tabId);
@@ -156,10 +265,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         tab.store.view = tab.view;
         for (const channel of tab.store.channels) { const update = tab.view.entries.find(e => e.expression === channel.expression); if (update) Object.assign(channel, update); }
       }
-      if (tab.info.kind === 'live' || tab.info.kind === 'template') {
-        this.debugDefaults = structuredClone(tab.view);
-        await this.context.workspaceState.update(STATE_KEY, this.debugDefaults);
-      }
+      if (this.isDebugTab(tab)) { tab.store?.syncChannels(tab.view.entries); this.persistGroups(); this.syncSampling(); }
       return;
     }
     if (tab.info.id !== this.activeId) return;
@@ -169,8 +275,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     }
     if (msg.command === 'addExpressions' && Array.isArray(msg.expressions)) {
       if (this.isDebugTab(tab)) {
-        this.sampleManager.addExpressions(msg.expressions.filter((expression: unknown): expression is string => typeof expression === 'string' && expression.length <= 4096));
-        this.refreshEntries();
+        this.changeExpressions(tab, msg.expressions.filter((expression: unknown): expression is string => typeof expression === 'string' && expression.length <= 4096));
         return;
       }
       for (const expression of new Set(msg.expressions)) {
@@ -202,15 +307,14 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         try { await this.saveCsv(tab, msg.scope); } finally { this.exporting = false; }
         break;
       case 'clearData':
-        if (tab.info.kind === 'live') this.beginFreshRecord(tab.session);
+        if (this.isDebugTab(tab)) this.beginFreshRecord(tab);
         break;
       case 'addExpression':
         if (typeof msg.expression === 'string') {
           const expression = stripHanCharacters(msg.expression).trim();
           if (!expression || expression.length > 4096) break;
           if (this.isDebugTab(tab)) {
-            this.sampleManager.addExpression(expression);
-            this.refreshEntries();
+            this.changeExpressions(tab, [expression]);
           } else {
             // Historical pages can select recorded channels without registering
             // new target reads or changing the debug configuration.
@@ -224,16 +328,18 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
         }
         break;
       case 'removeExpression':
-        if (this.isDebugTab(tab) && typeof msg.expression === 'string') { this.sampleManager.removeExpression(msg.expression); this.refreshEntries(); }
+        if (this.isDebugTab(tab) && typeof msg.expression === 'string') this.changeExpressions(tab, [], [msg.expression]);
         break;
       case 'toggleExpression':
-        if (this.isDebugTab(tab) && typeof msg.enabled === 'boolean') this.sampleManager.toggleExpression(msg.expression, msg.enabled);
+        if (this.isDebugTab(tab) && typeof msg.enabled === 'boolean') {
+          tab.view.entries = tab.view.entries.map(entry => entry.expression === msg.expression ? { ...entry, enabled: msg.enabled } : entry);
+          this.publishEntries(tab);
+        }
         break;
       case 'setColor':
         if (this.isDebugTab(tab) && typeof msg.expression === 'string' && /^#[0-9a-f]{6}$/i.test(msg.color)) {
-          this.debugDefaults.entries = this.debugDefaults.entries.map(e => e.expression === msg.expression ? { ...e, color: msg.color } : e);
-          this.sampleManager.setColor(msg.expression, msg.color);
-          this.refreshEntries();
+          tab.view.entries = tab.view.entries.map(entry => entry.expression === msg.expression ? { ...entry, color: msg.color } : entry);
+          this.publishEntries(tab);
         }
         break;
     }
@@ -252,13 +358,13 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     await this.symbolPicker?.open({
       mode: 'timeline', title: `选择变量 → Timeline · ${tab.info.name}`,
       existing: tab.view.entries.filter(entry => debug || entry.enabled).map(entry => entry.expression),
-      loadCatalog: () => debug ? loadActiveSymbolCatalog(this.canUseDapSession) : Promise.resolve(this.recordedSymbolCatalog(tab)),
+      loadCatalog: () => debug && (vscode.debug.activeDebugSession || !tab.store)
+        ? loadActiveSymbolCatalog(this.canUseDapSession) : Promise.resolve(this.recordedSymbolCatalog(tab)),
       canOpen: () => !this.disposed && tab.revision === revision && this.tabs.get(tab.info.id) === tab && tab.info.id === this.activeId,
       commit: (expressions, removedExpressions = []) => {
         if (this.disposed) return;
         if (debug) {
-          // Apply one sampling update; debug defaults outlive an archived recording.
-          this.sampleManager.updateExpressions(expressions, removedExpressions); this.refreshEntries();
+          if (this.tabs.get(tab.info.id) === tab) this.changeExpressions(tab, expressions, removedExpressions);
           return;
         }
         if (this.tabs.get(tab.info.id) !== tab) return;
@@ -275,29 +381,70 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       },
     });
   }
-  private beginFreshRecord(session?: vscode.DebugSession) { this.finishLive(); this.activeId = 'debug-template'; this.beginRecord(session); }
-  refreshEntries() {
-    const live = this.liveId ? this.tabs.get(this.liveId) : undefined;
-    const entries = this.makeEntries();
-    if (live) {
-      live.view.entries = entries; live.store!.syncChannels(entries);
-      if (this.activeId === live.info.id) this.postMessage({ command: 'entries', entries, tabId: live.info.id, recordId: live.info.recordId });
-    } else {
-      this.refreshTemplate();
-      // Editing a template is an entries update, not a tab switch: activation remounts the picker.
-      if (this.activeId === 'debug-template') this.postMessage({ command: 'entries', entries, tabId: 'debug-template', recordId: '' });
+  private beginFreshRecord(tab: RecordTab) {
+    if (this.tabs.size >= 32) throw new Error('最多同时打开 32 个标签，请先关闭历史标签');
+    if (tab.store) {
+      const store = tab.store;
+      const archived: RecordTab = { info: { id: store.id, recordId: store.id, name: tab.info.name + ' · 历史记录', kind: 'history', incomplete: tab.info.incomplete, error: tab.info.error },
+        store, view: { ...structuredClone(tab.view), autoFollow: false }, archiveDirectory: tab.archiveDirectory, revision: 0 };
+      this.tabs.set(store.id, archived);
+      this.attachStoreErrors(archived);
+      const ending = store.end();
+      this.finalizers.add(ending);
+      void ending.then(() => this.finalizers.delete(ending), () => this.finalizers.delete(ending));
+      tab.store = undefined;
     }
-    this.debugDefaults.entries = entries;
-    void this.context.workspaceState.update(STATE_KEY, this.debugDefaults);
-    void this.context.workspaceState.update('ozoneDataSamplingExpressions', entries.map(e => ({ expression: e.expression, color: e.color })));
+    tab.info.recordId = '';
+    tab.info.kind = 'template';
+    tab.info.incomplete = false;
+    tab.info.error = undefined;
+    tab.view = { ...tab.view, autoFollow: true, viewportEndMs: undefined, cursorA_ms: null, cursorB_ms: null };
+    tab.pendingSession = { name: tab.session?.name || '本地采样', startedAtUtc: tab.session ? this.sessionStarts.get(tab.session)! : new Date().toISOString() };
+    tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
+    tab.timestampOffset = 0;
+    if (tab.info.samplingEnabled) this.ensureStore(tab);
+    this.activateTab(tab.info.id);
+    this.persistGroups();
+  }
+  addExpressions(expressions: string[]) {
+    const tab = this.tabs.get(this.debugGroupId);
+    if (tab) this.changeExpressions(tab, expressions);
+  }
+  private changeExpressions(tab: RecordTab, additions: string[], removals: string[] = []) {
+    const removed = new Set(removals);
+    const entries = tab.view.entries.filter(entry => !removed.has(entry.expression));
+    for (const input of additions) {
+      const expression = stripHanCharacters(input).trim();
+      if (!expression || expression.length > 4096 || entries.some(entry => entry.expression === expression)) continue;
+      if (entries.length >= 1024) throw new Error('每组最多添加 1024 个变量');
+      entries.push(createTimelineEntry({ expression, color: pickTimelineColor(entries.map(entry => entry.color)) }));
+    }
+    tab.view.entries = entries;
+    this.publishEntries(tab);
+  }
+  private publishEntries(tab: RecordTab) {
+    if (tab.store) { tab.store.view = tab.view; tab.store.syncChannels(tab.view.entries); }
+    this.persistGroups(); this.syncSampling();
+    if (this.activeId === tab.info.id) this.postMessage({ command: 'entries', entries: tab.view.entries, tabId: tab.info.id, recordId: tab.info.recordId });
     this.postTabs();
   }
+  refreshEntries() {
+    if (this.syncingSampler || this.disposed) return;
+    const tab = this.tabs.get(this.debugGroupId);
+    if (!tab) return;
+    const known = new Set(this.debugTabs().flatMap(group => group.view.entries.map(entry => entry.expression)));
+    const own = new Set(tab.view.entries.map(entry => entry.expression));
+    tab.view.entries = mergeTimelineEntryRefresh(tab.view.entries, this.sampleManager.entriesList.filter(entry => own.has(entry.expression) || !known.has(entry.expression)));
+    this.publishEntries(tab);
+  }
   private activateTab(id: string) {
-    if (!this.tabs.has(id)) { this.refreshTemplate(); id = 'debug-template'; }
+    if (!this.tabs.has(id)) id = this.debugGroupId;
     const old = this.tabs.get(this.activeId); if (old) old.revision++;
     this.activeId = id; const tab = this.tabs.get(id)!; tab.revision++;
+    if (this.isDebugTab(tab)) { this.debugGroupId = id; this.persistGroups(); }
     this.postTabs();
-    this.postMessage({ command: 'activate', tab: tab.info, ...tab.view, historyBounds: tab.store?.bounds ?? null, sampleRateHz: tab.info.kind === 'live' ? tab.sampleRate?.getHz() ?? 0 : null, averageSampleRateHz: tab.store?.getAverageSampleRateHz() ?? null });
+    this.postMessage({ command: 'activate', tab: tab.info, ...tab.view, debugSessions: tab.store?.meta.debugSessions ?? [],
+      historyBounds: tab.store?.bounds ?? null, sampleRateHz: tab.info.kind === 'live' ? tab.sampleRate?.getHz() ?? 0 : null, averageSampleRateHz: tab.store?.getAverageSampleRateHz() ?? null });
   }
   private postTabs() { this.postMessage({ command: 'tabs', tabs: [...this.tabs.values()].map(t => t.info), activeId: this.activeId }); }
   private archiveDirectory(folder?: vscode.WorkspaceFolder) {
@@ -334,25 +481,55 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     const active = vscode.debug.activeDebugSession;
     const session = active && isOrbitDebugSessionType(active.type) ? active : undefined;
     if (session && this.endedSessions.has(session)) return;
-    const current = this.liveId ? this.tabs.get(this.liveId) : undefined;
-    if (!current || current.session !== session) this.beginRecord(session && isOrbitDebugSessionType(session.type) ? session : undefined);
-    const tab = this.liveId ? this.tabs.get(this.liveId) : undefined;
-    if (!tab?.store) return;
-    const accepted = tab.store.append(snapshots);
-    tab.sampleRate?.accept(accepted);
-    const now = performance.now();
-    if (now - this.storageSummaryAt >= 1000) {
-      this.storageSummaryAt = now;
-      const metrics = tab.store.getMetrics();
-      log.dap(`[timeline] storage summary recordId=${tab.info.recordId} accepted=${metrics.acceptedRows} written=${metrics.writtenRows} checkpoint=${metrics.checkpointRows} queuedBytes=${metrics.globalQueuedBytes}`);
-    }
-    if (tab.store.error?.startsWith('采样时钟回退')) { this.beginFreshRecord(tab.session); const replacement = this.liveId ? this.tabs.get(this.liveId) : undefined; replacement?.store?.append(snapshots); return; }
-    if (this.view?.visible && this.activeId === tab.info.id && accepted.length) {
-      // Deliver the current display tail without an extra range-query round trip.
-      // Hidden/history views still read the complete record on demand.
-      this.postMessage({ command: 'samples', tabId: tab.info.id, recordId: tab.info.recordId, sentAtMs: Date.now(), historyBounds: tab.store.bounds,
-        generation: tab.queryGeneration, resolutionKey: tab.queryResolutionKey,
-        snapshots: prepareTimelineLiveSamples(accepted, tab.queryResolutionKey), sampleRateHz: tab.sampleRate?.getHz() ?? 0 });
+    if (this.debugTabs().some(tab => tab.session !== session)) this.beginRecord(session);
+    for (const tab of this.debugTabs()) {
+      if (!tab.info.samplingEnabled) continue;
+      const expressions = new Set(tab.view.entries.map(entry => entry.expression));
+      const selected = snapshots.filter(snapshot => expressions.has(snapshot.expression));
+      const first = Math.min(...selected.flatMap(snapshot => {
+        const point = snapshot.data.find(point => Number.isFinite(point.timestamp) && Number.isFinite(point.value));
+        return point ? [point.timestamp] : [];
+      }));
+      if (!Number.isFinite(first)) continue;
+      this.ensureStore(tab);
+      const store = tab.store!;
+      const lastTime = store.bounds ? Date.parse(store.meta.timeOriginUtc) + store.bounds.end : undefined;
+      if (tab.pendingSession) {
+        tab.timestampOffset = lastTime === undefined ? 0 : Math.max(0, lastTime + 1 - first);
+      } else if (lastTime !== undefined && first + (tab.timestampOffset ?? 0) < lastTime) {
+        tab.pendingSession = { name: (session?.name || '本地采样') + ' · 时钟重置', startedAtUtc: new Date().toISOString() };
+        tab.timestampOffset = lastTime + 1 - first;
+        tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
+      }
+      const offset = tab.timestampOffset ?? 0;
+      const prepared = selected.map(snapshot => {
+        const markStart = tab.segmentExpressions?.has(snapshot.expression) === true;
+        if (offset === 0 && !markStart) return snapshot;
+        const firstIndex = snapshot.data.findIndex(point => Number.isFinite(point.timestamp) && Number.isFinite(point.value));
+        return { ...snapshot, data: snapshot.data.map((point, index) => ({ ...point, timestamp: point.timestamp + offset,
+          startsNewSegment: point.startsNewSegment || (markStart && index === firstIndex) })) };
+      });
+      const accepted = store.append(prepared);
+      if (!accepted.length) continue;
+      const markerAdded = !!tab.pendingSession;
+      if (tab.pendingSession) {
+        store.meta.debugSessions!.push({ ...tab.pendingSession, startMs: Math.min(...accepted.map(snapshot => snapshot.data[0].timestamp)) });
+        tab.pendingSession = undefined;
+      }
+      for (const snapshot of accepted) tab.segmentExpressions?.delete(snapshot.expression);
+      tab.sampleRate?.accept(accepted);
+      const now = performance.now();
+      if (now - this.storageSummaryAt >= 1000) {
+        this.storageSummaryAt = now;
+        const metrics = store.getMetrics();
+        log.dap(`[timeline] storage summary recordId=${tab.info.recordId} accepted=${metrics.acceptedRows} written=${metrics.writtenRows} checkpoint=${metrics.checkpointRows} queuedBytes=${metrics.globalQueuedBytes}`);
+      }
+      if (this.view?.visible && this.activeId === tab.info.id) {
+        this.postMessage({ command: 'samples', tabId: tab.info.id, recordId: tab.info.recordId, sentAtMs: Date.now(), historyBounds: store.bounds,
+          debugSessions: markerAdded ? store.meta.debugSessions : undefined,
+          generation: tab.queryGeneration, resolutionKey: tab.queryResolutionKey,
+          snapshots: prepareTimelineLiveSamples(accepted, tab.queryResolutionKey), sampleRateHz: tab.sampleRate?.getHz() ?? 0 });
+      }
     }
   }
   private isCurrent(tab: RecordTab, revision: number) { return !this.disposed && this.view?.visible === true && this.activeId === tab.info.id && this.tabs.get(tab.info.id) === tab && tab.revision === revision; }
@@ -419,13 +596,14 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
   }
   private async saveCsv(tab: RecordTab, scope: string) {
     if (!tab.store) throw new Error('当前没有可保存的记录');
+    const store = tab.store;
     // Capture view and bounds before opening dialogs; sampling continues independently.
     const view = structuredClone(tab.view);
     const range = scope === 'selection' && Number.isFinite(view.cursorA_ms) && Number.isFinite(view.cursorB_ms)
       ? { start: Math.min(view.cursorA_ms!, view.cursorB_ms!), end: Math.max(view.cursorA_ms!, view.cursorB_ms!) } : null;
     if (scope === 'selection' && !range) throw new Error('请先放置 A/B 游标');
-    const snapshot = tab.store.captureSnapshot(range, view);
-    const date = new Date(tab.store.meta.debugStartedAtUtc ?? tab.store.meta.timeOriginUtc);
+    const snapshot = store.captureSnapshot(range, view);
+    const date = new Date(store.meta.debugStartedAtUtc ?? store.meta.timeOriginUtc);
     const pad = (value: number, width = 2) => String(value).padStart(width, '0');
     const filename = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}-${pad(date.getMilliseconds(), 3)}.csv`;
     const directory = tab.archiveDirectory ?? this.archiveDirectory();
@@ -434,7 +612,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(path.join(directory ?? os.homedir(), filename)), filters: { CSV: ['csv'] }, title: range ? '保存 A/B 区间 CSV' : '保存全部 CSV' });
     if (!uri || this.disposed || this.tabs.get(tab.info.id) !== tab) return;
     await this.trackJob(vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在保存 Timeline CSV', cancellable: true }, (_progress, token) =>
-      this.withCancellation(token, signal => tab.store!.save(uri.fsPath, range, view, signal, snapshot))));
+      this.withCancellation(token, signal => store.save(uri.fsPath, range, view, signal, snapshot))));
     void vscode.window.showInformationMessage('Timeline CSV 已保存：' + uri.fsPath);
   }
   private postMessage(msg: any) { if (!this.disposed) void this.view?.webview.postMessage(msg); }

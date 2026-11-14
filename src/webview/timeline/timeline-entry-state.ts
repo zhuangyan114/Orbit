@@ -29,11 +29,14 @@ export function createTimelineEntry(update: TimelineEntryUpdate): TimelineEntryS
 }
 
 export function mergeTimelineEntryRefresh(
-  current: TimelineEntryState[],
-  updates: TimelineEntryUpdate[],
+  current: readonly TimelineEntryState[],
+  updates: readonly TimelineEntryUpdate[],
 ): TimelineEntryState[] {
   const currentByExpression = new Map(current.map(entry => [entry.expression, entry]));
-  return updates.map(update => {
+  const updatesByExpression = new Map(updates.map(update => [update.expression, update]));
+  const ordered = current.filter(entry => updatesByExpression.has(entry.expression)).map(entry => updatesByExpression.get(entry.expression)!);
+  ordered.push(...updates.filter(update => !currentByExpression.has(update.expression)));
+  return ordered.map(update => {
     const refreshed = createTimelineEntry(update);
     const existing = currentByExpression.get(update.expression);
     if (!existing) return refreshed;

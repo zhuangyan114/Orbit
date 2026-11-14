@@ -21,7 +21,7 @@ import {
   type TimelineEntryUpdate,
 } from './timeline-entry-state';
 
-import type { TimelineTab } from '../../timeline/timeline-model';
+import type { TimelineDebugSession, TimelineTab } from '../../timeline/timeline-model';
 import { calculateBufferedRange } from './timeline-range';
 import { clampTimelineTimePerDiv, MAX_TIMELINE_TIME_PER_DIV_MS, parseTimelineTimePerDiv, TIMELINE_TIME_PRESETS_MS } from './timeline-time-scale';
 import { TIMELINE_SAMPLE_RATE_STALE_MS } from './timeline-sample-rate';
@@ -29,6 +29,8 @@ import { TimelineColorPicker } from './timeline-color-picker';
 import { stripHanCharacters } from '../../utils/watch-expression-validation';
 import { readTimelineTheme } from './timeline-theme';
 import { TimelineHoverLayer } from './timeline-hover-layer';
+import { useTimelineVariableDrag } from './timeline-variable-drag';
+import { GroupTabs } from '../group-tabs';
 
 type DataPoint = TimelineDataPoint;
 type SampleSnapshot = TimelineSampleSnapshot;
@@ -84,21 +86,27 @@ export function TimelineApp() {
   }, []);
   const activeInfo = tabs.find(t => t.id === active?.tab?.id) ?? active?.tab;
   return <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-    <div role="tablist" aria-label="Timeline 记录" style={{ display: 'flex', flexShrink: 0, overflowX: 'auto', gap: 3, padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
-      {tabs.map(tab => <div key={tab.id} style={{ display: 'flex', alignItems: 'center', background: tab.id === active?.tab?.id ? 'var(--vscode-tab-activeBackground, #444)' : 'transparent', borderRadius: 3 }}>
-        <button role="tab" aria-selected={tab.id === active?.tab?.id} style={{ ...iconBtnStyle, border: 'none', whiteSpace: 'nowrap' }} onClick={() => vscode.postMessage({ command: 'selectTab', tabId: tab.id })} title={tab.error ?? tab.name}>
-          {tab.kind === 'live' ? '● ' : ''}{tab.name}{tab.incomplete ? ' ⚠' : ''}
-        </button>
-        {tab.kind === 'history' && <button aria-label={'关闭 ' + tab.name} style={{ ...iconBtnStyle, border: 'none' }} onClick={() => vscode.postMessage({ command: 'closeTab', tabId: tab.id })}>×</button>}
-      </div>)}
+    <GroupTabs label="Timeline 分组" activeId={active?.tab?.id ?? ''}
+      tabs={tabs.map(tab => ({ ...tab, warning: tab.incomplete, closable: tab.samplingEnabled === undefined || tabs.filter(item => item.samplingEnabled !== undefined).length > 1,
+        title: tab.error ? `${tab.name} · ${tab.error}` : undefined }))}
+      onSelect={tabId => { if (tabId !== active?.tab?.id) vscode.postMessage({ command: 'selectTab', tabId }); }}
+      onAdd={() => vscode.postMessage({ command: 'addGroup' })}
+      onRemove={tabId => vscode.postMessage({ command: 'closeTab', tabId })}
+      onRename={(tabId, name) => vscode.postMessage({ command: 'renameGroup', tabId, name })}
+      onReorder={(tabId, index) => vscode.postMessage({ command: 'reorderGroup', tabId, index })}
+      onSamplingChange={(tabId, enabled) => {
+        setTabs(current => current.map(tab => tab.id === tabId ? { ...tab, samplingEnabled: enabled } : tab));
+        vscode.postMessage({ command: 'setSamplingEnabled', tabId, enabled });
+      }}>
       <button style={iconBtnStyle} title="打开 CSV 为新标签" onClick={() => vscode.postMessage({ command: 'openCsv' })}>＋ 打开 CSV</button>
       <button style={iconBtnStyle} onClick={() => vscode.postMessage({ command: 'recoverRecord' })}>恢复记录</button>
-    </div>
-    {active && <TimelinePlot key={active.tab.id + ':' + activation} boot={active} kind={activeInfo.kind} />}
+    </GroupTabs>
+    {active && <TimelinePlot key={active.tab.id + ':' + activation} boot={active} kind={activeInfo.kind}
+      samplingEnabled={activeInfo.samplingEnabled} running={activeInfo.running} />}
   </div>;
 }
 
-function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) {
+function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kind: TimelineTab['kind']; samplingEnabled?: boolean; running?: boolean }) {
   const sendMessage = (message: any) => vscode.postMessage({ ...message, tabId: boot.tab.id, recordId: boot.tab.recordId });
   const [cursorA, setCursorA] = useState<number | null>(boot.cursorA_ms ?? null);
   const [cursorB, setCursorB] = useState<number | null>(boot.cursorB_ms ?? null);
@@ -108,6 +116,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
   const [rangeError, setRangeError] = useState(boot.tab.error ?? '');
   const [sampleRateHz, setSampleRateHz] = useState<number>(boot.sampleRateHz ?? 0);
   const [averageSampleRateHz, setAverageSampleRateHz] = useState<number | null>(boot.averageSampleRateHz ?? null);
+  const [debugSessions, setDebugSessions] = useState<TimelineDebugSession[]>(boot.debugSessions ?? []);
   const sampleRateReceivedAt = useRef(performance.now());
   const sampleRateDisplayedAt = useRef(0);
   const debugEditable = kind === 'live' || kind === 'template';
@@ -280,7 +289,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     latestSampleTimestampRef.current = bounds?.end ?? 0;
   };
 
-  const saveState = useCallback(() => {
+  const saveState = useCallback((orderedEntries = entries) => {
     sendMessage({
       command: 'saveState',
       state: {
@@ -289,7 +298,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
         viewportEndMs: tEndRef.current,
         cursorA_ms: cursorRef.current.A,
         cursorB_ms: cursorRef.current.B,
-        entries: entries.map(e => ({
+        entries: orderedEntries.map(e => ({
           expression: e.expression,
           enabled: e.enabled,
           color: e.color,
@@ -307,6 +316,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
       if (msg.tabId !== boot.tab.id || msg.recordId !== boot.tab.recordId) return;
       switch (msg.command) {
         case 'init': {
+          setDebugSessions(msg.debugSessions ?? []);
           const eList: Entry[] = (msg.entries || []).map((e: TimelineEntryUpdate) => createTimelineEntry(e));
           setEntries(eList);
           // Apply saved global state
@@ -339,10 +349,12 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
           break;
         }
         case 'sampleRate': {
+          if (Number.isFinite(msg.sampleRateHz) && msg.sampleRateHz >= 0) setSampleRateHz(msg.sampleRateHz);
           if (Number.isFinite(msg.averageSampleRateHz) && msg.averageSampleRateHz >= 0) setAverageSampleRateHz(msg.averageSampleRateHz);
           break;
         }
         case 'samples': {
+          if (Array.isArray(msg.debugSessions)) setDebugSessions(msg.debugSessions);
           const now = performance.now(), delivery = deliveryRef.current;
           delivery.notifications++;
           if (document.visibilityState !== 'visible') delivery.hiddenNotifications++;
@@ -473,7 +485,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     const H = rect.height;
     if (W < 50 || H < 50) return;
     if (autoFollowRef.current && latestSampleTimestampRef.current > 0) tEndRef.current = latestSampleTimestampRef.current;
-    const paintKey = [appliedRevisionRef.current, tEndRef.current, timePerDiv, W, H, dpr, entries, cursorRef.current.A, cursorRef.current.B, themeRef.current];
+    const paintKey = [appliedRevisionRef.current, tEndRef.current, timePerDiv, W, H, dpr, entries, debugSessions, cursorRef.current.A, cursorRef.current.B, themeRef.current];
     if (paintedKeyRef.current?.every((value, i) => value === paintKey[i])) return;
     const pixelWidth = Math.round(W * dpr);
     const pixelHeight = Math.round(H * dpr);
@@ -606,6 +618,27 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
 
     ctx.restore();
 
+    clipRegion(ctx);
+    debugSessions.forEach((session, index) => {
+      const x = margin.left + (session.startMs - tStart) / (tEnd - tStart) * plotW;
+      if (x < margin.left || x > margin.left + plotW) return;
+      ctx.strokeStyle = '#e5a348';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 4]);
+      ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      const label = `第${index + 1}次 ${session.name} ${new Date(session.startedAtUtc).toLocaleTimeString([], { hour12: false })}`;
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const width = Math.min(plotW, ctx.measureText(label).width + 10);
+      const left = Math.max(margin.left, Math.min(x + 3, margin.left + plotW - width));
+      const top = margin.top + 3 + index % 3 * 20;
+      ctx.fillStyle = '#e5a348'; ctx.fillRect(left, top, width, 18);
+      ctx.fillStyle = '#181818'; ctx.fillText(label, left + 5, top + 9, width - 10);
+    });
+    ctx.restore();
+
     for (const [label, time] of Object.entries(cursorRef.current)) {
       if (time === null) continue;
       const x = margin.left + (time - tStart) / (tEnd - tStart) * plotW;
@@ -637,7 +670,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
     }
     paintedKeyRef.current = paintKey;
     return true;
-  }, [entries, timePerDiv, renderTick, cursorA, cursorB]);
+  }, [entries, timePerDiv, renderTick, cursorA, cursorB, debugSessions]);
 
   paintRef.current = () => {
     const began = performance.now(); if (!draw()) return;
@@ -700,6 +733,16 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
   const toggle = (expr: string, enabled: boolean) => {
     setEntries(prev => prev.map(e => e.expression === expr ? { ...e, enabled } : e));
     sendMessage({ command: 'toggleExpression', expression: expr, enabled });
+  };
+
+  const reorder = (expression: string, index: number) => {
+    const sourceIndex = entries.findIndex(entry => entry.expression === expression);
+    if (sourceIndex < 0 || sourceIndex === index) return;
+    const ordered = [...entries];
+    const [entry] = ordered.splice(sourceIndex, 1);
+    ordered.splice(index, 0, entry);
+    setEntries(ordered);
+    saveState(ordered);
   };
 
   const remove = (expr: string) => {
@@ -988,6 +1031,14 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
             <span style={{ display: 'inline-block', minWidth: '4ch' }}>{kind === 'live' ? sampleRateHz.toFixed(0) : kind === 'history' ? averageSampleRateHz?.toFixed(0) ?? '—' : '—'}</span>
             <span>Hz</span>
           </span>
+          {samplingEnabled !== undefined && <span role="status" style={{ fontSize: 10, whiteSpace: 'nowrap',
+            color: samplingEnabled && running ? 'var(--vscode-charts-green, #4ec9b0)' : 'var(--vscode-descriptionForeground, #aaa)' }}>
+            {samplingEnabled ? running ? '采样已启用' : '等待调试' : '采样已关闭'}
+          </span>}
+          {debugSessions.length > 0 && <span aria-label="调试分段" style={{ fontSize: 10, color: '#e5a348', whiteSpace: 'nowrap' }}
+            title={debugSessions.map((session, index) => `第${index + 1}次 ${session.name} ${new Date(session.startedAtUtc).toLocaleString()}`).join('\n')}>
+            共 {debugSessions.length} 次调试
+          </span>}
           {rangeError && <span role="alert" style={{ color: 'var(--vscode-errorForeground)' }}>{rangeError}</span>}
         </div>
       </div>
@@ -995,7 +1046,7 @@ function TimelinePlot({ boot, kind }: { boot: any; kind: TimelineTab['kind'] }) 
         <VariableList
           entries={entries} allDataRef={allDataRef} onToggle={toggle} onRemove={remove}
           onSetYPerDiv={setYPerDiv} onSetYAutoScale={setYAutoScale}
-          onSetColor={setColor} removable={debugEditable}
+          onSetColor={setColor} onReorder={reorder} removable={debugEditable}
         />
         <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
           <canvas ref={canvasRef}
@@ -1070,7 +1121,7 @@ function Toolbar({ debugEditable, newExpr, onNewExpr, onAdd, onClear, onZoomIn, 
   );
 }
 
-function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSetYPerDiv, onSetYAutoScale, onSetColor }: {
+function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSetYPerDiv, onSetYAutoScale, onSetColor, onReorder }: {
   removable: boolean;
   entries: Entry[];
   allDataRef: React.MutableRefObject<Map<string, DataPoint[]>>;
@@ -1079,11 +1130,13 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
   onSetYPerDiv: (expr: string, val: number) => void;
   onSetYAutoScale: (expr: string) => void;
   onSetColor: (expr: string, color: string) => void;
+  onReorder: (expression: string, index: number) => void;
 }) {
   const [pendingInputs, setPendingInputs] = useState<Record<string, string>>({});
   const [colorExpression, setColorExpression] = useState<string | null>(null);
   const colorPickerRef = useRef<HTMLDivElement>(null);
   const colorButtonRef = useRef<HTMLButtonElement>(null);
+  const variableDrag = useTimelineVariableDrag(entries, onReorder);
   useEffect(() => {
     if (colorExpression === null) return;
     const dismissOutside = (event: MouseEvent) => {
@@ -1130,15 +1183,20 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
     );
   }
   return (
-    <div style={{
+    <div ref={variableDrag.listRef} role="list" aria-label="采样变量"
+      onPointerDown={event => { if (variableDrag.onPointerDown(event)) setColorExpression(null); }}
+      onPointerMove={variableDrag.onPointerMove} onPointerUp={variableDrag.onPointerUp}
+      onPointerCancel={variableDrag.onPointerCancel} onLostPointerCapture={variableDrag.onPointerCancel}
+      style={{
       width: VARIABLE_LIST_WIDTH, boxSizing: 'border-box', flexShrink: 0, fontSize: 11, overflow: 'auto',
+      position: 'relative', cursor: variableDrag.dragging ? 'grabbing' : undefined,
       borderRight: '1px solid var(--vscode-sideBar-border, #333)',
     }}>
-      {entries.map(e => (
-        <div key={e.expression} style={{
+      {entries.map((e, index) => (
+        <div key={e.expression} role="listitem" aria-label={e.expression} data-timeline-variable={e.expression} style={{
           display: 'flex', alignItems: 'center', gap: 3, padding: '3px 4px',
           borderBottom: '1px solid var(--vscode-sideBar-border, #333)',
-          flexWrap: 'wrap',
+          flexWrap: 'wrap', position: 'relative', ...variableDrag.rowStyle(index),
         }}>
           <input type="checkbox" checked={e.enabled}
             onChange={ev => onToggle(e.expression, ev.target.checked)}
@@ -1156,7 +1214,7 @@ function VariableList({ removable, entries, allDataRef, onToggle, onRemove, onSe
             flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
             color: e.enabled ? 'var(--vscode-sideBar-foreground, #ccc)' : 'var(--vscode-descriptionForeground, #888)',
             fontSize: 10,
-          }} title={e.expression}>{e.expression}</span>
+          }} title={`${e.expression}（按住拖动排序）`}>{e.expression}</span>
           {(() => {
             const pts = allDataRef.current.get(e.expression);
             const raw = pts && pts.length > 0 ? pts[pts.length - 1].display : '';

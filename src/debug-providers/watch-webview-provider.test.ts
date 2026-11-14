@@ -34,6 +34,19 @@ function createProvider(isCurrentSession: (session: any) => boolean = () => true
 afterEach(() => { vscodeState.activeDebugSession = undefined; });
 
 describe('WatchWebviewProvider groups', () => {
+  it('reorders tabs without re-evaluating watches or invalidating the current group', () => {
+    const { provider, saved, postMessage } = createProvider();
+    provider.addGroup(); provider.addGroup();
+    const generation = provider.generation;
+    postMessage.mockClear();
+    (provider as any).handleMessage({ command: 'reorderGroup', id: 'watch1', index: 2,
+      groupId: provider.activeGroupId, watchGeneration: generation });
+    expect((saved.get('ozoneWatchGroups') as any).groups.map((group: any) => group.id)).toEqual(['watch2', 'watch3', 'watch1']);
+    expect(provider.generation).toBe(generation);
+    expect(provider.activeGroupId).toBe('watch3');
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ command: 'watchGroups' }));
+    expect(postMessage.mock.calls.some(([message]) => message.command === 'init')).toBe(false);
+  });
   it('adds a symbol selection as one group update without dropping later items', () => {
     const { provider } = createProvider();
     const changed = vi.fn(); provider.onExpressionsChanged = changed;

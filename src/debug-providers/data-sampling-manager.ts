@@ -20,6 +20,7 @@ const MAX_INTERVAL_MS = 10000;
 
 export class DataSamplingManager {
   private entries: DataSamplingEntry[] = [];
+  private samplingExpressions: Set<string> | null = null;
   private retainHistory = true;
 
   setRetainHistory(enabled: boolean) {
@@ -38,6 +39,7 @@ export class DataSamplingManager {
   private remoteSession: vscode.DebugSession | null = null;
   private remoteSampling = false;
   private samplingGeneration = 0;
+  private endedSessions = new WeakSet<vscode.DebugSession>();
   private remoteTransition: Promise<void> = Promise.resolve();
   private readonly disposables: vscode.Disposable[] = [];
 
@@ -60,6 +62,7 @@ export class DataSamplingManager {
     this.disposables.push(vscode.debug.onDidChangeActiveDebugSession(() => void this.syncSamplingMode()));
     this.disposables.push(vscode.debug.onDidTerminateDebugSession(session => {
       if (!isOrbitDebugSessionType(session.type)) return;
+      this.endedSessions.add(session);
       if (this.remoteSession === session) {
         this.remoteSession = null;
         this.remoteSampling = false;
@@ -81,6 +84,23 @@ export class DataSamplingManager {
 
   get expressionList(): string[] {
     return this.entries.map(e => e.expression);
+  }
+
+  private get samplingEntries(): DataSamplingEntry[] {
+    return this.entries.filter(entry => this.samplingExpressions === null || this.samplingExpressions.has(entry.expression));
+  }
+
+  get samplingExpressionList(): string[] {
+    return this.samplingEntries.map(entry => entry.expression);
+  }
+
+  setSamplingExpressions(expressions: readonly string[]) {
+    const selected = new Set(expressions);
+    if (this.samplingExpressions?.size === selected.size && [...selected].every(expression => this.samplingExpressions!.has(expression))) return;
+    this.samplingExpressions = selected;
+    for (const pending of this.pendingMap.values()) pending.length = 0;
+    this.lastSampleTimestampMap.clear();
+    void this.syncSamplingMode();
   }
 
   get entriesList(): ReadonlyArray<DataSamplingEntry> {
@@ -188,7 +208,7 @@ export class DataSamplingManager {
 
   private async syncSamplingMode() {
     const generation = ++this.samplingGeneration;
-    if (this.entries.length === 0) {
+    if (this.samplingEntries.length === 0) {
       await this.stopRemoteSampling();
       this.stopLocalSampling();
       return;
@@ -197,6 +217,7 @@ export class DataSamplingManager {
     const session = vscode.debug.activeDebugSession;
     if (session && isOrbitDebugSessionType(session.type)) {
       this.stopLocalSampling();
+      if (this.endedSessions.has(session)) { await this.stopRemoteSampling(); return; }
       await this.startRemoteSampling(session, generation);
       return;
     }
@@ -223,7 +244,7 @@ export class DataSamplingManager {
     if (generation !== this.samplingGeneration || vscode.debug.activeDebugSession !== session) return;
     try {
       const response: any = await session.customRequest('dataSamplingStart', {
-        entries: this.entries.map(e => ({ expression: e.expression, color: e.color })),
+        entries: this.samplingEntries.map(e => ({ expression: e.expression, color: e.color })),
         sampleIntervalMs: this.sampleIntervalMs,
         sendIntervalMs: this.sendIntervalMs,
       });
@@ -326,17 +347,19 @@ export class DataSamplingManager {
   }
 
   private async sample() {
-    if (!this.backend.hasTargetConnection) return;
-    if (await this.isHalted()) return;
-    if (this.entries.length === 0) return;
+    const entries = this.samplingEntries;
+    if (entries.length === 0 || !this.backend.hasTargetConnection) return;
+    const generation = this.samplingGeneration;
+    if (await this.isHalted() || generation !== this.samplingGeneration) return;
     const now = Date.now();
-    const exprs = this.entries.map(e => e.expression);
+    const exprs = entries.map(e => e.expression);
     const values = await this.readValues(exprs);
-    for (let i = 0; i < this.entries.length; i++) {
+    if (generation !== this.samplingGeneration) return;
+    for (let i = 0; i < entries.length; i++) {
       const wv = values[i];
       if (!wv || wv.error) continue;
       if (typeof wv.value !== 'number' || !Number.isFinite(wv.value)) continue;
-      const entry = this.entries[i];
+      const entry = entries[i];
       const lastTimestamp = this.lastSampleTimestampMap.get(entry.expression);
       const gapThresholdMs = Math.max(this.sampleIntervalMs * 3, this.sendIntervalMs * 2);
       const startsNewSegment = lastTimestamp === undefined || now - lastTimestamp > gapThresholdMs;
@@ -377,7 +400,7 @@ export class DataSamplingManager {
 
   private acceptRemoteSamples(snapshots: DataSampleSnapshot[]) {
     const accepted: DataSampleSnapshot[] = [];
-    const entryByExpression = new Map(this.entries.map(entry => [entry.expression, entry]));
+    const entryByExpression = new Map(this.samplingEntries.map(entry => [entry.expression, entry]));
     for (const snapshot of snapshots) {
       const entry = entryByExpression.get(snapshot.expression);
       if (!entry || !Array.isArray(snapshot.data) || snapshot.data.length === 0) continue;
@@ -401,7 +424,7 @@ export class DataSamplingManager {
     if (this.pendingMap.size === 0) return;
     const snapshots: DataSampleSnapshot[] = [];
     let hasData = false;
-    for (const entry of this.entries) {
+    for (const entry of this.samplingEntries) {
       const pending = this.pendingMap.get(entry.expression);
       if (!pending || pending.length === 0) continue;
       const allData = this.dataMap.get(entry.expression) || [];

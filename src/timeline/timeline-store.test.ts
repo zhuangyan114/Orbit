@@ -24,6 +24,24 @@ function batch(first: number, count: number, segment = false) {
 afterEach(async () => { await Promise.all(stores.splice(0).map(s => s.dispose())); await Promise.all(directories.splice(0).map(d => fs.rm(d, { recursive: true, force: true }))); });
 
 describe('Timeline CSV store', () => {
+  it('preserves debug boundaries in CSV and freezes their metadata at the save snapshot', async () => {
+    const { store, base } = await record();
+    store.meta.debugSessions = [{ name: '第一轮', startedAtUtc: '2026-11-09T00:00:00.000Z', startMs: 0 }];
+    store.append(batch(0, 10));
+    const snapshot = store.captureSnapshot(null, store.view);
+    store.meta.debugSessions.push({ name: '第二轮', startedAtUtc: '2026-11-09T00:01:00.000Z', startMs: 100 });
+    store.append(batch(100, 10, true));
+    const oldFile = path.join(base, 'snapshot.csv');
+    await store.save(oldFile, null, store.view, undefined, snapshot);
+    const old = await TimelineRecordStore.open(base, oldFile); stores.push(old);
+    expect(old.meta.debugSessions).toHaveLength(1);
+    const currentFile = path.join(base, 'current.csv');
+    await store.save(currentFile, null, store.view);
+    const current = await TimelineRecordStore.open(base, currentFile); stores.push(current);
+    expect(current.meta.debugSessions).toEqual(store.meta.debugSessions);
+    const data = (await current.query(0, 200, 100, true))[0].data;
+    expect(data.find(point => point.timestamp === 100)?.startsNewSegment).toBe(true);
+  });
   it('keeps a short real gap localized when both segments occupy the same display bucket, hot and on disk', async () => {
     const { store } = await record();
     store.append(batch(0, 100)); store.append(batch(101, 100, true));

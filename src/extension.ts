@@ -155,14 +155,9 @@ export async function activate(context: vscode.ExtensionContext) {
       timelineProvider?.refreshEntries();
     };
     wvp.onSendToTimeline = (exprs) => {
-      for (const e of exprs) dsm.addExpression(e);
+      timelineProvider.addExpressions(exprs);
       vscode.commands.executeCommand('workbench.view.ozone-timeline-panel');
     };
-    const dsSaved = context.workspaceState.get<any[]>('ozoneDataSamplingExpressions', []);
-    if (dsSaved.length > 0) {
-      try { dsm.setExpressions(dsSaved); } catch { dsm.setExpressions([]); }
-    }
-
     const tl = new TimelineWebviewProvider(context, dsm, isUsableWatchSession, symbolPicker);
     timelineProvider = tl;
 
@@ -184,7 +179,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const fastSampleSink = new FastSampleSink({
       // Keep the UI Timeline's own sampler alive: the sink never stops the
       // adapter sampler while these expressions exist (plan Task 10).
-      persistentExpressions: () => dataSamplingManager?.expressionList ?? [],
+      persistentExpressions: () => dataSamplingManager?.samplingExpressionList ?? [],
     });
     apiFastSampleSink = fastSampleSink;
     apiViewState = new ViewStateService({ registry: sessionRegistry, runtime: apiRuntime, store: context.workspaceState, eventHub, sampleSink: fastSampleSink,
@@ -197,7 +192,7 @@ export async function activate(context: vscode.ExtensionContext) {
       sampleSink: fastSampleSink,
       // Keep the UI Timeline expressions live so the adapter sampler stays
       // shared with the Timeline while a recording runs (plan Task 10).
-      sharedSampleExpressions: () => dataSamplingManager?.expressionList ?? [],
+      sharedSampleExpressions: () => dataSamplingManager?.samplingExpressionList ?? [],
     });
     const sessionService = new SessionService({ registry: sessionRegistry });
     const breakpointService = new BreakpointService({ registry: sessionRegistry });
@@ -448,7 +443,7 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand('ozone.addToDataSampling', async (item) => {
         const expr = item?.watch?.expression || item;
         if (!expr || typeof expr !== 'string') return;
-        dataSamplingManager.addExpression(expr);
+        timelineProvider.addExpressions([expr]);
         vscode.commands.executeCommand('workbench.view.ozone-timeline-panel');
         vscode.commands.executeCommand('workbench.view.extension.ozone-timeline-panel');
       }),

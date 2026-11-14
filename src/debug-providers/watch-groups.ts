@@ -54,6 +54,13 @@ export class WatchGroups {
     group.name = name.trim();
     return true;
   }
+  reorder(id: string, index: number): boolean {
+    const source = this.state.groups.findIndex(group => group.id === id);
+    if (source < 0 || !Number.isInteger(index) || index < 0 || index >= this.state.groups.length || source === index) return false;
+    const [group] = this.state.groups.splice(source, 1);
+    this.state.groups.splice(index, 0, group);
+    return true;
+  }
   remove(id: string): boolean {
     const index = this.state.groups.findIndex(group => group.id === id);
     if (index < 0 || this.state.groups.length === 1) return false;

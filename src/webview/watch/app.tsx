@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { extractEditableWatchValue, parseWatchValueInput } from '../watch-value-input';
 import { stripHanCharacters } from '../../utils/watch-expression-validation';
+import { GroupTabs } from '../group-tabs';
 
 interface VSCODE_API { postMessage(message: any): void; }
 declare function acquireVsCodeApi(): VSCODE_API;
@@ -46,21 +47,9 @@ export function WatchApp() {
   const [activeGroupId, setActiveGroupId] = useState('watch1');
   const activeGroupRef = useRef('watch1');
   const generationRef = useRef(0);
-  const [renamingGroup, setRenamingGroup] = useState<{ id: string; name: string } | null>(null);
-  const renamingGroupRef = useRef<{ id: string; name: string } | null>(null);
   const postGroupMessage = (message: any) => vscode.postMessage({
     ...message, groupId: activeGroupRef.current, watchGeneration: generationRef.current,
   });
-  const startGroupRename = (group: { id: string; name: string }) => {
-    renamingGroupRef.current = { ...group };
-    setRenamingGroup(renamingGroupRef.current);
-  };
-  const finishGroupRename = (save: boolean) => {
-    const edit = renamingGroupRef.current;
-    renamingGroupRef.current = null;
-    setRenamingGroup(null);
-    if (save && edit?.name.trim()) postGroupMessage({ command: 'renameGroup', id: edit.id, name: edit.name.trim() });
-  };
   const [watches, setWatches] = useState<WatchEntry[]>([]);
   const [newExpr, setNewExpr] = useState('');
   const [editingIndex, setEditingIndex] = useState<string | null>(null);
@@ -83,11 +72,6 @@ export function WatchApp() {
       switch (msg.command) {
         case 'init':
           activeGroupRef.current = msg.activeGroupId || 'watch1';
-          // A delayed selection response may arrive after double-click started renaming that tab.
-          if (renamingGroupRef.current && renamingGroupRef.current.id !== activeGroupRef.current) {
-            renamingGroupRef.current = null;
-            setRenamingGroup(null);
-          }
           generationRef.current = msg.watchGeneration ?? 0;
           setActiveGroupId(activeGroupRef.current);
           setGroups(msg.groups || [{ id: 'watch1', name: 'watch1' }]);
@@ -323,37 +307,12 @@ export function WatchApp() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontSize: '12px' }}>
-      <div role="tablist" aria-label="Watch 分组" style={{ display: 'flex', flexShrink: 0, overflowX: 'auto',
-        alignItems: 'center', gap: 3, padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
-        {groups.map(group => <div key={group.id} style={{ display: 'flex', flexShrink: 0, alignItems: 'center',
-          borderBottom: group.id === activeGroupId ? '2px solid var(--vscode-focusBorder, #007fd4)' : '2px solid transparent',
-          background: group.id === activeGroupId ? 'var(--vscode-tab-activeBackground, #333)' : 'transparent', borderRadius: '3px 3px 0 0' }}>
-          {renamingGroup?.id === group.id ? <input autoFocus aria-label="分组名称" value={renamingGroup.name}
-            title="回车或失焦保存，Escape 取消" onFocus={event => event.target.select()}
-            onChange={event => {
-              const edit = { id: group.id, name: event.target.value };
-              renamingGroupRef.current = edit;
-              setRenamingGroup(edit);
-            }}
-            onBlur={() => finishGroupRename(true)}
-            onKeyDown={event => {
-              if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); finishGroupRename(true); }
-              if (event.key === 'Escape') { event.preventDefault(); finishGroupRename(false); }
-            }}
-            style={{ ...inputStyle, width: `${Math.min(24, Math.max(7, renamingGroup.name.length + 1))}ch`,
-              padding: '1px 4px', fontSize: 12, borderColor: 'var(--vscode-focusBorder, #007fd4)' }} />
-          : <button type="button" role="tab" aria-selected={group.id === activeGroupId}
-            title={`${group.name}（双击重命名）`} onDoubleClick={() => startGroupRename(group)}
-            onClick={() => postGroupMessage({ command: 'selectGroup', id: group.id })}
-            style={{ ...actionBtnStyle, fontSize: 12, color: 'var(--vscode-foreground, #ccc)', whiteSpace: 'nowrap' }}>{group.name}</button>}
-          <button type="button" aria-label={`删除 ${group.name}`} title={groups.length === 1 ? '至少保留一个 Watch 分组' : `删除 ${group.name}`}
-            disabled={groups.length === 1} onClick={() => postGroupMessage({ command: 'removeGroup', id: group.id })}
-            style={{ ...actionBtnStyle, minWidth: 20, padding: '0 3px', opacity: groups.length === 1 ? 0.3 : 0.7,
-              cursor: groups.length === 1 ? 'default' : 'pointer' }}>×</button>
-        </div>)}
-        <button type="button" aria-label="添加 Watch 分组" title="添加 Watch 分组"
-          onClick={() => postGroupMessage({ command: 'addGroup' })} style={{ ...actionBtnStyle, flexShrink: 0 }}>+</button>
-      </div>
+      <GroupTabs label="Watch 分组" tabs={groups.map(group => ({ ...group, closable: groups.length > 1 }))} activeId={activeGroupId}
+        onSelect={id => postGroupMessage({ command: 'selectGroup', id })}
+        onAdd={() => postGroupMessage({ command: 'addGroup' })}
+        onRemove={id => postGroupMessage({ command: 'removeGroup', id })}
+        onRename={(id, name) => postGroupMessage({ command: 'renameGroup', id, name })}
+        onReorder={(id, index) => postGroupMessage({ command: 'reorderGroup', id, index })} />
       <div style={{ display: 'flex', gap: '4px', padding: '4px 8px', borderBottom: '1px solid var(--vscode-sideBar-border, #333)' }}>
         <input value={newExpr} onChange={e => setNewExpr(stripHanCharacters(e.target.value))}
           onKeyDown={e => { if (e.key === 'Enter') addWatch(); }}

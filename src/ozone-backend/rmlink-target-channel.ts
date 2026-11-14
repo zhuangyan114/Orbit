@@ -22,6 +22,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   private streamAbort: AbortController | null = null;
   private streamTask: Promise<void> | null = null;
   private readonly listeners = new Set<(sample: CaptureSample) => void>();
+  private readonly streamLostListeners = new Set<()=>void>();
   private readonly rttData = new Map<number, Buffer>();
   private readonly rttIds = new Set<number>();
   private readonly activeCaptures=new Map<number,number>();
@@ -133,13 +134,21 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
         } finally {
           // Control/heartbeat requests establish whether the owner was lost.
           // EOF on this independent data stream alone cannot decide that.
-          if(this.streamAbort===abort){this.streamTask=null;this.streamAbort=null;}
+          if(this.streamAbort===abort){
+            this.streamTask=null;this.streamAbort=null;
+            if(!abort.signal.aborted && this.connected && !this.flashing) {
+              for(const listener of this.streamLostListeners) {
+                try{listener();}catch{this.streamLostListeners.delete(listener);}
+              }
+            }
+          }
         }
       });
     }
     return r;
   }
   onCapture(listener:(sample:CaptureSample)=>void) { this.listeners.add(listener);return ()=>this.listeners.delete(listener); }
+  onCaptureStreamLost(listener:()=>void) { this.streamLostListeners.add(listener);return ()=>this.streamLostListeners.delete(listener); }
   async unsubscribe(id:number) {
     await this.scheduler.schedule(async()=>{
       await this.client.unsubscribe(id);this.activeCaptures.delete(id);
@@ -248,9 +257,11 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   async stepOut():Promise<CppJLinkResult<NativeStepOutDiagnostics>> { return this.failure('Source stepping is pending'); }
   async disconnect() { await this.dispose();return this.success({}); }
   async dispose() {
+    this.connected=false;
     await this.stopCaptureStream();
     await this.client.close().catch(()=>{});this.connected=false;this.scheduler.dispose();
     this.listeners.clear();this.rttData.clear();
+    this.streamLostListeners.clear();
     this.activeCaptures.clear();
   }
   getPerformanceDiagnostics() { return {transport:'rmlink-service',boardSubscriptions:true,rttCacheDroppedBytes:this.rttCacheDropped}; }

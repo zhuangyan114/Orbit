@@ -87,6 +87,7 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   subscribe?(kind:'memory_series'|'memory_snapshot'|'rtt_stream',config:SubscriptionConfig):Promise<{subscription_id:number;capture_id?:number}>;
   unsubscribe?(id:number):Promise<unknown>;
   onCapture?(listener:(sample:CaptureSample)=>void):()=>void;
+  onCaptureStreamLost?(listener:()=>void):()=>void;
   readonly kind: Exclude<SessionTargetOwnerKind, 'none'>;
   readonly usingNative: boolean;
   detectProbe?(config: SessionTargetConnectConfig): Promise<CppJLinkResult<ProbeDiscoveryResult>>;
@@ -155,6 +156,9 @@ export class SessionTargetSelector {
   onCapture(listener:(sample:CaptureSample)=>void) {
     if(!this.owner?.onCapture)throw new Error('Selected owner does not support capture events');
     return this.owner.onCapture(listener);
+  }
+  onCaptureStreamLost(listener:()=>void) {
+    return this.owner?.onCaptureStreamLost?.(listener) || (()=>{});
   }
   get flashTarget(): FlashTargetDefinition | null { return this.owner?.flashTarget ?? null; }
 

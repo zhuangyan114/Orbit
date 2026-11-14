@@ -139,6 +139,8 @@ export class OzoneBackend {
       onSample:(sample:CaptureSample)=>void):Promise<()=>Promise<void>> {
     const target=this.sessionTarget;
     if(!target?.subscribe || !target.onCapture)throw new Error('Probe subscriptions unavailable');
+    const subscribe=target.subscribe.bind(target);
+    const unsubscribe=(id:number)=>target.unsubscribe?.(id) || Promise.resolve();
     const fields:NonNullable<SubscriptionConfig['fields']>=specs.map(spec=>{
       if(![1,2,4].includes(spec.size))throw new Error('RMLink supports 8/16/32-bit scalar fields');
       if(spec.pointerChain?.length) {
@@ -149,12 +151,55 @@ export class OzoneBackend {
     });
     const expectedKind=kind==='memory_series'?1:2;
     let expectedCapture:number|undefined;
-    const detach=target.onCapture(sample=>{if(sample.kind===expectedKind && sample.captureId===expectedCapture)onSample(sample);});
+    let handle:Awaited<ReturnType<typeof subscribe>>|undefined;
+    let stopped=false,retryDelay=500;
+    let retryTimer:NodeJS.Timeout|undefined;
+    let retryTask:Promise<void>=Promise.resolve();
+    const config={fields,period_us:periodUs};
+    const detach=target.onCapture(sample=>{
+      if(!stopped && sample.kind===expectedKind && sample.captureId===expectedCapture) {
+        retryDelay=500;onSample(sample);
+      }
+    });
+    const scheduleRetry=()=>{
+      // Only the live Timeline opts in. Strict recordings and other stopped
+      // subscriptions retain their failure rather than being silently replayed.
+      if(kind!=='memory_series' || stopped || !target.usingNative || retryTimer)return;
+      const delay=retryDelay;retryDelay=Math.min(5000,retryDelay*2);
+      log.dap(`[timeline] RMLink capture stream lost; retry in ${delay} ms`);
+      retryTimer=setTimeout(()=>{
+        retryTimer=undefined;
+        retryTask=retryTask.then(async()=>{
+          if(stopped || !target.usingNative)return;
+          try {
+            expectedCapture=undefined;
+            if(handle){await unsubscribe(handle.subscription_id);handle=undefined;}
+            if(stopped || !target.usingNative)return;
+            handle=await subscribe(kind,config);
+            expectedCapture=handle.capture_id;
+            log.dap(`[timeline] RMLink capture recreated subscription=${handle.subscription_id} capture=${handle.capture_id}`);
+          }catch(error){
+            log.dap(`[timeline] RMLink capture retry failed: ${String(error)}`);
+            const failure=error as {ownerLost?:boolean;httpStatus?:number};
+            if(!failure.ownerLost && failure.httpStatus!==503)scheduleRetry();
+          }
+        });
+      },delay);
+    };
+    const detachLost=target.onCaptureStreamLost?.(scheduleRetry) || (()=>{});
+    const stop=async()=>{
+      stopped=true;detach();detachLost();
+      if(retryTimer){clearTimeout(retryTimer);retryTimer=undefined;}
+      // A replacement may already be in flight. Drain it before deleting its
+      // handle, so unchecking/restarting cannot leave a hidden subscription.
+      await retryTask;
+      if(handle){const previous=handle;handle=undefined;await unsubscribe(previous.subscription_id);}
+    };
     try {
-      const handle=await target.subscribe(kind,{fields,period_us:periodUs});
+      handle=await subscribe(kind,config);
       expectedCapture=handle.capture_id;
-      return async()=>{detach();await target.unsubscribe?.(handle.subscription_id);};
-    }catch(error){detach();throw error;}
+      return stop;
+    }catch(error){await stop();throw error;}
   }
 
   get hasTargetConnection(): boolean {

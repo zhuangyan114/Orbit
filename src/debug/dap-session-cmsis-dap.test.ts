@@ -92,7 +92,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
       expect(calls.some(c=>c.cmd==='resolveProbe')).toBe(false);
       expect(calls.find(c=>c.cmd==='runToEntryPoint')).toMatchObject({symbol:'main',reset:true});
       expect(messages.find(m=>m.request_seq===1)?.success).toBe(true);
-      const expectedPath=probe==='rmlink'?'RMLink / 连接服务':'CMSIS-DAP /';
+      const expectedPath=probe==='rmlink'?'RMLink (owner=cmsis-dap)':'CMSIS-DAP /';
       expect(messages.some(m=>m.body?.output?.includes(expectedPath))).toBe(true);
     }finally{(session as any).stopConnectionMonitor();(session as any).stopRttLogPolling();}
   });
@@ -114,7 +114,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
       });
       expect(messages.find(message => message.event === 'output'
         && message.body?.output?.includes('调试路径:'))?.body.output)
-        .toContain('RMLink / 连接服务（板端订阅、缓存烧录） (owner=cmsis-dap) | ID=50787d15a924');
+        .toContain('RMLink (owner=cmsis-dap) | ID=50787d15a924');
       expect(execute).toHaveBeenCalledWith(expect.objectContaining({
         cmd: 'connect', config: expect.objectContaining({ rmlinkDeviceId: '50787d15a924' }),
       }));

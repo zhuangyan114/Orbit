@@ -2005,6 +2005,7 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
+        const flashStartedAtMs = this.nowMs();
         const flashResult = await this.withFlashProgress('Flashing', () => this.backend.execute({
           cmd: 'flash', elfPath, device, interface: interface_, speedKHz,
           probe: resolvedProbe,
@@ -2012,11 +2013,12 @@ export class DapSession extends EventEmitter {
           cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
           signal: flashAbortController.signal,
         }));
+        const flashElapsedMs = Math.max(0, this.nowMs() - flashStartedAtMs);
         if (this.flashAbortController === flashAbortController) this.flashAbortController = null;
         if (this.isSessionTerminating()) return;
         if (flashResult.ok) {
           this.rememberFlashedFirmware(elfPath);
-          this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any).message}\n` });
+          this.sendEvent('output', { category: 'console', output: `Flash successful: ${(flashResult.data as any).message}，总用时 ${(flashElapsedMs / 1000).toFixed(3)}s\n` });
         } else {
           this.phase = 'idle';
           this.sendEvent('output', { category: 'stderr', output: `Flash failed: ${flashResult.error}\n` });
@@ -2069,7 +2071,7 @@ export class DapSession extends EventEmitter {
         : ownerKind === 'jlink-legacy' ? 'J-Link / legacy koffi' : '未知路径';
       if (ownerKind === 'cmsis-dap') {
         debugPath = resolvedProbe === 'rmlink'
-          ? 'RMLink / 连接服务（板端订阅、缓存烧录）'
+          ? 'RMLink'
           : connectedDevice?.transport === 'winusb'
           ? 'CMSIS-DAP v2 / WinUSB'
           : connectedDevice?.transport === 'hid'

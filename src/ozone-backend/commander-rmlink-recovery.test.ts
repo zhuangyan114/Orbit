@@ -41,6 +41,27 @@ function fixture(ending:'eof'|'error'='eof') {
 
 describe('RMLink Timeline stream recovery on the existing owner',()=>{
   afterEach(()=>vi.useRealTimers());
+  it('keeps retry backoff through short sample bursts and resets it after sustained progress',async()=>{
+    vi.useFakeTimers({toFake:['setTimeout','clearTimeout','performance']});
+    let capture=0,emit!:(sample:any)=>void,lost!:()=>void;
+    const target={usingNative:true,
+      subscribe:vi.fn(async()=>({subscription_id:1,capture_id:++capture})),unsubscribe:vi.fn(async()=>{}),
+      onCapture:(listener:any)=>{emit=listener;return ()=>{};},
+      onCaptureStreamLost:(listener:any)=>{lost=listener;return ()=>{};},
+    };
+    const backend=new OzoneBackend();(backend as any).sessionTarget=target;
+    const stop=await backend.subscribeProbeSamples('memory_series',[{expression:'counter',address:0x20000100,size:4}],200,()=>{});
+    const sample=()=>emit({subscriptionId:1,kind:1,captureId:capture,values:[1]});
+    try {
+      lost();await vi.advanceTimersByTimeAsync(500);expect(capture).toBe(2);
+      sample();await vi.advanceTimersByTimeAsync(100);sample();lost();
+      await vi.advanceTimersByTimeAsync(500);expect(capture).toBe(2);
+      await vi.advanceTimersByTimeAsync(500);expect(capture).toBe(3);
+      sample();
+      for(let i=0;i<13;i++){await vi.advanceTimersByTimeAsync(250);sample();}
+      lost();await vi.advanceTimersByTimeAsync(500);expect(capture).toBe(4);
+    }finally{await stop();}
+  });
   it.each(['eof','error'] as const)('automatically recreates Timeline after %s without a new debug owner',async ending=>{
     vi.useFakeTimers({toFake:['setTimeout','clearTimeout']});
     const f=fixture(ending),samples:any[]=[];
@@ -48,6 +69,7 @@ describe('RMLink Timeline stream recovery on the existing owner',()=>{
     try {
       expect((await f.selector.connect({probe:'rmlink',device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'probe'})).ok).toBe(true);
       stop=await f.backend.subscribeProbeSamples('memory_series',[{expression:'counter',address:0x20000100,size:4}],200,sample=>samples.push(sample));
+      expect(f.client.subscribe).toHaveBeenCalledWith('memory_series',expect.objectContaining({realtime:true}));
       await tick();f.end();await tick();
       await vi.advanceTimersByTimeAsync(500);await tick();
       expect(f.client.subscribe).toHaveBeenCalledTimes(2);

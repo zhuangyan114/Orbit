@@ -1055,16 +1055,16 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
           <button style={iconBtnStyle} onClick={() => { saveState(); sendMessage({ command: 'saveCsv', scope: 'all' }); }}>保存全部 CSV</button>
           <button style={iconBtnStyle} disabled={cursorA === null || cursorB === null} onClick={() => { saveState(); sendMessage({ command: 'saveCsv', scope: 'selection' }); }}>保存 A/B 区间</button>
         </div>
-        <div style={{ display: 'flex', alignItems: 'flex-end', alignSelf: 'end', gap: 8, paddingLeft: PLOT_LEFT_MARGIN, minWidth: 0 }}>
-          <span title={kind === 'history' ? '平均采样率' : '实时采样率'} aria-label={kind === 'history' ? '平均采样率' : '实时采样率'} style={{ display: 'inline-flex', flexShrink: 0, gap: 0, position: 'relative', top: PLOT_TOP_MARGIN + EXPORT_ROW_PADDING - 3, zIndex: 1, color: 'var(--vscode-descriptionForeground, #aaa)', fontFamily: 'monospace', fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', alignSelf: 'end', gap: 8, paddingLeft: PLOT_LEFT_MARGIN, minWidth: 0, position: 'relative', top: PLOT_TOP_MARGIN + EXPORT_ROW_PADDING - 3, zIndex: 1 }}>
+          <span title={kind === 'history' ? '平均采样率' : '实时采样率'} aria-label={kind === 'history' ? '平均采样率' : '实时采样率'} style={{ display: 'inline-flex', flexShrink: 0, gap: 0, color: 'var(--vscode-descriptionForeground, #aaa)', fontFamily: 'monospace', fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
             <span style={{ display: 'inline-block', minWidth: '4ch' }}>{kind === 'live' ? sampleRateHz.toFixed(0) : kind === 'history' ? averageSampleRateHz?.toFixed(0) ?? '—' : '—'}</span>
             <span>Hz</span>
           </span>
-          {samplingEnabled !== undefined && <span role="status" style={{ fontSize: 10, whiteSpace: 'nowrap',
+          {samplingEnabled !== undefined && <span role="status" style={{ fontSize: 9, opacity: 0.65, whiteSpace: 'nowrap',
             color: samplingEnabled && running ? 'var(--vscode-charts-green, #4ec9b0)' : 'var(--vscode-descriptionForeground, #aaa)' }}>
             {samplingEnabled ? running ? '采样已启用' : '等待调试' : '采样已关闭'}
           </span>}
-          {debugSessions.length > 0 && <span aria-label="调试分段" style={{ fontSize: 10, color: '#e5a348', whiteSpace: 'nowrap' }}
+          {debugSessions.length > 0 && <span aria-label="调试分段" style={{ fontSize: 9, opacity: 0.65, color: '#e5a348', whiteSpace: 'nowrap' }}
             title={debugSessions.map((session, index) => `第${index + 1}次 ${session.name} ${new Date(session.startedAtUtc).toLocaleString()}`).join('\n')}>
             共 {debugSessions.length} 次调试
           </span>}

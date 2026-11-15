@@ -153,18 +153,26 @@ export class OzoneBackend {
     let expectedCapture:number|undefined;
     let handle:Awaited<ReturnType<typeof subscribe>>|undefined;
     let stopped=false,retryDelay=500;
+    let healthySince:number|undefined,lastProgress:number|undefined;
     let retryTimer:NodeJS.Timeout|undefined;
     let retryTask:Promise<void>=Promise.resolve();
-    const config={fields,period_us:periodUs};
+    const config={fields,period_us:periodUs,...(kind==='memory_series'?{realtime:true}:{})};
     const detach=target.onCapture(sample=>{
       if(!stopped && sample.kind===expectedKind && sample.captureId===expectedCapture) {
-        retryDelay=500;onSample(sample);
+        if(retryDelay>500) {
+          const now=performance.now();
+          if(lastProgress===undefined || now-lastProgress>Math.max(1000,3*periodUs/1000))healthySince=now;
+          lastProgress=now;
+          if(healthySince!==undefined && now-healthySince>=3000)retryDelay=500;
+        }
+        onSample(sample);
       }
     });
     const scheduleRetry=()=>{
       // Only the live Timeline opts in. Strict recordings and other stopped
       // subscriptions retain their failure rather than being silently replayed.
       if(kind!=='memory_series' || stopped || !target.usingNative || retryTimer)return;
+      healthySince=lastProgress=undefined;
       const delay=retryDelay;retryDelay=Math.min(5000,retryDelay*2);
       log.dap(`[timeline] RMLink capture stream lost; retry in ${delay} ms`);
       retryTimer=setTimeout(()=>{

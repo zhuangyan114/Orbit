@@ -7,6 +7,7 @@ export interface SubscriptionConfig {
   addresses?:number[]; fields?:Array<{address:number;offsets?:number[];byte_length?:1|2|4}>;
   period_us?:number; sample_limit?:number; control_block_address?:number; channel?:number;
   strict_deadlines?:boolean;
+  realtime?:boolean;
 }
 export function decodeCaptureFrame(frame:Uint8Array):CaptureSample;
 export class RMLinkClient {

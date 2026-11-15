@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 
+const fs = require('node:fs');
 const path = require('node:path');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
 
-const CLIENT_PATH = path.join(__dirname, '..', '..', 'clients', 'node', 'dist', 'index.js');
+const CLIENT_PATH = [
+  path.join(__dirname, '..', '..', 'clients', 'node', 'dist', 'index.js'),
+  path.join(__dirname, '..', 'clients', 'node', 'index.js'),
+].find(candidate => fs.existsSync(candidate))
+  || path.join(__dirname, '..', '..', 'clients', 'node', 'dist', 'index.js');
 
 function loadClient() {
   return require(CLIENT_PATH);

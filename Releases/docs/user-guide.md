@@ -1,6 +1,6 @@
 # Orbit — 用户使用与配置指南
 
-> 版本：1.1.7 文档
+> 版本：1.2.0 文档
 >
 > 本文按当前仓库源码、`package.json` 的贡献点和 Native helper 实现整理。配置名、默认值、范围和单位均以源码为准；外部扩展的具体版本和 UI 由外部扩展决定。
 
@@ -40,8 +40,8 @@
 | --- | --- |
 | 操作系统 | Native helper 的 CMake 配置明确要求 Windows；Native 发布目标为 `win32-x64`。当前产品应按 Windows 环境准备。 |
 | VS Code | `package.json` 声明 `engines.vscode: ^1.90.0`，即 VS Code 1.90.0 以上且仍在 1.x 主版本范围内。 |
-| 目标 | 产品定位为 STM32 / ARM Cortex-M；J-Link 需要 DLL 可识别的 device，CMSIS-DAP 烧录需要匹配目标的 Flash Algorithm。 |
-| 调试器 | 支持 SEGGER J-Link，以及标准 CMSIS-DAP/DAPLink probe。v1 HID 有真实调试证据；Horco v2 WinUSB 已通过自动发现、握手及 SWD 只读访问，控制/烧录与性能专项验收见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
+| 目标 | 产品定位为 STM32 / ARM Cortex-M；J-Link 需要 DLL 可识别的 device，CMSIS-DAP / RMLink 烧录需要匹配目标的 Flash Algorithm / 目标定义。 |
+| 调试器 | 支持 SEGGER J-Link、标准 CMSIS-DAP/DAPLink probe，以及 RMLink 连接服务（`probe: "rmlink"`）。v1 HID 有真实调试证据；Horco v2 WinUSB 已通过自动发现、握手及 SWD 只读访问，控制/烧录与性能专项验收见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)；RMLink 需本机或指定连接服务运行。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
 | 固件文件 | `program` 使用 ELF/AXF。符号、源码行和 DWARF 类型质量取决于文件是否包含相应调试信息。 |
 | 外部视图 | RTOS Views、Memory View、Peripheral Viewer 和 debug tracker 由外部扩展提供，Orbit 不在 `extensionDependencies` 中自动安装它们。 |
 | 源码构建 | 仅在从源码构建 Native helper 时需要 CMake 3.20+，以及 Visual Studio C++ 工具或 x64 MinGW-w64。 |
@@ -180,7 +180,28 @@ STM32F103C8T6 的最小配置如下，`program` 可按需指定；使用本次�
 
 F103C8 按官方 64 KiB 容量校验，不开放部分板卡宣称的额外 Flash，也不包含 F103CB 或兼容芯片。Flash 范围为 `0x08000000–0x0800FFFF`，SRAM 为 `0x20000000–0x20004FFF`。烧录前验证 DPIDR `0x1BA01477`、DEV_ID `0x410` 和容量寄存器 `0x1FFFF7E0` 的 64 KiB；不匹配返回 `TargetMismatch`。算法开启 HSI 供 FPEC 使用，保持系统时钟和预取配置，并在 UnInit 重新锁定 Flash。只调试已有固件时增加 `"flashBeforeDebug": false`。
 
-这张注册表只作用于 CMSIS-DAP 烧录；J-Link 链路不查注册表，`device` 会原样交给 J-Link DLL 和 `JLink.exe`，所以必须填已安装 J-Link 软件认识的器件名。实测 J-Link V9.56 的器件库没有 `STM32H723VGT6`：Commander 会提示器件名未知并降级到 `STM32H723VG`，自动烧录时还会弹出器件选择框、把流程卡到超时。`probe: "jlink"` 请写 `"device": "STM32H723VG"`。
+这张注册表只作用于 CMSIS-DAP 与 RMLink 烧录；J-Link 链路不查注册表，`device` 会原样交给 J-Link DLL 和 `JLink.exe`，所以必须填已安装 J-Link 软件认识的器件名。实测 J-Link V9.56 的器件库没有 `STM32H723VGT6`：Commander 会提示器件名未知并降级到 `STM32H723VG`，自动烧录时还会弹出器件选择框、把流程卡到超时。`probe: "jlink"` 请写 `"device": "STM32H723VG"`。
+
+### 2.4 RMLink 连接服务
+
+`probe: "rmlink"` 通过内置的 `@rmlink/client`（0.2.8）公开服务接入 RMLink：
+
+```jsonc
+{
+  "name": "Orbit RMLink",
+  "type": "orbit",
+  "request": "launch",
+  "probe": "rmlink",
+  "device": "STM32F407IG",
+  "interface": "SWD",
+  "speedKHz": 4000,
+  "flashBeforeDebug": true
+}
+```
+
+- 省略 `rmlinkDeviceId` 时，自动选择唯一在线且已配对的 RMLink 设备；多台在线设备时需填写 12 位十六进制 `rmlinkDeviceId`（仅填写 `rmlinkDeviceId` 且未写 `probe` 时也会自动选择 `rmlink`，该兼容写法下未显式设置 `flashBeforeDebug` 时默认跳过烧录；显式 `"probe": "rmlink"` 遵循正常 F5 默认烧录）。
+- 当前 RMLink 路径使用 `interface: "SWD"`，烧录复用共享目标算法包校验，支持缓存/页镜像烧录、详细阶段/地址/扇区/重试与耗时日志，并在失败时保留诊断信息。
+- Timeline 优先使用 RMLink 板端 `memory_series` 订阅及实时时间映射；当数据流因 EOF 或异常中断时，若分组采样仍处于启用状态，会自动在原控制会话上按指数退避重连恢复（持续稳定进度 3 秒后重置退避），不新建第二个 target owner。
 
 ## 3. `launch.json`
 
@@ -247,8 +268,10 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 
 | --- | --- | --- | --- |
 | `device` | string | `STM32F407VG` | 实际使用的目标设备名；J-Link 原样交给 DLL 与 `JLink.exe` 选型（必须是已安装 J-Link 软件认识的名称，例如 `STM32H723VG`），CMSIS-DAP 用于 Flash Algorithm 和芯片校验（走内置注册表）。 |
 | `deviceName` | string | 跟随 `device` | 兼容别名；通常无需填写，同时供外部 MCU Debug Views 使用。若只提供旧字段 `deviceName`，它也可顶替 `device`。 |
-| `probe` | `auto` / `jlink` / `cmsis-dap` | `auto` | 当前 session 的唯一物理 owner 类型。`auto` 先检测 J-Link、再检测 CMSIS-DAP；两者同时存在时固定选择 J-Link。 |
+| `probe` | `auto` / `jlink` / `cmsis-dap` / `rmlink` | `auto` | 当前 session 的唯一物理 owner 类型。`auto` 先检测 J-Link、再检测 CMSIS-DAP；两者同时存在时固定选择 J-Link。`rmlink` 直连 RMLink 服务。 |
+| `rmlinkDeviceId` | string（12 位十六进制） | `""` | RMLink 设备 ID；`probe: "rmlink"` 时可省略，自动选择唯一在线且已配对的设备。 |
 | `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` / `tcp` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1；`tcp` 连接 `cmsisDapPath` 指定的网络探针。 |
+| `cmsisDapXrSampling` | boolean | `false` | 是否启用 XR-DAP 厂商 Timeline 探针端采样；默认关闭，与传输类型独立。 |
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。 |
 | `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。 |
 | `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选；`cmsisDapTransport: "tcp"` 时为探针地址 `host[:port]`，默认端口 3241。 |
@@ -256,10 +279,10 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF 路径；用于可选烧录、符号和 DWARF。 |
 | `svdFile` | path | 自动解析 | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径；显式值优先级最高。 |
 | `svdPath` | path | 跟随 `svdFile` | `svdFile` 的兼容别名；两者都未填写时先查设置、本地文件和缓存，缺失时后台获取在线 Pack。 |
-| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
+| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 与 RMLink 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
 | `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
-| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
-| `runToEntryPoint` | string / `false` | `main` | CMSIS-DAP 启动或 Restart 后停靠的符号；`false` 禁用 run-to-entry。 |
+| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过烧录并复位直接运行，不同则重新烧录并停在 `runToEntryPoint`。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
+| `runToEntryPoint` | string / `false` | `main` | J-Link、CMSIS-DAP 和 RMLink 烧录后的停靠函数；Restart 时仅程序变化后停靠，程序未变化则直接运行；`false` 禁用 run-to-entry。 |
 | `rtos` | string | `""` | 传给 DAP capability/外部 RTOS Views 的 RTOS 名称，例如 `FreeRTOS`。 |
 | `rttLogEnabled` | boolean | `true` | 启动后读取 SEGGER RTT。 |
 | `rttBufferIndex` | number，up-buffer index | `0`，限制为 `0..15` | RTT 上行缓冲区索引。 |
@@ -334,7 +357,7 @@ DAP 源码还接受下列兼容输入：
 - 在 `WATCH` Webview 中添加和删除调试表达式。
 - 变量输入框留空时，点击右侧蓝色 **+**，在编辑器区域打开 Watch 和 Timeline 共用的「选择变量」面板。保留 J-Scope 式 Name、Type、Size、Address、Select 五列表格，按源文件分组；“其他符号”默认折叠，搜索时自动显示匹配项。可按变量名、成员名、类型或源文件筛选。点击箭头或双击变量名称展开结构体、数组或指针，旋转箭头和树形引导线显示层级；子项显示成员名，悬停查看完整表达式。Watch 可勾选整个变量或成员；Timeline 只允许新增数值叶子。主题色实线框表示可选，灰色虚线横杠框表示不可选；已经添加的变量默认勾选，也可取消勾选以移除。
 - 底部按钮为「添加」和「关闭」：点击「添加」同时应用本次新增、移除并关闭面板，即使只取消勾选已有变量也能提交。点击「关闭」、右上角 ×、侧边栏，切换编辑器标签、窗口失去焦点或按 Escape 都会关闭面板并丢弃本次修改。筛选、折叠过程中保留当前勾选；再次打开时恢复已提交的选择。只移除本次明确取消勾选的变量，未显示、未操作的已有表达式保持不变。Watch 修改原分组，Timeline 调试页批量更新采样变量；历史记录取消勾选只隐藏通道，保留记录数据，可重新勾选显示。
-- 顶部使用 `watch1`、`watch2` 等分组标签；点击加号新建空组，使用当前最小的空缺编号（例如删除 `watch2` 后再添加仍为 `watch2`），点击标签切换当前变量列表，点击标签旁的 × 删除该组。删除当前组会选中相邻组，至少保留一个分组。
+- 顶部使用 `watch1`、`watch2` 等分组标签；点击加号新建空组，使用当前最小的空缺编号（例如删除 `watch2` 后再添加仍为 `watch2`），点击标签切换当前变量列表，拖动标签可调整分组顺序并持久化，点击标签旁的 × 删除该组。删除当前组会选中相邻组，至少保留一个分组。
 - 双击分组名可重命名，支持中文；回车或移开焦点保存，Escape 取消，空白名称保留原名。名称随工程保存，改名不改变该组变量、展开状态或采样归属。
 - 展开结构体、数组、指针等返回的子节点。
 - 读取 `display`、类型、地址和错误状态；目标运行时可显示 `Running...` 或使用短期缓存。
@@ -354,13 +377,15 @@ Watch 只刷新选中分组的变量，其他组保留配置；切组前已发�
 
 ## 5. Timeline
 
-### 5.1 添加采样通道
+### 5.1 添加采样通道与分组
 
-Timeline 通道可以直接在 Timeline 中添加，也可以在 Watch 行的操作中发送到 Timeline。每个表达式有独立颜色、启用状态和 Y 轴配置。
+Timeline 通道可以直接在 Timeline 中添加，也可以在 Watch 行的操作中发送到 Timeline。每个表达式有独立颜色、启用状态和 Y 轴配置；左侧变量支持拖动调整显示顺序并持久化。
 
-输入框留空后点击蓝色 **+**，使用与 Watch 相同的共享编辑器面板，但只能勾选 `float`、整数、枚举等数值叶子；结构体、数组和指针需要展开后选择成员。大数组每次展开 100 项，也可输入如 `buffer[1500]` 直接筛选。有活动 Orbit 调试会话时，变量目录来自该会话加载的 ELF/DWARF；未调试时也能从 Orbit 的 launch 配置、`orbit.defaultProgram` 或工程构建目录解析 ELF，存在多个候选时选择文件，没有候选时可手动打开 ELF/AXF。离线解析不连接目标，重新编译后会重新解析。没有调试信息的条目不能用于 Timeline 选择，同名静态变量暂不支持按文件区分选择。历史记录的面板只列出本记录包含的通道；停止调试后保留「调试变量」标签，供下一次调试前添加变量，历史页不受影响。
+顶部支持多个调试分组标签（默认 `timeline1`），可新建、切换、双击重命名（支持中文）、删除（至少保留一个调试分组）和拖动排序，名称与顺序持久化到工作区。每个调试分组配有采样复选框：默认不勾选（“采样已关闭”），勾选后在调试运行期间开启采样（“采样已启用” / “等待调试”），取消勾选即停止该组采样并丢弃过期读取结果。
 
-Watch、变量选择编辑器面板以及 Timeline 画布、网格、文字和浮动读数随 VS Code 深色、浅色及高对比度主题更新；用户为曲线选择的颜色保留。指针成员的运行时地址不在变量目录中读取，Address 显示 `—`。
+输入框留空后点击蓝色 **+**，使用与 Watch 相同的共享编辑器面板，但只能勾选 `float`、整数、枚举等数值叶子；结构体、数组和指针需要展开后选择成员（保留多维数组真实行跨度）。大数组每次展开 100 项，也可输入如 `buffer[1500]` 直接筛选。有活动 Orbit 调试会话时，变量目录来自该会话加载的 ELF/DWARF；未调试时也能从 Orbit 的 launch 配置、`orbit.defaultProgram` 或工程构建目录解析 ELF，存在多个候选时选择文件，没有候选时可手动打开 ELF/AXF。离线解析不连接目标，重新编译后会重新解析。没有调试信息的条目不能用于 Timeline 选择，同名静态变量暂不支持按文件区分选择。历史记录的面板只列出本记录包含的通道；停止调试后保留调试分组标签，供下一次调试前配置变量，历史页不受影响。
+
+Watch、变量选择编辑器面板以及 Timeline 画布、网格、文字和浮动读数随 VS Code 深色、浅色及高对比度主题更新；调色盘内拖动、滚动和输入框操作保持面板打开，用户为曲线选择的颜色保留。指针成员的运行时地址不在变量目录中读取，Address 显示 `—`。
 
 ### 5.2 显示和交互
 
@@ -370,7 +395,7 @@ Watch、变量选择编辑器面板以及 Timeline 画布、网格、文字和�
 - 滚轮以鼠标所在时间点缩放；工具栏加减号和时间/div 输入以图表中心缩放。缩放后可以拖动查看历史，右键空白区域恢复追踪。
 - Y 轴默认自动缩放；手动设置 `/div` 后进入手动缩放，双击可回到自动缩放。
 - 鼠标悬停显示各通道在光标时间附近的值；数据点之间使用相邻点插值显示提示值。
-- 单击图表空白处依次放置 A/B 时间游标，拖动游标调整位置，图内显示时间差；右键游标删除它。
+- 单击图表空白处依次放置 A/B 时间游标（若 A 缺失或已超出当前视口则清掉旧配对重新放置 A，否则若 B 缺失或超出视口则放置 B），拖动游标调整位置，图内显示时间差；右键单个游标删除它，按下鼠标中键同时清除 A/B 游标。
 - 清除实时数据会结束当前记录并开始新记录，原记录保留为历史标签，表达式列表继续使用。
 
 实时调试页和历史标签分别保留变量、颜色、比例、视口、追踪与游标配置。新调试记录继承工作区保存的调试配置；CSV 标签使用文件中的配置，其修改不会覆盖下一次调试的变量列表。
@@ -389,8 +414,8 @@ Watch、变量选择编辑器面板以及 Timeline 画布、网格、文字和�
 - 调试结束后，同一位置切换为平均采样率，悬停提示“平均采样率”。打开 CSV 或恢复记录时也显示该记录的平均值；切换不会清空当前曲线。
 - 采样率根据原始点的时间戳计算：每通道为有效相邻采样间隔数除以相应时间跨度，再取有统计值通道的平均，不把通道数相加。历史平均累计同一段内的间隔和持续时间，排除断段之间的暂停；视口、曲线开关和绘图降采样不改变整份记录的平均值。
 - 目标停止时不生成新的 Timeline 采样点；恢复运行后从新的实时读取继续，不回填停止期间的时间槽。
-- 活动 DAP session 使用 J-Link Native/Legacy 或 CMSIS-DAP 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
-- XR-DAP 探针由探针端定时采样（见 2.3 节“探针端采样”），时间戳来自探针时钟，换算到 Orbit 时间轴时误差约为半个往返时间；其他探针由电脑轮询。
+- 活动 DAP session 使用 J-Link Native/Legacy、CMSIS-DAP 或 RMLink 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
+- RMLink 由板端 `memory_series` 订阅采集并映射探针时间，流中断时自动恢复；XR-DAP 探针在 `cmsisDapXrSampling: true` 时由探针端定时采样（见 2.3 节“探针端采样”），时间戳来自探针时钟，换算到 Orbit 时间轴时误差约为半个往返时间；其他探针由电脑轮询。
 - 不是每个表达式都能进入快速采样计划。无法解析为当前快速采样格式的表达式会被计划拒绝，不应把它当作“曲线为零”。
 - `orbit.timelineSampleIntervalMs` 是目标采样目标，不是硬件保证的实际采样频率。
 - `orbit.timelineSendIntervalMs` 只控制发送到 Webview 的节奏，不等于目标采样间隔。

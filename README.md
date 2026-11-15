@@ -5,7 +5,7 @@
 <h1 align="center">Orbit — The Debugger for What’s Next</h1>
 
 <p align="center">
-  在 VS Code 里调试 STM32 / ARM Cortex-M，支持 J-Link 和 DAPLink。<br>
+  在 VS Code 里调试 STM32 / ARM Cortex-M，支持 J-Link、DAPLink 和 RMLink。<br>
   直接读 MCU 变量画波形，不用写串口发送代码；参数可以在 Watch 里改。<br>
   断点、单步、RTT 日志也在这里，AI 可以通过 MCP 操作调试器。
 </p>
@@ -26,12 +26,12 @@
 
 ### TIMELINE 高频波形
 
-- **通过 J-Link / DAPLink 直接采样 MCU 变量**，不需要专门的波形上报代码，也不额外占用串口。
-- 支持多变量曲线、时间窗口缩放、游标读数和 CSV 导出。
+- **通过 J-Link / DAPLink / RMLink 直接采样 MCU 变量**，不需要专门的波形上报代码，也不额外占用串口。
+- 支持多变量曲线、多分组标签（可新建、重命名、拖动排序与按组勾选采样）、左侧变量拖动排序、时间窗口缩放、游标读数和 CSV 导出。
 - Watch 和 Timeline 输入框留空时，点击右侧蓝色 **+** 打开共用的变量选择编辑器：按源文件分组，用五列表格搜索、展开和多选变量，也可取消勾选已有变量；点击「添加」应用增删，关闭不保存。未调试时也可解析工程 ELF，Timeline 只可新增数值叶子变量，颜色跟随 VS Code 主题。
-- A/B 时间游标测量时间差，可保存全部数据或游标区间，再通过 CSV 和多个标签页回看；长期记录持续写盘，查看历史时实时采集继续。
+- A/B 时间游标测量时间差（左键放置、右键删除单个、中键同时清除），可保存全部数据或游标区间，再通过 CSV 和多个标签页回看；长期记录持续写盘，查看历史时实时采集继续。
 - 坐标格上方显示实时采样率；调试结束、打开 CSV 或恢复记录后显示平均采样率。支持回看超过十分钟的数据，时间比例最大为 **100 s/div**。
-- **J-Link 采样可达 1 kHz，无线 DAPLink 有约 400 Hz 的使用记录。** 实际速率取决于目标、表达式数量和并行负载。
+- **J-Link 采样可达 1 kHz，无线 DAPLink 有约 400 Hz 的使用记录**；支持 RMLink 板端订阅与可选 XR-DAP 探针端采样（`cmsisDapXrSampling: true`）。实际速率取决于目标、表达式数量和并行负载。
 
 [![Orbit TIMELINE：真实调试界面与多变量波形](https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-timeline-promo.png)](https://github.com/zhuangyan114/Orbit/blob/master/resources/orbit-timeline-promo.png)
 
@@ -69,7 +69,7 @@
 
 兼容 Memory View、Peripheral Viewer，查看内存和外设寄存器；需要另外安装对应扩展。
 
-**Orbit 的差异在于 VS Code 内使用、兼容 J-Link 与 DAPLink，并支持 MCP 自动化。** [Ozone](https://www.segger.com/products/development-tools/ozone-j-link-debugger/technology/tool-overview/) 已有 Watch、变量修改和波形采样，上限更高，但不支持 DAPLink；[VOFA+](https://www.vofa.plus/docs/learning/) 通过串口或网络接收上报数据，Orbit 则通过探针直接读取变量。
+**Orbit 的差异在于 VS Code 内使用、兼容 J-Link、DAPLink 与 RMLink，并支持 MCP 自动化。** [Ozone](https://www.segger.com/products/development-tools/ozone-j-link-debugger/technology/tool-overview/) 已有 Watch、变量修改和波形采样，上限更高，但不支持 DAPLink；[VOFA+](https://www.vofa.plus/docs/learning/) 通过串口或网络接收上报数据，Orbit 则通过探针直接读取变量。
 
 ## 开始使用
 
@@ -78,8 +78,8 @@
 | 你需要 | 说明 |
 | --- | --- |
 | Windows x64 + VS Code | 当前发布目标是 Windows；VS Code 需要 1.90.0 及以上的 1.x 版本 |
-| STM32 / ARM Cortex-M 开发板 | 芯片和探针组合需要在支持范围内，尤其是 CMSIS-DAP 烧录 |
-| J-Link 或 CMSIS-DAP / DAPLink | J-Link 需要安装 SEGGER 软件包；CMSIS-DAP v1 使用 HID，v2 使用 WinUSB |
+| STM32 / ARM Cortex-M 开发板 | 芯片和探针组合需要在支持范围内，尤其是 CMSIS-DAP / RMLink 烧录 |
+| J-Link、CMSIS-DAP / DAPLink 或 RMLink | J-Link 需要安装 SEGGER 软件包；CMSIS-DAP v1 使用 HID，v2 使用 WinUSB，亦支持 `tcp` 网络探针；RMLink 需运行 RMLink 连接服务 |
 | 带调试信息的 ELF/AXF | Orbit 负责调试，不替你编译固件；先确认工程能编译 |
 | GNU Arm 工具链 | 确保 `arm-none-eabi-nm`、`arm-none-eabi-objdump`、`arm-none-eabi-addr2line` 可用，建议加入 `PATH` |
 
@@ -113,7 +113,7 @@ J-Link、DAPLink 和 RMLink 烧录后默认停在 `main`。可在 `launch.json` 
 
 通常不需要填写 `program`：Orbit 会依次在 `build/Debug`、`build/Release`、`build` 中自动查找 ELF/AXF。工程里有多个固件，或输出到其他目录时，也可以用 `program` 手动指定。
 
-默认优先选择 J-Link；两种探针都插着、但你想用 DAPLink 时，加上 `"probe": "cmsis-dap"`。CMSIS-DAP 默认优先 v2 WinUSB，也兼容 v1 HID。更多配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
+默认优先选择 J-Link；两种探针都插着、但你想用 DAPLink 时，加上 `"probe": "cmsis-dap"`；使用 RMLink 连接服务时加上 `"probe": "rmlink"`（多台在线设备时再指定 `"rmlinkDeviceId"`）。CMSIS-DAP 默认优先 v2 WinUSB，也兼容 v1 HID，并支持 `"cmsisDapTransport": "tcp"` 与可选的 `"cmsisDapXrSampling": true`。更多配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 
 ## 限制
 

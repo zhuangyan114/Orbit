@@ -85,8 +85,10 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | --- | --- | --- | --- |
 | `device` | string | `STM32F407VG` | 目标 device；J-Link 用于 DLL 选型，CMSIS-DAP 用于芯片/Flash Algorithm 校验。|
 | `deviceName` | string | 跟随 `device` | 外部 MCU Views 兼容别名；通常无需填写。|
-| `probe` | `auto` / `jlink` / `cmsis-dap` | `auto` | 每个 session 的物理 target owner 类型；`auto` 固定 J-Link 优先。|
+| `probe` | `auto` / `jlink` / `cmsis-dap` / `rmlink` | `auto` | 每个 session 的物理 target owner 类型；`auto` 固定 J-Link 优先。|
+| `rmlinkDeviceId` | string | `""` | RMLink 的 12 位十六进制设备 ID；`probe: "rmlink"` 时可省略，自动选择唯一在线且已配对设备。|
 | `cmsisDapTransport` | enum | `auto` | `auto`、`cmsis-dap-v2`/`winusb`、`cmsis-dap`/`hid`、`tcp`（网络探针，地址写在 `cmsisDapPath`，`host[:port]`，默认端口 3241）。|
+| `cmsisDapXrSampling` | boolean | `false` | 是否启用 XR-DAP 厂商 Timeline 探针端采样；默认关闭，与传输类型独立。|
 | `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。|
 | `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。|
 | `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选。|
@@ -94,10 +96,10 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF；provider 可能自动从 build 目录选择。|
 | `svdFile` | path | 自动解析 | SVD 兼容字段；显式值优先级最高。|
 | `svdPath` | path | 跟随 `svdFile` | SVD 兼容字段；未填写时可从工作区、本机 Pack、缓存或按需下载解析。|
-| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口；当前 CMSIS-DAP 路径使用 SWD。|
+| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口；当前 CMSIS-DAP 与 RMLink 路径使用 SWD。|
 | `speedKHz` | number, kHz | `4000` | target interface speed。|
-| `flashBeforeDebug` | boolean | `true` | 使用当前 owner 烧录/校验；`false` 明确跳过。|
-| `runToEntryPoint` | string / `false` | `main` | CMSIS-DAP Launch/Restart 后停靠符号；`false` 禁用。|
+| `flashBeforeDebug` | boolean | `true` | 使用当前 owner 烧录/校验；Restart 时 ELF 未变化跳过烧录并复位直接运行，变化后重烧并停在 `runToEntryPoint`；`false` 明确跳过。|
+| `runToEntryPoint` | string / `false` | `main` | J-Link、CMSIS-DAP 和 RMLink 烧录后停靠符号（Restart 仅程序变化后停靠）；`false` 禁用。|
 | `rtos` | string | `""` | 传给 RTOS Views 的 RTOS 名称。|
 | `rttLogEnabled` | boolean | `true` | 是否轮询 RTT。|
 | `rttBufferIndex` | number | `0` | RTT up-buffer index；运行时限制为 `0..15`。|

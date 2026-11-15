@@ -2,10 +2,16 @@
 
 按版本从新到旧排列。具体板卡、探针和验证范围以对应的[验收记录](docs/api/orbit-automation-hardware-acceptance.md)为准。
 
-## 未发布
+## 1.2.0 — 2026-11-15
 
-- CMSIS-DAP 新增 `cmsisDapTransport: "tcp"`：经 TCP 连接网络探针，`cmsisDapPath` 填 `host[:port]`（默认 3241），帧格式与 OpenOCD cmsis-dap `tcp` 后端相同。
-- Timeline 支持 XR-DAP 探针端采样：探针实现 XR-DAP 厂商扩展时由探针定时采样并带时间戳缓存，Orbit 批量取回；不支持的探针仍由电脑轮询。采样期间 Watch 标量读取和运行态查询不打断采样，控制命令由 helper 暂停并恢复采样。
+- 新增 `probe: "rmlink"` 后端支持：接入 `@rmlink/client`（0.2.8）公开服务，支持自动选择唯一在线且已配对设备或通过 `rmlinkDeviceId` 指定 12 位设备 ID，提供 SWD 目标控制、缓存/页镜像烧录、板端三订阅（`memory_series`、`memory_snapshot`、`rtt_stream`）与实时时间映射。
+- 优化 RMLink 烧录诊断与采样流恢复：控制台输出烧录阶段、实际地址、扇区进度、板端重试/扇区恢复与总耗时，烧录失败时持久化诊断日志；修复数据流 EOF/异常后重新勾选 Timeline 仍显示 0 Hz 的问题，并对 `memory_series` 启用实时采样标记与断线指数退避自动恢复（持续稳定进度 3 秒后重置退避）。
+- 统一入口停靠与按固件变化处理重启：J-Link、CMSIS-DAP 和 RMLink 共用 `runToEntryPoint`（默认 `main`，支持自定义函数名或 `false`）；`flashBeforeDebug: true` 时 Restart 比较 ELF 内容，未变化则跳过烧录并复位直接运行（仍响应用户断点），变化后重新烧录并停在配置入口；J-Link 启动烧录后补充显示总耗时。
+- CMSIS-DAP 新增 `cmsisDapTransport: "tcp"`：经 TCP 连接网络探针，`cmsisDapPath` 填 `host[:port]`（默认 3241），帧格式与 OpenOCD cmsis-dap `tcp` 后端相同；同步提供烧录阶段与恢复进度日志。
+- Timeline 支持默认关闭的 XR-DAP 探针端采样（`cmsisDapXrSampling: true`）：探针实现 XR-DAP 厂商扩展时由探针定时采样并带时间戳缓存，Orbit 批量取回；不支持的探针仍由电脑轮询。采样期间 Watch 标量读取和运行态查询不打断采样，控制命令由 helper 暂停并恢复采样。
+- 新增 Watch 与 Timeline 共用变量选择面板：输入框留空点击右侧 `+` 打开五列表格，按源文件分组并支持搜索筛选与结构体/数组/指针展开（保留 GCC 多维数组实际行跨度）、多选与取消勾选；未调试时也可离线解析工程 ELF，Timeline 仅允许新增数值叶子变量。
+- 完善 Watch 与 Timeline 分组、排序及交互：支持新建、切换、双击重命名（含中文）、删除与拖动排序分组标签并持久化；Timeline 支持按分组勾选/取消启用采样、左侧变量拖动排序、调色盘主题适配与内部交互优化，以及中键同时清除 A/B 游标和视口外游标重新放置。
+- 修复 Watch 运行中写入后误显示暂停并导致 Timeline 停采的竞态、DAP UTF-8 字节分帧等问题，并统一 Orbit 与 RMLink 的共享目标算法包校验（`target-pack.json`）。
 
 ## 1.1.7 — 2026-10-12
 

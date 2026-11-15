@@ -42,6 +42,6 @@ docs/debug-rtos.md
 docs/rtos-debug-guide.md
 docs/test-rtos-fix.md
 docs/test-rtos-views.md
-*.zip
-*.vsix
+**/*.zip
+**/*.vsix
 scripts/**

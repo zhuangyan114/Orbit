@@ -1,65 +1,60 @@
-# Orbit — 用户使用与配置指南
+# Orbit 用户手册
 
-> 版本：1.2.0 文档
->
-> 本文按当前仓库源码、`package.json` 的贡献点和 Native helper 实现整理。配置名、默认值、范围和单位均以源码为准；外部扩展的具体版本和 UI 由外部扩展决定。
+> 适用版本：1.2.0
 
 ## 目录
 
-- [1. 安装和系统要求](#1-安装和系统要求)
+- [1. 安装与环境要求](#1-安装与环境要求)
 - [2. 调试探针与烧录](#2-调试探针与烧录)
-- [3. launch.json](#3-launchjson)
-- [4. Watch](#4-watch)
-- [5. Timeline](#5-timeline)
-- [6. RTT](#6-rtt)
-- [7. P-RTLog](#7-p-rtlog)
+- [3. launch.json 配置](#3-launchjson-配置)
+- [4. Watch 变量读写](#4-watch-变量读写)
+- [5. Timeline 波形采样](#5-timeline-波形采样)
+- [6. RTT 日志](#6-rtt-日志)
+- [7. P-RTLog 二进制日志](#7-p-rtlog-二进制日志)
 - [8. RTOS Views](#8-rtos-views)
 - [9. Memory View](#9-memory-view)
 - [10. Peripheral Viewer](#10-peripheral-viewer)
-- [11. Target owner 与调试通道](#11-target-owner-与调试通道)
+- [11. 调试通道与调度机制](#11-调试通道与调度机制)
 - [12. MCP 与 Plugin API](#12-mcp-与-plugin-api)
 - [13. 常见问题](#13-常见问题)
 - [14. 已知限制](#14-已知限制)
 
-## 1. 安装和系统要求
+## 1. 安装与环境要求
 
-### 1.1 使用发行版安装
+### 1.1 安装扩展
 
-正式发布资产放在 [GitHub Releases](https://github.com/zhuangyan114/Orbit/releases)。安装 VSIX 的标准流程是：
+可以直接在 VS Code 扩展市场搜索 **Orbit STM32 Debugger**（ID：`orbit-debug.orbit-for-vscode`）安装，也可以从 [GitHub Releases](https://github.com/zhuangyan114/Orbit/releases) 下载 `.vsix` 离线安装：
 
-1. 下载对应版本的 `.vsix`。
-2. 在 VS Code 中打开命令面板，执行 `Extensions: Install from VSIX...`。
-3. 选择 VSIX，安装完成后重新加载窗口。
-4. 打开包含 ELF/AXF 固件的工作区，再使用 `type: "orbit"` 的调试配置；旧配置中的 `type: "ozone"` 仍可用。
+1. 在 VS Code 中按 `Ctrl + Shift + P`，执行 `Extensions: Install from VSIX...`。
+2. 选择下载的 `.vsix` 文件，安装后按提示重新加载窗口。
+3. 打开包含 ELF/AXF 固件的工程，在 `launch.json` 中使用 `"type": "orbit"` 即可（旧配置中的 `"type": "ozone"` 仍然兼容）。
 
-当前仓库的发布计划还会把 MCP server 和 SKILL 作为 Releases 资产提供；它们不是 VSIX 内的 DAP 协议替代品，详见 [MCP 与 Plugin API](#12-mcp-与-plugin-api)。
+Releases 中也会附带独立的 MCP server 和配置 Skill，配合 AI 进行自动化调试，详见 [12. MCP 与 Plugin API](#12-mcp-与-plugin-api)。
 
-### 1.2 运行时要求
+### 1.2 运行环境
 
-| 项目 | 源码依据和要求 |
+| 项目 | 说明 |
 | --- | --- |
-| 操作系统 | Native helper 的 CMake 配置明确要求 Windows；Native 发布目标为 `win32-x64`。当前产品应按 Windows 环境准备。 |
-| VS Code | `package.json` 声明 `engines.vscode: ^1.90.0`，即 VS Code 1.90.0 以上且仍在 1.x 主版本范围内。 |
-| 目标 | 产品定位为 STM32 / ARM Cortex-M；J-Link 需要 DLL 可识别的 device，CMSIS-DAP / RMLink 烧录需要匹配目标的 Flash Algorithm / 目标定义。 |
-| 调试器 | 支持 SEGGER J-Link、标准 CMSIS-DAP/DAPLink probe，以及 RMLink 连接服务（`probe: "rmlink"`）。v1 HID 有真实调试证据；Horco v2 WinUSB 已通过自动发现、握手及 SWD 只读访问，控制/烧录与性能专项验收见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)；RMLink 需本机或指定连接服务运行。J-Link 需要软件包和 `JLink_x64.dll`；CMSIS-DAP 使用 VSIX 内的独立 helper。 |
-| 固件文件 | `program` 使用 ELF/AXF。符号、源码行和 DWARF 类型质量取决于文件是否包含相应调试信息。 |
-| 外部视图 | RTOS Views、Memory View、Peripheral Viewer 和 debug tracker 由外部扩展提供，Orbit 不在 `extensionDependencies` 中自动安装它们。 |
-| 源码构建 | 仅在从源码构建 Native helper 时需要 CMake 3.20+，以及 Visual Studio C++ 工具或 x64 MinGW-w64。 |
-| MCP | 从源码运行 `Releases/mcp/orbit-mcp-server.js` 时需要可执行的 `node`；仓库未声明独立的 Node.js 最低版本。 |
+| 操作系统 | 目前仅支持 Windows x64（扩展自带原生 helper 可执行文件）。 |
+| VS Code | 需要 VS Code 1.90.0 及以上版本。 |
+| 目标芯片 | 面向 STM32 与 ARM Cortex-M。J-Link 支持其自带器件库中的所有芯片；CMSIS-DAP / RMLink 烧录目前内置 F103C8、F407VE/IG 和 H723VG 等常见型号。 |
+| 调试探针 | 支持 SEGGER J-Link（需安装 SEGGER 软件包提供 `JLink_x64.dll`）、CMSIS-DAP / DAPLink（HID v1、WinUSB v2 与 TCP 网络探针）以及 RMLink 连接服务。WinUSB 详细测试见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。 |
+| 固件文件 | 需要带 DWARF 调试信息的 `.elf` 或 `.axf` 文件。 |
+| 外部视图 | RTOS Views、Memory View 和 Peripheral Viewer 由对应外部扩展提供，Orbit 负责向它们提供内存、寄存器和符号数据。 |
 
-### 1.3 符号工具链
+### 1.3 GNU Arm 符号工具链
 
-源码会调用以下 GNU Arm 工具读取 ELF 符号和 DWARF：
+Orbit 通过以下工具解析 ELF 符号、源码行号与变量类型：
 
-- `arm-none-eabi-nm.exe`；
-- `arm-none-eabi-objdump.exe`；
-- `arm-none-eabi-addr2line.exe`。
+- `arm-none-eabi-nm.exe`
+- `arm-none-eabi-objdump.exe`
+- `arm-none-eabi-addr2line.exe`
 
-工具会优先从 `PATH` 查找，也会检查源码中列出的 Windows GNU Arm 工具链目录。找不到工具时，连接可能仍可建立，但断点、源码行、表达式类型或 Native source-level step 的能力会受影响。
+建议将它们所在的 `bin` 目录加入系统 `PATH`。缺少这些工具时探针仍可连接，但断点定位、变量展开和源码级单步会受到影响。
 
-### 1.4 从源码构建（开发者选项）
+### 1.4 从源码构建（开发者）
 
-仓库已经提供 Native helper 的构建脚本；常用命令为：
+如果你需要自己修改并构建扩展，除了 Node.js / npm 外，构建原生 helper 还需要 CMake 3.20+ 和 Windows C++ 编译环境（Visual Studio C++ 工具链或 x64 MinGW-w64）：
 
 ```powershell
 npm install
@@ -68,42 +63,33 @@ npm run build:native
 npm run typecheck
 ```
 
-`npm run build:native` 会寻找 CMake 3.20+，优先使用 Visual Studio 生成器，否则要求 x64 MinGW-w64；产物目标目录是 `out/native/win32-x64/`。发布版用户通常直接安装 Releases 中的 VSIX，不需要在目标机上安装 CMake。
+构建产物位于 `dist/` 和 `out/native/win32-x64/`。普通用户直接安装 VSIX 即可，不需要配置 CMake 或 C++ 编译器。
 
 ## 2. 调试探针与烧录
 
-### 2.1 DLL 的作用
+### 2.1 J-Link
 
-F5/Run and Debug 的 `orbit` DAP 路径按 `probe` 选择 J-Link 或 CMSIS-DAP；旧的 `ozone` DAP 类型仍路由到同一实现。两种路径都不需要 OpenOCD、GDB server 或 Ozone GUI 承接常规 DAP 控制。
+Orbit 通过 `orbit-jlink-helper.exe`（或备选的 `koffi` 通道）加载 `JLink_x64.dll` 与探针通信，不需要启动 OpenOCD、GDB server 或 Ozone GUI。
 
-扩展设置 `orbit.jlinkDllPath` 为空时，源码按以下顺序尝试定位 `JLink_x64.dll`：
+当工作区设置 `orbit.jlinkDllPath` 留空时，Orbit 按以下顺序查找 `JLink_x64.dll`：
 
-1. `orbit.jlinkDllPath` 指定的、且确实存在的文件；
-2. `C:\Program Files\SEGGER\JLink_V*\JLink_x64.dll` 中按版本目录倒序找到的文件；
-3. `C:\Program Files\SEGGER\Ozone\JLink_x64.dll`；
-4. 名为 `JLink_x64.dll` 的系统搜索路径候选。
+1. `C:\Program Files\SEGGER\JLink_V*\JLink_x64.dll`（优先最新版本号）；
+2. `C:\Program Files\SEGGER\Ozone\JLink_x64.dll`；
+3. 系统默认搜索路径中的 `JLink_x64.dll`。
 
-Native helper 加载 DLL 后要求基础调试、寄存器、内存、断点、复位和连接相关的 J-Link 导出符号；RTT 还需要 DLL 提供 `JLINK_RTTERMINAL_Control` 和 `JLINK_RTTERMINAL_Read`。缺少 RTT 导出时，调试本身不等于 RTT 可用。
+遇到连接或驱动异常时，可以先查看工程目录下的 `outputs/Log/dll.log`。如果安装的 J-Link DLL 缺少 RTT 导出函数，即使调试功能正常，RTT 日志也无法使用。
 
-诊断 DLL 路径、版本、打开、连接和 owner 选择时，优先查看 `outputs/Log/dll.log`。
+### 2.2 `JLink.exe` 与自动烧录
 
-### 2.2 `JLink.exe` 只用于可选烧录
+`orbit.jlinkPath` 默认指向 `C:\Program Files\SEGGER\JLink\JLink.exe`。当 `flashBeforeDebug` 为 `true`（默认值）且指定了有效的固件文件时，启动调试会调用 `JLink.exe` 完成擦除、烧录和校验（默认超时 30 秒）。
 
-`orbit.jlinkPath` 的默认值是：
-
-```text
-C:\Program Files\SEGGER\JLink\JLink.exe
-```
-
-它由烧录流程调用。launch 中有 `program` 且 `flashBeforeDebug` 没有设为 `false` 时，Orbit 会调用 JLink Commander，参数包含目标设备、`SWD`/`JTAG` 接口、速度和临时 CommanderScript；烧录默认超时为 30 秒。
-
-没有 `program`，或显式设置 `flashBeforeDebug: false` 时，不会因为 DAP 连接本身而调用 `JLink.exe`。同一会话 Restart 时，若 `flashBeforeDebug: true` 且 ELF 与刚刚烧录的固件相同，也不会再次调用 Commander。J-Link DLL 仍然是调试连接的必需品。
+如果设置了 `"flashBeforeDebug": false`，或在同一次调试中点击“重启”且固件文件没有变化，Orbit 会跳过烧录流程，直接复位运行。
 
 ### 2.3 CMSIS-DAP / DAPLink
 
-`probe: "cmsis-dap"` 启动 `orbit-cmsis-dap-helper.exe`。`cmsisDapTransport: "auto"` 优先选择 CMSIS-DAP v2 WinUSB，找不到匹配接口时兼容 v1 HID；可用 serial、VID/PID 或 device path 缩小设备选择范围。Horco v2（`FAED:4870`）于 2026-10-02 通过真实 WinUSB 自动选择、bulk 握手、DP power-up、MEM-AP 与运行态查询；USB 名称和 serial 从描述符读取，复合接口的 Windows instance token 不作为 serial。详细证据与尚未验收的控制/烧录/性能范围见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。
+设置 `"probe": "cmsis-dap"` 会启动 `orbit-cmsis-dap-helper.exe` 连接探针。默认 `"cmsisDapTransport": "auto"` 会优先匹配 CMSIS-DAP v2（WinUSB），找不到时再尝试 v1（HID）。多只探针同时接入时，可通过 `cmsisDapSerial`、`cmsisDapVid`、`cmsisDapPid` 或 `cmsisDapPath` 指定具体设备。
 
-已有 `device`/`program` 配置可继续使用；锁定 v2 和具体探针时增加以下字段：
+如果电脑上同时插着 J-Link 和 DAPLink 且希望强制使用 DAPLink，请在 `launch.json` 中加上 `"probe": "cmsis-dap"`。锁定 v2 WinUSB 和序列号的示例：
 
 ```jsonc
 "probe": "cmsis-dap",
@@ -111,11 +97,11 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 "cmsisDapSerial": "507874001033"
 ```
 
-`winusb` 与 `cmsis-dap-v2` 等价；显式选择 v2 时不会退到 HID。当前 v2 只读验收时钟为 1000 kHz，未执行 erase/program/verify；初次验证可使用 `flashBeforeDebug: false`。如果同时接着 J-Link，需要 `probe: "cmsis-dap"` 才能固定使用 DAPLink。
+（`winusb` 与 `cmsis-dap-v2` 等价；显式指定 `cmsis-dap-v2` 时不会降级到 HID。）
 
 #### 网络探针（TCP）
 
-`cmsisDapTransport: "tcp"` 通过 TCP 连接网络 CMSIS-DAP 探针，`cmsisDapPath` 填探针地址 `host` 或 `host:port`，不写端口时用 3241；IPv6 写成 `[addr]:port`。帧格式与 OpenOCD cmsis-dap 的 `tcp` 后端相同（`"DAP\0"` + 长度 + 类型的 8 字节帧头，后面是一个 CMSIS-DAP 包），所以也能连接实现了这种帧格式的其他探针或转发程序。`auto` 不会扫描网络，网络探针必须显式选 `tcp`。
+将 `cmsisDapTransport` 设为 `"tcp"`，并在 `cmsisDapPath` 中填入探针地址 `host` 或 `host:port`（默认端口 3241，IPv6 写成 `[addr]:port`），即可连接支持 OpenOCD `cmsis-dap tcp` 帧格式的网络探针。由于 `"auto"` 不会扫描局域网，网络探针需要显式指定 `"tcp"`。
 
 ```jsonc
 "probe": "cmsis-dap",
@@ -126,65 +112,32 @@ C:\Program Files\SEGGER\JLink\JLink.exe
 
 #### 探针端采样（XR-DAP）
 
-探针实现了 [XR-DAP](https://github.com/Jiu-xiao/XRDAP-ESP) 厂商扩展（CMSIS-DAP 厂商命令 0x80–0x85）时，Timeline 自动改由探针按固定周期读取变量：Orbit 把各通道的地址和指针链交给探针，探针用自己的定时器采样、打上微秒时间戳并缓存，Orbit 每 10 ms 批量取回。采样节拍和时间戳不受 USB/网络往返和电脑调度影响，Wi-Fi 下也能保持设定的采样率。连接时 helper 发一次 0x80 INFO 判断是否支持；不支持的探针（普通 DAPLink 等）照旧由电脑轮询，行为不变。USB、TCP 和 HID 都可用。
+当探针固件实现了 [XR-DAP](https://github.com/Jiu-xiao/XRDAP-ESP) 厂商扩展（命令 `0x80–0x85`），且在 `launch.json` 中显式设置 `"cmsisDapXrSampling": true` 时，Timeline 会把采样任务交给探针本身：探针按固定定时器采样并打上微秒级时间戳缓存，Orbit 每 10 ms 批量取回，即使在 Wi-Fi 下也能保持稳定的采样节拍。USB、HID 和 TCP 均可使用。
 
-- 探针采样期间，Watch 的标量读取和运行态查询改用厂商 READ 命令，不打断采样；单步、暂停、继续、断点、写变量、RTT 等其他请求由 helper 先停止采样、执行完再恢复，停止期间探针缓存里的帧保留。
-- 探针采样期间暂停 RTT 文本读取，停止采样后恢复；电脑轮询时 RTT 同样让位于 Timeline。
-- 探针估计跟不上 `orbit.timelineSampleIntervalMs` 时，helper 自动放宽到探针能保持的周期，Timeline 显示实际周期。
-- 当前固件每次最多 32 个通道、指针链偏移在 0–32767 字节内；超出时整组退回电脑轮询。
+- 探针采样期间，Watch 标量读取和运行态查询不打断采样；单步、断点、写变量或 RTT 读取等命令会由 helper 自动暂停采样、执行完再恢复。
+- 如果探针评估无法跟上 `orbit.timelineSampleIntervalMs`，helper 会自动放宽到探针可维持的周期，并在界面显示实际速率。
+- 当前单次最多支持 32 个采样通道，且指针偏移需在 `0–32767` 字节内；超出限制或探针不支持时自动退回电脑轮询。
 
-CMSIS-DAP 的 `flashBeforeDebug: true` 通过当前 helper owner 运行匹配目标的 Flash Algorithm，并完成 erase/program/verify；它不会调用 `JLink.exe`。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过再烧，不同则重新烧录。`flashBeforeDebug: false` 完全跳过烧录（包括 Restart），仍使用 `program` 加载 ELF/DWARF。CMSIS-DAP 不会在失败时回退到 J-Link owner。
+#### 内置 Flash 烧录支持
 
-当前 CMSIS-DAP 内置 Flash 目标：
+CMSIS-DAP（以及 RMLink）开启 `flashBeforeDebug: true` 时，会通过当前探针直接运行内置 Flash 算法完成擦除、编程和校验，不需要安装 J-Link 软件。目前内置支持的芯片如下：
 
-DAPLink + STM32F407IG 可使用以下配置。`program` 未指定时会自动寻找工作区的 ELF/AXF；如有多个固件，应显式指定实际项目的 ELF 路径。
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [{
-    "name": "Orbit DAPLink STM32F407IG",
-    "type": "orbit",
-    "request": "launch",
-    "device": "STM32F407IG",
-    "probe": "cmsis-dap",
-    "cmsisDapTransport": "auto",
-    "flashBeforeDebug": true,
-    "runToEntryPoint": "main"
-  }]
-}
-```
-
-`flashBeforeDebug: true` 会擦除 ELF 涉及的扇区、编程并校验；板上已有相同固件且只需调试时设为 `false`。IG 的 Flash 范围为 `0x08000000–0x080FFFFF`，烧录前要求 `DEV_ID=0x413` 和容量寄存器报告 1024 KiB。此 ID 属于 F405/407/415/417 家族，不能单独证明封装型号；`device` 应与板上芯片及工程一致。算法、缓冲区和栈使用 `0x20000000` 起的 128 KiB 普通 SRAM；Flash ELF 校验沿用 F407VE 的 RAM 窗口，暂不接受 CCM RAM 中的 PT_LOAD 段。用户于 2026-10-02 确认修复后当前板卡/固件正常使用；全扇区、其他探针/transport、断线和长稳专项验收仍需单独补充。
-
-| `device` / 别名 | Flash | 真机验收 |
+| `device` 名称 / 别名 | 容量与算法说明 | 实板状态 |
 | --- | --- | --- |
-| `STM32F407VET6` / `STM32F407VE` | 512 KiB，自研 F4 算法 | CMSIS-DAP HID v1 已验收 |
-| `STM32F407IG` / `STM32F407IGT6` / `STM32F407IGT7` / `STM32F407IGH6` / `STM32F407IGH7` | 1 MiB，12 扇区，独立 F4 算法镜像 | 用户于 2026-10-02 确认当前板卡/固件正常使用（HID v1）；其他组合及专项验收未覆盖 |
-| `STM32F103C8T6` / `STM32F103C8` | 64 KiB，64 个 1 KiB 页，20 KiB SRAM，自研 Cortex-M3 / F1 半字算法 | 源码和自动化适配；HID / WinUSB 实板烧录、调试及长稳待验收 |
-| `STM32H723VGT6` / `STM32H723VG` | 1 MiB，自研 H7 算法 | CMSIS-DAP HID v1 已验收（P7-1～P7-5，2026-08-25）；J-Link 已验收（P7-6，2026-09-11）。长稳/断线（P7-7）未验收 |
+| `STM32F407VET6` / `STM32F407VE` | 512 KiB Flash，自研 F4 算法 | 已在 HID v1 上验证通过 |
+| `STM32F407IG` / `STM32F407IGT6` / `STM32F407IGT7` / `STM32F407IGH6` / `STM32F407IGH7` | 1 MiB（12 扇区），独立 F4 算法镜像 | 已在 HID v1 / RMLink 上实测可用 |
+| `STM32F103C8T6` / `STM32F103C8` | 64 KiB（64 × 1 KiB 页），20 KiB SRAM，F1 半字算法 | 源码已适配，待完整实板验证 |
+| `STM32H723VGT6` / `STM32H723VG` | 1 MiB Flash，自研 H7 算法 | 已在 HID v1 与 J-Link 上验证通过 |
 
-未注册的器件名会在擦除前返回 `TargetMismatch`，不会回退到 F407 算法。H723 的其他封装/容量（例如 512 KiB E 密度）以及 H725/H73x 不在本版注册表中。默认 `device` 仍是 `STM32F407VG`；调试 H723 必须显式写成 `STM32H723VGT6` 或 `STM32H723VG`。
-
-STM32F103C8T6 的最小配置如下，`program` 可按需指定；使用本次源码构建，已发布旧版本不包含这一适配：
-
-```jsonc
-{
-  "name": "Orbit DAPLink STM32F103C8T6",
-  "type": "orbit",
-  "request": "launch",
-  "device": "STM32F103C8T6",
-  "probe": "cmsis-dap"
-}
-```
-
-F103C8 按官方 64 KiB 容量校验，不开放部分板卡宣称的额外 Flash，也不包含 F103CB 或兼容芯片。Flash 范围为 `0x08000000–0x0800FFFF`，SRAM 为 `0x20000000–0x20004FFF`。烧录前验证 DPIDR `0x1BA01477`、DEV_ID `0x410` 和容量寄存器 `0x1FFFF7E0` 的 64 KiB；不匹配返回 `TargetMismatch`。算法开启 HSI 供 FPEC 使用，保持系统时钟和预取配置，并在 UnInit 重新锁定 Flash。只调试已有固件时增加 `"flashBeforeDebug": false`。
-
-这张注册表只作用于 CMSIS-DAP 与 RMLink 烧录；J-Link 链路不查注册表，`device` 会原样交给 J-Link DLL 和 `JLink.exe`，所以必须填已安装 J-Link 软件认识的器件名。实测 J-Link V9.56 的器件库没有 `STM32H723VGT6`：Commander 会提示器件名未知并降级到 `STM32H723VG`，自动烧录时还会弹出器件选择框、把流程卡到超时。`probe: "jlink"` 请写 `"device": "STM32H723VG"`。
+说明：
+- 未在内置列表中的型号会在擦除前直接报错退出，避免误刷。如需为其他芯片烧录，可通过 `cmsisDapFlashAlgorithmPath` 提供自己的算法文件，或暂时设置 `"flashBeforeDebug": false`（自行用其他工具下载固件后再调试）。
+- `STM32F407IG` 的芯片 ID（`0x413`）为 F405/407/415/417 系列共用，算法工作区使用 `0x20000000` 起的普通 SRAM（暂不支持固件段直接落在 CCM RAM 中）。
+- `STM32F103C8` 按标准 64 KiB 容量校验，暂不支持非官方扩容型号或 128 KiB 的 CB 型号。
+- 用 **J-Link** 调试 `STM32H723` 时请注意：部分旧版 J-Link 器件库（例如 V9.56）只识别 `"STM32H723VG"`，不识别 `"STM32H723VGT6"`，写错会导致 J-Link 弹窗卡住。
 
 ### 2.4 RMLink 连接服务
 
-`probe: "rmlink"` 通过内置的 `@rmlink/client`（0.2.8）公开服务接入 RMLink：
+设置 `"probe": "rmlink"` 即可通过 RMLink 服务进行调试、缓存/页镜像烧录和板端高速订阅采样：
 
 ```jsonc
 {
@@ -199,19 +152,15 @@ F103C8 按官方 64 KiB 容量校验，不开放部分板卡宣称的额外 Flas
 }
 ```
 
-- 省略 `rmlinkDeviceId` 时，自动选择唯一在线且已配对的 RMLink 设备；多台在线设备时需填写 12 位十六进制 `rmlinkDeviceId`（仅填写 `rmlinkDeviceId` 且未写 `probe` 时也会自动选择 `rmlink`，该兼容写法下未显式设置 `flashBeforeDebug` 时默认跳过烧录；显式 `"probe": "rmlink"` 遵循正常 F5 默认烧录）。
-- 当前 RMLink 路径使用 `interface: "SWD"`，烧录复用共享目标算法包校验，支持缓存/页镜像烧录、详细阶段/地址/扇区/重试与耗时日志，并在失败时保留诊断信息。
-- Timeline 优先使用 RMLink 板端 `memory_series` 订阅及实时时间映射；当数据流因 EOF 或异常中断时，若分组采样仍处于启用状态，会自动在原控制会话上按指数退避重连恢复（持续稳定进度 3 秒后重置退避），不新建第二个 target owner。
+- **设备选择**：如果当前只有一台在线且已配对的 RMLink 设备，可省略 `rmlinkDeviceId`；多台设备在线时请填写 12 位十六进制 `rmlinkDeviceId`。如果只写了 `rmlinkDeviceId` 而未写 `probe`，Orbit 也会自动启用 RMLink（此时若未显式设置 `flashBeforeDebug`，默认跳过烧录）。
+- **烧录与诊断**：支持基于芯片注册表的缓存/页镜像烧录，控制台会输出阶段、地址、扇区进度、板端重试与总耗时；若烧录失败，诊断信息会记录在日志中方便排查。
+- **Timeline 订阅与恢复**：Timeline 会使用 RMLink 板端 `memory_series` 订阅并同步探针时间。如果采样流因网络波动中断且分组采样仍处于开启状态，Orbit 会自动按指数退避重连恢复（连续稳定接收 3 秒后重置退避时间），无需重启调试。
 
-## 3. `launch.json`
+## 3. `launch.json` 配置
 
 ### 3.1 最小配置
 
-在“运行和调试”中点击“创建 launch.json”，选择 **Orbit (J-Link / CMSIS-DAP)**。生成的配置只保留 name、type、request 和空的 device；填入板上的芯片型号后即可使用。已有 launch.json 也可通过“添加配置”选择 **Orbit: 最小调试配置**。
-
-编辑 device 时提供 18 个常用 STM32 F1/F4/G4/H7 型号的补全，也可按 Ctrl+Space 调出建议；仍允许手动输入其他型号。补全建议不代表所有探针链路均有对应烧录算法，请按第 2 节的支持与验收范围选择器件。
-
-推荐配置如下。用户只需填写一次芯片型号；`probe` 默认 `auto`，`interface` 默认 `SWD`，`speedKHz` 默认 `4000`，`nativeDebugEngineMode` 默认 `auto`。`deviceName` 自动跟随 `device`，`program` 和 SVD 按后文规则自动解析：
+在 VS Code 的“运行和调试”面板点击 **创建 launch.json 文件**，选择 **Orbit (J-Link / CMSIS-DAP / RMLink)**，会生成一份精简配置。通常只需要把 `device` 填上你的芯片型号就能直接按 **F5** 调试：
 
 ```jsonc
 {
@@ -227,21 +176,13 @@ F103C8 按官方 64 KiB 容量校验，不开放部分板卡宣称的额外 Flas
 }
 ```
 
-`probe: "auto"` 使用确定性优先级：先检测 J-Link，只有没有可用 J-Link 时才检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。探针发现只做枚举/可用性检查，不选择目标、不烧录，并在建立正式 owner 前释放发现 helper。需要强制使用 DAPLink 时只增加一项：
+编辑 `device` 时会提供 18 个常用 STM32 F1/F4/G4/H7 型号的代码补全（按 `Ctrl + Space` 触发），也可以手动输入其他型号。
+
+默认省略 `probe` 时等效于 `"probe": "auto"`：Orbit 会先检测是否连接了 J-Link，没有的话再检测 CMSIS-DAP/DAPLink（两者同时连接时优先选 J-Link）。如果需要强制使用 DAPLink 或 RMLink，只需加上对应的 `probe` 字段即可：
 
 ```jsonc
 {
-  "type": "orbit",
-  "request": "launch",
-  "probe": "cmsis-dap",
-  "device": "STM32F407VG"
-}
-```
-
-STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 走内置注册表，两个名称都可用，其他默认项无需重复：
-
-```jsonc
-{
+  "name": "Orbit DAPLink",
   "type": "orbit",
   "request": "launch",
   "probe": "cmsis-dap",
@@ -249,287 +190,198 @@ STM32H723VGT6 必须显式写器件名；默认值不会变成 H723。CMSIS-DAP 
 }
 ```
 
-同一块板强制改用 J-Link 时，`device` 要写成 J-Link 器件库里的名称；`deviceName` 会自动使用同一值：
+### 3.2 常用 `launch.json` 属性
+
+| 属性 | 类型 / 可选值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `device` | string | `"STM32F407VG"` | 目标芯片型号。J-Link 需使用 J-Link 软件识别的型号名；CMSIS-DAP / RMLink 用于匹配内置算法和校验芯片。 |
+| `deviceName` | string | 跟随 `device` | 供外部 MCU Debug Views 使用的别名，通常不用单独填写。 |
+| `probe` | `auto` / `jlink` / `cmsis-dap` / `rmlink` | `"auto"` | 调试探针类型。 |
+| `rmlinkDeviceId` | string（12 位十六进制） | `""` | 指定 RMLink 设备 ID；`probe: "rmlink"` 且仅一台设备在线时可省略。 |
+| `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` / `tcp` | `"auto"` | CMSIS-DAP 传输方式；`auto` 优先 WinUSB v2，其次 HID v1；`tcp` 用于网络探针。 |
+| `cmsisDapXrSampling` | boolean | `false` | 是否启用 XR-DAP 探针端 Timeline 采样。 |
+| `cmsisDapSerial` | string | `""` | 按探针序列号过滤。 |
+| `cmsisDapVid` / `cmsisDapPid` | string | `""` | 按 USB VID / PID 过滤（十六进制字符串）。 |
+| `cmsisDapPath` | string | `""` | 按设备路径精确匹配；`cmsisDapTransport: "tcp"` 时填 `host[:port]`（默认端口 3241）。 |
+| `cmsisDapFlashAlgorithmPath` | path | `""` | 自定义 CMSIS-DAP Flash 算法文件（`.flm` 或 manifest）路径。 |
+| `program` | path | 自动查找 | `.elf` / `.axf` 固件路径（兼容旧别名 `elfPath`）。 |
+| `svdFile` / `svdPath` | path | 自动解析 | 外设寄存器描述文件（`.svd`）路径，留空时自动搜索或后台按需下载。 |
+| `interface` | `SWD` / `JTAG` | `"SWD"` | 调试接口。CMSIS-DAP、RMLink 与 J-Link Legacy 仅使用 SWD；JTAG 需配合 J-Link Native。 |
+| `speedKHz` | number（kHz） | `4000` | SWD / JTAG 通信时钟频率。 |
+| `flashBeforeDebug` | boolean | `true` | 启动前是否烧录固件。点击“重启”时若固件未变化则自动跳过烧录直接复位运行，固件变化后重烧并停在入口；设为 `false` 则始终跳过烧录。 |
+| `runToEntryPoint` | string / `false` | `"main"` | J-Link、CMSIS-DAP 和 RMLink 烧录后自动停靠的函数名（重启时仅固件变化后停靠）；设为 `false` 禁用。 |
+| `rtos` | string | `""` | 传给外部 RTOS Views 的系统名称（如 `"FreeRTOS"`，兼容别名 `defaultRtos`）。 |
+| `rttLogEnabled` | boolean | `true` | 是否开启 SEGGER RTT 日志读取。 |
+| `rttBufferIndex` | number（`0..15`） | `0` | RTT 上行缓冲区编号。 |
+| `rttPollIntervalMs` | number（`10..5000` ms） | `50` | RTT 轮询间隔。 |
+| `rttReadSize` | number（`64..65536` bytes） | `4096` | 每次轮询最大读取字节数。 |
+| `rttControlBlockAddress` | number / string | `""` | RTT 控制块地址（支持 `0x...` 或十进制）。留空时 J-Link 自动搜索内存，CMSIS-DAP 从 ELF 的 `_SEGGER_RTT` 符号定位。 |
+| `rttStripAnsi` | boolean | `true` | 输出到 Debug Console 时是否去除 ANSI 颜色控制符（RTT 终端始终保留颜色）。 |
+| `rttLogTarget` | `terminal` / `debugConsole` / `both` | `"terminal"` | RTT 日志显示位置。 |
+| `pRtLogEnabled` | boolean | `false` | 是否启用 P-RTLog 二进制帧解码。 |
+| `pRtLogRoot` | path | `""` | P-RTLog 诊断记录用路径配置。 |
+| `nativeDebugEngineEnabled` | boolean | `true` | 是否优先使用 J-Link 原生 C++ helper。 |
+| `nativeDebugEngineMode` | `auto` / `native` / `legacy` | `"auto"` | J-Link 引擎模式：`auto` 优先原生 helper，启动失败时回退 `koffi` Legacy；`native` 与 `legacy` 分别强制使用对应模式。 |
+
+### 3.3 固件 ELF/AXF 自动查找规则
+
+如果 `program` 和 `orbit.defaultProgram` 都未填写，Orbit 会按顺序扫描工程下的以下目录，选取找到的第一个 `.elf` 或 `.axf` 文件：
+
+1. `build/Debug`
+2. `build/Release`
+3. `build`
+
+若工程同时存在多个编译产物或放在自定义目录，建议直接在 `program` 中显式指定路径。
+
+### 3.4 工作区全局设置（`orbit.*`）
+
+在 VS Code 的 `settings.json` 中可以配置 `orbit.*` 默认参数（旧版 `ozone.*` 设置会在激活时自动迁移）；`launch.json` 中的同名配置优先级更高。
+
+| 设置项 | 类型 / 范围 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `orbit.jlinkPath` | path | `C:\Program Files\SEGGER\JLink\JLink.exe` | J-Link 烧录使用的 Commander 路径。 |
+| `orbit.jlinkDllPath` | path | `""` | 手动指定 `JLink_x64.dll` 路径，留空自动查找。 |
+| `orbit.defaultDevice` | string | `"STM32F407VG"` | 默认芯片型号。 |
+| `orbit.defaultInterface` | `SWD` / `JTAG` | `"SWD"` | 默认调试接口。 |
+| `orbit.defaultSpeed` | number（kHz） | `4000` | 默认时钟速率。 |
+| `orbit.defaultProgram` | path | `""` | 默认固件路径，留空自动扫描 `build/` 目录。 |
+| `orbit.defaultSvdFile` | path | `""` | 默认 SVD 文件路径。 |
+| `orbit.svdAutoDownload` | boolean | `true` | 本地缺少 SVD 时先正常启动调试，并在后台按芯片系列下载缓存 Keil DFP 中的对应 SVD。 |
+| `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称（如 `"FreeRTOS"`）。 |
+| `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次命中断点获取栈帧后自动刷新外部 RTOS Views（开启会略微增加调试通信开销）。 |
+| `orbit.logging.enabled` | boolean | `true` | 是否记录 Orbit 内部诊断日志（输出到 `outputs/Log/`）。 |
+| `orbit.logging.clearOnStart` | boolean | `true` | 每次启动时是否清空旧的内部诊断日志。 |
+| `orbit.rttLogEnabled` | boolean | `true` | 默认启用 RTT。 |
+| `orbit.rttBufferIndex` | number（`0..15`） | `0` | 默认 RTT 通道索引。 |
+| `orbit.rttPollIntervalMs` | number（`10..5000` ms） | `50` | 默认 RTT 轮询周期。 |
+| `orbit.rttReadSize` | number（`64..65536` bytes） | `4096` | 默认 RTT 单次读取字节数。 |
+| `orbit.rttControlBlockAddress` | string | `""` | 默认 RTT 控制块地址。 |
+| `orbit.rttStripAnsi` | boolean | `true` | Debug Console 输出去除 ANSI 颜色码。 |
+| `orbit.rttLogTarget` | `terminal` / `debugConsole` / `both` | `"terminal"` | 默认 RTT 显示窗口。 |
+| `orbit.pRtLogEnabled` | boolean | `false` | 默认启用 P-RTLog 解码。 |
+| `orbit.pRtLogRoot` | path | `""` | 默认 P-RTLog 路径配置。 |
+| `orbit.nativeDebugEngine.enabled` | boolean | `true` | 是否允许 J-Link 原生 helper。 |
+| `orbit.nativeDebugEngine.mode` | `auto` / `native` / `legacy` | `"auto"` | 默认 J-Link 引擎策略。 |
+| `orbit.watchPollIntervalMs` | number（`100..10000` ms） | `500` | Watch 面板可见时的轮询刷新间隔。 |
+| `orbit.timelineSampleIntervalMs` | number（`0.1..10000` ms） | `0.2` | Timeline 目标采样间隔（0.2 ms 对应目标 5 kHz；实际速率受探针和通道数限制）。 |
+| `orbit.timelineSendIntervalMs` | number（`1..10000` ms） | `16` | Timeline 向界面推送刷新的节拍。 |
+| `orbit.flashBeforeDebug` | boolean | `true` | 默认启动调试前烧录固件。 |
+| `orbit.recentSessions` | number（`0..50`） | `10` | 保留的最近调试会话记录条数。 |
+| `orbit.automation.enabled` | boolean | `false` | 是否开启本地 Automation API（供 MCP 和脚本接入）。 |
+| `orbit.automation.allowedScopes` | string[] | `["read"]` | 自动化接口允许授予的最高权限范围。 |
+
+## 4. Watch 变量读写
+
+### 4.1 主要功能
+
+- **直接添加与批量选变量**：在 `WATCH` 面板输入框直接输入表达式回车添加；或者留空后点击右侧蓝色 **+**，在编辑器区域打开「选择变量」面板。
+  - 变量选择面板采用 Name、Type、Size、Address、Select 五列表格，按源文件分组，支持按变量名、成员名、类型或源文件搜索（“其他符号”默认折叠，搜索时自动展开匹配项）。
+  - 点击箭头或双击变量名可展开结构体、数组或指针，勾选或取消勾选后点击「添加」一次性应用增删；点击「关闭」、`Esc` 或切换窗口会取消本次修改。
+- **多分组管理**：顶部提供 `watch1`、`watch2` 等分组标签，支持新建分组（自动复用最小空缺编号）、点击切换、双击重命名（支持中文）、拖动调整标签顺序以及点击 `×` 删除分组（至少保留一个）。
+- **数值实时查看与高亮**：支持展开结构体、数组和指针查看子成员；数值发生变化时会自动高亮提示（持续 500 ms）。
+- **直接修改变量值**：点击叶子数值可以直接修改并写入 MCU 内存，支持十进制、科学计数法和 `0x...` 十六进制格式（复合结构节点不能整体直接写入）。
+- **一键发送到 Timeline**：点击 Watch 行上的图表图标，可直接把该数值变量添加到 Timeline 采样。
+
+### 4.2 状态与调度机制
+
+- 各分组的表达式、展开状态与顺序会自动保存在当前工作区；当前活动分组每次只刷新可见面板里的表达式，Watch 面板隐藏时自动停止后台轮询，减少探针占用。
+- 调试控制指令（暂停、继续、单步、断点、修改变量）优先于 Watch 和 Timeline 读取，确保调试控制响应流畅。
+
+## 5. Timeline 波形采样
+
+### 5.1 通道管理与分组
+
+- **添加采样变量**：可以在 Timeline 输入框直接输入全局变量或成员路径添加，也可以从 Watch 行一键发送过来；输入框留空点击蓝色 **+** 即可打开共用的「选择变量」面板。
+  - Timeline 只允许新增数值叶子变量（`float`、`double`、整数、枚举等）；结构体、数组和指针需要先展开再勾选内部成员（大数组每次分页展开 100 项，也可直接输入如 `buffer[1500]` 筛选）。
+  - 即使没有启动调试，也可以直接离线解析工程的 ELF/AXF 文件预先选好要看的变量（如果工程有多个 ELF 会弹出列表供选择）。
+- **变量排序与颜色**：左侧变量列表支持鼠标拖动调整顺序并保存；点击变量前的色块可打开调色盘（跟随 VS Code 深/浅/高对比度主题），支持拖动选色或输入 RGB / 十六进制颜色值。
+- **调试分组与采样开关**：顶部支持新建、切换、双击重命名（支持中文）、拖动排序和删除调试分组（默认 `timeline1`）。每个调试分组左侧带有一个采样复选框：
+  - 默认未勾选（显示“采样已关闭”），防止不需要采样时白占探针带宽；
+  - 勾选后，在调试运行期间自动开启采样（显示“采样已启用”或“等待调试”）；取消勾选可随时停止该组采样。
+
+### 5.2 图表交互与游标测量
+
+- **追踪与缩放**：默认开启自动追踪最新波形；鼠标滚轮以当前指针所在时间为中心缩放横轴，工具栏加减号与输入框以图表中心缩放（横轴最大支持 `100 s/div`，8 格可查看 800 秒）。缩放或向左拖动查看历史后会自动暂停追踪，**右键单击图表空白处**可立刻恢复追踪。
+- **Y 轴比例**：默认开启自动缩放；在左侧或通道栏手动输入 `/div` 数值后进入手动缩放，双击即可切回自动缩放。
+- **A/B 时间游标**：
+  - **左键单击**图表空白处依次放置 A、B 两条时间游标，图内自动绘制水平连线并标注时间差 Δt（若 A 未放置或已移出当前可视范围，再次单击会重新从 A 开始放置）。
+  - **左右拖动**游标可微调位置，虚线与悬浮值实时跟随；**右键单击**某个游标将其删除，**按下鼠标中键**可一次性清除 A/B 两条游标。
+- **开始新记录**：点击清除实时数据会结束当前记录并保留为一个历史标签页，同时基于当前变量列表开始一段全新的记录，不会丢失刚才抓到的波形。
+
+### 5.3 保存、打开与恢复历史记录
+
+- **导出 CSV**：“保存全部 CSV”导出整段记录，“保存 A/B 区间”只导出两条游标之间的数据。CSV 内同时保存原始时间戳、数值和各通道颜色/比例/游标等视图配置，默认保存在工程的 `.vscode/timeline/` 目录下（以调试开始时间命名）。
+- **离线查看**：点击“打开 CSV”可在独立标签页回看保存的波形，无需连接开发板，也不会干扰当前正在采集的实时标签页；点击“恢复记录”可快速列出工作区 `.vscode/timeline/` 中保存过的历史文件。
+- **长期记录支持**：采集期间采样数据会持续写入系统的临时磁盘缓存，内存占用保持平稳，可以轻松回看超过 10 分钟的长波形（只有手动点击保存的 CSV 才会保留在工程目录中，关闭 VS Code 后未保存的临时记录会自动清理）。
+
+### 5.4 采样率与多探针说明
+
+- **采样率显示**：保存按钮右侧、坐标格上方显示当前采样率（整数 Hz）。实时调试时悬停提示“实时采样率”（约 1.5 秒无新数据后归零）；调试结束、打开 CSV 或恢复记录后自动切换为整段“平均采样率”（暂停期间不计入）。
+- **采集方式差异**：
+  - **J-Link / 普通 CMSIS-DAP**：由电脑端定时批量读取内存；复杂多级指针或过多通道会分摊读取带宽，目标处于暂停状态时不产生新采样点。
+  - **RMLink**：由探针板端直接订阅 `memory_series` 采样并带有精确时间戳，流中断时支持自动重连恢复。
+  - **XR-DAP（需开启 `cmsisDapXrSampling: true`）**：由探针端定时器采样并缓存回传，避免 USB/Wi-Fi 往返抖动。
+- **表达格式限制**：如果输入的表达式无法解析为静态地址或受限指针链，会被快速采样计划跳过（不会画成一条零线），可在 `outputs/Log/dap.log` 查看详细原因。
+
+## 6. RTT 日志
+
+### 6.1 使用方法
+
+`rttLogEnabled` 默认为 `true`。启动调试连接目标后，Orbit 会自动开始读取 SEGGER RTT 上行通道数据：
+
+- **J-Link**：通过 DLL 内置的 RTT 接口自动搜索控制块并读取；
+- **CMSIS-DAP / RMLink**：通过目标内存直接读取控制块与环形缓冲区（要求固件已初始化 RTT，且 ELF 中存在 `_SEGGER_RTT` 符号或配置了 `rttControlBlockAddress`）。
+
+通过 `rttLogTarget` 可选择输出位置：
+- `terminal`（默认）：在 VS Code 的 `Orbit RTT Log` 终端显示，完整保留 ANSI 彩色日志；
+- `debugConsole`：输出到 VS Code Debug Console（默认去除 ANSI 控制符）；
+- `both`：两处同时输出。
+
+### 6.2 常用 RTT 配置
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `rttBufferIndex` | `0` | 上行通道号（`0..15`）。 |
+| `rttPollIntervalMs` | `50` | 轮询间隔（`10..5000 ms`）。 |
+| `rttReadSize` | `4096` | 单次最大读取字节数（`64..65536`）。 |
+| `rttControlBlockAddress` | `""` | 手动指定 RTT 控制块地址（如 `0x20000000`）。 |
+| `rttStripAnsi` | `true` | 写入 Debug Console 前去除颜色控制码。 |
+| `rttLogTarget` | `"terminal"` | 显示目标：`terminal`、`debugConsole` 或 `both`。 |
+
+注：在高速 Timeline 采样期间，后台 RTT 轮询可能会自动暂停以让出探针带宽，采样停止后自动恢复。
+
+## 7. P-RTLog 二进制日志
+
+P-RTLog 是运行在 RTT 之上的二进制令牌化日志格式（基于 `pw_tokenizer`），能大幅减少 MCU 串口/RTT 格式化开销。在 `launch.json` 中启用 `"pRtLogEnabled": true` 后：
+
+1. Orbit 从当前 `program` ELF 的 `.pw_tokenizer.entries` 段加载 token 字符串表；
+2. 按 `[2 字节小端长度][帧负载]` 拆分 RTT 字节流；
+3. 解析前 4 字节 token 及后续变长参数（支持整数、浮点、字符串、指针及常见 printf 格式），还原出日志级别、模块名、源码位置和格式化文本。
 
 ```jsonc
 {
   "type": "orbit",
   "request": "launch",
-  "probe": "jlink",
-  "device": "STM32H723VG"
-}
-```
-
-### 3.2 默认值和 launch 属性
-
-以下是 `package.json` 的 launch schema 以及 DAP 源码实际读取的值：
-
-| 属性 | 类型 / 单位 | 默认值 | 作用 |
-| --- | --- | --- | --- |
-| `device` | string | `STM32F407VG` | 实际使用的目标设备名；J-Link 原样交给 DLL 与 `JLink.exe` 选型（必须是已安装 J-Link 软件认识的名称，例如 `STM32H723VG`），CMSIS-DAP 用于 Flash Algorithm 和芯片校验（走内置注册表）。 |
-| `deviceName` | string | 跟随 `device` | 兼容别名；通常无需填写，同时供外部 MCU Debug Views 使用。若只提供旧字段 `deviceName`，它也可顶替 `device`。 |
-| `probe` | `auto` / `jlink` / `cmsis-dap` / `rmlink` | `auto` | 当前 session 的唯一物理 owner 类型。`auto` 先检测 J-Link、再检测 CMSIS-DAP；两者同时存在时固定选择 J-Link。`rmlink` 直连 RMLink 服务。 |
-| `rmlinkDeviceId` | string（12 位十六进制） | `""` | RMLink 设备 ID；`probe: "rmlink"` 时可省略，自动选择唯一在线且已配对的设备。 |
-| `cmsisDapTransport` | `auto` / `cmsis-dap-v2` / `winusb` / `cmsis-dap` / `hid` / `tcp` | `auto` | CMSIS-DAP transport；`auto` 优先 WinUSB v2 并兼容 HID v1；`tcp` 连接 `cmsisDapPath` 指定的网络探针。 |
-| `cmsisDapXrSampling` | boolean | `false` | 是否启用 XR-DAP 厂商 Timeline 探针端采样；默认关闭，与传输类型独立。 |
-| `cmsisDapSerial` | string | `""` | 可选 probe serial 筛选。 |
-| `cmsisDapVid` / `cmsisDapPid` | string | `""` | 可选 USB VID/PID 筛选。 |
-| `cmsisDapPath` | string | `""` | 可选设备 interface path 精确筛选；`cmsisDapTransport: "tcp"` 时为探针地址 `host[:port]`，默认端口 3241。 |
-| `cmsisDapFlashAlgorithmPath` | path | `""` | 可选、来源和许可已确认的 Flash Algorithm binary/manifest。 |
-| `program` | path | `${workspaceFolder}/build/Debug/frame.elf` | ELF/AXF 路径；用于可选烧录、符号和 DWARF。 |
-| `svdFile` | path | 自动解析 | 提供给外部 Peripheral Viewer 的 CMSIS-SVD 路径；显式值优先级最高。 |
-| `svdPath` | path | 跟随 `svdFile` | `svdFile` 的兼容别名；两者都未填写时先查设置、本地文件和缓存，缺失时后台获取在线 Pack。 |
-| `interface` | `SWD` / `JTAG` | `SWD` | 调试接口。当前 CMSIS-DAP 与 RMLink 路径使用 SWD；J-Link Legacy 固定选择 SWD，见限制。 |
-| `speedKHz` | number，kHz | `4000` | SWD/JTAG 目标速度。 |
-| `flashBeforeDebug` | boolean | `true` | 使用当前选定 owner 烧录并校验。Launch 总会烧录；同一会话 Restart 时若 ELF 与刚刚烧录的固件相同则跳过烧录并复位直接运行，不同则重新烧录并停在 `runToEntryPoint`。`false` 明确跳过所有 Flash 操作，包括 Restart。 |
-| `runToEntryPoint` | string / `false` | `main` | J-Link、CMSIS-DAP 和 RMLink 烧录后的停靠函数；Restart 时仅程序变化后停靠，程序未变化则直接运行；`false` 禁用 run-to-entry。 |
-| `rtos` | string | `""` | 传给 DAP capability/外部 RTOS Views 的 RTOS 名称，例如 `FreeRTOS`。 |
-| `rttLogEnabled` | boolean | `true` | 启动后读取 SEGGER RTT。 |
-| `rttBufferIndex` | number，up-buffer index | `0`，限制为 `0..15` | RTT 上行缓冲区索引。 |
-| `rttPollIntervalMs` | number，ms | `50`，限制为 `10..5000` | RTT 轮询周期。 |
-| `rttReadSize` | number，bytes/poll | `4096`，限制为 `64..65536` | 每次 RTT 读取的最大字节数。 |
-| `rttControlBlockAddress` | number 或 string，地址 | `""` | RTT control block 地址；J-Link 可自动检测，CMSIS-DAP 可从 ELF 符号定位或使用显式地址；正数可写成十进制或 `0x`。 |
-| `rttStripAnsi` | boolean | `true` | 写入 Debug Console 前去除 ANSI 控制序列；RTT terminal 始终保留 ANSI。 |
-| `rttLogTarget` | `terminal` / `debugConsole` / `both` | `terminal` | RTT 文本显示位置。 |
-| `pRtLogEnabled` | boolean | `false` | 将 RTT 字节按 P-RTLog tokenized 帧解码，而不是按普通文本处理。 |
-| `pRtLogRoot` | path | `""` | P-RTLog root 配置值；当前 decoder 不从该目录加载 token 数据，见 P-RTLog 限制。 |
-| `nativeDebugEngineEnabled` | boolean | `true` | `auto` 模式下是否优先 Native helper。 |
-| `nativeDebugEngineMode` | `legacy` / `native` / `auto` | `auto` | 选择 Legacy、强制 Native，或 Native 启动失败时允许回退 Legacy。 |
-
-### 3.3 ELF 自动查找与源码兼容别名
-
-如果 `program` 和 `orbit.defaultProgram` 都为空，配置提供器按以下顺序检查工作区：
-
-1. `build/Debug`；
-2. `build/Release`；
-3. `build`。
-
-每个目录中按文件系统返回顺序取第一个 `.elf` 或 `.axf`。找不到时使用 `${workspaceFolder}/build/Debug/frame.elf` 作为未解析的默认路径。
-
-DAP 源码还接受下列兼容输入：
-
-| 输入 | 默认值 | 当前行为 |
-| --- | --- | --- |
-| `elfPath` | `""` | `program` 为空时作为 ELF 路径别名。 |
-| `defaultRtos` | `""` | `rtos` 为空时作为 RTOS 名称别名。 |
-| `flashBeforeDebug` | `true` | 使用当前 owner 烧录；J-Link 调用 Commander，CMSIS-DAP 运行 Flash Algorithm。设为 `false` 时不执行擦除、编程或校验。 |
-
-### 3.4 `orbit.*` 工作区设置
-
-这些设置可以在 VS Code Settings JSON 中使用；正式前缀为 `orbit.*`，旧版 `ozone.*` 会在激活时迁移。
-
-| 设置 | 类型 / 范围 | 默认值 | 作用 |
-| --- | --- | --- | --- |
-| `orbit.jlinkPath` | path | `C:\Program Files\SEGGER\JLink\JLink.exe` | 烧录流程使用的 J-Link Commander 可执行文件。 |
-| `orbit.jlinkDllPath` | path | `""` | `JLink_x64.dll` 路径；空值自动查找。 |
-| `orbit.defaultDevice` | string | `STM32F407VG` | 默认目标设备名。 |
-| `orbit.defaultInterface` | `SWD` / `JTAG` | `SWD` | 默认调试接口。 |
-| `orbit.defaultSpeed` | number，kHz | `4000` | 默认接口速度。 |
-| `orbit.defaultProgram` | path | `""` | 默认 ELF/AXF；空值时自动扫描 `build/Debug`、`build/Release`、`build`。 |
-| `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的默认 CMSIS-SVD；优先于自动查找和下载。 |
-| `orbit.svdAutoDownload` | boolean | `true` | 本地没有匹配 SVD 时直接启动调试，后台下载并缓存对应系列的 Keil DFP；失败重试，成功后下次启动自动使用。 |
-| `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称，例如 `FreeRTOS`。 |
-| `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次 stack trace 后自动 focus/refresh 外部 RTOS Views；关闭可减少调试会话额外开销。 |
-| `orbit.rttLogEnabled` | boolean | `true` | 是否读取 RTT。 |
-| `orbit.logging.enabled` | boolean | `true` | 是否启用 Orbit 内部诊断日志。 |
-| `orbit.logging.clearOnStart` | boolean | `true` | 启动时是否清空 Orbit 内部诊断日志。 |
-| `orbit.rttBufferIndex` | number，`0..15` | `0` | RTT up-buffer 索引。 |
-| `orbit.rttPollIntervalMs` | number，`10..5000` ms | `50` | RTT 轮询周期。 |
-| `orbit.rttReadSize` | number，`64..65536` bytes | `4096` | 每轮 RTT 最大读取量。 |
-| `orbit.rttControlBlockAddress` | string | `""` | RTT control block 地址；空值自动检测。 |
-| `orbit.rttStripAnsi` | boolean | `true` | 仅 Debug Console 输出去除 ANSI。 |
-| `orbit.rttLogTarget` | `terminal` / `debugConsole` / `both` | `terminal` | RTT 输出位置。 |
-| `orbit.pRtLogEnabled` | boolean | `false` | 启用 P-RTLog 解码。 |
-| `orbit.pRtLogRoot` | path | `""` | P-RTLog root 配置值。 |
-| `orbit.nativeDebugEngine.enabled` | boolean | `true` | Native 总开关；关闭时 `auto` 使用 Legacy。 |
-| `orbit.nativeDebugEngine.mode` | `legacy` / `native` / `auto` | `auto` | 目标 owner 选择策略。 |
-| `orbit.watchPollIntervalMs` | number，`100..10000` ms | `500` | Watch Webview 可见时的扩展侧刷新计时基准；活动 DAP 会话还会执行目标状态和读取调度。 |
-| `orbit.timelineSampleIntervalMs` | number，`0.1..10000` ms | `0.2` | Timeline 目标采样间隔；`0.2 ms` 是 5 kHz 的目标值，实际速率取决于目标读取延迟和表达式数量。 |
-| `orbit.timelineSendIntervalMs` | number，`1..10000` ms | `16` | Timeline Webview 更新间隔；采样可以快于 UI 更新。 |
-| `orbit.flashBeforeDebug` | boolean | `true` | 启动调试前是否烧录当前 ELF/AXF。 |
-| `orbit.recentSessions` | number，`0..50` | `10` | 保留的最近调试会话数量。 |
-旧版本的 `ozone.*` 设置会在 Orbit 激活时自动迁移到对应的 `orbit.*` 设置；launch 中显式提供的字段仍然优先于设置值。
-
-## 4. Watch
-
-### 4.1 能力
-
-- 在 `WATCH` Webview 中添加和删除调试表达式。
-- 变量输入框留空时，点击右侧蓝色 **+**，在编辑器区域打开 Watch 和 Timeline 共用的「选择变量」面板。保留 J-Scope 式 Name、Type、Size、Address、Select 五列表格，按源文件分组；“其他符号”默认折叠，搜索时自动显示匹配项。可按变量名、成员名、类型或源文件筛选。点击箭头或双击变量名称展开结构体、数组或指针，旋转箭头和树形引导线显示层级；子项显示成员名，悬停查看完整表达式。Watch 可勾选整个变量或成员；Timeline 只允许新增数值叶子。主题色实线框表示可选，灰色虚线横杠框表示不可选；已经添加的变量默认勾选，也可取消勾选以移除。
-- 底部按钮为「添加」和「关闭」：点击「添加」同时应用本次新增、移除并关闭面板，即使只取消勾选已有变量也能提交。点击「关闭」、右上角 ×、侧边栏，切换编辑器标签、窗口失去焦点或按 Escape 都会关闭面板并丢弃本次修改。筛选、折叠过程中保留当前勾选；再次打开时恢复已提交的选择。只移除本次明确取消勾选的变量，未显示、未操作的已有表达式保持不变。Watch 修改原分组，Timeline 调试页批量更新采样变量；历史记录取消勾选只隐藏通道，保留记录数据，可重新勾选显示。
-- 顶部使用 `watch1`、`watch2` 等分组标签；点击加号新建空组，使用当前最小的空缺编号（例如删除 `watch2` 后再添加仍为 `watch2`），点击标签切换当前变量列表，拖动标签可调整分组顺序并持久化，点击标签旁的 × 删除该组。删除当前组会选中相邻组，至少保留一个分组。
-- 双击分组名可重命名，支持中文；回车或移开焦点保存，Escape 取消，空白名称保留原名。名称随工程保存，改名不改变该组变量、展开状态或采样归属。
-- 展开结构体、数组、指针等返回的子节点。
-- 读取 `display`、类型、地址和错误状态；目标运行时可显示 `Running...` 或使用短期缓存。
-- 叶子数值可编辑。输入支持十进制、科学计数法和完整的十六进制 `0x...` 数字；复合节点不能直接写入。
-- 写入通过活动 Orbit DAP session 的 `setWatchValue` 完成；写入后会清理对应运行时缓存并重新读取。
-- 叶子表达式可以发送到 Timeline；值变化会短暂高亮，源码中的高亮窗口是 500 ms。
-
-### 4.2 状态保存和路由
-
-各 Watch 分组的表达式、展开节点、当前选择和编号保存到工程的 workspace state `ozoneWatchGroups`。已有单列表会自动迁入 `watch1`；切换视图、重新创建 Webview 或重载窗口后恢复所选分组。当前组同时写入兼容键 `ozoneWatchExpressions` 和 `ozoneWatchExpandedExpressions`，Automation API 的 Watch 增删与替换也作用于当前组。
-
-如果存在活动的 `orbit` DAP session（或旧 `ozone` 别名），Watch 读取和写入都通过该 session 路由；不会为同一目标再打开一个 Extension Host owner。没有活动 DAP session 时，扩展侧 Watch provider 才会使用其后端路径。
-
-### 4.3 刷新和并发
-
-Watch 只刷新选中分组的变量，其他组保留配置；切组前已发出的读取或写入结果不会覆盖新组，尚未提交的编辑会取消。Watch Webview 不可见时，扩展侧轮询不会读取目标。活动 DAP session 会把目标读取切成有限大小的批次，并为控制操作让出优先级；继续、暂停、单步、断点和变量写入不会被 Timeline 低优先级采样绕过。
-
-## 5. Timeline
-
-### 5.1 添加采样通道与分组
-
-Timeline 通道可以直接在 Timeline 中添加，也可以在 Watch 行的操作中发送到 Timeline。每个表达式有独立颜色、启用状态和 Y 轴配置；左侧变量支持拖动调整显示顺序并持久化。
-
-顶部支持多个调试分组标签（默认 `timeline1`），可新建、切换、双击重命名（支持中文）、删除（至少保留一个调试分组）和拖动排序，名称与顺序持久化到工作区。每个调试分组配有采样复选框：默认不勾选（“采样已关闭”），勾选后在调试运行期间开启采样（“采样已启用” / “等待调试”），取消勾选即停止该组采样并丢弃过期读取结果。
-
-输入框留空后点击蓝色 **+**，使用与 Watch 相同的共享编辑器面板，但只能勾选 `float`、整数、枚举等数值叶子；结构体、数组和指针需要展开后选择成员（保留多维数组真实行跨度）。大数组每次展开 100 项，也可输入如 `buffer[1500]` 直接筛选。有活动 Orbit 调试会话时，变量目录来自该会话加载的 ELF/DWARF；未调试时也能从 Orbit 的 launch 配置、`orbit.defaultProgram` 或工程构建目录解析 ELF，存在多个候选时选择文件，没有候选时可手动打开 ELF/AXF。离线解析不连接目标，重新编译后会重新解析。没有调试信息的条目不能用于 Timeline 选择，同名静态变量暂不支持按文件区分选择。历史记录的面板只列出本记录包含的通道；停止调试后保留调试分组标签，供下一次调试前配置变量，历史页不受影响。
-
-Watch、变量选择编辑器面板以及 Timeline 画布、网格、文字和浮动读数随 VS Code 深色、浅色及高对比度主题更新；调色盘内拖动、滚动和输入框操作保持面板打开，用户为曲线选择的颜色保留。指针成员的运行时地址不在变量目录中读取，Address 显示 `—`。
-
-### 5.2 显示和交互
-
-- 默认自动跟随最新采样；关闭自动跟随后可以拖动时间轴查看历史。
-- 横轴单位是毫秒；默认每格 100 ms，共 8 个横向 division。
-- 可放大、缩小、输入每格时间和每个通道的 Y 轴 `/div`。横轴最大为 100 s/div，八格可显示 800 秒（13 分 20 秒）；输入 100s 或 100000ms 均可。
-- 滚轮以鼠标所在时间点缩放；工具栏加减号和时间/div 输入以图表中心缩放。缩放后可以拖动查看历史，右键空白区域恢复追踪。
-- Y 轴默认自动缩放；手动设置 `/div` 后进入手动缩放，双击可回到自动缩放。
-- 鼠标悬停显示各通道在光标时间附近的值；数据点之间使用相邻点插值显示提示值。
-- 单击图表空白处依次放置 A/B 时间游标（若 A 缺失或已超出当前视口则清掉旧配对重新放置 A，否则若 B 缺失或超出视口则放置 B），拖动游标调整位置，图内显示时间差；右键单个游标删除它，按下鼠标中键同时清除 A/B 游标。
-- 清除实时数据会结束当前记录并开始新记录，原记录保留为历史标签，表达式列表继续使用。
-
-实时调试页和历史标签分别保留变量、颜色、比例、视口、追踪与游标配置。新调试记录继承工作区保存的调试配置；CSV 标签使用文件中的配置，其修改不会覆盖下一次调试的变量列表。
-
-### 5.3 保存、打开与恢复记录
-
-- “保存全部 CSV”保存当前记录；“保存 A/B 区间”保存两条游标之间的数据。文件同时包含原始采样与视图配置。
-- 默认保存目录为工程 `.vscode/timeline`，文件名使用调试开始时间；可以在保存对话框中选择其他位置。
-- “打开 CSV”在独立历史标签中查看数据，无需连接目标板；实时采集继续写入实时记录。
-- “恢复记录”列出已打开工程 `.vscode/timeline` 下手动保存的 CSV。重载窗口后不恢复未保存的临时记录。
-- 采集期间持续写入临时磁盘缓存，内存保持有界，支持回看超过十分钟的历史；实际保留时长受磁盘空间和写入能力限制。
-
-### 5.4 采样语义
-
-- 保存按钮右侧、坐标格上方显示整数 Hz，数值左边缘与坐标格对齐，Hz 单位在四位数以内保持固定。实时页悬停提示“实时采样率”；约 1.5 秒没有新点后显示 0 Hz。
-- 调试结束后，同一位置切换为平均采样率，悬停提示“平均采样率”。打开 CSV 或恢复记录时也显示该记录的平均值；切换不会清空当前曲线。
-- 采样率根据原始点的时间戳计算：每通道为有效相邻采样间隔数除以相应时间跨度，再取有统计值通道的平均，不把通道数相加。历史平均累计同一段内的间隔和持续时间，排除断段之间的暂停；视口、曲线开关和绘图降采样不改变整份记录的平均值。
-- 目标停止时不生成新的 Timeline 采样点；恢复运行后从新的实时读取继续，不回填停止期间的时间槽。
-- 活动 DAP session 使用 J-Link Native/Legacy、CMSIS-DAP 或 RMLink 选定 owner 的快速采样路径；控制和 Watch 读取优先于 Timeline。
-- RMLink 由板端 `memory_series` 订阅采集并映射探针时间，流中断时自动恢复；XR-DAP 探针在 `cmsisDapXrSampling: true` 时由探针端定时采样（见 2.3 节“探针端采样”），时间戳来自探针时钟，换算到 Orbit 时间轴时误差约为半个往返时间；其他探针由电脑轮询。
-- 不是每个表达式都能进入快速采样计划。无法解析为当前快速采样格式的表达式会被计划拒绝，不应把它当作“曲线为零”。
-- `orbit.timelineSampleIntervalMs` 是目标采样目标，不是硬件保证的实际采样频率。
-- `orbit.timelineSendIntervalMs` 只控制发送到 Webview 的节奏，不等于目标采样间隔。
-
-## 6. RTT
-
-### 6.1 启动和输出
-
-`rttLogEnabled` 默认为 `true`。DAP launch 在目标连接并初次 halt 后开始 RTT 轮询，断开或会话结束时停止。读取始终使用当前 session 选定的 owner：J-Link 调用 DLL RTT API，CMSIS-DAP 通过目标内存读取 RTT control block 和 ring buffer。
-
-输出目标由 `rttLogTarget` 选择：
-
-- `terminal`：显示在 VS Code 的 `Orbit RTT Log` 终端；
-- `debugConsole`：写入 VS Code Debug Console；
-- `both`：同时写入两处。
-
-Debug Console 输出默认移除 ANSI 控制序列；RTT terminal 始终保留 ANSI。RTT 中的 `ESC[2J` 会触发 Debug Console 清屏事件，并输出一个带时间的清屏标记。
-
-### 6.2 RTT 配置
-
-| 配置 | 默认值 | 范围 / 单位 |
-| --- | --- | --- |
-| `rttBufferIndex` | `0` | `0..15`，RTT up-buffer index |
-| `rttPollIntervalMs` | `50` | `10..5000 ms` |
-| `rttReadSize` | `4096` | `64..65536 bytes` / poll |
-| `rttControlBlockAddress` | 空 | 正的 32-bit 地址；J-Link 可自动检测，CMSIS-DAP 可从 ELF 符号定位或使用显式地址 |
-| `rttStripAnsi` | `true` | 只影响 Debug Console |
-| `rttLogTarget` | `terminal` | `terminal`、`debugConsole` 或 `both` |
-
-RTT 需要目标固件已经初始化 SEGGER RTT control block。J-Link 还要求 DLL 导出 RTT control/read 函数；CMSIS-DAP 要求 control block 地址/符号和目标内存可读写。RTT 不会替目标固件自动插入初始化代码。
-
-## 7. P-RTLog
-
-### 7.1 工作方式
-
-P-RTLog 是 RTT 之上的 tokenized 二进制帧格式。启用 `pRtLogEnabled: true` 后：
-
-1. Orbit 从当前 `program` ELF 中寻找 `.pw_tokenizer.entries` section；
-2. 从 section 读取 token、格式字符串和域信息；
-3. 把 RTT 数据按 `[2-byte little-endian length][frame payload]` 拆帧；
-4. 将 payload 前 4 个字节作为 little-endian token，解码其后的参数；
-5. 输出信息级别、文本、模块、文件位置以及必要的解码警告。
-
-当前 decoder 支持源码中实现的整数、浮点、字符串、指针和常见 printf 转换；未知 token、截断帧和不支持的转换会输出带 `[P-RTLog]` 或 warning 的诊断文本，不会静默伪造正常日志。
-
-### 7.2 配置和前提
-
-```jsonc
-{
-  "type": "orbit",
-  "request": "launch",
-  "program": "${workspaceFolder}/build/Debug/frame.elf",
   "rttLogEnabled": true,
-  "pRtLogEnabled": true,
-  "pRtLogRoot": "D:\\STM32\\tool\\P-RTLog"
+  "pRtLogEnabled": true
 }
 ```
 
-`pRtLogRoot` 目前会被读取并在 token database 加载失败时显示在诊断信息中；当前 `PRtLogDecoder` 实际从 ELF 读取 `.pw_tokenizer.entries`，不会遍历该 root 目录寻找 token 数据。若 ELF 没有该 section，启用 P-RTLog 也不会成功加载 token 字符串。
+请确保 ELF 文件在链接时保留了 `.pw_tokenizer.entries` 段；若遇到未识别的 token，日志中会直接输出原始 token ID 方便核对固件版本。
 
 ## 8. RTOS Views
 
-### 8.1 外部扩展和自动登记
+> **提示**：目前 Orbit 与外部 RTOS Views 扩展的兼容性仍有已知问题，暂不建议在关键任务分析中依赖该视图。
 
-RTOS Views 由外部扩展提供。Orbit 激活时会尝试把主类型 `orbit` 和兼容别名 `ozone` 加入以下设置数组：
+RTOS Views 由外部扩展（`mcu-debug.rtos-views`、`mcu-debug.debug-tracker-vscode`）提供。Orbit 在激活时会自动尝试将 `"orbit"`（以及兼容旧配置 `"ozone"`）写入它们的 `trackDebuggers` 设置中；也可以在命令面板运行 `Orbit: Enable MCU Debug Views Integration` 后重载窗口。
 
-```jsonc
-{
-  "memory-view.trackDebuggers": ["orbit", "ozone"],
-  "mcu-debug.rtos-views.trackDebuggers": ["orbit", "ozone"],
-  "mcu-debug.debug-tracker-vscode.trackDebuggers": ["orbit", "ozone"]
-}
-```
-
-也可以执行命令 `Orbit: Enable MCU Debug Views Integration`，由扩展补齐缺少的数组项；命令完成后可按提示 Reload Window。
-
-### 8.2 RTOS 名称与自动刷新
-
-在 launch 中设置：
-
-```json
-{
-  "rtos": "FreeRTOS"
-}
-```
-
-该值会进入 DAP 的 `supportsRTOS` / `rtosName` capability 和线程名称。Orbit 本身不内置 RTOS kernel 任务解析器；任务列表、栈、运行时间和检测逻辑由外部 RTOS Views 根据 DAP 数据和目标固件决定。
-
-`orbit.rtosViewsAutoRefresh` 默认 `false`。设为 `true` 后，Orbit 在外部 debug tracker 报告第一次 stack trace 时，延迟触发 RTOS Views focus，再触发 `mcu-debug.rtos-views.refresh`。该兼容路径会增加调试会话开销，因此默认关闭。
-
-### 8.3 运行时前提
-
-RTOS Views 能看到的字段取决于：
-
-- 外部 RTOS Views 与 debug tracker 已安装并启用；
-- `trackDebuggers` 包含 `orbit`（为旧配置兼容也可同时保留 `ozone`）；
-- ELF/DWARF 中保留了外部视图需要的类型和符号；
-- 目标处于外部视图可读取的状态；
-- 固件使用的 RTOS 版本和配置被外部视图支持。
-
-Orbit 不会根据 `rtos: "FreeRTOS"` 自动证明固件确实运行 FreeRTOS。
+如果固件使用了 RTOS，可在 `launch.json` 中加上对应的名称（例如 `"rtos": "FreeRTOS"`，请写 `"FreeRTOS"` 而不是 `"CMSIS-RTOS"`）。需要首次暂停时自动触发视图刷新，可将工作区设置 `orbit.rtosViewsAutoRefresh` 设为 `true`。
 
 ## 9. Memory View
 
-Memory View 是外部扩展通过 DAP memory 请求访问 Orbit 的目标内存。Orbit 的 DAP initialize capability 声明：
+Memory View 同样由外部扩展（`mcu-debug.memory-view`）提供。Orbit 已实现标准 DAP 内存读写接口（单次读取上限 1 MiB）并为有地址的变量提供跳转支持。
 
-- `supportsReadMemoryRequest: true`；
-- `supportsWriteMemoryRequest: true`。
-
-读请求使用字符串或数字形式的 `memoryReference`，支持 offset；返回值是 base64 编码的字节，带 `address` 和 `unreadableBytes`。单次 DAP 读请求的 `count` 在源码中限制为最多 `1024 * 1024` bytes。
-
-变量节点有有效地址时会提供 `memoryReference`，供外部 Memory View 跳转。读写请求仍由当前 DAP session 的唯一 target owner 执行；目标忙或读取失败时返回 DAP 错误，不会偷偷创建第二个连接。
-
-若 Memory View 没有列出 Orbit，执行集成命令，或在工作区设置中加入：
+如果 Memory View 没有自动识别 Orbit 会话，可执行 `Orbit: Enable MCU Debug Views Integration`，或在工作区设置中添加：
 
 ```json
 {
@@ -537,204 +389,101 @@ Memory View 是外部扩展通过 DAP memory 请求访问 Orbit 的目标内存�
 }
 ```
 
-Orbit 不包含独立的 Memory View 网格 UI；Memory View 的分页、显示格式和外部扩展行为不由 Orbit 控制。
-
 ## 10. Peripheral Viewer
 
-Peripheral Viewer 使用 CMSIS-SVD 描述文件构建寄存器树。Orbit 提供两个 launch 兼容字段：
+Peripheral Viewer 使用 CMSIS-SVD 文件渲染外设寄存器树。Orbit 会按以下优先级自动解析并提供 SVD 文件：
 
-```jsonc
-{
-  "svdFile": "${workspaceFolder}/STM32F407.svd",
-  "svdPath": "${workspaceFolder}/STM32F407.svd",
-  "deviceName": "STM32F407IG"
-}
-```
+1. `launch.json` 中显式填写的 `svdFile` 或 `svdPath`；
+2. 工作区设置 `orbit.defaultSvdFile`；
+3. 工程目录下与芯片型号匹配的 `.svd` 文件（如 `STM32F407.svd`）；
+4. 本机 Keil Pack 目录（`CMSIS_PACK_ROOT` 或 `%LOCALAPPDATA%\Arm\Packs`）中已安装的对应系列 SVD；
+5. Orbit 扩展全局缓存中的 SVD；
+6. 当本地均找不到且 `orbit.svdAutoDownload` 为 `true`（默认）时，Orbit 会先正常启动调试，同时在后台自动下载对应系列的 Keil Device Family Pack 并只提取当前芯片的 SVD 缓存下来，下一次启动调试即可直接使用。
 
-也可以设置：
+如果需要完全离线环境或固定 SVD 版本，可将 `orbit.svdAutoDownload` 设为 `false` 并显式指定 `svdFile`。
 
-```json
-{
-"orbit.defaultSvdFile": "${workspaceFolder}/STM32F407.svd"
-}
-```
+## 11. 调试通道与调度机制
 
-Orbit 不内置 Peripheral Viewer，但会为外部 MCU Debug Views 解析 `svdFile` / `svdPath`。解析优先级为：
+### 11.1 单连接架构
 
-1. launch 中显式填写的 `svdFile` 或 `svdPath`；
-2. `orbit.defaultSvdFile`；
-3. 工作区内文件名与芯片系列完全匹配的 SVD，例如 `STM32F407.svd`；
-4. `CMSIS_PACK_ROOT` 或 `%LOCALAPPDATA%\Arm\Packs` 中已安装的 Keil DFP；
-5. Orbit 扩展全局存储中的 SVD 缓存；
-6. 本地没有匹配 SVD 且 `orbit.svdAutoDownload: true` 时，先启动调试，再后台读取 Keil 官方 PDSC、下载对应系列的一个 Device Family Pack 并缓存，只从包内提取当前芯片系列的 SVD。
+为了避免多工具同时抢占探针导致掉线或状态错乱，Orbit 严格保证**每个调试会话只持有唯一一个目标连接**：
 
-自动下载的单位是一个芯片系列 Pack，例如 F407 使用 `Keil.STM32F4xx_DFP`。Pack 压缩包本身可能包含同系列多个 SVD，但 Orbit 不会下载所有厂商或所有 STM32 系列，也不会把其他 SVD 解压到缓存。下载完全在后台进行，每次下载最多等待 15 秒，失败后分别等待 5 秒、15 秒再尝试，最多 3 次。同系列 SVD 的并发请求合并，关闭扩展时取消下载。成功后，下次启动自动使用缓存；当前会话继续调试，外部 Peripheral Viewer 暂时没有寄存器描述。下载失败写入 DAP 日志，不中断会话。
+- **J-Link 原生通道**（`orbit-jlink-helper.exe`）：独立进程加载 `JLink_x64.dll`，支持源码级单步（`stepInto` / `stepOver` / `stepOut`）、批量读取和优先级调度。
+- **J-Link Legacy 通道**（`koffi`）：仅在原生通道初始化失败（或显式设为 `legacy`）时作为备用，不支持原生源码级单步。
+- **CMSIS-DAP 通道**（`orbit-cmsis-dap-helper.exe`）：独立进程处理 HID / WinUSB / TCP 通信、SWD、硬件断点（FPB）、烧录和内存型 RTT。
+- **RMLink 通道**：通过 `@rmlink/client` 与 RMLink 服务通信，复用同一条连接完成控制、烧录、订阅和 RTT。
 
-寄存器名称、bit 字段、读写权限和显示质量仍取决于 SVD 文件及外部 Viewer。外部 Viewer 不显示时先检查扩展安装、`trackDebuggers`、最终 SVD 路径和目标 device name。需要完全离线或固定版本时，设置 `orbit.svdAutoDownload: false` 并显式提供 SVD。
+无论是 Watch、Timeline、RTT、外部 Viewer 还是 MCP 自动化请求，在调试运行期间全部复用这同一个连接，不会额外打开第二条调试链路。
 
-## 11. Target owner 与调试通道
+### 11.2 任务优先级调度
 
-### 11.1 三类 owner
-
-| 通道 | 实现 | 特点 |
-| --- | --- | --- |
-| Native | 独立的 `orbit-jlink-helper.exe`，通过 JSON-lines 与 DAP 侧通信；helper 内加载 J-Link DLL | 拥有 Native source-level step into/over/out、批量内存读取和 NativeScheduler；目标为 Windows x64。 |
-| Legacy | Node 进程中的 `koffi` 直接加载 `JLink_x64.dll` | 保留现有调试和 DAP 兼容路径；Native source-level step API 在该 owner 上不可用。 |
-| CMSIS-DAP | 独立的 `orbit-cmsis-dap-helper.exe`，HID v1 已真机验收；Horco WinUSB v2 已通过只读连接/内存验收 | 提供 SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm、Watch/Timeline 和内存型 RTT；不加载 J-Link DLL。具体 transport 的验收范围见第 2.3 节。 |
-
-### 11.2 owner 选择
-
-当前每个 DAP session 由 `SessionTargetSelector` 选择且只持有一个物理 owner：
-
-- `probe: "auto"`：先用短生命周期 discovery helper 检测 J-Link；检测成功即固定选择 J-Link，不再检测/打开 DAPLink。只有 J-Link 不可用时才枚举 CMSIS-DAP。因此两者同时连接时始终选择 J-Link；发现阶段结束并释放 helper 后才建立唯一正式 owner；
-- `probe: "cmsis-dap"`：只建立 CMSIS-DAP owner；失败或 owner loss 都不回退 J-Link；
-- `probe: "jlink"`：再由以下 Native/Legacy 设置选择 J-Link owner；
-- `nativeDebugEngineMode: "legacy"`：只建立 Legacy owner；
-- `nativeDebugEngineMode: "native"`：只尝试 Native，Native 初始化失败即失败，不回退；
-- `nativeDebugEngineMode: "auto"` 且 `nativeDebugEngineEnabled: true`：先尝试 Native，只有 Native 启动/初始化失败且尚未建立目标连接时才创建 Legacy owner；
-- `nativeDebugEngineMode: "auto"` 且 `nativeDebugEngineEnabled: false`：走 Legacy；
-- Native owner 已连接后发生 `NativeOwnerLost`：当前 session 终止，重新启动时再选择通道，不在原 session 热切换。
-
-选择 Native owner 后，`stepInto`、`stepOver` 和 `stepOut` 都强制走 Native source-level stepping；选择 Legacy owner 时三种单步都走 Legacy 路径。
-
-### 11.3 访问调度
-
-Native owner 的 scheduler 优先级为：
+所有探针访问按以下四级优先级串行调度：
 
 ```text
-control  >  watch  >  timeline  >  background
+control（控制） > watch（变量刷新） > timeline（波形采样） > background（RTT / 后台刷新）
 ```
 
-继续、暂停、复位、断点、单步、Flash 和变量/内存写入属于 control；RTT 和 RTOS refresh 属于 background。调试会话运行时，活动 DAP 请求沿已选 owner 路由，Extension Host 不会再作为第二个物理 owner 接管目标。
+单步、暂停、继续、复位、断点修改、变量写入和烧录属于最高优先级 `control`，执行期间会暂停低优先级采样并在结束后自动恢复，确保调试操作永远跟手；Watch 读取会在每个表达式分片之间让出间隙，避免长时间饿死 Timeline。
 
 ## 12. MCP 与 Plugin API
 
 ### 12.1 Automation API v1
 
-工作区设置 `orbit.automation.enabled`（默认 `false`）后，每个 Extension Host 在 `127.0.0.1` 启动独立 API：
+在工作区设置中开启 `"orbit.automation.enabled": true` 并重载窗口后，Orbit 会在本机回环地址 `127.0.0.1` 启动独立的 JSON-RPC 2.0 + SSE 自动化服务（带 Bearer Token 鉴权），方便 Python、Node.js 脚本或 AI 工具操作调试器。
 
-- `GET /health`：实例身份、API version、uptime，不含 token；
-- `POST /v1/rpc`：JSON-RPC 2.0，强制 Bearer；
-- `GET /v1/events`：SSE，需 Bearer 与 `X-Orbit-Connection-Id`；
-- 请求体最大 `1 MiB`；
-- 发现：用户范围 `registries.json` + 每窗口 endpoint 文件；
-- 一个发布周期仍写 legacy `plugin-api-endpoint.json`，内容只标记 `unique`/`ambiguous`，不会替客户端选窗口。
+为了安全起见，Automation API 默认关闭；开启后 `orbit.automation.allowedScopes` 默认也只授予 `["read"]` 只读权限，如需执行暂停/单步、修改断点、录波、写变量或烧录，需要在工作区设置中手动勾选对应权限。
 
-默认 `orbit.automation.allowedScopes` 仅为 `["read"]`。控制、断点、写入、录波、RTT、Flash 需要对应 scope。目标绑定方法必须带精确 `sessionId`/`sessionGeneration`；mutation 还要 `idempotencyKey`。
+客户端通过 `%LOCALAPPDATA%\Orbit\automation\registries.json`（可通过环境变量 `ORBIT_AUTOMATION_REGISTRY` 覆盖）发现运行中的 VS Code 窗口；如果同时打开了多个同一工程的窗口，调用时需指定具体的 `instanceId`。详细接口定义见 [Automation API 文档](../../docs/api/orbit-automation-api.md)。
 
-完整方法清单、错误码和 DTO 以 [Automation API v1](../../docs/api/orbit-automation-api.md) 和 OpenRPC 为准。Node / Python 客户端与 MCP 共用该协议。
+### 12.2 MCP Server
 
-一个发布周期保留旧 `POST /rpc` 的 `ozone.status` / `ozone.expr.*` / `ozone.record.*` / `ozone.experiment.run`，它们只映射到新 service 并带 deprecation，不能跳过 handshake 或 generation fence。
+仓库中提供了开箱即用的 stdio MCP 适配器 `Releases/mcp/orbit-mcp-server.js`（以及兼容旧名的 `ozone-mcp-server.js`），使 Claude Code、Codex、OpenCode、Cursor 等支持 MCP 的 AI 客户端可以直接连接并控制 Orbit：
 
-若活动 `orbit` DAP session（或旧 `ozone` 别名）存在，RuntimeRouter 将读写和目标状态请求发送到该 DAP session；DAP 请求失败会作为该操作的错误返回，不会回退到 Extension Host 的另一条目标连接。
-
-### 12.2 MCP server
-
-源码 MCP server 是 stdio 进程 `Releases/mcp/orbit-mcp-server.js`，它只作为 Automation API v1 的适配器：通过 Node client 发现 `ORBIT_AUTOMATION_REGISTRY` 中的实例、握手，再调用 `POST /v1/rpc`。`ozone-mcp-server.js` 只是兼容启动器。多个相同 `projectId` 窗口必须指定 `instanceId`，禁止选择最近活动窗口。
-
-v1 工具：`orbit_instances`、`orbit_handshake`、`orbit_session_*`、`orbit_target_*`、`orbit_breakpoints_*`、`orbit_memory_*`，以及 `orbit_record_get` / `orbit_expression_evaluate` / `orbit_diagnostics_snapshot`。
-
-便捷工具名同样映射到同一 v1 方法：
-
-- `orbit_status` → `orbit.session.list`
-- `orbit_read_many` → `orbit.expression.readMany`
-- `orbit_write_many` → `orbit.expression.writeMany`
-- `orbit_record` → `orbit.record.start/get/stop/clear`（分页读取）
-- `orbit_experiment_run` → `orbit.experiment.run`
-
-工具返回 structured JSON。`errorCode` 失败不得伪装成文本成功。默认 registry 为：
-
-```text
-%LOCALAPPDATA%\Orbit\automation\registries.json
-```
-
-`tools/list` 给每个 object `inputSchema` 显式带上 `required` 数组；全可选工具为 `[]`。opencode 对缺失 `required` 的 object schema 会发出 `required: null`（[issue #15540](https://github.com/anomalyco/opencode/issues/15540)，修复 PR 未合并）。严格的 OpenAI 兼容中转在转成 Anthropic 协议时会因此返回 `standard_violation /required: got null, want array`。MCP 侧补空数组即可，不改变工具参数语义。
-
-### 12.3 MCP 数值、录波和实验边界
-
-| 项目 | 源码限制 |
-| --- | --- |
-| 写入值 | Automation API 的 write value 是字符串；`orbit_write_many` 仍接受 number，适配器会转成字符串。 |
-| 单次录波通道 | 至少 1 个，最多 64 个；alias 不能重复。 |
-| 录波间隔 | 默认 `10 ms`，最终限制到 `5..10000 ms` 并取整数毫秒。 |
-| 录波帧数 | 每个 recording 最多保留 `50000` 帧，超出时丢弃最旧帧。 |
-| 录波时长 | `orbit_record` 按 `durationMs` 等待后分页读取全部 frames，再 stop/clear；单页默认 100、最大 1,000 frames。 |
-| wait 时长 | `0..60000 ms`，取整数毫秒。 |
-| 实验步骤 | 最多 64 步，类型为 `read`、`write`、`wait`、`record`。 |
-| safety | 对匹配 expression 的写入执行可选 `min` / `max` 检查。 |
-
-MCP 可以写入目标变量，因此应先用只读状态/读取确认表达式和目标状态，再进行带边界的写入。`unit`、`role`、`writable` 是 signal 元数据，不会替 Orbit 猜测目标变量的真实单位或安全范围。
+- **主要工具**：`orbit_instances`、`orbit_handshake`、`orbit_session_*`、`orbit_target_*`、`orbit_breakpoints_*`、`orbit_memory_*`、`orbit_expression_evaluate`、`orbit_diagnostics_snapshot`，以及便捷组合工具 `orbit_status`、`orbit_read_many`、`orbit_write_many`、`orbit_record`、`orbit_experiment_run`。
+- **录波与实验限制**：单次 `orbit_record` 最多支持 64 个通道，采样间隔 `5..10000 ms`（默认 `10 ms`），单份缓存最多保留 `50000` 帧；`orbit_experiment_run` 单次最多编排 64 步（支持 `read` / `write` / `wait` / `record`），支持通过 `min` / `max` 配置写入安全边界。
 
 ## 13. 常见问题
 
-### Q1：报 `Failed to load JLink DLL` 或 `JLinkDllLoadFailed`。
+### Q1：提示 `Failed to load JLink DLL` 或 `JLinkDllLoadFailed`
+确认已安装 SEGGER J-Link 软件包且 `JLink_x64.dll` 存在。如果安装在了非默认路径，请在设置中填写 `orbit.jlinkDllPath`，然后查看 `outputs/Log/dll.log` 检查具体加载路径和报错。
 
-先确认 J-Link 软件已安装，并确认 `JLink_x64.dll` 存在。需要固定版本时设置 `orbit.jlinkDllPath`。然后查看 `outputs/Log/dll.log`，确认加载路径、DLL 版本和缺失导出符号。
+### Q2：调试能连上，但启动自动烧录失败
+- 使用 J-Link 时，连接走 `JLink_x64.dll` 而烧录默认调用 `JLink.exe`，请检查 `orbit.jlinkPath` 是否正确。
+- 使用 CMSIS-DAP / RMLink 时，请确认芯片型号在内置支持列表中（或已配置 `cmsisDapFlashAlgorithmPath`）。如果芯片里已经有固件只想直接调试，在 `launch.json` 加上 `"flashBeforeDebug": false` 即可。
 
-### Q2：调试连接正常，但自动烧录失败。
+### Q3：提示找不到 ELF/AXF 文件
+Orbit 默认只自动扫描 `build/Debug`、`build/Release` 和 `build` 目录。如果固件在其他位置（比如 Keil `MDK-ARM/Objects/`），请在 `launch.json` 中手动填写 `"program"` 字段。
 
-J-Link 调试连接使用 DLL，自动烧录使用 `JLink.exe`；确认 `orbit.jlinkPath` 指向真实 Commander。CMSIS-DAP 烧录使用当前 helper 和匹配目标的 Flash Algorithm；检查算法来源、RAM 布局、芯片 ID 和 verify 错误。固件已存在时可设置 `flashBeforeDebug: false`，`program` 仍用于符号加载。
+### Q4：Watch 显示 `Running...`，或者 Timeline 没波形
+- Timeline 在 MCU 处于暂停状态时不会采集新数据点，请先按 F5 让程序跑起来；另外请检查 Timeline 顶部对应调试分组左侧的**采样复选框**是否已经勾选。
+- 若仍无数据，可检查表达式是否为全局变量/简单结构体成员，并在 `outputs/Log/dap.log` 中查看采样计划是否正常生成。
 
-### Q3：没有找到 ELF/AXF。
+### Q5：RTT 终端没有输出
+1. 确认固件已经调用过 `SEGGER_RTT_Init()` 或打印过日志；
+2. 检查 `rttBufferIndex` 是否与固件使用的通道一致（通常为 0）；
+3. 使用 CMSIS-DAP / RMLink 时确认 ELF 中包含 `_SEGGER_RTT` 符号（或手动指定 `rttControlBlockAddress`）；
+4. 注意默认输出在终端面板的 `Orbit RTT Log` 中，而不是 Debug Console。
 
-设置 `program` 或 `orbit.defaultProgram`。未设置时只会检查 `build/Debug`、`build/Release`、`build`，且只匹配 `.elf` / `.axf`。
+### Q6：P-RTLog 输出 `unknown token` 或找不到数据库
+确认当前 `program` 指向的 ELF 文件中包含 `.pw_tokenizer.entries` 段，并与板子上正在运行的固件一致，同时已开启 `"rttLogEnabled": true` 和 `"pRtLogEnabled": true`。
 
-### Q4：Watch 显示 `Running...`，或者 Timeline 没有数据。
+### Q7：Memory View 或 Peripheral Viewer 没有显示内容
+确认已安装对应外部扩展，在命令面板执行 `Orbit: Enable MCU Debug Views Integration` 后重新加载窗口；使用 Peripheral Viewer 时检查 `outputs/Log/dap.log` 中的 `[svd]` 日志确认 SVD 是否加载成功。
 
-Watch 和 Timeline 都依赖当前 DAP session 的目标状态。Timeline 在目标停止时不生成采样点；表达式还必须能进入快速采样计划。减少通道数、确认目标确实在运行，并查看 `outputs/Log/dap.log` 中的读取和 Timeline 计划日志。
+### Q8：配置了 `interface: "JTAG"` 但依然走了 SWD
+J-Link Legacy 引擎当前固定使用 SWD；需要使用 JTAG 请确认 `orbit.nativeDebugEngine.mode` 为 `"auto"` 或 `"native"`，不要设为 `"legacy"`。
 
-### Q5：RTT 没有输出。
-
-确认 `rttLogEnabled` 为 `true`、固件已初始化 RTT 且 up-buffer index 正确。J-Link 要确认 DLL RTT 导出；CMSIS-DAP 要确认 `_SEGGER_RTT` 符号或显式 `rttControlBlockAddress`。如果使用 `debugConsole`，注意默认输出位置是 `terminal`。
-
-### Q6：P-RTLog 输出 unknown token 或 token database not found。
-
-确认当前 launch 的 `program` 是包含 `.pw_tokenizer.entries` 的 ELF，并同时设置 `rttLogEnabled: true` 与 `pRtLogEnabled: true`。当前 decoder 不从 `pRtLogRoot` 目录查找 token 数据；unknown token 会保留原始 token 和帧数据用于诊断。
-
-### Q7：RTOS Views、Memory View 或 Peripheral Viewer 没有跟踪到 Orbit。
-
-确认外部扩展已安装，并检查对应的 `trackDebuggers` 数组是否包含 `orbit`；兼容配置可同时保留 `ozone`。可以执行 MCU Debug Views 集成命令后 Reload Window。Peripheral Viewer 还需要最终解析到有效 `svdFile` / `svdPath`；自动获取失败时查看 `outputs/Log/dap.log` 的 `[svd]` 日志。RTOS Views 还需要外部扩展能解析当前 ELF、RTOS 和目标状态。
-
-### Q8：`nativeDebugEngineMode: "auto"` 为什么变成 Legacy？
-
-`auto` 只在 Native 启动/初始化失败时回退 Legacy。查看 `outputs/Log/dll.log` 和 `outputs/Log/dap.log`；如果 Native owner 已连接后丢失，不会在原 session 中热切换，必须重新启动调试。
-
-### Q9：配置写了 `interface: "JTAG"`，行为与预期不同。
-
-Native helper 会按 `JTAG` 选择 JTAG；Legacy 当前 `JLinkDLL.connect()` 源码固定调用 `TIF_Select(SWD)`。请先使用 Native，并把该行为作为当前版本限制处理。
-
-### Q10：MCP 找不到实例或 endpoint。
-
-先打开工作区并设置 `orbit.automation.enabled: true`，再 Reload Window。客户端读取 `%LOCALAPPDATA%\Orbit\automation\registries.json`（可用 `ORBIT_AUTOMATION_REGISTRY` 覆盖）。多个相同 `projectId` 窗口必须指定 `instanceId`。旧的 `plugin-api-endpoint.json` 在多窗口时是 `ambiguous`，不能用来选窗口。
-
-### Q11：MCP 读取/写入失败，但 VS Code 中调试已启动。
-
-确认活动 session 的类型是 `orbit`（旧配置也可能是 `ozone`），目标状态为 `running` 或 `halted`，并使用 ELF/DWARF 中实际存在的表达式。活动 DAP session 存在时 MCP 不会绕过它建立第二条目标连接。
+### Q9：MCP 客户端提示找不到调试实例或读写报错
+1. 确认已在 VS Code 中打开工作区、设置了 `"orbit.automation.enabled": true` 并重新加载窗口；
+2. 修改变量或控制调试器前，确认已在 `orbit.automation.allowedScopes` 中添加了对应权限；
+3. 确保目标变量存在于当前 ELF 符号表中（局部变量仅在停在对应作用域时可访问）。
 
 ## 14. 已知限制
 
-### 当前实现限制
-
-- Native helper 和当前 J-Link DLL 集成是 Windows 目标；仓库没有把 Linux/macOS 作为当前 Native 运行目标。
-- CMSIS-DAP helper 当前同样以 Windows x64 为发布目标；实现 v2 WinUSB 和 v1 HID。HID 有真实调试证据；Horco v2 已通过只读连接/内存验收，但真实 v2 烧录、调试控制、Watch/Timeline/RTT 与性能/长稳仍待专项验证；具体 probe 固件兼容性不能从一个组合外推。
-- `J-Link` 设备支持列表由已安装的 J-Link 软件/DLL 决定，源码没有内置完整 MCU 清单。STM32H723VGT6 的 J-Link 链路已在 1.1.2 通过真机验收（P7-6，2026-09-11，owner 只出现 `jlink-native`）；`device` 必须写 J-Link 软件认识的名称（如 `STM32H723VG`），`STM32H723VGT6` 不在 J-Link V9.56 的器件库里。长稳/断线（P7-7）未验收。
-- CMSIS-DAP 内置 Flash 注册表包含 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 与 `STM32F103C8T6`（及各自别名）。这些目标需显式设置 `device`；默认值仍是 `STM32F407VG`。F103C8T6 实板待验收；IG 已有用户基本使用确认，专项验收范围见第 2.3 节。
-- `interface` schema 接受 `SWD` 和 `JTAG`，但 Legacy DLL 连接实现当前固定选择 SWD；JTAG 应使用 Native 并单独确认硬件。
-- J-Link 路径使用 6 个槽位索引；CMSIS-DAP 会读取 Cortex-M FPB 容量。任何路径槽位耗尽时新硬件断点都必须返回明确错误。
-- Native source-level step into/over/out 只属于 Native owner；Legacy 不能把普通单步宣传为 Native source-level stepping。
-- Timeline 的 `0.2 ms` 是目标间隔，不是硬件实时采样保证；目标读取延迟、表达式数量、控制操作和 Watch 会降低实际频率。
-- Timeline 使用持续写盘和有界显示缓存，可以回看超过十分钟的记录；可保留时长受磁盘空间与写入能力限制，停止期间不回填数据。只有手动保存的 CSV 可在重载窗口后恢复。
-- 快速 Timeline 只接受当前源码能解析的表达式；不支持的表达式会被采样计划拒绝。
-- RTOS Views、Memory View 和 Peripheral Viewer 不随 Orbit 的源码自动获得全部功能；它们需要外部扩展、正确的 tracking 配置和与当前固件匹配的 ELF/SVD。
-- Orbit 负责定位、按需获取和传递 SVD 路径，但不自行渲染 SVD 寄存器树，也不内置 RTOS kernel 解析器。
-- P-RTLog token 必须在当前 ELF 的 `.pw_tokenizer.entries` 中；`pRtLogRoot` 当前不是 token 搜索路径。
-- Automation API v1 默认关闭。1.1.0 硬件层：J-Link native 与 CMSIS-DAP HID v1 已通过（无 flash）；J-Link legacy 与显式 Flash 不在本版范围，不得与 Mock/自动化结果合并成“全部通过”。
-- J-Link Legacy 不提供 Native source-level `stepInto`/`stepOver`/`stepOut`；这些调用必须返回 `CapabilityUnavailable`，不得启动第二个 owner 来模拟。
-
-### 当前 DAP capability 中明确未提供的功能
-
-源码的 `initialize` 响应明确关闭或不支持：conditional breakpoint、hit conditional breakpoint、step back、set variable、restart frame、goto targets、step-in targets、completions、exception options、terminate debuggee、log points、data breakpoints、disassemble、cancel、breakpoint locations、stepping granularity 和 instruction breakpoints。读写 memory、evaluate for hovers、restart request 和 RTOS capability 则明确声明支持。
-
-### 发布/品牌确认边界
-
-Orbit 改名已覆盖扩展元数据、用户可见命令和视图标题、输出通道、图标、MCP 展示文案以及 Native helper 产物。`ozone` 前缀的 DAP 类型、配置键、外部视图 tracking 值、workspace state 键和 MCP 方法仍作为兼容标识保留。
+- **平台限制**：目前仅支持 Windows x64，暂不支持 macOS 与 Linux。
+- **烧录芯片支持范围**：J-Link 烧录取决于已安装的 SEGGER 软件包；CMSIS-DAP 与 RMLink 内置烧录支持 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 和 `STM32F103C8T6`（F103C8 待完整实板验证）。其他芯片可使用自定义 `cmsisDapFlashAlgorithmPath` 或设为 `flashBeforeDebug: false`。
+- **硬件断点数量**：J-Link 最多使用 6 个硬件断点槽位；CMSIS-DAP 根据芯片 FPB 比较器数量动态判断，槽位用满后新增断点会提示失败。
+- **单步与接口限制**：J-Link Legacy 模式不支持源码级单步（`stepInto`/`stepOver`/`stepOut`）与 JTAG 接口，建议保持默认的原生 helper 模式。
+- **采样频率**：`orbit.timelineSampleIntervalMs`（默认 `0.2 ms`）是期望周期而非硬实时保证，实际采样率取决于探针通信速率、通道数、指针深度和并发 Watch/RTT 负载。
+- **RTOS Views**：外部 RTOS Views 扩展的集成目前存在已知问题，暂不建议用于正式调试。
+- **部分 DAP 高级特性未支持**：当前暂不支持条件断点（Conditional Breakpoint）、数据断点（Watchpoint）、Logpoint、反向单步（Step Back）以及反汇编视图（Disassemble）。

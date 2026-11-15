@@ -63,7 +63,7 @@
 - **AI 可通过 MCP 实际操作调试器，自动执行已配置、已授权的调试流程。**
 - 脚本和 AI 复用当前调试连接，不另开连接抢占探针。
 
-自动化默认关闭；开启后默认只授予读取权限。记录、写入、控制和烧录等操作需要对应授权，AI 结论仍需实板验证。配置见 [MCP 接入指南](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md#12-mcp-与-plugin-api)和 [Automation API 文档](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-api.md)。
+自动化接口默认关闭；开启后默认只开放只读权限，控制、写入和烧录等操作需要手动授予对应权限。配置方法见 [MCP 接入指南](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md#12-mcp-与-plugin-api) 和 [Automation API 文档](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-api.md)。
 
 ### 内存与外设视图
 
@@ -115,18 +115,17 @@ J-Link、DAPLink 和 RMLink 烧录后默认停在 `main`。可在 `launch.json` 
 
 默认优先选择 J-Link；两种探针都插着、但你想用 DAPLink 时，加上 `"probe": "cmsis-dap"`；使用 RMLink 连接服务时加上 `"probe": "rmlink"`（多台在线设备时再指定 `"rmlinkDeviceId"`）。CMSIS-DAP 默认优先 v2 WinUSB，也兼容 v1 HID，并支持 `"cmsisDapTransport": "tcp"` 与可选的 `"cmsisDapXrSampling": true`。更多配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 
-## 限制
+## 限制与已知问题
 
-Orbit 主要由个人维护，板子、探针和测试时间都有限。能在一块板上跑通，不等于所有芯片都已经适配。
+Orbit 主要由个人维护，手头开发板和探针有限，目前仅覆盖了常用型号与常见场景：
 
-- **当前发布只面向 Windows x64。** macOS / Linux 暂未提供支持。
-- **CMSIS-DAP 的芯片支持不是填个型号就有。** 连接、调试和烧录也不是一回事；烧录还需要匹配的 Flash 算法和容量校验。
-  1.1.6 已加入 `STM32F103C8T6` / `STM32F103C8` 的 64 KiB Flash、20 KiB SRAM 和半字编程算法；完整实板验收尚未完成。配置与各型号验收范围见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
-- **表达式不是越复杂越好。** 类型和地址解析依赖 ELF/DWARF；局部变量可能只在暂停且对应栈帧有效时能访问。高频采样优先从简单、可解析的变量开始。
-- **采样和日志要共享带宽。** 大量 Watch 展开、复杂表达式或高日志负载可能拖慢波形；高速采样期间，RTT 文本轮询可能暂停，结束后恢复。
-- **RTOS 视图目前有已知问题，暂不建议使用。** 不建议依赖它完成任务分析。
+- **仅支持 Windows x64**：暂不提供 macOS / Linux 版本。
+- **CMSIS-DAP / RMLink 烧录范围有限**：目前内置支持 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 和 `STM32F103C8T6`（其中 F103C8 尚未在实板上完整验证）。如果只是调试板上已有固件，可设置 `"flashBeforeDebug": false`。各型号支持详情见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
+- **复杂表达式与局部变量**：表达式类型和地址依赖 ELF/DWARF 调试信息，局部变量只在暂停且对应栈帧有效时可读取；高频采样建议优先使用全局变量或简单成员表达式。
+- **采样与日志带宽共享**：展开大量 Watch 变量或高负载 RTT 输出会占用探针带宽；高速采样期间 RTT 文本轮询会自动暂停，采样结束后恢复。
+- **RTOS 视图**：目前仍有已知问题，暂不建议用于正式的任务分析。
 
-碰到问题可以提 [Issue](https://github.com/zhuangyan114/Orbit/issues)。附上芯片完整型号、探针和传输方式、Orbit 版本、`launch.json`、复现步骤及相关日志，比一句“连不上”更容易定位。发之前记得删掉敏感路径和身份信息。
+遇到问题欢迎提 [Issue](https://github.com/zhuangyan114/Orbit/issues)。反馈时请尽量附上芯片型号、探针类型、Orbit 版本、`launch.json`、复现步骤和 `outputs/Log/` 下的相关日志（注意删掉个人路径等敏感信息），方便快速定位。
 
 ## 欢迎加入
 
@@ -160,7 +159,7 @@ npm run typecheck
 npm test
 ```
 
-启动扩展开发窗口可执行 `npm run dev`。源码在 `src/` 和 `native/`，不要直接修改生成的 `dist/` 文件。自动化测试通过不等于实板验收通过。
+启动扩展开发窗口可执行 `npm run dev`。源码位于 `src/` 和 `native/`，请勿直接修改生成的 `dist/` 文件。
 
 </details>
 

@@ -32,6 +32,27 @@
 
 三种 Trace 模式的实板配置、有效缓冲区、启停/冻结和读取结果在 4.4 验收；链路预算在 3.4 冻结。阶段 0 只验收源代码、构建、离线样本及可复跑方法。
 
-## 0.2 / 0.3 检查入口
+## 0.2 / 0.3 离线验收
 
-契约、来源和录制模式依据见 protocol.md。fixture 构建、样本生成与检查命令将在 0.3 完成后补入本节。各条结果只标注实际完成的层级，阶段 1 快照引擎、UI、实板和长稳均未开始。
+契约与来源见 [protocol.md](protocol.md)，工程入口见 [fixture README](../../scripts/rtos/fixtures/README.md)，固定结果见 [offline-evidence.json](offline-evidence.json)。
+
+| 检查 | 实际结果 |
+|---|---|
+| python scripts/rtos/fixtures/build.py --update-samples | 初始生成 5 个独立样本；后续排除未使用的大小写兼容头，最终依赖集合以下一行检查为准 |
+| python scripts/rtos/fixtures/build.py | 最终 63 个依赖 hash、10 个固件及派生无 DWARF ELF 通过；重新生成并逐字节比较 5 个样本通过，不需要更新期望值 |
+| python -m unittest discover -s scripts/rtos/fixtures -p test_fixtures.py -v | 7 项通过；覆盖手工包期望、字节损坏、缺失检查、未冻结、截断、溢出误标完整及 vendor 篡改 |
+| 隔离源码、空输出目录构建 | 最终 fixture 复制至 out/rtos-stage0/clean-source-final，从其自身目录构建至 clean-build-final；全部通过，无原应用或 Cube 包路径依赖 |
+| 两次构建比较 | 11/11 可加载镜像字节一致；5/5 原始流及元数据一致。带调试信息 ELF 的 hash 不同，分别登记，不宣称整个 ELF 字节可重复；去除 DWARF 的 ELF 一致 |
+| ELF 配置与尺寸 | .fixture_config 与变体一致；原生 StaticTask_t=100 bytes，关闭统计或栈高地址后=96 bytes；Ready 数组 8 优先级=160 bytes，CMSIS v2 的 56 优先级=1120 bytes |
+
+内核根符号、列表入口、同名类型编译单元和 DWARF 成员存在性均已检查。无 DWARF 变体确实不含 .debug_info，保留普通内核符号。以上属于构建/静态证据，不表示已读出目标任务。
+
+基本样本含十个手工可核算包；Continuous/Single-Shot 均为 68 bytes。Continuous 溢出样本为 8201 bytes，恢复后有 OVERFLOW；Single-Shot 溢出样本为 8190 bytes，冻结前处于丢包状态；Post-Mortem 保留 8191 bytes，含周期同步和覆盖前缀状态。样本 hash 见 JSON 证据，不把主机模拟的 1 MHz timestamp 当作实板频率。
+
+开发中已解决：CMSIS v1 声明而未实现 osKernelInitialize，fixture 不调用该入口；CMSIS v2 自带 SysTick_Handler，保留其包装并避免 port 同名映射；补齐 RTT ConfDefaults；归一化 Windows nm 换行。第三方源码未修改。Post-Mortem 初始化缺项及所采用的官方自动分配配置见 protocol.md。
+
+已知警告：固定 CMSIS v1 源码有未使用参数；64 位主机编译 SystemView 的未使用 pointer/heap API 有指针宽度转换警告。样本使用明确 32 位 ID，目标另检查 32 位 ABI；不据此宣称任意主机指针 API 可用。
+
+本地记录为 out/rtos-stage0/fixtures-run.txt、fixtures-verify.txt、final-verify.txt、clean-build-final-run.txt，以及 fixtures/、clean-build-final/ 下的 verification.json、编译日志、符号和 DWARF 输出。工程、固定依赖、样本及摘要纳入 Git；构建产物和完整日志保留在 out/。
+
+阶段 0 离线出口已满足。阶段 1 引擎、新运行时接口、UI、实板和长稳均未开始；本次独立 fixture 改动不触发未受影响的原生 helper/Flash Algorithm 验收。

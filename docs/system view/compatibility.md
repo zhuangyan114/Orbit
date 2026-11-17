@@ -11,8 +11,8 @@
 | 候选板卡 | STM32H723VGT6，单核 Cortex-M7，小端、32 位指针 | 本地工程配置；芯片 ID、CPUID、RAM 与时钟待实板核对 |
 | 候选链路 | Wi-Fi RMLink，Orbit 当前会话唯一 owner | 本次不连接、不烧录、不控制运行、不推进 RTT 指针 |
 | 内核 | STM32CubeH7 1.12.1 所带 FreeRTOS 10.3.1 | tasks.c SHA256：6f540b927668e4c87a064749c03f6ee0ca7370b9dfae7d9d5e96ebd0fdf12b8d |
-| port | portable/GCC/ARM_CM4F，沿用现有 H723VG 工程 | 编译与源码依据将在 0.3 记录；硬件适用性待 CPUID 核对 |
-| API 包装 | 原生、CMSIS-RTOS v1、CMSIS-RTOS v2，均来自上述固定包 | 0.3 构建验收 |
+| port | portable/GCC/ARM_CM4F，沿用现有 H723VG 工程 | 0.3 编译通过；硬件适用性待 CPUID 核对 |
+| API 包装 | 原生、CMSIS-RTOS v1、CMSIS-RTOS v2，均来自上述固定包 | 三种入口构建与静态检查通过 |
 | allocator | heap_4；动态任务与静态任务均纳入场景 | 仅 fixture 范围，不声明所有 allocator 均可解析 |
 | 目标工具链 | Arm GNU Toolchain 13.3.Rel1，GCC 13.3.1 20240614 | 当前命令行实际版本；不按安装目录名猜版本 |
 | 调试构建 | -Og -g3 -gdwarf-4；优化变体 -O2 -g3 -gdwarf-4 | 0.3 固定构建参数和输出清单 |
@@ -21,15 +21,17 @@
 
 ## 离线工程矩阵
 
-| 变体 | 必要差异 | 0.1 状态 |
+| 变体 | 必要差异 | 当前状态（0.3） |
 |---|---|---|
-| native-debug / cmsis-v1 / cmsis-v2 | 同一内核，三种任务入口 | 待 0.3 构建 |
-| native-optimized | -O2，保留 DWARF | 待 0.3 构建 |
-| native-no-stats | 关闭运行统计 | 待 0.3 构建 |
-| native-no-stack-bound | 不记录栈高地址 | 待 0.3 构建 |
-| native-tickless | 开启 tickless | 待 0.3 构建 |
-| native-no-dwarf | 由 native-debug 去除调试信息，保留普通符号 | 待 0.3 构建 |
-| trace-continuous / trace-single-shot / trace-post-mortem | 三种目标配置及确定性主机记录样本 | 待 0.3 验证 |
+| native-debug / cmsis-v1 / cmsis-v2 | 同一内核，三种任务入口 | ELF/DWARF/内核根符号核对通过；实板未执行 |
+| native-optimized | -O2，保留 DWARF | 构建与符号核对通过；实板未执行 |
+| native-no-stats | 关闭运行统计 | 构建通过；StaticTask_t 从 100 降至 96 bytes |
+| native-no-stack-bound | 不记录栈高地址 | 构建通过；StaticTask_t 从 100 降至 96 bytes |
+| native-tickless | 开启 tickless | 构建通过；休眠统计口径待实板核对 |
+| native-no-dwarf | 由 native-debug 去除调试信息，保留普通符号 | 已确认没有 .debug_info，内核普通符号保留 |
+| trace-continuous / trace-single-shot / trace-post-mortem | 三种目标配置及确定性主机样本 | 目标 ELF 构建、5 份主机原始样本通过；实板未执行 |
+
+固定依赖与工程见 [fixture 使用说明](../../scripts/rtos/fixtures/README.md)。64 个源文件的来源/hash 见 vendor-manifest.json；没有虚构原始包的 Git commit。CMSIS v2 的 ready 列表总大小为 1120 bytes，其他变体为 160 bytes，对应 56/8 个优先级，不能复用固定布局。
 
 ## 使用条件与后续验收
 

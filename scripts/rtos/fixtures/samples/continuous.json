@@ -1,0 +1,75 @@
+{
+  "mode": 1,
+  "case": "basic",
+  "frozen": true,
+  "timestampBits": 32,
+  "frequencyHz": 1000000,
+  "channel": 2,
+  "bufferSize": 8192,
+  "rdOff": 66,
+  "wrOff": 68,
+  "retainedBytes": 2,
+  "wrapped": false,
+  "discardedPrefixBytes": 0,
+  "integrity": "complete",
+  "stateBeforeStop": 1,
+  "stateAfterStop": 0,
+  "overflowState": 0,
+  "recovered": false,
+  "recoveryFirstByte": 0,
+  "checks": [
+    {
+      "name": "task-create",
+      "offset": 35,
+      "length": 3
+    },
+    {
+      "name": "task-ready",
+      "offset": 38,
+      "length": 3
+    },
+    {
+      "name": "task-running",
+      "offset": 41,
+      "length": 3
+    },
+    {
+      "name": "isr-outer",
+      "offset": 44,
+      "length": 3
+    },
+    {
+      "name": "isr-inner",
+      "offset": 47,
+      "length": 3
+    },
+    {
+      "name": "isr-inner-exit",
+      "offset": 50,
+      "length": 2
+    },
+    {
+      "name": "isr-outer-exit",
+      "offset": 52,
+      "length": 2
+    },
+    {
+      "name": "marker-start",
+      "offset": 54,
+      "length": 4
+    },
+    {
+      "name": "marker-stop",
+      "offset": 58,
+      "length": 4
+    },
+    {
+      "name": "task-terminate",
+      "offset": 62,
+      "length": 4
+    }
+  ],
+  "sha256": "478db52beab0cc5a09975555793de5a584d0c293acc06f0d379f84a537a2f90a",
+  "source": "official SystemView 3.32 + RTT, deterministic single-thread host harness",
+  "hardware": "not-run"
+}

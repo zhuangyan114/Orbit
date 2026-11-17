@@ -1,0 +1,27 @@
+{
+  "basis": "Manually calculated: task API shrinks (0x20000100-0x20000000)>>2 to 0x40; marker 300 encodes ac02; delta=10. No Orbit encoder/decoder.",
+  "packets": {
+    "task-create": "08400a",
+    "task-ready": "06400a",
+    "task-running": "04400a",
+    "isr-outer": "02110a",
+    "isr-inner": "02120a",
+    "isr-inner-exit": "030a",
+    "isr-outer-exit": "030a",
+    "marker-start": "0fac020a",
+    "marker-stop": "10ac020a",
+    "task-terminate": "1d01400a"
+  },
+  "scenario": [
+    [110, "task-create", "0x20000100"],
+    [120, "task-ready", "0x20000100"],
+    [130, "task-running", "0x20000100"],
+    [140, "isr-outer", 17],
+    [150, "isr-inner", 18],
+    [160, "isr-inner-exit"],
+    [170, "isr-outer-exit"],
+    [180, "marker-start", 300],
+    [190, "marker-stop", 300],
+    [200, "task-terminate", "0x20000100"]
+  ]
+}

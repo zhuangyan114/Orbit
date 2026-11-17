@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-18",
+  "hardware": "not-run",
+  "vendorFiles": 63,
+  "fixtureTreeSha256": "5f0753308f6db959b98cf719fcb0c098140b82ba63dc58b5a6bf527ab80fd690",
+  "fixtureTreeHashMethod": "sorted relative POSIX path + NUL + SHA256(raw file bytes), excluding __pycache__",
+  "compiler": "arm-none-eabi-gcc.exe (Arm GNU Toolchain 13.3.Rel1 (Build arm-13.24)) 13.3.1 20240614",
+  "validation": {
+    "firmwareImages": 11,
+    "samples": 5,
+    "negativeAcceptanceTests": 7,
+    "cleanSourceBuild": "passed",
+    "sampleBytesAndMetadataIdentical": true,
+    "loadImagesIdentical": true,
+    "elfDebugIdentity": "Debug ELF hashes differ between build directories; use the per-build ELF identities below."
+  },
+  "images": [
+    {
+      "name": "native-debug",
+      "loadImageBytes": 12388,
+      "loadImageSha256": "887ddd1060f6241b003375410a37e8e589e8aaf94f3be3f5c04c5d90c4205376",
+      "originalElfSha256": "27e8b7fe8e2c0240ecdb671d32903cedb4e7f61d5b1e7bf225ab05aca9d79aea",
+      "cleanElfSha256": "24dc76fd9039c74f7d328c6de4558a07bd059cdef0d762558bfc1a48267890e4",
+      "staticTcbBytes": 100,
+      "readyListBytes": 160
+    },
+    {
+      "name": "cmsis-v1",
+      "loadImageBytes": 12536,
+      "loadImageSha256": "bd1ca3e68a4da411cb30a1616e67973f7d1afcf927b19f6e211b788f51b40ffc",
+      "originalElfSha256": "4ad6d4834158826ab5b2529219440dd42fd14a5f3fc8b06faceedb98a667cc35",
+      "cleanElfSha256": "b8a637e29be3684e25f01771fbe9c43c4f3605331620bd62c069101a2a02d9c9",
+      "staticTcbBytes": null,
+      "readyListBytes": 160
+    },
+    {
+      "name": "cmsis-v2",
+      "loadImageBytes": 12720,
+      "loadImageSha256": "6e0c79b59ef7c613e8b08f8f99fb46eddfd5eece00281157954258e2272f2e6e",
+      "originalElfSha256": "2a5d6236c29969b6ce314473864833a4e536436f2e48092397cddef0ff9c0dde",
+      "cleanElfSha256": "2a5d6236c29969b6ce314473864833a4e536436f2e48092397cddef0ff9c0dde",
+      "staticTcbBytes": null,
+      "readyListBytes": 1120
+    },
+    {
+      "name": "native-optimized",
+      "loadImageBytes": 12236,
+      "loadImageSha256": "299e5b55de74def7fc4c6a6bbd8c7a32d647419bdafdaca2005b7880f9d27ce4",
+      "originalElfSha256": "086ee5fa09ead560c13eb4b25e5e0d79c3ea3c1c14dd349f1e337795bc9be4eb",
+      "cleanElfSha256": "7ed2b756452702be4a6efd9dd4b99efefec945cf1b03dfadc8f2b3d1b8466833",
+      "staticTcbBytes": 100,
+      "readyListBytes": 160
+    },
+    {
+      "name": "native-no-stats",
+      "loadImageBytes": 12324,
+      "loadImageSha256": "83ca660f1b5028bf52c3cd41e6f8eb788f881691737f6c7b0a787c8140b1e323",
+      "originalElfSha256": "58b6124ab18312d4f2b0f2664172d50fd274adb1923a6391b171a381e33d37ea",
+      "cleanElfSha256": "54d0b27dcd1c91bc7e07819428c8759e11e5eb2cbe76f213497b54b06696716f",
+      "staticTcbBytes": 96,
+      "readyListBytes": 160
+    },
+    {
+      "name": "native-no-stack-bound",
+      "loadImageBytes": 12388,
+      "loadImageSha256": "731103ac1a0367df8183255de8f0e4f3333d86ff649fa11aad74dfbf84cbcd20",
+      "originalElfSha256": "8ade95ce2294fabe7f33a890255efb7fc8cdb8807aa957093339b3455aa58f22",
+      "cleanElfSha256": "f346cf93be3d8ab4031e5f256bad9384f18fa9275633474979373cd010b883f7",
+      "staticTcbBytes": 96,
+      "readyListBytes": 160
+    },
+    {
+      "name": "native-tickless",
+      "loadImageBytes": 12944,
+      "loadImageSha256": "eae86364b9b4bc6441cf4a8dbfbe188a66f0b14b3fe466bd2ced6b60f0580bd9",
+      "originalElfSha256": "d64739d367105527963795e0a2115f8ebde585304c6df18af2d79799bc4f7fd0",
+      "cleanElfSha256": "2ee96bc6aadb85e4e030185e5964eb034e118f4fce8445295902397c993e8cd5",
+      "staticTcbBytes": 100,
+      "readyListBytes": 160
+    },
+    {
+      "name": "trace-continuous",
+      "loadImageBytes": 17576,
+      "loadImageSha256": "324abd12abed47576743abae3f0f17dbacd963e7e91d580975fd5fdf96fe6de6",
+      "originalElfSha256": "d1ad4a27ab3f999c21348fb8b22dbaecb4647d868777d1e16a2d31e3432c48b2",
+      "cleanElfSha256": "e260e141ee8c67f328a0ce84a04c1e043b78549eaaba90a07f5f15c4754818ba",
+      "staticTcbBytes": 100,
+      "readyListBytes": 160
+    },
+    {
+      "name": "trace-single-shot",
+      "loadImageBytes": 17544,
+      "loadImageSha256": "f2e5a740ca0cb6dca31e1efcb6b7c7c86989425346c645bafe9a8987f097749b",
+      "originalElfSha256": "d601f070aa098d2876b507ef7ff1829c0bf1de457f43bdbd1ded10df28b3d20e",
+      "cleanElfSha256": "e1d94ad35906306e5ed9df29914e7787f8226166ca8c6f9698d8e0197fb207ab",
+      "staticTcbBytes": 100,
+      "readyListBytes": 160
+    },
+    {
+      "name": "trace-post-mortem",
+      "loadImageBytes": 16856,
+      "loadImageSha256": "86dcd18ca09aa7c4d48a28314a5ed01a5350f5f1de78a88f0f72b880f254bf14",
+      "originalElfSha256": "5b16e6dc4d1c729b1180e989b5dc0e5e9fbe6dd06d6266ea023af51cc3184e03",
+      "cleanElfSha256": "cc8637c1668cd8342a5bf0d8218946e69b9e6e9f6894204b891a7ad36bf9d4f9",
+      "staticTcbBytes": 100,
+      "readyListBytes": 160
+    },
+    {
+      "name": "native-no-dwarf",
+      "loadImageBytes": 12388,
+      "loadImageSha256": "887ddd1060f6241b003375410a37e8e589e8aaf94f3be3f5c04c5d90c4205376",
+      "originalElfSha256": "0394cc7801dbe00b374c2818a9d24ff9751b8a2cceb5e1fea338f7905067640b",
+      "cleanElfSha256": "0394cc7801dbe00b374c2818a9d24ff9751b8a2cceb5e1fea338f7905067640b",
+      "staticTcbBytes": null,
+      "readyListBytes": null
+    }
+  ],
+  "samples": [
+    {
+      "name": "continuous",
+      "bytes": 68,
+      "sha256": "478db52beab0cc5a09975555793de5a584d0c293acc06f0d379f84a537a2f90a"
+    },
+    {
+      "name": "continuous-overflow",
+      "bytes": 8201,
+      "sha256": "d281c9d33b7666717af7989880707c6679d153757e2b822127ed5421d3798a5f"
+    },
+    {
+      "name": "single-shot",
+      "bytes": 68,
+      "sha256": "478db52beab0cc5a09975555793de5a584d0c293acc06f0d379f84a537a2f90a"
+    },
+    {
+      "name": "single-shot-overflow",
+      "bytes": 8190,
+      "sha256": "8aafd8c54cfd3e223594364d540728ac658654ad0c4696e4592ddb4644c7ac7b"
+    },
+    {
+      "name": "post-mortem",
+      "bytes": 8191,
+      "sha256": "3e30b263e0b163be7cd672d58cfc777f3c793e7638ba4c473471c5e43e1b6faa"
+    }
+  ]
+}

@@ -1,0 +1,448 @@
+{
+  "schemaVersion": 1,
+  "importedAt": "2026-11-18",
+  "note": "Unmodified source snapshots. No upstream commit is inferred.",
+  "files": [
+    {
+      "path": "freertos/croutine.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/croutine.c",
+      "sha256": "dd390a8f432d7a7ba4ca9ad7a37ef3a549fb1c621a3f8d09f8ee30e48a759627",
+      "bytes": 12824
+    },
+    {
+      "path": "freertos/event_groups.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/event_groups.c",
+      "sha256": "54f696c16294199f4445d042d907b14da401fbb7f3bc3b2ca71acd5dbb120218",
+      "bytes": 26038
+    },
+    {
+      "path": "freertos/list.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/list.c",
+      "sha256": "2c7593ec5c67bcdb371d5c3fda60f240e594dd3a7b60f72947f53e8c01971e24",
+      "bytes": 8277
+    },
+    {
+      "path": "freertos/queue.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/queue.c",
+      "sha256": "4613e2dd8c099ee689ff4fabc1d4979c0c22683a95f3e85283c6ef1b92a32bd8",
+      "bytes": 93655
+    },
+    {
+      "path": "freertos/stream_buffer.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/stream_buffer.c",
+      "sha256": "20e1a58018635a746b5193073f09a3736464bc913f4ebfe28c39bbb75b4cac6b",
+      "bytes": 42465
+    },
+    {
+      "path": "freertos/tasks.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/tasks.c",
+      "sha256": "6f540b927668e4c87a064749c03f6ee0ca7370b9dfae7d9d5e96ebd0fdf12b8d",
+      "bytes": 173337
+    },
+    {
+      "path": "freertos/timers.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/timers.c",
+      "sha256": "87be4c74af661ade4ad39f420888c655067d11df008e7a66c88658f7131cb7f4",
+      "bytes": 40088
+    },
+    {
+      "path": "freertos/include/atomic.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/atomic.h",
+      "sha256": "343ced16833df1aad70972829631136d18727bd687fce6f08264162fc9bf221c",
+      "bytes": 11851
+    },
+    {
+      "path": "freertos/include/croutine.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/croutine.h",
+      "sha256": "ecbc64327844a7f24255314d65c4205d3490e8ace8b5d655c1c9f45725b2d7d6",
+      "bytes": 25818
+    },
+    {
+      "path": "freertos/include/deprecated_definitions.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/deprecated_definitions.h",
+      "sha256": "dcfd3ab2633029c04037ef35a854db090995fcf938ca33b51199377c36720d47",
+      "bytes": 7295
+    },
+    {
+      "path": "freertos/include/event_groups.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/event_groups.h",
+      "sha256": "b97b6b2d7aa918e62434083f76dca08ae73c85fedd021ecc91af1f39838324f7",
+      "bytes": 29678
+    },
+    {
+      "path": "freertos/include/FreeRTOS.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/FreeRTOS.h",
+      "sha256": "74c201409e1156806627c233a27adb1f4da62d9e40baae99db5c7ddc7e9aae2f",
+      "bytes": 42752
+    },
+    {
+      "path": "freertos/include/FreeRTOSConfig_template.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/FreeRTOSConfig_template.h",
+      "sha256": "6d76a6f59ac99892241c07897c5bb288a983e7e7b953909599f04b203b14bd89",
+      "bytes": 6961
+    },
+    {
+      "path": "freertos/include/list.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/list.h",
+      "sha256": "973915ae18a63c6783fe09bf589798cbccf3baee7dfa4b14f8d1525607af3ab6",
+      "bytes": 18159
+    },
+    {
+      "path": "freertos/include/message_buffer.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/message_buffer.h",
+      "sha256": "07c912a59ba6af0b6f619f23cc7b58f445596d5ff7f589e9fc564cebbf2530bf",
+      "bytes": 37401
+    },
+    {
+      "path": "freertos/include/mpu_prototypes.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/mpu_prototypes.h",
+      "sha256": "94ca481a3cb128b2caf847dc570cc82942ee6ffb06710eff09fb0bcbef173848",
+      "bytes": 13874
+    },
+    {
+      "path": "freertos/include/mpu_wrappers.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/mpu_wrappers.h",
+      "sha256": "5a02b1083a49d9dadd65ac52cd6f21283f24586c939f68c75ce632f60863fd3f",
+      "bytes": 9216
+    },
+    {
+      "path": "freertos/include/portable.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/portable.h",
+      "sha256": "e3921faf76c89c5bcf068b41b5b806655a0841b68114f9496a56e3a25a5fd84e",
+      "bytes": 7943
+    },
+    {
+      "path": "freertos/include/projdefs.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/projdefs.h",
+      "sha256": "f646ef12236991a3b34c170c65aa12d2d0c0310b28e324ace620e1957b7c109e",
+      "bytes": 5627
+    },
+    {
+      "path": "freertos/include/queue.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/queue.h",
+      "sha256": "c4372fb6b9cd6fb08121c1ac21153bdf3621f92edf2a8381cc631fcef2964fae",
+      "bytes": 60107
+    },
+    {
+      "path": "freertos/include/semphr.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/semphr.h",
+      "sha256": "6d4179c295ec9aadb186744e7618854c5ef10cb9a0f8c27948b343a3f6a129af",
+      "bytes": 47151
+    },
+    {
+      "path": "freertos/include/stack_macros.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/stack_macros.h",
+      "sha256": "54ff69e8652c7f1332d1679594d1b2076a1633955d6d46e51b3ab4f99780f6ee",
+      "bytes": 5836
+    },
+    {
+      "path": "freertos/include/stream_buffer.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/stream_buffer.h",
+      "sha256": "13f288307ce0b9182941cecfc261b8281fe0fb0e9156f621c252f96f9de8de07",
+      "bytes": 37648
+    },
+    {
+      "path": "freertos/include/task.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/task.h",
+      "sha256": "1d75dff80cdc81720b60eeb4cb825370bd05508feed244d2ee1cf263be51ffd9",
+      "bytes": 105243
+    },
+    {
+      "path": "freertos/include/timers.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/include/timers.h",
+      "sha256": "bd94103aef9d4dbf18db3296b5c55be524d229bae90aecb01e2b9475b8f02f55",
+      "bytes": 60173
+    },
+    {
+      "path": "freertos/portable/GCC/ARM_CM4F/port.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c",
+      "sha256": "41538311e845a7b4b6e8227b595c63b0d6c1e7b1ffd196104b57339d6c5ba3f7",
+      "bytes": 29442
+    },
+    {
+      "path": "freertos/portable/GCC/ARM_CM4F/portmacro.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/portable/GCC/ARM_CM4F/portmacro.h",
+      "sha256": "203df13c4041a32d681ece9884e3e0e5fda00814ec40d3d644b15b3e7e3eb0e4",
+      "bytes": 8263
+    },
+    {
+      "path": "freertos/CMSIS_RTOS/cmsis_os.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS/cmsis_os.c",
+      "sha256": "0d37e9b95a6cf35125bb3a9a2231730013751d8d57873a8d436897c6e3ac24aa",
+      "bytes": 49161
+    },
+    {
+      "path": "freertos/CMSIS_RTOS/cmsis_os.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS/cmsis_os.h",
+      "sha256": "b4d04af6200435f043eb143c8a45659a93d33c773273951c6fb106223b22afe9",
+      "bytes": 49405
+    },
+    {
+      "path": "freertos/CMSIS_RTOS_V2/cmsis_os.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os.h",
+      "sha256": "f383e9c853ee3b4d47f54990f61ae507c6d90a5f1b2eb74aa8392042d6efec1f",
+      "bytes": 35893
+    },
+    {
+      "path": "freertos/CMSIS_RTOS_V2/cmsis_os2.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os2.c",
+      "sha256": "405bde449889d672725bd3ad3908bb9f54e823b168bf437c6afe360246ba0947",
+      "bytes": 57969
+    },
+    {
+      "path": "freertos/CMSIS_RTOS_V2/cmsis_os2.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os2.h",
+      "sha256": "b1670376fa97bba8d55e144b602970f535aa41e276a2e1b3e87ecd906045caf8",
+      "bytes": 35134
+    },
+    {
+      "path": "freertos/CMSIS_RTOS_V2/freertos_mpool.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS_V2/freertos_mpool.h",
+      "sha256": "ee814ffa60a09e0d114f7f0b1a2a46dc299f8ce5ce1800e909417e71bfe7af08",
+      "bytes": 2395
+    },
+    {
+      "path": "freertos/CMSIS_RTOS_V2/freertos_os2.h",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/CMSIS_RTOS_V2/freertos_os2.h",
+      "sha256": "c4f3afb4bc759c43a2b9e5a6a236acca4b1f7301585f02809ae98bec2b15cc93",
+      "bytes": 12812
+    },
+    {
+      "path": "freertos/portable/MemMang/heap_4.c",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/portable/MemMang/heap_4.c",
+      "sha256": "d91f47f6338a4501835989582ae87fd344b6d92b37b5853fa32fd2fffbfaee59",
+      "bytes": 15642
+    },
+    {
+      "path": "freertos/LICENSE",
+      "component": "FreeRTOS 10.3.1",
+      "origin": "STM32CubeH7 1.12.1/FreeRTOS/Source/LICENSE",
+      "sha256": "a74efb143c66527cdb7a96461fc4e9652cbd33700bd2a129a0407e31ae03084a",
+      "bytes": 1101
+    },
+    {
+      "path": "cmsis/core_cm7.h",
+      "component": "CMSIS",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Include/core_cm7.h",
+      "sha256": "34d91327a5f1b251c54fa6bb532d9f5ec0423bf3b7f2b679c8f7b3df95af0fc8",
+      "bytes": 149036
+    },
+    {
+      "path": "cmsis/cmsis_version.h",
+      "component": "CMSIS",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Include/cmsis_version.h",
+      "sha256": "1b2c47a90e9ae741c8fd4d0f323495327b25ff5d555a6c7afd6749a65ba1bb8e",
+      "bytes": 1676
+    },
+    {
+      "path": "cmsis/cmsis_compiler.h",
+      "component": "CMSIS",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Include/cmsis_compiler.h",
+      "sha256": "b51963d271c1571ca3463654c76aa7ea50c4eac5d0a2710df10414ac64d9e0f8",
+      "bytes": 9481
+    },
+    {
+      "path": "cmsis/cmsis_gcc.h",
+      "component": "CMSIS",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Include/cmsis_gcc.h",
+      "sha256": "1fba3e120e5c0a439e0982bd37fae04bd033dbd14187428214462a1707c56252",
+      "bytes": 62627
+    },
+    {
+      "path": "cmsis/mpu_armv7.h",
+      "component": "CMSIS",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Include/mpu_armv7.h",
+      "sha256": "c9ad7cc99ba0481365550ae997c63cde9732d067d9ec0de28b0d6ac39280656d",
+      "bytes": 11690
+    },
+    {
+      "path": "cmsis/stm32h7xx.h",
+      "component": "ST CMSIS device",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h",
+      "sha256": "9bad4fffca7a09b179e6be9d55204eff634cda7e2cec620a79002f6f4d0e0bcf",
+      "bytes": 11835
+    },
+    {
+      "path": "cmsis/stm32h723xx.h",
+      "component": "ST CMSIS device",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h723xx.h",
+      "sha256": "19086af8741f4aab5c6aecc895bc98d997a752dc28b1cc74d059b03717005259",
+      "bytes": 1907088
+    },
+    {
+      "path": "cmsis/system_stm32h7xx.h",
+      "component": "ST CMSIS device",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Device/ST/STM32H7xx/Include/system_stm32h7xx.h",
+      "sha256": "edbd2ae253530241ca82470fde1db4de1b0ba856590d69b17d3342b952c1fcba",
+      "bytes": 2275
+    },
+    {
+      "path": "cmsis/cmsis_os2.h",
+      "component": "CMSIS RTOS2",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/RTOS2/Include/cmsis_os2.h",
+      "sha256": "9ad88770c156ac4e7a84775a95708620551c64e1bf9477fbe197e7a2e7fc8d94",
+      "bytes": 35974
+    },
+    {
+      "path": "cmsis/os_tick.h",
+      "component": "CMSIS RTOS2",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/RTOS2/Include/os_tick.h",
+      "sha256": "f76bcfd977c1fce91c1368986ce2582c4d2c15b767c2014a8cfbc796225e6af3",
+      "bytes": 2218
+    },
+    {
+      "path": "cmsis/LICENSE.txt",
+      "component": "CMSIS / ST",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/LICENSE.txt",
+      "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+      "bytes": 11357
+    },
+    {
+      "path": "cmsis/LICENSE-ST.txt",
+      "component": "CMSIS / ST",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Device/ST/STM32H7xx/LICENSE.txt",
+      "sha256": "135fb2d86e9ecdf6824cc3bba21c72b8e380c07b055fbebb6b995463eb609baf",
+      "bytes": 371
+    },
+    {
+      "path": "cmsis/system_stm32h7xx.c",
+      "component": "CMSIS / ST",
+      "origin": "STM32CubeH7 1.12.1/Drivers/CMSIS/Device/ST/STM32H7xx/Source/Templates/system_stm32h7xx.c",
+      "sha256": "2ea5c2bd1c55e454fcbe26612c0b2a57f321fffb857ccd92844682288dd62518",
+      "bytes": 20245
+    },
+    {
+      "path": "board/startup_stm32h723xx.s",
+      "component": "ST H723 startup/linker",
+      "origin": "h7vgt6_test/startup_stm32h723xx.s",
+      "sha256": "8460ce955e1ab8ccd9bbf22b62351058035ed0f2c8020b3c91c09d84cc48f416",
+      "bytes": 30168
+    },
+    {
+      "path": "board/STM32H723XG_FLASH.ld",
+      "component": "ST H723 startup/linker",
+      "origin": "h7vgt6_test/STM32H723XG_FLASH.ld",
+      "sha256": "ced8e9a3dca84b0c900079e9fbb4482f5b459d1f45ba280e353c573588688f0f",
+      "bytes": 8634
+    },
+    {
+      "path": "systemview/SYSVIEW/SEGGER_SYSVIEW.c",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/SYSVIEW/SEGGER_SYSVIEW.c",
+      "sha256": "e78081730955cf18083beb7b9bc8b8c645e67d8b45774782ebcead367575d116",
+      "bytes": 143488
+    },
+    {
+      "path": "systemview/SYSVIEW/SEGGER_SYSVIEW.h",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/SYSVIEW/SEGGER_SYSVIEW.h",
+      "sha256": "70c0c28f28e94e8d0f40ef2efa631bb5e3a6182a9af63e72e2914b2a37dc05b6",
+      "bytes": 31030
+    },
+    {
+      "path": "systemview/SYSVIEW/SEGGER_SYSVIEW_ConfDefaults.h",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/SYSVIEW/SEGGER_SYSVIEW_ConfDefaults.h",
+      "sha256": "ce7717e6e3762950c129d68cd0e733e1c7450a1927d6ee5fdfa7b5a7fc818394",
+      "bytes": 19833
+    },
+    {
+      "path": "systemview/SYSVIEW/SEGGER_SYSVIEW_Int.h",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/SYSVIEW/SEGGER_SYSVIEW_Int.h",
+      "sha256": "b8d3e0e51739d8ff1463c2da5a5551b3dccf9ce2b0099708030b8657595a1c96",
+      "bytes": 4347
+    },
+    {
+      "path": "systemview/SEGGER/SEGGER.h",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/SEGGER/SEGGER.h",
+      "sha256": "344bebeb8e9062de65db492bd48f03b8d2603a07c4d77e23a487fbc5cb9c9ef3",
+      "bytes": 10767
+    },
+    {
+      "path": "systemview/FreeRTOSV10/SEGGER_SYSVIEW_FreeRTOS.c",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/FreeRTOSV10/SEGGER_SYSVIEW_FreeRTOS.c",
+      "sha256": "90492a7b552fe5d61faa56a69eefa1f0b4b857c3e2c6d7af3e4172a471e4c086",
+      "bytes": 9544
+    },
+    {
+      "path": "systemview/FreeRTOSV10/SEGGER_SYSVIEW_FreeRTOS.h",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/FreeRTOSV10/SEGGER_SYSVIEW_FreeRTOS.h",
+      "sha256": "5acadf0a4d2cc72ab08cb40440d7c97e3cf51b56dba4cf5a4a849e544e702423",
+      "bytes": 25316
+    },
+    {
+      "path": "systemview/Config/Global.h",
+      "component": "SystemView 3.32.0",
+      "origin": "vet6_led/ThirdParty/SystemView/Config/Global.h",
+      "sha256": "002cea04190c99ae23a85144539cd721d3204eb6a0c2385ce00be90fe325b6cb",
+      "bytes": 4867
+    },
+    {
+      "path": "rtt/RTT/SEGGER_RTT.c",
+      "component": "SEGGER RTT file snapshot",
+      "origin": "P-RTLog/third_party/segger_rtt/RTT/SEGGER_RTT.c",
+      "sha256": "51f8969b91694d322bfe6fd0a4a5015e67e89eb46b3cbf6d3a22095cfcb58a50",
+      "bytes": 73840
+    },
+    {
+      "path": "rtt/RTT/SEGGER_RTT.h",
+      "component": "SEGGER RTT file snapshot",
+      "origin": "P-RTLog/third_party/segger_rtt/RTT/SEGGER_RTT.h",
+      "sha256": "fe21e9618410807676e5e964ea76da11a1744d20b5c0125afc24f1474b09c595",
+      "bytes": 22337
+    },
+    {
+      "path": "rtt/LICENSE.md",
+      "component": "SEGGER RTT file snapshot",
+      "origin": "P-RTLog/third_party/segger_rtt/LICENSE.md",
+      "sha256": "ec948bcbd8dbffe92b1d7c623f1337b4b2299c5ab7fdc13f27e52faee1329c0c",
+      "bytes": 1110
+    },
+    {
+      "path": "rtt/RTT/SEGGER_RTT_ConfDefaults.h",
+      "component": "SEGGER RTT file snapshot",
+      "origin": "P-RTLog/third_party/segger_rtt/RTT/SEGGER_RTT_ConfDefaults.h",
+      "sha256": "f2f1e3a67bf139ba056860a745cf635d029e51f62be6d208f89412d25ea434a4",
+      "bytes": 25750
+    }
+  ]
+}

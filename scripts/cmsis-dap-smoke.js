@@ -136,6 +136,11 @@ async function runMockMatrix() {
   const xrResult = spawnSync(xrTests, [], { windowsHide: true, encoding: 'utf8' });
   check('xr-dap unit tests', xrResult.status === 0, xrResult.stdout || xrResult.stderr || String(xrResult.error));
 
+  // SEGGER RTT range validation and channel enumeration unit tests.
+  const rttTests = path.resolve('out', 'native', 'cmsis-dap-helper-build', 'bin', 'orbit-cmsis-dap-rtt-tests.exe');
+  const rttResult = spawnSync(rttTests, [], { windowsHide: true, encoding: 'utf8' });
+  check('segger-rtt unit tests', rttResult.status === 0, rttResult.stdout || rttResult.stderr || String(rttResult.error));
+
   const hello = await request('hello', { clientProtocol: 1, extensionVersion: 'cmsis-dap-smoke' });
   check('hello', hello.ok && hello.data.protocol === 1, JSON.stringify(hello));
   check('hello capabilities', Array.isArray(hello.data.capabilities)
@@ -148,7 +153,8 @@ async function runMockMatrix() {
     && hello.data.capabilities.includes('readMemory')
     && hello.data.capabilities.includes('readMemoryBatch')
     && hello.data.capabilities.includes('readMemoryBlock')
-    && hello.data.capabilities.includes('rtt'), JSON.stringify(hello.data.capabilities));
+    && hello.data.capabilities.includes('rtt')
+    && hello.data.capabilities.includes('rttEnumerate'), JSON.stringify(hello.data.capabilities));
 
   const enumAll = await request('enumDevices', { transport: 'mock' });
   check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 26,
@@ -1447,6 +1453,245 @@ async function runF103C8Matrix() {
   await closeDevice('f103c8');
 }
 
+function le32Bytes(value) {
+  return [
+    value & 0xFF,
+    (value >>> 8) & 0xFF,
+    (value >>> 16) & 0xFF,
+    (value >>> 24) & 0xFF,
+  ];
+}
+
+function cstrBytes(text) {
+  return [...Buffer.from(text, 'utf8'), 0];
+}
+
+function rttHeaderBytes(maxUp, maxDown) {
+  return [
+    0x53, 0x45, 0x47, 0x47, 0x45, 0x52, 0x20, 0x52, 0x54, 0x54,
+    0, 0, 0, 0, 0, 0,
+    ...le32Bytes(maxUp),
+    ...le32Bytes(maxDown),
+  ];
+}
+
+function rttDescriptorBytes(sName, pBuffer, size, wrOff, rdOff, flags) {
+  return [
+    ...le32Bytes(sName),
+    ...le32Bytes(pBuffer),
+    ...le32Bytes(size),
+    ...le32Bytes(wrOff),
+    ...le32Bytes(rdOff),
+    ...le32Bytes(flags),
+  ];
+}
+
+async function runRttStage31Matrix() {
+  // 1. H723 non-fixed AXI SRAM (0x24000000) + Flash RO name + Up/Down enumeration
+  await openAndInfo('1234', '5690', 'rtt31-h723');
+  const h7Connect = await request('connect', { port: 'SWD' });
+  check('rtt31-h723: connect', h7Connect.ok, JSON.stringify(h7Connect));
+  if (h7Connect.ok) {
+    await request('halt', { timeoutMs: 100 });
+    const h7RamRanges = [{ address: 0x24000000, size: 320 * 1024 }];
+    const h7RoRanges = [{ address: 0x08000000, size: 1024 * 1024 }];
+
+    const badEmptyRange = await request('startRtt', {
+      controlBlockAddress: 0x24000100, ramRanges: [],
+    });
+    check('rtt31-h723: empty ramRanges rejected', !badEmptyRange.ok
+      && badEmptyRange.errorCode === 'DapInvalidRequest', JSON.stringify(badEmptyRange));
+
+    const badZeroRange = await request('enumerateRtt', {
+      controlBlockAddress: 0x24000100, ramRanges: [{ address: 0x24000000, size: 0 }],
+    });
+    check('rtt31-h723: zero-size ramRange rejected', !badZeroRange.ok
+      && badZeroRange.errorCode === 'DapInvalidRequest', JSON.stringify(badZeroRange));
+
+    // Write Flash-resident name "FlashCh" into erased sector at 0x080E0000
+    const flashNameAddr = 0x080E0000;
+    const flashNameBytes = new Array(32).fill(0);
+    cstrBytes('FlashCh').forEach((b, i) => { flashNameBytes[i] = b; });
+    await request('flashAlgorithm', h723FlashParams('init', 0x08000000, 0));
+    await request('flashAlgorithm', h723FlashParams('eraseSector', flashNameAddr, 0x20000));
+    const progName = await request('flashAlgorithm', h723FlashParams('programPage', flashNameAddr, 32, flashNameBytes));
+    check('rtt31-h723: flash RO name programmed', progName.ok && progName.data.returnCode === 0, JSON.stringify(progName));
+    await request('flashAlgorithm', h723FlashParams('uninit', 0x08000000, 0));
+
+    const cb = 0x24000100;
+    const nameSysView = 0x24000800;
+    const nameEmpty = 0x24000820;
+    const up0Buf = 0x24001000;
+    const up2Buf = 0x24001100;
+    const up3Buf = 0x24001200;
+    const down0Buf = 0x24002000;
+    const down1Buf = 0x24002100;
+    await request('writeMemory', { address: nameSysView, bytes: cstrBytes('SysView') });
+    await request('writeMemory', { address: nameEmpty, bytes: [0] });
+    await request('writeMemory', { address: up2Buf, bytes: [0x53, 0x56, 0x21] });
+    await request('writeMemory', { address: cb, bytes: [
+      ...rttHeaderBytes(6, 2),
+      ...rttDescriptorBytes(flashNameAddr, up0Buf, 32, 0, 0, 0),    // Up[0]: RO Flash name
+      ...rttDescriptorBytes(0, 0, 0, 0, 0, 0),                      // Up[1]: unused
+      ...rttDescriptorBytes(nameSysView, up2Buf, 64, 3, 0, 1),      // Up[2]: SysView (dup 1)
+      ...rttDescriptorBytes(nameSysView, up3Buf, 64, 0, 0, 0),      // Up[3]: SysView (dup 2)
+      ...rttDescriptorBytes(nameEmpty, up3Buf + 64, 32, 0, 0, 0),   // Up[4]: empty ""
+      ...rttDescriptorBytes(0x40020000, up3Buf + 96, 32, 0, 0, 4),  // Up[5]: corrupt flags
+      ...rttDescriptorBytes(nameSysView, down0Buf, 64, 0, 0, 0),    // Down[0]: SysView
+      ...rttDescriptorBytes(0, down1Buf, 32, 0, 0, 0),              // Down[1]: null name
+    ] });
+
+    const enumRes = await request('enumerateRtt', {
+      controlBlockAddress: cb,
+      ramRanges: h7RamRanges,
+      roRanges: h7RoRanges,
+    });
+    check('rtt31-h723: enumerateRtt non-fixed AXI SRAM + Flash RO + duplicates + corrupt', enumRes.ok
+      && enumRes.data.maxUpBuffers === 6
+      && enumRes.data.maxDownBuffers === 2
+      && enumRes.data.validUpCount === 4
+      && enumRes.data.validDownCount === 2
+      && enumRes.data.unusedCount === 1
+      && enumRes.data.corruptCount === 1
+      && enumRes.data.duplicateUpNames.join(',') === 'SysView'
+      && enumRes.data.duplicateDownNames.length === 0
+      && enumRes.data.upBuffers[0].name === 'FlashCh'
+      && enumRes.data.upBuffers[0].nameStatus === 'ok'
+      && enumRes.data.upBuffers[1].status === 'unused'
+      && enumRes.data.upBuffers[2].duplicateName === true
+      && enumRes.data.upBuffers[3].duplicateName === true
+      && enumRes.data.upBuffers[4].nameStatus === 'empty'
+      && enumRes.data.upBuffers[5].status === 'corrupt'
+      && enumRes.data.upBuffers[5].errorCode === 'RttInvalidBufferFlags'
+      && enumRes.data.downBuffers[0].name === 'SysView'
+      && enumRes.data.downBuffers[0].duplicateName === false
+      && enumRes.data.downBuffers[1].nameStatus === 'null',
+    JSON.stringify(enumRes));
+
+    const legacyAddrRejected = await request('startRtt', {
+      controlBlockAddress: 0x20000100,
+      ramRanges: h7RamRanges,
+    });
+    check('rtt31-h723: startRtt outside explicit ramRanges rejected', !legacyAddrRejected.ok
+      && legacyAddrRejected.errorCode === 'RttInvalidControlBlock', JSON.stringify(legacyAddrRejected));
+
+    const startH7 = await request('startRtt', {
+      controlBlockAddress: cb,
+      ramRanges: h7RamRanges,
+    });
+    const omittedReuse = await request('enumerateRtt', {
+      roRanges: h7RoRanges,
+    });
+    check('rtt31-h723: enumerateRtt with omitted controlBlockAddress/ramRanges/timeoutMs reuses active startRtt',
+      omittedReuse.ok
+      && omittedReuse.data.controlBlockAddress === cb
+      && omittedReuse.data.validUpCount === 4
+      && omittedReuse.data.validDownCount === 2,
+    JSON.stringify(omittedReuse));
+
+    for (const [label, badParams] of [
+      ['controlBlockAddress=null', { controlBlockAddress: null, ramRanges: h7RamRanges, timeoutMs: 2000 }],
+      ['controlBlockAddress=-1', { controlBlockAddress: -1, ramRanges: h7RamRanges, timeoutMs: 2000 }],
+      ['controlBlockAddress=string', { controlBlockAddress: '0x24000100', ramRanges: h7RamRanges, timeoutMs: 2000 }],
+      ['controlBlockAddress=0', { controlBlockAddress: 0, ramRanges: h7RamRanges, timeoutMs: 2000 }],
+      ['controlBlockAddress=float', { controlBlockAddress: 603980032.5, ramRanges: h7RamRanges, timeoutMs: 2000 }],
+      ['timeoutMs=null', { controlBlockAddress: cb, ramRanges: h7RamRanges, timeoutMs: null }],
+      ['timeoutMs=0', { controlBlockAddress: cb, ramRanges: h7RamRanges, timeoutMs: 0 }],
+      ['timeoutMs=-5', { controlBlockAddress: cb, ramRanges: h7RamRanges, timeoutMs: -5 }],
+      ['timeoutMs=string', { controlBlockAddress: cb, ramRanges: h7RamRanges, timeoutMs: '1000' }],
+      ['timeoutMs=10001', { controlBlockAddress: cb, ramRanges: h7RamRanges, timeoutMs: 10001 }],
+    ]) {
+      const rejected = await request('enumerateRtt', badParams);
+      check(`rtt31-h723: enumerateRtt rejects explicit invalid ${label}`,
+        !rejected.ok && rejected.errorCode === 'DapInvalidRequest',
+        JSON.stringify(rejected));
+    }
+    const startBadTimeout = await request('startRtt', {
+      controlBlockAddress: cb,
+      ramRanges: h7RamRanges,
+      timeoutMs: null,
+    });
+    check('rtt31-h723: startRtt rejects explicit timeoutMs=null',
+      !startBadTimeout.ok && startBadTimeout.errorCode === 'DapInvalidRequest',
+      JSON.stringify(startBadTimeout));
+
+    // Shared bounded deadline on 64 Up + 64 Down distinct channel names with timeoutMs=1
+    const fullCb = 0x24010000;
+    const fullNames = 0x24014000;
+    const fullBuf = 0x24018000;
+    const fullTable = Buffer.alloc(24 + 24 * 128);
+    Buffer.from('SEGGER RTT', 'ascii').copy(fullTable, 0);
+    fullTable.writeUInt32LE(64, 16);
+    fullTable.writeUInt32LE(64, 20);
+    const fullNameBytes = Buffer.alloc(128 * 64);
+    for (let i = 0; i < 128; i++) {
+      fullTable.writeUInt32LE(fullNames + 64 * i, 24 + 24 * i);
+      fullTable.writeUInt32LE(fullBuf + 32 * i, 28 + 24 * i);
+      fullTable.writeUInt32LE(32, 32 + 24 * i);
+      fullNameBytes.write(`channel-${i}`, 64 * i, 'ascii');
+    }
+    await request('writeMemory', { address: fullCb, bytes: [...fullTable] });
+    await request('writeMemory', { address: fullNames, bytes: [...fullNameBytes] });
+    const boundedEnum = await request('enumerateRtt', {
+      controlBlockAddress: fullCb,
+      ramRanges: h7RamRanges,
+      timeoutMs: 1,
+    });
+    check('rtt31-h723: enumerateRtt 64+64 timeoutMs=1 stays bounded',
+      boundedEnum.ok
+        ? boundedEnum.elapsedMs <= 1
+        : (boundedEnum.errorCode === 'ReadTimeout' && boundedEnum.elapsedMs <= 5),
+      JSON.stringify({ ok: boundedEnum.ok, errorCode: boundedEnum.errorCode, elapsedMs: boundedEnum.elapsedMs }));
+
+    const readH7 = await request('readRtt', { bufferIndex: 2, size: 16 });
+    const stopH7 = await request('stopRtt', {});
+    check('rtt31-h723: startRtt + readRtt at 0x24000100', startH7.ok
+      && readH7.ok && readH7.data.bytes.join(',') === '83,86,33'
+      && readH7.data.committedRdOff === 3 && stopH7.ok,
+    JSON.stringify({ startH7, readH7, stopH7 }));
+  }
+  await closeDevice('rtt31-h723');
+
+  // 2. F103 20 KiB SRAM (0x20000000..0x20005000): out-of-bounds / cross-boundary rejected
+  await openAndInfo('1234', '5691', 'rtt31-f103');
+  const f1Connect = await request('connect', { port: 'SWD' });
+  check('rtt31-f103: connect', f1Connect.ok, JSON.stringify(f1Connect));
+  if (f1Connect.ok) {
+    await request('halt', { timeoutMs: 100 });
+    const f1RamRanges = [{ address: 0x20000000, size: 20 * 1024 }];
+
+    const oobStart = await request('startRtt', {
+      controlBlockAddress: 0x20005000,
+      ramRanges: f1RamRanges,
+    });
+    check('rtt31-f103: startRtt past 20 KiB SRAM rejected', !oobStart.ok
+      && oobStart.errorCode === 'RttInvalidControlBlock', JSON.stringify(oobStart));
+
+    const f1Cb = 0x20000100;
+    await request('writeMemory', { address: f1Cb, bytes: [
+      ...rttHeaderBytes(1, 0),
+      ...rttDescriptorBytes(0, 0x20004FF8, 16, 4, 0, 0),  // crosses 0x20005000 boundary!
+    ] });
+    const f1Enum = await request('enumerateRtt', {
+      controlBlockAddress: f1Cb,
+      ramRanges: f1RamRanges,
+    });
+    const f1Start = await request('startRtt', {
+      controlBlockAddress: f1Cb,
+      ramRanges: f1RamRanges,
+    });
+    const f1Read = await request('readRtt', { bufferIndex: 0, size: 8 });
+    await request('stopRtt', {});
+    check('rtt31-f103: ring buffer crossing 20 KiB SRAM boundary flagged corrupt and rejected',
+      f1Enum.ok && f1Enum.data.corruptCount === 1
+      && f1Enum.data.upBuffers[0].status === 'corrupt'
+      && f1Enum.data.upBuffers[0].errorCode === 'RttInvalidBufferLayout'
+      && f1Start.ok && !f1Read.ok && f1Read.errorCode === 'RttInvalidBufferLayout',
+    JSON.stringify({ f1Enum, f1Start, f1Read }));
+  }
+  await closeDevice('rtt31-f103');
+}
+
 async function main() {
   try {
     if (useMock) {
@@ -1455,6 +1700,7 @@ async function main() {
     await runDap02AMatrix();
     await runDap11H723Matrix();
     await runF103C8Matrix();
+    await runRttStage31Matrix();
       await runDap04Matrix();
       await runDap05Matrix();
       await runDap05CleanupMatrix();

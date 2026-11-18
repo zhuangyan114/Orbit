@@ -330,7 +330,7 @@ std::string handleHello(const JsonValue& params) {
       "\"dapDisconnect\",\"dapTransfer\",\"dapTransferBlock\",\"swDp\",\"memAp\","
       "\"readMemory\",\"readMemoryBatch\",\"readMemoryBlock\",\"writeMemory\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
       "\"reset\",\"stepInstruction\",\"readRegister\",\"hardwareBreakpoints\",\"runToAddress\","
-       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\",\"tcpTransport\","
+       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\",\"rttEnumerate\",\"tcpTransport\","
        "\"xrDapSampling\"]}";
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -1182,22 +1182,36 @@ std::string handleWriteMemory(const JsonValue& params, Channel& channel) {
 
 class CmsisDapRttMemory final : public RttMemory {
  public:
-  CmsisDapRttMemory(CmsisDapTarget& target, std::chrono::milliseconds timeout)
-      : target_(target), timeout_(timeout) {}
+  CmsisDapRttMemory(CmsisDapTarget& target, std::chrono::steady_clock::time_point deadline)
+      : target_(target), deadline_(deadline) {}
 
   Result read(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
               DapTransferDiagnostics& diagnostics) override {
-    return target_.readMemory(address, size, bytes, diagnostics);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline_) {
+      return Result::error(ErrorCodes::kReadTimeout, "RTT read deadline exceeded");
+    }
+    const auto remaining = std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - now));
+    return target_.readMemory(address, size, bytes, diagnostics, remaining);
   }
 
   Result write(uint32_t address, const std::vector<uint8_t>& bytes,
                DapTransferDiagnostics& diagnostics) override {
-    return target_.writeMemory(address, bytes, diagnostics, timeout_);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline_) {
+      return Result::error(ErrorCodes::kWriteTimeout, "RTT write deadline exceeded");
+    }
+    const auto remaining = std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - now));
+    return target_.writeMemory(address, bytes, diagnostics, remaining);
   }
 
  private:
   CmsisDapTarget& target_;
-  std::chrono::milliseconds timeout_;
+  std::chrono::steady_clock::time_point deadline_;
 };
 
 std::optional<uint32_t> controlTimeoutMs(const JsonValue& params);
@@ -1239,6 +1253,137 @@ std::string rttDiagnosticsJson(const DapTransferDiagnostics& diagnostics, uint16
   return json;
 }
 
+const char* rttDirectionString(RttChannelDirection direction) {
+  return direction == RttChannelDirection::Up ? "up" : "down";
+}
+
+const char* rttDescriptorStatusString(RttDescriptorStatus status) {
+  switch (status) {
+    case RttDescriptorStatus::Valid: return "valid";
+    case RttDescriptorStatus::Unused: return "unused";
+    case RttDescriptorStatus::Corrupt: return "corrupt";
+  }
+  return "corrupt";
+}
+
+const char* rttNameStatusString(RttNameStatus status) {
+  switch (status) {
+    case RttNameStatus::Ok: return "ok";
+    case RttNameStatus::Null: return "null";
+    case RttNameStatus::Empty: return "empty";
+    case RttNameStatus::ShortRead: return "short-read";
+    case RttNameStatus::Unterminated: return "unterminated";
+    case RttNameStatus::InvalidAddress: return "invalid-address";
+    case RttNameStatus::ReadFailed: return "read-failed";
+    case RttNameStatus::None: return "none";
+  }
+  return "none";
+}
+
+bool parseRttMemoryRangesField(const JsonValue& params, const char* key, bool allowEmpty,
+                               bool& present, std::vector<RttMemoryRange>& out,
+                               std::string& errorMessage) {
+  out.clear();
+  const JsonValue* value = params.get(key);
+  if (!value) {
+    present = false;
+    return true;
+  }
+  present = true;
+  if (value->kind != JsonValue::Kind::Array) {
+    errorMessage = std::string(key) + " must be an array of {address, size}";
+    return false;
+  }
+  if (value->array.size() > 32u) {
+    errorMessage = std::string(key) + " exceeds maximum of 32 entries";
+    return false;
+  }
+  out.reserve(value->array.size());
+  for (const JsonValue& item : value->array) {
+    if (item.kind != JsonValue::Kind::Object) {
+      errorMessage = std::string(key) + " entries must be objects";
+      return false;
+    }
+    const auto address = uintField(item, "address");
+    const auto size = uintField(item, "size");
+    if (!address || *address > 0xFFFFFFFFull || !size || *size == 0 || *size > 0xFFFFFFFFull) {
+      errorMessage = std::string(key) + " entries require uint32 address and positive size";
+      return false;
+    }
+    out.push_back(RttMemoryRange{static_cast<uint32_t>(*address), static_cast<uint32_t>(*size)});
+  }
+  const Result valid = SeggerRttReader::validateMemoryRanges(out, allowEmpty, key);
+  if (!valid.ok) {
+    errorMessage = valid.message;
+    return false;
+  }
+  return true;
+}
+
+std::string rttChannelDescriptorJson(const RttChannelDescriptor& entry) {
+  std::string json = std::string("{\"direction\":\"") + rttDirectionString(entry.direction) +
+      "\",\"index\":" + std::to_string(entry.index) +
+      ",\"descriptorAddress\":" + std::to_string(entry.descriptorAddress) +
+      ",\"configured\":" + (entry.configured ? "true" : "false") +
+      ",\"valid\":" + (entry.valid ? "true" : "false") +
+      ",\"status\":\"" + rttDescriptorStatusString(entry.status) + "\"" +
+      ",\"name\":\"" + jsonEscape(entry.name) + "\"" +
+      ",\"nameAddress\":" + std::to_string(entry.nameAddress) +
+      ",\"nameStatus\":\"" + rttNameStatusString(entry.nameStatus) + "\"" +
+      ",\"duplicateName\":" + (entry.duplicateName ? "true" : "false") +
+      ",\"bufferAddress\":" + std::to_string(entry.bufferAddress) +
+      ",\"bufferSize\":" + std::to_string(entry.bufferSize) +
+      ",\"wrOff\":" + std::to_string(entry.wrOff) +
+      ",\"rdOff\":" + std::to_string(entry.rdOff) +
+      ",\"flags\":" + std::to_string(entry.flags) +
+      ",\"mode\":" + std::to_string(entry.mode);
+  if (!entry.nameError.empty()) {
+    json += ",\"nameError\":\"" + jsonEscape(entry.nameError) + "\"";
+  }
+  if (!entry.errorCode.empty()) {
+    json += ",\"errorCode\":\"" + jsonEscape(entry.errorCode) + "\"";
+  }
+  if (!entry.errorMessage.empty()) {
+    json += ",\"errorMessage\":\"" + jsonEscape(entry.errorMessage) + "\"";
+  }
+  json += "}";
+  return json;
+}
+
+std::string rttChannelListJson(const std::vector<RttChannelDescriptor>& entries) {
+  std::string json = "[";
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (i > 0) json += ",";
+    json += rttChannelDescriptorJson(entries[i]);
+  }
+  json += "]";
+  return json;
+}
+
+std::string stringListJson(const std::vector<std::string>& items) {
+  std::string json = "[";
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) json += ",";
+    json += "\"" + jsonEscape(items[i]) + "\"";
+  }
+  json += "]";
+  return json;
+}
+
+std::string rttEnumDataJson(const RttEnumerationResult& output) {
+  return "{\"controlBlockAddress\":" + std::to_string(output.controlBlockAddress) +
+      ",\"maxUpBuffers\":" + std::to_string(output.maxUpBuffers) +
+      ",\"maxDownBuffers\":" + std::to_string(output.maxDownBuffers) +
+      ",\"upBuffers\":" + rttChannelListJson(output.upBuffers) +
+      ",\"downBuffers\":" + rttChannelListJson(output.downBuffers) +
+      ",\"duplicateUpNames\":" + stringListJson(output.duplicateUpNames) +
+      ",\"duplicateDownNames\":" + stringListJson(output.duplicateDownNames) +
+      ",\"validUpCount\":" + std::to_string(output.validUpCount) +
+      ",\"validDownCount\":" + std::to_string(output.validDownCount) +
+      ",\"corruptCount\":" + std::to_string(output.corruptCount) +
+      ",\"unusedCount\":" + std::to_string(output.unusedCount) + "}";
+}
+
 std::string handleStartRtt(const JsonValue& params, Channel& channel) {
   const auto started = std::chrono::steady_clock::now();
   const Result ready = channel.ensureReady();
@@ -1252,12 +1397,21 @@ std::string handleStartRtt(const JsonValue& params, Channel& channel) {
     return resultJson(false, "startRtt requires controlBlockAddress and timeoutMs", channel.state(), 0, "{}",
                       ErrorCodes::kDapInvalidRequest, "{\"operation\":\"startRtt\"}");
   }
+  bool ramRangesPresent = false;
+  std::vector<RttMemoryRange> ramRanges;
+  std::string rangeError;
+  if (!parseRttMemoryRangesField(params, "ramRanges", false, ramRangesPresent, ramRanges, rangeError)) {
+    return resultJson(false, rangeError, channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"startRtt\"}");
+  }
   CmsisDapProtocol protocol(channel.transport.get());
   protocol.setEffectivePacketSize(channel.packetSize);
   CmsisDapTarget target(&protocol, channel.packetSize);
-  CmsisDapRttMemory memory(target, std::chrono::milliseconds(*timeout));
+  CmsisDapRttMemory memory(target, started + std::chrono::milliseconds(*timeout));
   DapTransferDiagnostics diagnostics;
-  const Result result = channel.rttReader.start(memory, static_cast<uint32_t>(*address), diagnostics);
+  const Result result = ramRangesPresent
+      ? channel.rttReader.start(memory, static_cast<uint32_t>(*address), ramRanges, diagnostics)
+      : channel.rttReader.start(memory, static_cast<uint32_t>(*address), diagnostics);
   const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count();
   const std::string extra = "\"operation\":\"startRtt\",\"controlBlockAddress\":" +
@@ -1268,6 +1422,77 @@ std::string handleStartRtt(const JsonValue& params, Channel& channel) {
   }
   return resultJson(true, "RTT started", channel.state(), elapsedMs,
                     "{\"controlBlockAddress\":" + std::to_string(*address) + "}", "",
+                    rttDiagnosticsJson(diagnostics, channel.packetSize, nullptr, extra));
+}
+
+std::string handleEnumerateRtt(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) {
+    return resultJson(false, ready.message, channel.state(), 0, "{}", ready.errorCode,
+                      "{\"operation\":\"enumerateRtt\"}");
+  }
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) {
+    return resultJson(false, "enumerateRtt timeoutMs must be an integer in 1..10000", channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"enumerateRtt\"}");
+  }
+  const JsonValue* addressRaw = params.get("controlBlockAddress");
+  uint32_t controlBlockAddress = 0;
+  if (addressRaw) {
+    const auto addressOpt = uintField(params, "controlBlockAddress");
+    if (!addressOpt || *addressOpt == 0 || *addressOpt > 0xFFFFFFFFull) {
+      return resultJson(false, "enumerateRtt controlBlockAddress must be a positive uint32", channel.state(), 0, "{}",
+                        ErrorCodes::kDapInvalidRequest, "{\"operation\":\"enumerateRtt\"}");
+    }
+    controlBlockAddress = static_cast<uint32_t>(*addressOpt);
+  } else if (channel.rttReader.started()) {
+    controlBlockAddress = channel.rttReader.controlBlockAddress();
+  } else {
+    return resultJson(false, "enumerateRtt requires controlBlockAddress when RTT is not started",
+                      channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
+                      "{\"operation\":\"enumerateRtt\"}");
+  }
+
+  bool ramRangesPresent = false;
+  std::vector<RttMemoryRange> ramRanges;
+  std::string rangeError;
+  if (!parseRttMemoryRangesField(params, "ramRanges", false, ramRangesPresent, ramRanges, rangeError)) {
+    return resultJson(false, rangeError, channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"enumerateRtt\"}");
+  }
+  if (!ramRangesPresent) {
+    ramRanges = (channel.rttReader.started() && controlBlockAddress == channel.rttReader.controlBlockAddress())
+        ? channel.rttReader.ramRanges()
+        : SeggerRttReader::defaultSramRanges();
+  }
+
+  bool roRangesPresent = false;
+  std::vector<RttMemoryRange> roRanges;
+  if (!parseRttMemoryRangesField(params, "roRanges", true, roRangesPresent, roRanges, rangeError)) {
+    return resultJson(false, rangeError, channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"enumerateRtt\"}");
+  }
+
+  const auto timeoutDuration = std::chrono::milliseconds(*timeout);
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CmsisDapRttMemory memory(target, started + timeoutDuration);
+  DapTransferDiagnostics diagnostics;
+  RttEnumerationResult output;
+  const Result result = channel.rttReader.enumerate(
+      memory, controlBlockAddress, ramRanges, roRanges, output, diagnostics, timeoutDuration, started);
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string extra = "\"operation\":\"enumerateRtt\",\"controlBlockAddress\":" +
+      std::to_string(controlBlockAddress);
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedMs, "{}",
+                      result.errorCode, rttDiagnosticsJson(diagnostics, channel.packetSize, nullptr, extra));
+  }
+  return resultJson(true, "RTT channels enumerated", channel.state(), elapsedMs,
+                    rttEnumDataJson(output), "",
                     rttDiagnosticsJson(diagnostics, channel.packetSize, nullptr, extra));
 }
 
@@ -1304,7 +1529,7 @@ std::string handleReadRtt(const JsonValue& params, Channel& channel) {
   CmsisDapProtocol protocol(channel.transport.get());
   protocol.setEffectivePacketSize(channel.packetSize);
   CmsisDapTarget target(&protocol, channel.packetSize);
-  CmsisDapRttMemory memory(target, std::chrono::milliseconds(*timeout));
+  CmsisDapRttMemory memory(target, started + std::chrono::milliseconds(*timeout));
   DapTransferDiagnostics diagnostics;
   RttReadResult output;
   const Result result = channel.rttReader.read(memory, static_cast<uint32_t>(*bufferIndex),
@@ -1396,9 +1621,13 @@ constexpr uint64_t kControlTimeoutMaxMs = 10000;
 constexpr uint64_t kFlashAlgorithmTimeoutMaxMs = 60000;
 
 std::optional<uint32_t> boundedTimeoutMs(const JsonValue& params, uint64_t maxMs) {
-  const uint64_t timeout = uintField(params, "timeoutMs").value_or(1000);
-  if (timeout == 0 || timeout > maxMs) return std::nullopt;
-  return static_cast<uint32_t>(timeout);
+  const JsonValue* raw = params.get("timeoutMs");
+  if (!raw) {
+    return 1000 <= maxMs ? std::optional<uint32_t>(1000u) : std::nullopt;
+  }
+  const auto timeout = uintField(params, "timeoutMs");
+  if (!timeout || *timeout == 0 || *timeout > maxMs) return std::nullopt;
+  return static_cast<uint32_t>(*timeout);
 }
 
 std::optional<uint32_t> controlTimeoutMs(const JsonValue& params) {
@@ -2736,6 +2965,8 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
     result = handleWriteMemory(*params, channel);
   } else if (name == "startRtt") {
     result = handleStartRtt(*params, channel);
+  } else if (name == "enumerateRtt") {
+    result = handleEnumerateRtt(*params, channel);
   } else if (name == "stopRtt") {
     result = handleStopRtt(channel);
   } else if (name == "readRtt") {

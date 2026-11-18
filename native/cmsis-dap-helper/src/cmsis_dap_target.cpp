@@ -281,26 +281,50 @@ Result CmsisDapTarget::readMemoryBlock(uint32_t address, uint32_t wordCount,
   // leaving chunk - 1 words for the block command.
   const uint32_t maxBlockRead = packetSize_ >= 8 ? (packetSize_ - 4) / 4 : 1;
 
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto remainingTimeout = [&]() -> std::chrono::milliseconds {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return std::chrono::milliseconds(0);
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+  };
+
   words.reserve(wordCount);
   uint32_t position = address;
   uint32_t remaining = wordCount;
   while (remaining > 0) {
+    const std::chrono::milliseconds chunkTimeout = remainingTimeout();
+    if (chunkTimeout.count() <= 0) {
+      return Result::error(ErrorCodes::kReadTimeout,
+                           "readMemoryBlock deadline exceeded at 0x" + std::to_string(position));
+    }
     const uint32_t chunk =
         std::min(remaining, std::min(maxBlockRead, wordsUntilBoundary(position)));
     ++diag.chunks;
 
     uint32_t attempt = 0;
     for (;;) {
+      const std::chrono::milliseconds attemptTimeout = remainingTimeout();
+      if (attemptTimeout.count() <= 0) {
+        return Result::error(ErrorCodes::kReadTimeout,
+                             "readMemoryBlock deadline exceeded at 0x" + std::to_string(position));
+      }
       // AP reads are pipelined: the [AP DRW read][DP RDBUFF] pair returns the
       // word at the current TAR and advances TAR. Keep that value as the
       // first word; a following block read starts at the next word.
       uint32_t firstWord = 0;
-      Result dummyResult = readMemoryFirstWord(position, firstWord, diag, timeout);
+      Result dummyResult = readMemoryFirstWord(position, firstWord, diag, attemptTimeout);
       if (!dummyResult.ok) {
         if (dummyResult.errorCode == ErrorCodes::kDapAckFault) {
           // FAULT: the sticky error must be cleared before any retry.
           diag.faultClears++;
-          Result clearResult = clearStickyErrors(diag, timeout);
+          const std::chrono::milliseconds clearTimeout = remainingTimeout();
+          if (clearTimeout.count() <= 0) {
+            return Result::error(ErrorCodes::kReadTimeout,
+                                 "readMemoryBlock deadline exceeded before FAULT clear");
+          }
+          Result clearResult = clearStickyErrors(diag, clearTimeout);
           if (!clearResult.ok) return clearResult;
         } else if (dummyResult.errorCode != ErrorCodes::kDapAckWait) {
           return dummyResult;
@@ -322,6 +346,11 @@ Result CmsisDapTarget::readMemoryBlock(uint32_t address, uint32_t wordCount,
       chunkWords.reserve(chunk);
       chunkWords.push_back(firstWord);
       if (chunk > 1) {
+        const std::chrono::milliseconds blockTimeout = remainingTimeout();
+        if (blockTimeout.count() <= 0) {
+          return Result::error(ErrorCodes::kReadTimeout,
+                               "readMemoryBlock deadline exceeded at 0x" + std::to_string(position));
+        }
         const uint16_t blockWordCount = static_cast<uint16_t>(chunk - 1);
         std::vector<uint32_t> blockWords;
         uint8_t ack = 0;
@@ -333,11 +362,16 @@ Result CmsisDapTarget::readMemoryBlock(uint32_t address, uint32_t wordCount,
             static_cast<uint8_t>(kRequestApnDp | kRequestRnw | ((kApRegDrw >> 2) << 2));
         const Result blockResult = protocol_->dapTransferBlockRead(
             0, blockRequest, blockWordCount, blockWords, ack, completed,
-            timeout);
+            blockTimeout);
         if (!blockResult.ok) {
           if (blockResult.errorCode == ErrorCodes::kDapAckFault) {
             diag.faultClears++;
-            Result clearResult = clearStickyErrors(diag, timeout);
+            const std::chrono::milliseconds clearTimeout = remainingTimeout();
+            if (clearTimeout.count() <= 0) {
+              return Result::error(ErrorCodes::kReadTimeout,
+                                   "readMemoryBlock deadline exceeded before FAULT clear");
+            }
+            Result clearResult = clearStickyErrors(diag, clearTimeout);
             if (!clearResult.ok) return clearResult;
           }
           if (blockResult.errorCode != ErrorCodes::kDapAckWait &&
@@ -370,7 +404,8 @@ Result CmsisDapTarget::readMemoryBlock(uint32_t address, uint32_t wordCount,
 }
 
 Result CmsisDapTarget::readMemory(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
-                                  DapTransferDiagnostics& diag) {
+                                  DapTransferDiagnostics& diag,
+                                  std::chrono::milliseconds timeout) {
   bytes.clear();
   if (size == 0) {
     return Result::error(ErrorCodes::kDapInvalidRequest, "readMemory size must be > 0");
@@ -385,7 +420,7 @@ Result CmsisDapTarget::readMemory(uint32_t address, uint32_t size, std::vector<u
   const uint32_t lastWord = static_cast<uint32_t>((end - 1) / 4);  // inclusive
   const uint32_t wordCount = lastWord - firstWord / 4 + 1;
   std::vector<uint32_t> words;
-  const Result blockResult = readMemoryBlock(firstWord, wordCount, words, diag);
+  const Result blockResult = readMemoryBlock(firstWord, wordCount, words, diag, timeout);
   if (!blockResult.ok) return blockResult;
   bytes.resize(size);
   for (uint32_t i = 0; i < size; ++i) {

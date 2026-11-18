@@ -939,4 +939,65 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     dapLog.mockRestore();
     stepLog.mockRestore();
   });
+
+  it('routes enumerateRtt and startRtt ramRanges through the single CMSIS-DAP owner', async () => {
+    const enumerateRtt = vi.fn(async () => ({
+      ok: true,
+      message: 'RTT channels enumerated',
+      targetState: 'Running' as const,
+      elapsedMs: 2,
+      data: {
+        controlBlockAddress: 0x24000100,
+        maxUpBuffers: 1,
+        maxDownBuffers: 0,
+        upBuffers: [],
+        downBuffers: [],
+        duplicateUpNames: [],
+        duplicateDownNames: [],
+        validUpCount: 0,
+        validDownCount: 0,
+        corruptCount: 0,
+        unusedCount: 0,
+      },
+    }));
+    const startRtt = vi.fn(async () => ({
+      ok: true,
+      message: 'RTT started',
+      targetState: 'Running' as const,
+      elapsedMs: 1,
+      data: { controlBlockAddress: 0x24000100 },
+    }));
+    const owner = cmsisOwner({ enumerateRtt, startRtt } as any);
+    const backend = new OzoneBackend(undefined, owner);
+
+    const ramRanges = [{ address: 0x24000000, size: 327680 }];
+    await expect(backend.execute({
+      cmd: 'enumerateRtt',
+      controlBlockAddress: 0x24000100,
+      options: { ramRanges },
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { controlBlockAddress: 0x24000100 },
+    });
+    expect(enumerateRtt).toHaveBeenCalledWith(0x24000100, { ramRanges });
+
+    await expect(backend.execute({
+      cmd: 'startRtt',
+      controlBlockAddress: 0x24000100,
+      ramRanges,
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { controlBlockAddress: 0x24000100 },
+    });
+    expect(startRtt).toHaveBeenCalledWith(0x24000100, { ramRanges });
+
+    const unsupportedBackend = new OzoneBackend(undefined, cmsisOwner());
+    await expect(unsupportedBackend.execute({
+      cmd: 'enumerateRtt',
+      controlBlockAddress: 0x20000100,
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+  });
 });

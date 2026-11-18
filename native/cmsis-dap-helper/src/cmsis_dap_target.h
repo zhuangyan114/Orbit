@@ -140,7 +140,8 @@ class CmsisDapTarget {
   // Byte-oriented memory read of any size at any address. Unaligned ranges
   // are covered with aligned word reads and sliced on the host side.
   Result readMemory(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
-                    DapTransferDiagnostics& diag);
+                    DapTransferDiagnostics& diag,
+                    std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
   // Reads aligned, read-only 32-bit scalars through packed DAP_Transfer
   // requests. Caller order is preserved. On failure, `values` contains only

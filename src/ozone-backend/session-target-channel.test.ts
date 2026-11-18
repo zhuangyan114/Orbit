@@ -229,6 +229,83 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
             data: { controlBlockAddress: params.controlBlockAddress },
             diagnostics: { ownerKind: 'cmsis-dap', bufferIndex: 0 },
           };
+        case 'enumerateRtt':
+          return {
+            ok: true,
+            message: 'RTT channels enumerated',
+            targetState: 'Running' as const,
+            elapsedMs: 2,
+            data: {
+              controlBlockAddress: (params.controlBlockAddress as number) ?? 0x20000100,
+              maxUpBuffers: 2,
+              maxDownBuffers: 1,
+              upBuffers: [
+                {
+                  direction: 'up',
+                  index: 0,
+                  descriptorAddress: 0x20000118,
+                  configured: true,
+                  valid: true,
+                  status: 'valid',
+                  name: 'Terminal',
+                  nameAddress: 0x08001000,
+                  nameStatus: 'ok',
+                  duplicateName: false,
+                  bufferAddress: 0x20001000,
+                  bufferSize: 1024,
+                  wrOff: 0,
+                  rdOff: 0,
+                  flags: 0,
+                  mode: 0,
+                },
+                {
+                  direction: 'up',
+                  index: 1,
+                  descriptorAddress: 0x20000130,
+                  configured: true,
+                  valid: true,
+                  status: 'valid',
+                  name: 'SysView',
+                  nameAddress: 0x08001010,
+                  nameStatus: 'ok',
+                  duplicateName: false,
+                  bufferAddress: 0x20001400,
+                  bufferSize: 2048,
+                  wrOff: 0,
+                  rdOff: 0,
+                  flags: 0,
+                  mode: 0,
+                },
+              ],
+              downBuffers: [
+                {
+                  direction: 'down',
+                  index: 0,
+                  descriptorAddress: 0x20000148,
+                  configured: true,
+                  valid: true,
+                  status: 'valid',
+                  name: 'SysView',
+                  nameAddress: 0x08001010,
+                  nameStatus: 'ok',
+                  duplicateName: false,
+                  bufferAddress: 0x20002000,
+                  bufferSize: 128,
+                  wrOff: 0,
+                  rdOff: 0,
+                  flags: 0,
+                  mode: 0,
+                },
+              ],
+              duplicateUpNames: [],
+              duplicateDownNames: [],
+              validUpCount: 2,
+              validDownCount: 1,
+              corruptCount: 0,
+              unusedCount: 0,
+            },
+            diagnostics: { ownerKind: 'cmsis-dap' },
+          };
         case 'readRtt':
           return {
             ok: true,
@@ -421,10 +498,210 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(stopped.ok).toBe(true);
     expect(helper.controlRequest).toHaveBeenCalledWith('startRtt', expect.objectContaining({
       controlBlockAddress: 0x20000100,
+      ramRanges: [{ address: 0x20000000, size: 131072 }],
     }));
     expect(helper.request).toHaveBeenCalledWith('readRtt', expect.anything(), expect.objectContaining({
       priority: 'background',
     }));
+  });
+
+  it('forwards registered STM32H723 RAM/RO ranges to startRtt and enumerateRtt and preserves single owner', async () => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+
+    const connected = await selector.connect({
+      device: 'STM32H723VGT6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+    expect(connected.ok).toBe(true);
+
+    const started = await selector.startRtt(0x24000100);
+    expect(started.ok).toBe(true);
+    expect(helper.controlRequest).toHaveBeenCalledWith('startRtt', expect.objectContaining({
+      controlBlockAddress: 0x24000100,
+      ramRanges: expect.arrayContaining([
+        { address: 0x00000000, size: 65536 },
+        { address: 0x20000000, size: 131072 },
+        { address: 0x24000000, size: 327680 },
+      ]),
+    }));
+
+    const enumerated = await selector.enumerateRtt(0x24000100);
+    expect(enumerated).toMatchObject({
+      ok: true,
+      data: {
+        controlBlockAddress: 0x24000100,
+        validUpCount: 2,
+        validDownCount: 1,
+      },
+      diagnostics: { ownerKind: 'cmsis-dap', method: 'enumerateRtt' },
+    });
+    expect(helper.request).toHaveBeenCalledWith(
+      'enumerateRtt',
+      expect.objectContaining({
+        controlBlockAddress: 0x24000100,
+        ramRanges: expect.arrayContaining([{ address: 0x24000000, size: 327680 }]),
+        roRanges: [{ address: 0x08000000, size: 1048576 }],
+      }),
+      expect.objectContaining({ priority: 'watch' }),
+    );
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+    await selector.dispose(false);
+  });
+
+  it('rejects invalid RAM ranges and unregistered enumerateRtt without explicit ranges, while keeping legacy startRtt', async () => {
+    const helper = fakeCmsisDapHelper();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    await channel.connect({
+      device: 'STM32F429VGT6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+
+    // Unregistered device without explicit ramRanges: startRtt omits ramRanges for legacy compatibility
+    const legacyStart = await channel.startRtt(0x20000100);
+    expect(legacyStart.ok).toBe(true);
+    const startParams = (helper.controlRequest as any).mock.calls[1][1];
+    expect(startParams).not.toHaveProperty('ramRanges');
+
+    // Unregistered device without explicit ramRanges: enumerateRtt reports UnsupportedCapability
+    await expect(channel.enumerateRtt(0x20000100)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+
+    // Explicit invalid ramRanges rejected before helper RPC
+    await expect(channel.startRtt(0x20000100, { ramRanges: [] })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'DapInvalidRequest',
+    });
+    await expect(channel.enumerateRtt(0x20000100, {
+      ramRanges: [{ address: 0x20000000, size: 0x2000 }, { address: 0x20001000, size: 0x1000 }],
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'DapInvalidRequest',
+    });
+
+    // Unregistered device WITH explicit ramRanges succeeds (omitted timeoutMs defaults to 2000)
+    await expect(channel.enumerateRtt(0x20000100, {
+      ramRanges: [{ address: 0x20000000, size: 0x10000 }],
+    })).resolves.toMatchObject({ ok: true });
+
+    // Explicit invalid controlBlockAddress and timeoutMs fail with DapInvalidRequest without calling helper
+    const requestsBeforeInvalid = (helper.request as any).mock.calls.length;
+    for (const badAddr of [null, -1, '0x20000100', 0, 1.5] as unknown[]) {
+      await expect(channel.enumerateRtt(badAddr as number, {
+        ramRanges: [{ address: 0x20000000, size: 0x10000 }],
+      })).resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+    }
+    for (const badTimeout of [null, 0, -5, '1000', 1.5, 10001] as unknown[]) {
+      await expect(channel.enumerateRtt(0x20000100, {
+        ramRanges: [{ address: 0x20000000, size: 0x10000 }],
+        timeoutMs: badTimeout as number,
+      })).resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+    }
+    expect((helper.request as any).mock.calls.length).toBe(requestsBeforeInvalid);
+
+    // Omitted controlBlockAddress forwards without controlBlockAddress property
+    await expect(channel.enumerateRtt(undefined, {
+      ramRanges: [{ address: 0x20000000, size: 0x10000 }],
+    })).resolves.toMatchObject({ ok: true });
+    const omittedCall = (helper.request as any).mock.calls.at(-1);
+    expect(omittedCall[0]).toBe('enumerateRtt');
+    expect(omittedCall[1]).not.toHaveProperty('controlBlockAddress');
+    expect(omittedCall[1].timeoutMs).toBe(2000);
+
+    await channel.disconnect();
+  });
+
+  it('propagates enumerateRtt ReadTimeout without terminating or replacing the single CMSIS-DAP owner', async () => {
+    const base = fakeCmsisDapHelper();
+    const request = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'enumerateRtt') {
+        return {
+          ok: false,
+          message: 'RTT enumeration exceeded 1 ms deadline during channel name enumeration',
+          errorCode: 'ReadTimeout',
+          targetState: 'Running' as const,
+          elapsedMs: 1,
+        };
+      }
+      return (base.request as any)(method, params);
+    });
+    const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper({ request: request as any }) });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    await selector.connect({
+      device: 'STM32H723VGT6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+
+    await expect(selector.enumerateRtt(0x24000100, { timeoutMs: 1 })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'ReadTimeout',
+    });
+    expect(selector.ownerKind).toBe('cmsis-dap');
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+    await expect(selector.startRtt(0x24000100)).resolves.toMatchObject({ ok: true });
+    await selector.dispose(false);
+  });
+
+  it('rejects malformed enumerateRtt helper responses with MalformedResponse', async () => {
+    const base = fakeCmsisDapHelper();
+    const request = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+      if (method === 'enumerateRtt') {
+        return {
+          ok: true,
+          message: 'bad enum',
+          targetState: 'Running' as const,
+          elapsedMs: 1,
+          data: { controlBlockAddress: 0x20000100, maxUpBuffers: 2, maxDownBuffers: 0, upBuffers: [], downBuffers: [] },
+        };
+      }
+      return (base.request as any)(method, params);
+    });
+    const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper({ request: request as any }) });
+    await channel.connect({
+      device: 'STM32F407VET6',
+      interface: 'SWD',
+      speedKHz: 1000,
+      probe: 'cmsis-dap',
+    });
+
+    await expect(channel.enumerateRtt(0x20000100)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'MalformedResponse',
+    });
+    await channel.disconnect();
+  });
+
+  it('returns UnsupportedCapability when SessionTargetSelector owner does not support enumerateRtt', async () => {
+    const legacyLikeOwner = {
+      kind: 'jlink-legacy',
+      usingNative: false,
+      connect: vi.fn(async () => ({ ok: true, message: 'ok', targetState: 'Halted', elapsedMs: 0, data: { channel: 'koffi' } })),
+      disconnect: vi.fn(async () => ({ ok: true, message: 'ok', targetState: 'Disconnected', elapsedMs: 0, data: {} })),
+      dispose: vi.fn(async () => {}),
+    } as unknown as SessionTargetOwner;
+    const selector = new SessionTargetSelector(vi.fn(), () => legacyLikeOwner);
+    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'legacy');
+
+    await expect(selector.enumerateRtt(0x20000100)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+    await selector.dispose(false);
   });
 
   it.each(['STM32H723VGT6', 'STM32F407IG', 'STM32F103C8T6'])('exposes the %s flash target and clears it on disconnect', async device => {

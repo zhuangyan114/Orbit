@@ -19,7 +19,12 @@ import {
   CmsisDapMemoryReadResult,
   CmsisDapMemoryBatchReadResult,
   CmsisDapMemoryWriteResult,
+  CmsisDapRttChannelDescriptor,
+  CmsisDapRttEnumOptions,
+  CmsisDapRttEnumResult,
+  CmsisDapRttMemoryRange,
   CmsisDapRttReadResult,
+  CmsisDapRttStartOptions,
   CmsisDapCoreStateResult,
   CmsisDapRunToAddressResult,
   CmsisDapStepInstructionResult,
@@ -109,7 +114,8 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   setBreakpoint(address: number, preferredSlot?: number): Promise<CppJLinkResult<{ id: number }>>;
   clearBreakpoint(id: number): Promise<CppJLinkResult<any>>;
   clearAllBreakpoints(): Promise<CppJLinkResult<any>>;
-  startRtt(controlBlockAddress?: number): Promise<CppJLinkResult<any>>;
+  startRtt(controlBlockAddress?: number, options?: CmsisDapRttStartOptions): Promise<CppJLinkResult<any>>;
+  enumerateRtt?(controlBlockAddress?: number, options?: CmsisDapRttEnumOptions): Promise<CppJLinkResult<CmsisDapRttEnumResult>>;
   stopRtt(): Promise<CppJLinkResult<any>>;
   readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
   flash?(elfPath: string, device: string, options?: CmsisDapFlashOptions): Promise<CppJLinkResult<CmsisDapFlashResult>>;
@@ -360,7 +366,18 @@ export class SessionTargetSelector {
     if (result.ok) this.breakpointSlots.fill(null);
     return result;
   }
-  async startRtt(controlBlockAddress?: number) { return this.call('startRtt', owner => owner.startRtt(controlBlockAddress)); }
+  async startRtt(controlBlockAddress?: number, options?: CmsisDapRttStartOptions) {
+    return this.call('startRtt', owner => owner.startRtt(controlBlockAddress, options));
+  }
+  async enumerateRtt(controlBlockAddress?: number, options?: CmsisDapRttEnumOptions) {
+    return this.call('enumerateRtt', owner => owner.enumerateRtt
+      ? owner.enumerateRtt(controlBlockAddress, options)
+      : Promise.resolve(failure<CmsisDapRttEnumResult>(
+        'selected target owner does not support RTT channel enumeration',
+        'UnsupportedCapability',
+        { ownerKind: owner.kind, capability: 'enumerateRtt' },
+      )));
+  }
   async stopRtt() { return this.call('stopRtt', owner => owner.stopRtt()); }
   async readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions) {
     return this.call('readRtt', owner => owner.readRtt(bufferIndex, size, options));
@@ -1027,21 +1044,150 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   async clearAllBreakpoints() {
     return this.controlViaHelper<CmsisDapClearAllBreakpointsResult>('clearAllBreakpoints', {});
   }
-  async startRtt(controlBlockAddress?: number) {
+  async startRtt(controlBlockAddress?: number, options?: CmsisDapRttStartOptions) {
     if (this.state !== 'connected') return this.invalidState('startRtt');
-    if (!Number.isInteger(controlBlockAddress) || !controlBlockAddress || controlBlockAddress < 0) {
+    if (!Number.isInteger(controlBlockAddress) || !controlBlockAddress || controlBlockAddress < 0 || controlBlockAddress > 0xFFFFFFFF) {
       return failure('CMSIS-DAP RTT requires an explicit control block address', 'RttInvalidControlBlock', {
         ownerKind: this.kind,
         capability: 'startRtt',
       });
     }
+    let ramRanges: CmsisDapRttMemoryRange[] | undefined;
+    if (options?.ramRanges !== undefined) {
+      const checked = validateRttMemoryRanges(options.ramRanges, false, 'ramRanges');
+      if (!checked.ok) {
+        return failure(checked.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'startRtt',
+        });
+      }
+      ramRanges = checked.normalized;
+    } else if (this.flashTargetDef) {
+      ramRanges = this.flashTargetDef.ramRegions.map(region => ({
+        address: region.address,
+        size: region.size,
+      }));
+    }
     const result = await this.controlViaHelper<{ controlBlockAddress: number }>('startRtt', {
       controlBlockAddress: controlBlockAddress >>> 0,
       timeoutMs: 2000,
+      ...(ramRanges ? { ramRanges } : {}),
     });
     log.dap('[cmsis-dap] startRtt controlBlock=0x' + (controlBlockAddress >>> 0).toString(16)
+      + ' ramRanges=' + (ramRanges ? ramRanges.length : 'default')
       + ' ok=' + result.ok + ' errorCode=' + (result.errorCode || ''));
     return result;
+  }
+  async enumerateRtt(
+    controlBlockAddress?: number,
+    options?: CmsisDapRttEnumOptions,
+  ): Promise<CppJLinkResult<CmsisDapRttEnumResult>> {
+    if (this.state !== 'connected') return this.invalidState<CmsisDapRttEnumResult>('enumerateRtt');
+    if (controlBlockAddress !== undefined
+      && (!Number.isInteger(controlBlockAddress) || controlBlockAddress <= 0 || controlBlockAddress > 0xFFFFFFFF)) {
+      return failure<CmsisDapRttEnumResult>(
+        'CMSIS-DAP RTT control block address must be a positive uint32',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'enumerateRtt' },
+      );
+    }
+
+    let ramRanges: CmsisDapRttMemoryRange[];
+    if (options?.ramRanges !== undefined) {
+      const checked = validateRttMemoryRanges(options.ramRanges, false, 'ramRanges');
+      if (!checked.ok) {
+        return failure<CmsisDapRttEnumResult>(checked.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'enumerateRtt',
+        });
+      }
+      ramRanges = checked.normalized;
+    } else if (this.flashTargetDef) {
+      ramRanges = this.flashTargetDef.ramRegions.map(region => ({
+        address: region.address,
+        size: region.size,
+      }));
+    } else {
+      return failure<CmsisDapRttEnumResult>(
+        'CMSIS-DAP RTT channel enumeration requires a registered target or explicit ramRanges',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'enumerateRtt' },
+      );
+    }
+
+    let roRanges: CmsisDapRttMemoryRange[] | undefined;
+    if (options?.roRanges !== undefined) {
+      const checkedRo = validateRttMemoryRanges(options.roRanges, true, 'roRanges');
+      if (!checkedRo.ok) {
+        return failure<CmsisDapRttEnumResult>(checkedRo.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'enumerateRtt',
+        });
+      }
+      roRanges = checkedRo.normalized;
+    } else if (this.flashTargetDef) {
+      roRanges = [{ address: this.flashTargetDef.flashBase, size: this.flashTargetDef.flashSize }];
+    }
+
+    let timeoutMs = 2000;
+    if (options?.timeoutMs !== undefined) {
+      if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0 || options.timeoutMs > 10000) {
+        return failure<CmsisDapRttEnumResult>('CMSIS-DAP enumerateRtt timeoutMs must be an integer in 1..10000', 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'enumerateRtt',
+        });
+      }
+      timeoutMs = options.timeoutMs;
+    }
+
+    let result: CppJLinkResult<CmsisDapRttEnumResult>;
+    try {
+      result = await this.helper.request<CmsisDapRttEnumResult>(
+        'enumerateRtt',
+        {
+          ...(controlBlockAddress !== undefined ? { controlBlockAddress: controlBlockAddress >>> 0 } : {}),
+          ramRanges,
+          ...(roRanges ? { roRanges } : {}),
+          timeoutMs,
+        },
+        { priority: 'watch', label: 'RTT channel enumeration' },
+      );
+    } catch (error) {
+      if (error instanceof NativeSchedulerCancelledError) {
+        return {
+          ok: false,
+          message: 'CMSIS-DAP enumerateRtt was cancelled',
+          errorCode: 'RequestCancelled',
+          targetState: 'Unknown',
+          elapsedMs: 0,
+          diagnostics: { ownerKind: this.kind, method: 'enumerateRtt' },
+        };
+      }
+      return this.helperFailure<CmsisDapRttEnumResult>('enumerateRtt', error);
+    }
+    if (!result.ok) {
+      log.dap('[cmsis-dap] enumerateRtt failed owner=cmsis-dap errorCode=' + (result.errorCode || 'unknown')
+        + ' message=' + result.message);
+      return result;
+    }
+    if (!isValidRttEnumResult(result.data)) {
+      return {
+        ok: false,
+        message: 'CMSIS-DAP enumerateRtt returned a malformed result',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error',
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'enumerateRtt' },
+      };
+    }
+    log.dap('[cmsis-dap] enumerateRtt controlBlock=0x' + (result.data.controlBlockAddress >>> 0).toString(16)
+      + ' up=' + result.data.validUpCount + '/' + result.data.maxUpBuffers
+      + ' down=' + result.data.validDownCount + '/' + result.data.maxDownBuffers
+      + ' corrupt=' + result.data.corruptCount + ' unused=' + result.data.unusedCount);
+    return {
+      ...result,
+      diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'enumerateRtt' },
+    };
   }
   async stopRtt() {
     if (this.state !== 'connected') return this.invalidState('stopRtt');
@@ -1416,4 +1562,86 @@ function failure<T = Record<string, never>>(
   diagnostics?: Record<string, unknown>,
 ): CppJLinkResult<T> {
   return { ok: false, message, errorCode, diagnostics, targetState: 'Error', elapsedMs: 0 };
+}
+
+const MAX_RTT_MEMORY_RANGES = 32;
+const MAX_RTT_BUFFERS = 64;
+const VALID_RTT_STATUS = new Set(['valid', 'unused', 'corrupt']);
+const VALID_RTT_NAME_STATUS = new Set([
+  'ok', 'null', 'empty', 'short-read', 'unterminated', 'invalid-address', 'read-failed', 'none',
+]);
+
+function validateRttMemoryRanges(
+  ranges: readonly CmsisDapRttMemoryRange[],
+  allowEmpty: boolean,
+  label: string,
+): { ok: true; normalized: CmsisDapRttMemoryRange[] } | { ok: false; message: string } {
+  if (!Array.isArray(ranges)) {
+    return { ok: false, message: `${label} must be an array of {address, size}` };
+  }
+  if (!allowEmpty && ranges.length === 0) {
+    return { ok: false, message: `${label} must not be empty` };
+  }
+  if (ranges.length > MAX_RTT_MEMORY_RANGES) {
+    return { ok: false, message: `${label} exceeds maximum of ${MAX_RTT_MEMORY_RANGES} entries` };
+  }
+  const normalized: CmsisDapRttMemoryRange[] = [];
+  for (const entry of ranges) {
+    if (!entry || typeof entry !== 'object'
+      || !Number.isSafeInteger(entry.address) || entry.address < 0 || entry.address > 0xFFFFFFFF
+      || !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.address + entry.size > 0x100000000) {
+      return { ok: false, message: `${label} entries require uint32 address and positive size within 32-bit space` };
+    }
+    normalized.push({ address: entry.address, size: entry.size });
+  }
+  const sorted = [...normalized].sort((a, b) => a.address - b.address);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].address < sorted[i - 1].address + sorted[i - 1].size) {
+      return { ok: false, message: `${label} entries must not overlap` };
+    }
+  }
+  return { ok: true, normalized };
+}
+
+function isValidRttDescriptor(entry: unknown, expectedDirection: 'up' | 'down', expectedIndex: number): entry is CmsisDapRttChannelDescriptor {
+  if (!entry || typeof entry !== 'object') return false;
+  const item = entry as Partial<CmsisDapRttChannelDescriptor>;
+  return item.direction === expectedDirection
+    && item.index === expectedIndex
+    && typeof item.descriptorAddress === 'number' && Number.isInteger(item.descriptorAddress)
+    && typeof item.configured === 'boolean'
+    && typeof item.valid === 'boolean'
+    && typeof item.status === 'string' && VALID_RTT_STATUS.has(item.status)
+    && typeof item.name === 'string'
+    && typeof item.nameAddress === 'number' && Number.isInteger(item.nameAddress)
+    && typeof item.nameStatus === 'string' && VALID_RTT_NAME_STATUS.has(item.nameStatus)
+    && typeof item.duplicateName === 'boolean'
+    && typeof item.bufferAddress === 'number' && Number.isInteger(item.bufferAddress)
+    && typeof item.bufferSize === 'number' && Number.isInteger(item.bufferSize)
+    && typeof item.wrOff === 'number' && Number.isInteger(item.wrOff)
+    && typeof item.rdOff === 'number' && Number.isInteger(item.rdOff)
+    && typeof item.flags === 'number' && Number.isInteger(item.flags)
+    && typeof item.mode === 'number' && Number.isInteger(item.mode);
+}
+
+function isValidRttEnumResult(data: unknown): data is CmsisDapRttEnumResult {
+  if (!data || typeof data !== 'object') return false;
+  const value = data as Partial<CmsisDapRttEnumResult>;
+  if (!Number.isInteger(value.controlBlockAddress) || (value.controlBlockAddress as number) <= 0) return false;
+  if (!Number.isInteger(value.maxUpBuffers) || (value.maxUpBuffers as number) <= 0 || (value.maxUpBuffers as number) > MAX_RTT_BUFFERS) {
+    return false;
+  }
+  if (!Number.isInteger(value.maxDownBuffers) || (value.maxDownBuffers as number) < 0 || (value.maxDownBuffers as number) > MAX_RTT_BUFFERS) {
+    return false;
+  }
+  if (!Array.isArray(value.upBuffers) || value.upBuffers.length !== value.maxUpBuffers) return false;
+  if (!Array.isArray(value.downBuffers) || value.downBuffers.length !== value.maxDownBuffers) return false;
+  if (!Array.isArray(value.duplicateUpNames) || !value.duplicateUpNames.every(name => typeof name === 'string')) return false;
+  if (!Array.isArray(value.duplicateDownNames) || !value.duplicateDownNames.every(name => typeof name === 'string')) return false;
+  if (!Number.isInteger(value.validUpCount) || !Number.isInteger(value.validDownCount)
+    || !Number.isInteger(value.corruptCount) || !Number.isInteger(value.unusedCount)) {
+    return false;
+  }
+  return value.upBuffers.every((item, index) => isValidRttDescriptor(item, 'up', index))
+    && value.downBuffers.every((item, index) => isValidRttDescriptor(item, 'down', index));
 }

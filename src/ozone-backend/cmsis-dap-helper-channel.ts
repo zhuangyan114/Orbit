@@ -49,6 +49,15 @@ export type CmsisDapErrorCode =
   | 'StartupUnexpectedStop'
   | 'StartupRecoveryFailed'
   | 'StartupEntryNotReached'
+  | 'RttInvalidControlBlock'
+  | 'RttInvalidBufferIndex'
+  | 'RttInvalidBufferLayout'
+  | 'RttInvalidBufferFlags'
+  | 'RttMemoryReadFailed'
+  | 'RttMemoryWriteFailed'
+  | 'RttBufferOverrun'
+  | 'RttOwnerLost'
+  | 'RttStopped'
   | 'ProtocolVersionMismatch'
   | 'UnknownMethod'
   | 'HelperExited'
@@ -198,6 +207,69 @@ export interface CmsisDapMemoryBlockReadResult {
   address: number;
   wordCount: number;
   words: number[];
+}
+
+export interface CmsisDapRttMemoryRange {
+  address: number;
+  size: number;
+}
+
+export interface CmsisDapRttStartOptions {
+  ramRanges?: readonly CmsisDapRttMemoryRange[];
+}
+
+export interface CmsisDapRttEnumOptions {
+  ramRanges?: readonly CmsisDapRttMemoryRange[];
+  roRanges?: readonly CmsisDapRttMemoryRange[];
+  timeoutMs?: number;
+}
+
+export type CmsisDapRttChannelDirection = 'up' | 'down';
+export type CmsisDapRttDescriptorStatus = 'valid' | 'unused' | 'corrupt';
+export type CmsisDapRttNameStatus =
+  | 'ok'
+  | 'null'
+  | 'empty'
+  | 'short-read'
+  | 'unterminated'
+  | 'invalid-address'
+  | 'read-failed'
+  | 'none';
+
+export interface CmsisDapRttChannelDescriptor {
+  direction: CmsisDapRttChannelDirection;
+  index: number;
+  descriptorAddress: number;
+  configured: boolean;
+  valid: boolean;
+  status: CmsisDapRttDescriptorStatus;
+  name: string;
+  nameAddress: number;
+  nameStatus: CmsisDapRttNameStatus;
+  nameError?: string;
+  duplicateName: boolean;
+  bufferAddress: number;
+  bufferSize: number;
+  wrOff: number;
+  rdOff: number;
+  flags: number;
+  mode: number;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+export interface CmsisDapRttEnumResult {
+  controlBlockAddress: number;
+  maxUpBuffers: number;
+  maxDownBuffers: number;
+  upBuffers: CmsisDapRttChannelDescriptor[];
+  downBuffers: CmsisDapRttChannelDescriptor[];
+  duplicateUpNames: string[];
+  duplicateDownNames: string[];
+  validUpCount: number;
+  validDownCount: number;
+  corruptCount: number;
+  unusedCount: number;
 }
 
 export interface CmsisDapRttReadResult {
@@ -692,6 +764,7 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'readMemory':
     case 'readMemoryBatch':
     case 'readMemoryBlock':
+    case 'enumerateRtt':
       return 'watch';
     case 'readRtt':
       return 'background';

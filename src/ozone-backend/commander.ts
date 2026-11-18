@@ -9,6 +9,7 @@ import {
 import { probeSamplingItems } from './probe-sampling-plan';
 import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
+import type { CmsisDapRttMemoryRange } from './cmsis-dap-helper-channel';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
 import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress, buildSymbolCatalog } from './jlink-symbols';
@@ -346,14 +347,17 @@ export class OzoneBackend {
     return result.ok;
   }
 
-  private async targetStartRtt(controlBlockAddress?: number): Promise<CppJLinkResult<any>> {
+  private async targetStartRtt(
+    controlBlockAddress?: number,
+    ramRanges?: readonly CmsisDapRttMemoryRange[],
+  ): Promise<CppJLinkResult<any>> {
     if (!this.sessionTarget) {
       const ok = this.jlink.startRtt(controlBlockAddress);
       return ok
         ? { ok: true, message: 'RTT started', targetState: 'Unknown', elapsedMs: 0, data: {} }
         : { ok: false, message: 'legacy RTT start failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
     }
-    return this.sessionTarget.startRtt(controlBlockAddress);
+    return this.sessionTarget.startRtt(controlBlockAddress, ramRanges ? { ramRanges } : undefined);
   }
 
   private async targetStopRtt(): Promise<CppJLinkResult<any>> {
@@ -570,11 +574,31 @@ case 'readVariableRuntime':
           return await this.doSetWatchValue(command.expression, command.value, command.address, command.typeName);
         case 'startRtt':
           {
-            const result = await this.targetStartRtt(command.controlBlockAddress);
+            const result = await this.targetStartRtt(command.controlBlockAddress, command.ramRanges);
             if (!result.ok) return this.sessionOwnerFailure(result, 'RttStartFailed');
             return {
               ok: true,
               data: result.data ?? 'RTT started',
+              message: result.message,
+              targetState: result.targetState,
+              elapsedMs: result.elapsedMs,
+              diagnostics: result.diagnostics,
+            };
+          }
+        case 'enumerateRtt':
+          {
+            if (!this.sessionTarget?.enumerateRtt) {
+              return {
+                ok: false,
+                errorCode: 'UnsupportedCapability',
+                error: 'UnsupportedCapability: selected target owner does not support RTT channel enumeration',
+              };
+            }
+            const result = await this.sessionTarget.enumerateRtt(command.controlBlockAddress, command.options);
+            if (!result.ok) return this.sessionOwnerFailure(result, 'RttEnumerateFailed');
+            return {
+              ok: true,
+              data: result.data,
               message: result.message,
               targetState: result.targetState,
               elapsedMs: result.elapsedMs,

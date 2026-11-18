@@ -278,4 +278,26 @@ describe('CMSIS-DAP helper control critical section', () => {
 
     expect(order).toEqual(['readMemory', 'readMemoryBlock', 'readRtt']);
   });
+
+  it('schedules enumerateRtt at watch priority above timeline/background and yields to control', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstReleased = new Promise<void>(resolve => { releaseFirst = resolve; });
+    (helper as any).sendRequest = vi.fn(async (method: string) => {
+      order.push(method);
+      if (method === 'readRtt') await firstReleased;
+      return { ok: true, message: method, targetState: 'Running', elapsedMs: 0, data: {} };
+    });
+
+    const runningBackground = helper.request('readRtt');
+    const timeline = helper.request('readMemoryBlock', {}, { priority: 'timeline' });
+    const enumReq = helper.request('enumerateRtt', { controlBlockAddress: 0x24000100 });
+    const control = helper.request('halt');
+    await Promise.resolve();
+    releaseFirst();
+    await Promise.all([runningBackground, timeline, enumReq, control]);
+
+    expect(order).toEqual(['readRtt', 'halt', 'enumerateRtt', 'readMemoryBlock']);
+  });
 });

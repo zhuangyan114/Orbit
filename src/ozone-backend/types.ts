@@ -1,3 +1,5 @@
+import type { CmsisDapRttEnumOptions, CmsisDapRttMemoryRange } from './cmsis-dap-helper-channel';
+
 export type DebugProbe = 'jlink' | 'cmsis-dap' | 'rmlink';
 export type DebugProbePreference = DebugProbe | 'auto';
 export type CmsisDapTransport = 'auto' | 'cmsis-dap-v2' | 'cmsis-dap' | 'hid' | 'winusb' | 'tcp';
@@ -252,7 +254,8 @@ export type OzoneCommand =
   | { cmd: 'getPerformanceDiagnostics' }
   | { cmd: 'getSchedulerSnapshot' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
-  | { cmd: 'startRtt'; controlBlockAddress?: number }
+  | { cmd: 'startRtt'; controlBlockAddress?: number; ramRanges?: readonly CmsisDapRttMemoryRange[] }
+  | { cmd: 'enumerateRtt'; controlBlockAddress?: number; options?: CmsisDapRttEnumOptions }
   | { cmd: 'stopRtt' }
   | { cmd: 'readRtt'; bufferIndex: number; size: number; signal?: AbortSignal };
 

@@ -118,3 +118,14 @@
 - 证据：src/utils/orbit-settings.test.ts、scripts/rtos/vscode-stage2-driver.js、out/rtos-stage2/vscode-ui/report.json、out/rtos-stage2/orbit-stage2.4.vsix。
 - 剩余事项：阶段 2 已关闭，下一阶段为阶段 3（RTT 多通道枚举与下行写入）。
 - 提交：清理 RTOS 阶段 2.4：移除旧 RTOS Views 专属集成；hash 用 git log 查询本记录所在提交。
+
+## 3.1 / 2026-11-18
+
+- 状态：已完成，独立 mock 验收通过。实板回环验证归 3.4。
+- 实现：native/cmsis-dap-helper/src/segger_rtt.h、segger_rtt.cpp、cmsis_dap_target.h、cmsis_dap_target.cpp、main.cpp 与 src/ozone-backend/cmsis-dap-helper-channel.ts、session-target-channel.ts、types.ts、commander.ts 实现可配置非固定 RAM 范围校验（1..32 段、防溢出/重叠/跨区/越界）及有界 Up/Down descriptor 与名称枚举（enumerateRtt，最多 64 Up + 64 Down、名称最多 64 bytes 并按 RAM/RO 范围钳制，区分 unused/valid/corrupt 与 null/empty/short-read/unterminated/invalid-address/read-failed，按方向独立检测重复名）；区分字段省略与显式非法值（controlBlockAddress、timeoutMs 在显式传入 null/负数/字符串/非 uint32 时返回 DapInvalidRequest，真正省略才允许复用已启动控制块或默认 timeout），并将 timeoutMs 作为 CmsisDapRttMemory、CmsisDapTarget::readMemory/readMemoryBlock 与 SeggerRttReader::enumerate（头/表/名称各阶段）的共享有界期限，超时或设备移除立即以 ReadTimeout/DeviceRemoved 终止枚举而不吞并或占住唯一 helper；未传递 ramRanges 的旧客户端与 J-Link helper 仍保留既有默认行为及 RTT Log/单物理 owner 路由，不扩充芯片支持，未提前实现 3.2 下行写入。
+- 设计变更：将合法目标 RAM 范围校验同时用于 startRtt/readRtt 与 enumerateRtt；当已连接注册目标时由 CmsisDapTargetChannel 自动提供 target-pack 的 ramRegions（及枚举时的 flashBase/flashSize 作为 roRanges），未注册目标在 startRtt 省略参数时沿用既有 128 KiB 默认以兼容旧 RTT Log，在 enumerateRtt 无显式 ramRanges 时返回 UnsupportedCapability。
+- 检查：node out/rtos-stage3/acceptance-3.1/manual-enumerate-rpc.cjs 复验通过（nullable 返回 DapInvalidRequest；64+64 通道 timeoutMs=1 5 次均于 elapsedMs=1 返回 ReadTimeout 且 count=0）；orbit-cmsis-dap-rtt-tests.exe（含 FakeClock 分阶段超时与 ReadTimeout 传播独立单测）、npm run test:cmsis-dap:mock、npm run test:cpp-channel:mock、聚焦 Vitest（4 文件 108 项：session-target-channel.test.ts、cmsis-dap-helper-channel.test.ts、commander-cmsis-dap.test.ts、dap-session-rtt.test.ts）、npm run typecheck、npm run build 与 git diff --check 全部通过。
+- 硬件：未执行；3.1 仅涉及 CMSIS-DAP RTT 合法 RAM 范围与通道枚举，硬件传输门槛归 3.4。
+- 证据：native/cmsis-dap-helper/src/segger_rtt_test.cpp、scripts/cmsis-dap-smoke.js、out/rtos-stage3/acceptance-3.1/manual-enumerate-rpc.cjs、src/ozone-backend/session-target-channel.test.ts、src/ozone-backend/cmsis-dap-helper-channel.test.ts、src/ozone-backend/commander-cmsis-dap.test.ts、src/debug/dap-session-rtt.test.ts。
+- 独立复验覆盖原生构建、CMSIS-DAP 与 J-Link mock、五个聚焦 Vitest 文件的 121 项用例，以及原两个失败用例的复跑。下一小部分为 3.2（CMSIS-DAP Down-buffer 写入）。
+- 提交：`实现 RTOS 阶段 3.1：完善 RTT 内存范围与通道枚举`。

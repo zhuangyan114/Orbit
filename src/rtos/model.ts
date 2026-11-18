@@ -46,6 +46,8 @@ export interface RtosSnapshot extends SnapshotIdentity {
   reason?: string;
   kernel: { name: 'FreeRTOS'; version: Field<string>; source: string };
   tasks: TaskSnapshot[];
+  runtimeTotal: Field<string>;
+  runtimeTotalBits: Field<number>;
   issues: RtosIssue[];
   diagnostics: SnapshotDiagnostics;
 }

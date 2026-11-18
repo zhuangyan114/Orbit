@@ -9,6 +9,7 @@ export interface FreeRtosLayout {
   elfSha256: string; layoutId: string;
   source: string;
   current: number; taskCount: number; taskCountBytes: number;
+  runtimeTotal?: { address: number; size: number };
   lists: ListRoot[];
   list: { size: number; count: Member; end: Member; endNext: Member; endPrevious: Member };
   item: { size: number; next: Member; previous: Member; owner: Member; container: Member };
@@ -97,7 +98,11 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
   }
   const taskCountBytes = symbolByteSize(catalog, count.typeOffset);
   if (![1, 2, 4].includes(taskCountBytes) || count.size !== taskCountBytes) fail('LayoutIncomplete', 'Invalid task count');
+  const total = root('ulTotalRunTime', false);
+  const totalSize = total ? symbolByteSize(catalog, total.typeOffset) : 0;
+  if (total && ![4, 8].includes(totalSize)) fail('LayoutIncomplete', 'Invalid runtime total');
   const plan = { elfSha256, source: `DWARF:${current.file}:${tcbOffset}`, current: current.address!, taskCount: count.address!, taskCountBytes,
+    ...(total ? { runtimeTotal: { address: total.address!, size: totalSize } } : {}),
     lists, list, item, tcb: { size: tcbType.byteSize, typeOffset: tcbOffset, fields, nameBytes: fields.pcTaskName.size, stackWordBytes } };
   return { ...plan, layoutId: createHash('sha256').update(JSON.stringify(plan)).digest('hex') };
 }

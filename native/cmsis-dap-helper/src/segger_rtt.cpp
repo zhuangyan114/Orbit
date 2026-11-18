@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace cmsis_dap_helper {
@@ -36,6 +37,14 @@ const RttMemoryRange* findContainingRange(uint64_t address, uint64_t size,
 
 bool inRamRanges(uint64_t address, uint64_t size, const std::vector<RttMemoryRange>& ranges) {
   return findContainingRange(address, size, ranges) != nullptr;
+}
+
+bool rangesOverlap(uint32_t aAddress, uint32_t aSize, uint64_t bAddress, uint64_t bSize) {
+  if (aSize == 0 || bSize == 0) return false;
+  const uint64_t aStart = static_cast<uint64_t>(aAddress);
+  const uint64_t aEnd = aStart + static_cast<uint64_t>(aSize);
+  const uint64_t bEnd = bAddress + bSize;
+  return aStart < bEnd && bAddress < aEnd;
 }
 
 const RttMemoryRange* findNameRange(uint32_t address,
@@ -77,11 +86,44 @@ Result memoryReadFailure(const Result& result, const char* operation) {
 Result memoryWriteFailure(const Result& result) {
   if (result.errorCode == ErrorCodes::kWriteTimeout ||
       result.errorCode == ErrorCodes::kReadTimeout ||
+      result.errorCode == ErrorCodes::kWriteCompletedLate ||
+      result.errorCode == ErrorCodes::kOutcomeUnknown ||
+      result.errorCode == ErrorCodes::kMalformedResponse ||
       result.errorCode == ErrorCodes::kDeviceRemoved) {
     return result;
   }
   return Result::error(ErrorCodes::kRttMemoryWriteFailed,
                        "RTT RdOff write failed: " + result.errorCode + ": " + result.message);
+}
+
+bool isUnknownWriteOutcome(const std::string& errorCode) {
+  return errorCode == ErrorCodes::kWriteTimeout ||
+      errorCode == ErrorCodes::kReadTimeout ||
+      errorCode == ErrorCodes::kWriteCompletedLate ||
+      errorCode == ErrorCodes::kOutcomeUnknown ||
+      errorCode == ErrorCodes::kMalformedResponse ||
+      errorCode == ErrorCodes::kDeviceRemoved ||
+      errorCode == ErrorCodes::kDapAckNoAck;
+}
+
+Result downWriteFailure(const Result& result, const char* operation) {
+  if (result.errorCode == ErrorCodes::kWriteTimeout ||
+      result.errorCode == ErrorCodes::kReadTimeout ||
+      result.errorCode == ErrorCodes::kWriteCompletedLate ||
+      result.errorCode == ErrorCodes::kOutcomeUnknown ||
+      result.errorCode == ErrorCodes::kMalformedResponse ||
+      result.errorCode == ErrorCodes::kDeviceRemoved ||
+      result.errorCode == ErrorCodes::kDapAckNoAck ||
+      result.errorCode == ErrorCodes::kDapAckWait ||
+      result.errorCode == ErrorCodes::kDapAckFault) {
+    return result;
+  }
+  return Result::error(ErrorCodes::kRttMemoryWriteFailed,
+                       std::string(operation) + " failed: " + result.errorCode + ": " + result.message);
+}
+
+void defaultRttSleep(std::chrono::milliseconds duration) {
+  std::this_thread::sleep_for(duration);
 }
 
 struct CachedNameResult {
@@ -592,6 +634,307 @@ Result SeggerRttReader::enumerate(RttMemory& memory, uint32_t controlBlockAddres
 
   markDuplicateNames(output.upBuffers, output.duplicateUpNames);
   markDuplicateNames(output.downBuffers, output.duplicateDownNames);
+  return Result::success();
+}
+
+Result SeggerRttReader::writeDown(RttMemory& memory, uint32_t controlBlockAddress,
+                                  const std::vector<RttMemoryRange>& ramRanges,
+                                  uint32_t bufferIndex, const std::vector<uint8_t>& bytes,
+                                  RttWriteResult& output, DapTransferDiagnostics& diagnostics,
+                                  std::chrono::milliseconds timeout,
+                                  std::optional<std::chrono::steady_clock::time_point> startTime,
+                                  RttClockNow clockNow, RttSleepFn sleepFn) const {
+  output = RttWriteResult{};
+  output.controlBlockAddress = controlBlockAddress;
+  output.bufferIndex = bufferIndex;
+  output.requestedBytes = static_cast<uint32_t>(bytes.size());
+  output.completion = RttWriteCompletion::NotStarted;
+  output.failureStage = RttWriteFailureStage::Validation;
+  output.retryable = false;
+
+  const Result ramValid = validateMemoryRanges(ramRanges, false, "ramRanges");
+  if (!ramValid.ok) return ramValid;
+  if (controlBlockAddress == 0) {
+    return invalid(ErrorCodes::kRttInvalidControlBlock, "RTT Control Block address is invalid");
+  }
+  if (bytes.empty() || bytes.size() > kMaxReadBytes) {
+    return invalid(ErrorCodes::kDapInvalidRequest, "RTT write size is outside 1..65536");
+  }
+  if (timeout.count() <= 0) {
+    return invalid(ErrorCodes::kDapInvalidRequest, "RTT write timeoutMs must be positive");
+  }
+
+  const RttClockNow nowFn = clockNow ? clockNow : &std::chrono::steady_clock::now;
+  const RttSleepFn sleep = sleepFn ? sleepFn : &defaultRttSleep;
+  const auto started = startTime.value_or(nowFn());
+  const auto deadline = started + timeout;
+  auto deadlineReached = [&]() -> bool { return nowFn() >= deadline; };
+  auto completionOnKnown = [&]() -> RttWriteCompletion {
+    return output.committedBytes > 0 ? RttWriteCompletion::Partial : RttWriteCompletion::NotStarted;
+  };
+  auto failDeadline = [&](RttWriteFailureStage stage, const char* detail) -> Result {
+    output.failureStage = stage;
+    output.completion = completionOnKnown();
+    output.shortWrite = output.committedBytes > 0 && output.committedBytes < output.requestedBytes;
+    return Result::error(ErrorCodes::kWriteTimeout,
+                         std::string("RTT Down write exceeded ") + std::to_string(timeout.count()) +
+                             " ms deadline " + detail);
+  };
+
+  output.failureStage = RttWriteFailureStage::ControlBlock;
+  if (deadlineReached()) {
+    return failDeadline(RttWriteFailureStage::ControlBlock, "before control block read");
+  }
+
+  std::vector<uint8_t> header;
+  uint32_t maxUpBuffers = 0;
+  uint32_t maxDownBuffers = 0;
+  Result result = readControlBlock(memory, controlBlockAddress, ramRanges, header,
+                                   maxUpBuffers, maxDownBuffers, diagnostics);
+  if (!result.ok) {
+    output.completion = RttWriteCompletion::NotStarted;
+    return result;
+  }
+
+  output.failureStage = RttWriteFailureStage::Descriptor;
+  if (bufferIndex >= maxDownBuffers) {
+    return invalid(ErrorCodes::kRttInvalidBufferIndex, "RTT Down Buffer index is out of range");
+  }
+  const uint64_t cbTotalBytes = static_cast<uint64_t>(kControlHeaderSize) +
+      (static_cast<uint64_t>(maxUpBuffers) + static_cast<uint64_t>(maxDownBuffers)) * kBufferDescriptorSize;
+  const uint64_t descAddress = static_cast<uint64_t>(controlBlockAddress) + kControlHeaderSize +
+      (static_cast<uint64_t>(maxUpBuffers) + bufferIndex) * kBufferDescriptorSize;
+  if (!inRamRanges(descAddress, kBufferDescriptorSize, ramRanges)) {
+    return invalid(ErrorCodes::kRttInvalidBufferLayout,
+                   "RTT Down Buffer descriptor exceeds valid target RAM ranges");
+  }
+  output.descriptorAddress = static_cast<uint32_t>(descAddress);
+
+  auto readAndValidateDescriptor = [&](bool initial, uint32_t expectedWrOff,
+                                       RttWriteFailureStage stage) -> Result {
+    output.failureStage = stage;
+    if (deadlineReached()) {
+      return failDeadline(stage, "before descriptor read");
+    }
+    std::vector<uint8_t> descriptor;
+    const Result descRead = memory.read(output.descriptorAddress, kBufferDescriptorSize, descriptor, diagnostics);
+    if (!descRead.ok) {
+      output.completion = completionOnKnown();
+      return memoryReadFailure(descRead, "RTT Down Buffer descriptor read");
+    }
+    if (descriptor.size() != kBufferDescriptorSize) {
+      output.completion = completionOnKnown();
+      return invalid(ErrorCodes::kRttInvalidBufferLayout, "RTT Down Buffer descriptor response is short");
+    }
+    const uint32_t bufAddr = readLe32(descriptor, 4);
+    const uint32_t bufSize = readLe32(descriptor, 8);
+    const uint32_t wrOff = readLe32(descriptor, 12);
+    const uint32_t rdOff = readLe32(descriptor, 16);
+    const uint32_t flags = readLe32(descriptor, 20);
+    const uint32_t mode = flags & kRttModeMask;
+
+    if (initial) {
+      output.bufferAddress = bufAddr;
+      output.bufferSize = bufSize;
+      output.initialWrOff = wrOff;
+      output.initialRdOff = rdOff;
+      output.rdOff = rdOff;
+      output.committedWrOff = wrOff;
+      output.flags = flags;
+      output.mode = mode;
+    }
+
+    if (validateBufferFlags_ &&
+        ((flags & ~kRttModeMask) != 0 || mode > kRttModeBlockIfFifoFull)) {
+      output.completion = completionOnKnown();
+      return invalid(ErrorCodes::kRttInvalidBufferFlags,
+                     "RTT Down Buffer Flags contain an unknown mode or reserved bits"
+                     " flags=" + std::to_string(flags) +
+                         " mode=" + std::to_string(mode) +
+                         " bufferIndex=" + std::to_string(bufferIndex));
+    }
+    if (bufAddr == 0 || bufSize == 0 ||
+        !inRamRanges(bufAddr, bufSize, ramRanges) ||
+        wrOff >= bufSize || rdOff >= bufSize) {
+      output.completion = completionOnKnown();
+      return invalid(ErrorCodes::kRttInvalidBufferLayout,
+                     "RTT Down Buffer pointer, size, or offsets are invalid"
+                     " address=" + std::to_string(bufAddr) +
+                         " size=" + std::to_string(bufSize) +
+                         " wrOff=" + std::to_string(wrOff) +
+                         " rdOff=" + std::to_string(rdOff));
+    }
+    if (rangesOverlap(bufAddr, bufSize, static_cast<uint64_t>(controlBlockAddress), cbTotalBytes)) {
+      output.completion = completionOnKnown();
+      return invalid(ErrorCodes::kRttInvalidBufferLayout,
+                     "RTT Down Buffer range overlaps RTT Control Block"
+                     " address=" + std::to_string(bufAddr) +
+                         " size=" + std::to_string(bufSize) +
+                         " controlBlockAddress=" + std::to_string(controlBlockAddress) +
+                         " controlBlockBytes=" + std::to_string(cbTotalBytes));
+    }
+
+    if (!initial) {
+      if (bufAddr != output.bufferAddress || bufSize != output.bufferSize) {
+        output.completion = completionOnKnown();
+        return invalid(ErrorCodes::kRttInvalidBufferLayout,
+                       "RTT Down Buffer layout changed while waiting for space");
+      }
+      if (validateBufferFlags_ && flags != output.flags) {
+        output.completion = completionOnKnown();
+        return invalid(ErrorCodes::kRttInvalidBufferFlags,
+                       "RTT Down Buffer Flags changed while waiting for space");
+      }
+      if (wrOff != expectedWrOff) {
+        output.completion = completionOnKnown();
+        return invalid(ErrorCodes::kRttBufferOverrun,
+                       "RTT Down Buffer WrOff changed concurrently while waiting for space");
+      }
+      output.rdOff = rdOff;
+    }
+    return Result::success();
+  };
+
+  result = readAndValidateDescriptor(true, 0u, RttWriteFailureStage::Descriptor);
+  if (!result.ok) return result;
+
+  uint32_t currentWrOff = output.initialWrOff;
+  uint32_t offset = 0;
+  const uint32_t totalBytes = static_cast<uint32_t>(bytes.size());
+
+  while (offset < totalBytes) {
+    if (offset > 0) {
+      result = readAndValidateDescriptor(false, currentWrOff, RttWriteFailureStage::PollWait);
+      if (!result.ok) return result;
+    }
+
+    const uint32_t avail = output.rdOff <= currentWrOff
+        ? (output.bufferSize - 1u - currentWrOff + output.rdOff)
+        : (output.rdOff - currentWrOff - 1u);
+    output.availableSpace = avail;
+
+    uint32_t chunkSize = 0;
+    if (output.mode == 0u) {
+      if (avail < totalBytes) {
+        output.shortWrite = true;
+        output.skipped = true;
+        output.completion = RttWriteCompletion::NotStarted;
+        output.failureStage = RttWriteFailureStage::None;
+        return Result::success();
+      }
+      chunkSize = totalBytes;
+    } else if (output.mode == 1u) {
+      chunkSize = std::min(avail, totalBytes);
+      if (chunkSize < totalBytes) {
+        output.shortWrite = true;
+      }
+      if (chunkSize == 0u) {
+        output.completion = RttWriteCompletion::NotStarted;
+        output.failureStage = RttWriteFailureStage::None;
+        return Result::success();
+      }
+    } else {
+      // Mode 2: SEGGER_RTT_MODE_BLOCK_IF_FIFO_FULL
+      if (avail == 0u) {
+        if (deadlineReached()) {
+          return failDeadline(RttWriteFailureStage::PollWait, "while waiting for Down buffer space");
+        }
+        const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - nowFn());
+        const auto waitMs = std::max(std::chrono::milliseconds(1),
+                                     std::min(std::chrono::milliseconds(1), rem));
+        sleep(waitMs);
+        if (deadlineReached()) {
+          return failDeadline(RttWriteFailureStage::PollWait, "after wait for Down buffer space");
+        }
+        result = readAndValidateDescriptor(false, currentWrOff, RttWriteFailureStage::PollWait);
+        if (!result.ok) return result;
+        continue;
+      }
+      chunkSize = std::min(avail, totalBytes - offset);
+    }
+
+    output.firstSegmentWritten = false;
+    output.secondSegmentWritten = false;
+    output.wrOffWriteAttempted = false;
+    output.wrOffCommitted = false;
+
+    const uint32_t tail = output.bufferSize - currentWrOff;
+    const uint32_t firstSize = std::min(chunkSize, tail);
+    const uint32_t secondSize = chunkSize - firstSize;
+    if (secondSize > 0u) {
+      output.wrapped = true;
+    }
+
+    // Commit order invariant: write valid ring data BEFORE publishing WrOff;
+    // never touch target-owned RdOff. Never blindly retry a failed write.
+    output.failureStage = RttWriteFailureStage::DataFirst;
+    if (deadlineReached()) {
+      return failDeadline(RttWriteFailureStage::DataFirst, "before data segment 1 write");
+    }
+    std::vector<uint8_t> first(bytes.begin() + offset, bytes.begin() + offset + firstSize);
+    Result writeRes = memory.write(output.bufferAddress + currentWrOff, first, diagnostics);
+    if (!writeRes.ok) {
+      const Result mapped = downWriteFailure(writeRes, "RTT Down data segment 1 write");
+      output.completion = isUnknownWriteOutcome(mapped.errorCode)
+          ? RttWriteCompletion::Unknown
+          : completionOnKnown();
+      output.shortWrite = output.committedBytes > 0 && output.committedBytes < totalBytes;
+      return mapped;
+    }
+    output.firstSegmentWritten = true;
+    output.writtenBytes += firstSize;
+
+    if (secondSize > 0u) {
+      output.failureStage = RttWriteFailureStage::DataSecond;
+      if (deadlineReached()) {
+        return failDeadline(RttWriteFailureStage::DataSecond, "before data segment 2 write");
+      }
+      std::vector<uint8_t> second(bytes.begin() + offset + firstSize,
+                                  bytes.begin() + offset + chunkSize);
+      writeRes = memory.write(output.bufferAddress, second, diagnostics);
+      if (!writeRes.ok) {
+        const Result mapped = downWriteFailure(writeRes, "RTT Down data segment 2 write");
+        output.completion = isUnknownWriteOutcome(mapped.errorCode)
+            ? RttWriteCompletion::Unknown
+            : completionOnKnown();
+        output.shortWrite = output.committedBytes > 0 && output.committedBytes < totalBytes;
+        return mapped;
+      }
+      output.secondSegmentWritten = true;
+      output.writtenBytes += secondSize;
+    }
+
+    output.failureStage = RttWriteFailureStage::CommitWrOff;
+    if (deadlineReached()) {
+      return failDeadline(RttWriteFailureStage::CommitWrOff, "before WrOff commit");
+    }
+    const uint32_t nextWrOff = (currentWrOff + chunkSize) % output.bufferSize;
+    output.wrOffWriteAttempted = true;
+    writeRes = memory.write(output.descriptorAddress + 12u, le32(nextWrOff), diagnostics);
+    if (!writeRes.ok) {
+      const Result mapped = downWriteFailure(writeRes, "RTT Down WrOff commit");
+      output.completion = isUnknownWriteOutcome(mapped.errorCode)
+          ? RttWriteCompletion::Unknown
+          : completionOnKnown();
+      output.shortWrite = output.committedBytes > 0 && output.committedBytes < totalBytes;
+      return mapped;
+    }
+
+    output.wrOffCommitted = true;
+    currentWrOff = nextWrOff;
+    output.committedWrOff = nextWrOff;
+    output.committedBytes += chunkSize;
+    offset += chunkSize;
+
+    if (output.mode != kRttModeBlockIfFifoFull) {
+      break;
+    }
+  }
+
+  output.failureStage = RttWriteFailureStage::None;
+  output.completion = (output.committedBytes == totalBytes)
+      ? RttWriteCompletion::Completed
+      : RttWriteCompletion::Partial;
   return Result::success();
 }
 

@@ -300,4 +300,53 @@ describe('CMSIS-DAP helper control critical section', () => {
 
     expect(order).toEqual(['readRtt', 'halt', 'enumerateRtt', 'readMemoryBlock']);
   });
+
+  it('runs writeRtt at control priority and pauses watch, timeline, and RTT background reads', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const order: string[] = [];
+    const pausedDuringWrite: string[][] = [];
+    let releaseFirst!: () => void;
+    const firstReleased = new Promise<void>(resolve => { releaseFirst = resolve; });
+    (helper as any).sendRequest = vi.fn(async (method: string) => {
+      order.push(method);
+      if (method === 'writeRtt') {
+        pausedDuringWrite.push([...helper.getSchedulerSnapshot().pausedPriorities]);
+      }
+      if (method === 'readRtt') await firstReleased;
+      return { ok: true, message: method, targetState: 'Running', elapsedMs: 0, data: {} };
+    });
+
+    const runningBackground = helper.request('readRtt');
+    const watch = helper.request('readMemory');
+    const timeline = helper.request('readMemoryBlock', {}, { priority: 'timeline' });
+    const downWrite = helper.controlRequest('writeRtt', { bufferIndex: 0, bytes: [1, 2], timeoutMs: 200 });
+    await Promise.resolve();
+    releaseFirst();
+    await Promise.all([runningBackground, watch, timeline, downWrite]);
+
+    expect(order).toEqual(['readRtt', 'writeRtt', 'readMemory', 'readMemoryBlock']);
+    expect(pausedDuringWrite).toEqual([['watch', 'timeline', 'background']]);
+    expect(helper.getSchedulerSnapshot().pausedPriorities).toEqual([]);
+  });
+
+  it('schedules direct writeRtt requests at control priority', async () => {
+    const helper = new CmsisDapHelperClient('unused-helper-path');
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstReleased = new Promise<void>(resolve => { releaseFirst = resolve; });
+    (helper as any).sendRequest = vi.fn(async (method: string) => {
+      order.push(method);
+      if (method === 'readRtt') await firstReleased;
+      return { ok: true, message: method, targetState: 'Running', elapsedMs: 0, data: {} };
+    });
+
+    const runningBackground = helper.request('readRtt');
+    const watch = helper.request('readMemory');
+    const downWrite = helper.request('writeRtt', { bufferIndex: 0, bytes: [1] });
+    await Promise.resolve();
+    releaseFirst();
+    await Promise.all([runningBackground, watch, downWrite]);
+
+    expect(order).toEqual(['readRtt', 'writeRtt', 'readMemory']);
+  });
 });

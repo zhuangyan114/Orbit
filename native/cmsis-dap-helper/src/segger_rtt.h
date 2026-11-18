@@ -12,6 +12,7 @@
 namespace cmsis_dap_helper {
 
 using RttClockNow = std::chrono::steady_clock::time_point (*)();
+using RttSleepFn = void (*)(std::chrono::milliseconds);
 
 class RttMemory {
  public:
@@ -105,6 +106,52 @@ struct RttReadResult {
   bool writerAdvanced = false;
 };
 
+enum class RttWriteCompletion {
+  NotStarted,
+  Partial,
+  Completed,
+  Unknown,
+};
+
+enum class RttWriteFailureStage {
+  None,
+  Validation,
+  ControlBlock,
+  Descriptor,
+  DataFirst,
+  DataSecond,
+  CommitWrOff,
+  PollWait,
+};
+
+struct RttWriteResult {
+  uint32_t controlBlockAddress = 0;
+  uint32_t bufferIndex = 0;
+  uint32_t descriptorAddress = 0;
+  uint32_t bufferAddress = 0;
+  uint32_t bufferSize = 0;
+  uint32_t initialWrOff = 0;
+  uint32_t initialRdOff = 0;
+  uint32_t rdOff = 0;
+  uint32_t committedWrOff = 0;
+  uint32_t flags = 0;
+  uint32_t mode = 0;
+  uint32_t availableSpace = 0;
+  uint32_t requestedBytes = 0;
+  uint32_t writtenBytes = 0;
+  uint32_t committedBytes = 0;
+  bool wrapped = false;
+  bool shortWrite = false;
+  bool skipped = false;
+  bool firstSegmentWritten = false;
+  bool secondSegmentWritten = false;
+  bool wrOffWriteAttempted = false;
+  bool wrOffCommitted = false;
+  RttWriteCompletion completion = RttWriteCompletion::NotStarted;
+  RttWriteFailureStage failureStage = RttWriteFailureStage::None;
+  bool retryable = false;
+};
+
 class SeggerRttReader {
  public:
   explicit SeggerRttReader(bool validateBufferFlags = true)
@@ -130,6 +177,14 @@ class SeggerRttReader {
                    std::chrono::milliseconds timeout = std::chrono::milliseconds(2000),
                    std::optional<std::chrono::steady_clock::time_point> startTime = std::nullopt,
                    RttClockNow clockNow = nullptr) const;
+  Result writeDown(RttMemory& memory, uint32_t controlBlockAddress,
+                   const std::vector<RttMemoryRange>& ramRanges,
+                   uint32_t bufferIndex, const std::vector<uint8_t>& bytes,
+                   RttWriteResult& output, DapTransferDiagnostics& diagnostics,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds(2000),
+                   std::optional<std::chrono::steady_clock::time_point> startTime = std::nullopt,
+                   RttClockNow clockNow = nullptr,
+                   RttSleepFn sleepFn = nullptr) const;
 
   bool started() const { return started_; }
   uint32_t controlBlockAddress() const { return controlBlockAddress_; }

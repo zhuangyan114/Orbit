@@ -630,6 +630,41 @@ case 'readVariableRuntime':
             diagnostics: result.diagnostics,
           };
         }
+        case 'writeRtt': {
+          if (!this.sessionTarget?.writeRtt) {
+            const ownerKind = this.sessionTarget
+              ? ('ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind)
+              : 'none';
+            return {
+              ok: false,
+              errorCode: 'UnsupportedCapability',
+              error: 'UnsupportedCapability: selected target owner does not support RTT down-buffer writes',
+              diagnostics: { ownerKind, capability: 'writeRtt' },
+            };
+          }
+          const bytes = command.bytes instanceof Uint8Array
+            ? command.bytes
+            : Array.isArray(command.bytes) && command.bytes.every(b => Number.isInteger(b) && b >= 0 && b <= 255)
+              ? Uint8Array.from(command.bytes)
+              : null;
+          if (!bytes) {
+            return {
+              ok: false,
+              errorCode: 'DapInvalidRequest',
+              error: 'DapInvalidRequest: writeRtt bytes must be a Uint8Array or uint8 array',
+            };
+          }
+          const result = await this.sessionTarget.writeRtt(command.bufferIndex, bytes, command.options);
+          if (!result.ok) return this.sessionOwnerFailure(result, 'RttWriteFailed');
+          return {
+            ok: true,
+            data: result.data,
+            message: result.message,
+            targetState: result.targetState,
+            elapsedMs: result.elapsedMs,
+            diagnostics: result.diagnostics,
+          };
+        }
         case 'loadSymbols':
     if (this.elfPath === command.elfPath && this.symbols.length > 0) {
       return { ok: true, data: `Already loaded ${this.symbols.length} symbols` };

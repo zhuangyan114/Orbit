@@ -330,7 +330,7 @@ std::string handleHello(const JsonValue& params) {
       "\"dapDisconnect\",\"dapTransfer\",\"dapTransferBlock\",\"swDp\",\"memAp\","
       "\"readMemory\",\"readMemoryBatch\",\"readMemoryBlock\",\"writeMemory\",\"flashAlgorithm\",\"getState\",\"halt\",\"run\","
       "\"reset\",\"stepInstruction\",\"readRegister\",\"hardwareBreakpoints\",\"runToAddress\","
-       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\",\"rttEnumerate\",\"tcpTransport\","
+       "\"stepIntoSourceLine\",\"stepOverSourceLine\",\"stepOut\",\"rtt\",\"rttEnumerate\",\"rttWrite\",\"tcpTransport\","
        "\"xrDapSampling\"]}";
   const long long elapsedMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -1544,6 +1544,146 @@ std::string handleReadRtt(const JsonValue& params, Channel& channel) {
   return resultJson(true, output.bytes.empty() ? "RTT empty read" : "RTT read",
                     channel.state(), elapsedMs, rttReadDataJson(output), "",
                     rttDiagnosticsJson(diagnostics, channel.packetSize, &output, extra));
+}
+
+const char* rttWriteCompletionString(RttWriteCompletion completion) {
+  switch (completion) {
+    case RttWriteCompletion::NotStarted: return "not-started";
+    case RttWriteCompletion::Partial: return "partial";
+    case RttWriteCompletion::Completed: return "completed";
+    case RttWriteCompletion::Unknown: return "unknown";
+  }
+  return "unknown";
+}
+
+const char* rttWriteFailureStageString(RttWriteFailureStage stage) {
+  switch (stage) {
+    case RttWriteFailureStage::None: return "none";
+    case RttWriteFailureStage::Validation: return "validation";
+    case RttWriteFailureStage::ControlBlock: return "control-block";
+    case RttWriteFailureStage::Descriptor: return "descriptor";
+    case RttWriteFailureStage::DataFirst: return "data-first";
+    case RttWriteFailureStage::DataSecond: return "data-second";
+    case RttWriteFailureStage::CommitWrOff: return "commit-wroff";
+    case RttWriteFailureStage::PollWait: return "poll-wait";
+  }
+  return "validation";
+}
+
+std::string rttWriteDataJson(const RttWriteResult& output) {
+  return "{\"controlBlockAddress\":" + std::to_string(output.controlBlockAddress) +
+      ",\"bufferIndex\":" + std::to_string(output.bufferIndex) +
+      ",\"descriptorAddress\":" + std::to_string(output.descriptorAddress) +
+      ",\"bufferAddress\":" + std::to_string(output.bufferAddress) +
+      ",\"bufferSize\":" + std::to_string(output.bufferSize) +
+      ",\"initialWrOff\":" + std::to_string(output.initialWrOff) +
+      ",\"initialRdOff\":" + std::to_string(output.initialRdOff) +
+      ",\"rdOff\":" + std::to_string(output.rdOff) +
+      ",\"committedWrOff\":" + std::to_string(output.committedWrOff) +
+      ",\"flags\":" + std::to_string(output.flags) +
+      ",\"mode\":" + std::to_string(output.mode) +
+      ",\"availableSpace\":" + std::to_string(output.availableSpace) +
+      ",\"requestedBytes\":" + std::to_string(output.requestedBytes) +
+      ",\"writtenBytes\":" + std::to_string(output.writtenBytes) +
+      ",\"committedBytes\":" + std::to_string(output.committedBytes) +
+      ",\"wrapped\":" + std::string(output.wrapped ? "true" : "false") +
+      ",\"shortWrite\":" + std::string(output.shortWrite ? "true" : "false") +
+      ",\"skipped\":" + std::string(output.skipped ? "true" : "false") +
+      ",\"firstSegmentWritten\":" + std::string(output.firstSegmentWritten ? "true" : "false") +
+      ",\"secondSegmentWritten\":" + std::string(output.secondSegmentWritten ? "true" : "false") +
+      ",\"wrOffWriteAttempted\":" + std::string(output.wrOffWriteAttempted ? "true" : "false") +
+      ",\"wrOffCommitted\":" + std::string(output.wrOffCommitted ? "true" : "false") +
+      ",\"completion\":\"" + rttWriteCompletionString(output.completion) + "\"" +
+      ",\"failureStage\":\"" + rttWriteFailureStageString(output.failureStage) + "\"" +
+      ",\"retryable\":" + std::string(output.retryable ? "true" : "false") + "}";
+}
+
+std::string rttWriteDiagnosticsJson(const DapTransferDiagnostics& diagnostics, uint16_t packetSize,
+                                    const RttWriteResult& output, const std::string& extra) {
+  std::string json = targetDiagnosticsJson(diagnostics, packetSize);
+  json.pop_back();
+  json += ",\"rtt\":" + rttWriteDataJson(output);
+  if (!extra.empty()) json += "," + extra;
+  json += "}";
+  return json;
+}
+
+std::string handleWriteRtt(const JsonValue& params, Channel& channel) {
+  const auto started = std::chrono::steady_clock::now();
+  const Result ready = channel.ensureReady();
+  if (!ready.ok) {
+    return resultJson(false, ready.message, channel.state(), 0, "{}", ready.errorCode,
+                      "{\"operation\":\"writeRtt\"}");
+  }
+  const auto timeout = controlTimeoutMs(params);
+  if (!timeout) {
+    return resultJson(false, "writeRtt timeoutMs must be an integer in 1..10000", channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"writeRtt\"}");
+  }
+  const JsonValue* addressRaw = params.get("controlBlockAddress");
+  uint32_t controlBlockAddress = 0;
+  if (addressRaw) {
+    const auto addressOpt = uintField(params, "controlBlockAddress");
+    if (!addressOpt || *addressOpt == 0 || *addressOpt > 0xFFFFFFFFull) {
+      return resultJson(false, "writeRtt controlBlockAddress must be a positive uint32", channel.state(), 0, "{}",
+                        ErrorCodes::kDapInvalidRequest, "{\"operation\":\"writeRtt\"}");
+    }
+    controlBlockAddress = static_cast<uint32_t>(*addressOpt);
+  } else if (channel.rttReader.started()) {
+    controlBlockAddress = channel.rttReader.controlBlockAddress();
+  } else {
+    return resultJson(false, "writeRtt requires controlBlockAddress when RTT is not started",
+                      channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
+                      "{\"operation\":\"writeRtt\"}");
+  }
+
+  const auto bufferIndex = uintField(params, "bufferIndex");
+  const auto bytes = byteArrayField(params, "bytes", kMaxMemoryWriteBytes);
+  if (!bufferIndex || *bufferIndex > 0xFFFFFFFFull || !bytes || bytes->empty()) {
+    return resultJson(false,
+                      "writeRtt requires uint32 bufferIndex and bytes in 1.." +
+                          std::to_string(kMaxMemoryWriteBytes),
+                      channel.state(), 0, "{}", ErrorCodes::kDapInvalidRequest,
+                      "{\"operation\":\"writeRtt\"}");
+  }
+
+  bool ramRangesPresent = false;
+  std::vector<RttMemoryRange> ramRanges;
+  std::string rangeError;
+  if (!parseRttMemoryRangesField(params, "ramRanges", false, ramRangesPresent, ramRanges, rangeError)) {
+    return resultJson(false, rangeError, channel.state(), 0, "{}",
+                      ErrorCodes::kDapInvalidRequest, "{\"operation\":\"writeRtt\"}");
+  }
+  if (!ramRangesPresent) {
+    ramRanges = (channel.rttReader.started() && controlBlockAddress == channel.rttReader.controlBlockAddress())
+        ? channel.rttReader.ramRanges()
+        : SeggerRttReader::defaultSramRanges();
+  }
+
+  const auto timeoutDuration = std::chrono::milliseconds(*timeout);
+  CmsisDapProtocol protocol(channel.transport.get());
+  protocol.setEffectivePacketSize(channel.packetSize);
+  CmsisDapTarget target(&protocol, channel.packetSize);
+  CmsisDapRttMemory memory(target, started + timeoutDuration);
+  DapTransferDiagnostics diagnostics;
+  RttWriteResult output;
+  const Result result = channel.rttReader.writeDown(
+      memory, controlBlockAddress, ramRanges, static_cast<uint32_t>(*bufferIndex), *bytes,
+      output, diagnostics, timeoutDuration, started);
+  const long long elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  const std::string extra = "\"operation\":\"writeRtt\",\"controlBlockAddress\":" +
+      std::to_string(controlBlockAddress) + ",\"bufferIndex\":" + std::to_string(*bufferIndex);
+  if (!result.ok) {
+    return resultJson(false, result.message, channel.state(), elapsedMs, "{}",
+                      result.errorCode, rttWriteDiagnosticsJson(diagnostics, channel.packetSize, output, extra));
+  }
+  const std::string message = output.skipped
+      ? "RTT down write skipped (insufficient space)"
+      : (output.shortWrite ? "RTT down short write committed" : "RTT down write committed");
+  return resultJson(true, message, channel.state(), elapsedMs,
+                    rttWriteDataJson(output), "",
+                    rttWriteDiagnosticsJson(diagnostics, channel.packetSize, output, extra));
 }
 
 // ---------------------------------------------------------------------------
@@ -2971,6 +3111,8 @@ std::string dispatch(const JsonValue& request, Channel& channel) {
     result = handleStopRtt(channel);
   } else if (name == "readRtt") {
     result = handleReadRtt(*params, channel);
+  } else if (name == "writeRtt") {
+    result = handleWriteRtt(*params, channel);
   } else if (name == "flashAlgorithm") {
     result = handleFlashAlgorithm(*params, channel);
   } else if (name == "getState") {
@@ -5684,8 +5826,115 @@ int runSelfTest() {
            "xr-sampling-stops-on-disconnect");
   }
 
+  // --- RTT Stage 3.2: Down-buffer write through CmsisDapTarget + MockCmsisDapTransport
+  // and non-retryable unknown-completion handling. ---
+  {
+    MockCmsisDapTransport mock;
+    expect(openMock("1234", "5678", mock), "rtt32-open-mock");
+    CmsisDapProtocol protocol(&mock);
+    CmsisDapTarget target(&protocol, 64);
+    DapTransferDiagnostics diag;
+
+    const uint32_t cb = 0x20000100u;
+    const uint32_t upBuf = 0x20001000u;
+    const uint32_t downBuf = 0x20002000u;
+    const uint32_t downName = 0x20000800u;
+    std::vector<uint8_t> table(24 + 24 * 2, 0);
+    const char magic[] = "SEGGER RTT";
+    std::copy(magic, magic + 10, table.begin());
+    auto putLe32 = [&](size_t off, uint32_t v) {
+      table[off] = static_cast<uint8_t>(v & 0xFFu);
+      table[off + 1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+      table[off + 2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+      table[off + 3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+    };
+    putLe32(16, 1);
+    putLe32(20, 1);
+    // Up[0]
+    putLe32(24 + 4, upBuf);
+    putLe32(24 + 8, 16);
+    // Down[0]: size 8, wrOff=6, rdOff=3, mode=0 (4 bytes free: slots 6,7,0,1; slot 2 sentinel)
+    putLe32(48 + 0, downName);
+    putLe32(48 + 4, downBuf);
+    putLe32(48 + 8, 8);
+    putLe32(48 + 12, 6);
+    putLe32(48 + 16, 3);
+    putLe32(48 + 20, 0);
+    expect(target.writeMemory(downName, {'S', 'y', 's', 'V', 'i', 'e', 'w', 0}, diag).ok &&
+               target.writeMemory(cb, table, diag).ok &&
+               target.writeMemory(downBuf, {0, 0, 0xEE, 0xCC, 0xDD, 0xAA, 0, 0}, diag).ok,
+           "rtt32-setup-mock-ram");
+
+    SeggerRttReader reader;
+    const std::vector<RttMemoryRange> ramRanges = {{0x20000000u, 0x20000u}};
+    CmsisDapRttMemory rttMem(target, std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+    RttWriteResult writeOut;
+    DapTransferDiagnostics writeDiag;
+    const Result wrapped = reader.writeDown(
+        rttMem, cb, ramRanges, 0, {0x11, 0x22, 0x33, 0x44}, writeOut, writeDiag,
+        std::chrono::milliseconds(500));
+    std::vector<uint8_t> ringReadback;
+    std::vector<uint8_t> descReadback;
+    expect(wrapped.ok && writeOut.wrapped && !writeOut.shortWrite &&
+               writeOut.committedBytes == 4 && writeOut.committedWrOff == 2 &&
+               writeOut.rdOff == 3 && writeOut.wrOffCommitted &&
+               writeOut.completion == RttWriteCompletion::Completed &&
+               target.readMemory(downBuf, 8, ringReadback, diag).ok &&
+               ringReadback == std::vector<uint8_t>({0x33, 0x44, 0xEE, 0xCC, 0xDD, 0xAA, 0x11, 0x22}) &&
+               target.readMemory(cb + 48, 24, descReadback, diag).ok &&
+               readLe32Local(descReadback, 12) == 2 &&
+               readLe32Local(descReadback, 16) == 3,
+           "rtt32-wrapped-unaligned-write-and-preserves-rdoff");
+
+    // Verify unknown-outcome error during WrOff commit is never retried and reports Unknown.
+    class FailWrOffMemory final : public RttMemory {
+     public:
+      FailWrOffMemory(RttMemory& inner, uint32_t wrOffAddr, Result failResult)
+          : inner_(inner), wrOffAddr_(wrOffAddr), failResult_(std::move(failResult)) {}
+      Result read(uint32_t address, uint32_t size, std::vector<uint8_t>& bytes,
+                  DapTransferDiagnostics& d) override {
+        return inner_.read(address, size, bytes, d);
+      }
+      Result write(uint32_t address, const std::vector<uint8_t>& bytes,
+                   DapTransferDiagnostics& d) override {
+        if (address == wrOffAddr_) {
+          ++wrOffAttempts;
+          return failResult_;
+        }
+        return inner_.write(address, bytes, d);
+      }
+      uint32_t wrOffAttempts = 0;
+
+     private:
+      RttMemory& inner_;
+      uint32_t wrOffAddr_;
+      Result failResult_;
+    };
+    // Advance target-side RdOff from 3 -> 4 so 1 byte of space is free before testing WrOff failure.
+    expect(target.writeMemory(cb + 48 + 16, {4, 0, 0, 0}, diag).ok, "rtt32-advance-rdoff");
+    FailWrOffMemory lateMem(
+        rttMem, cb + 48 + 12,
+        Result::error(ErrorCodes::kWriteCompletedLate, "late HID write"));
+    RttWriteResult lateOut;
+    DapTransferDiagnostics lateDiag;
+    const Result lateRes = reader.writeDown(
+        lateMem, cb, ramRanges, 0, {0x55}, lateOut, lateDiag,
+        std::chrono::milliseconds(500));
+    expect(!lateRes.ok && lateRes.errorCode == ErrorCodes::kWriteCompletedLate &&
+               lateMem.wrOffAttempts == 1 &&
+               lateOut.firstSegmentWritten && lateOut.wrOffWriteAttempted &&
+               !lateOut.wrOffCommitted && lateOut.committedBytes == 0 &&
+               lateOut.committedWrOff == 2 &&
+               lateOut.failureStage == RttWriteFailureStage::CommitWrOff &&
+               lateOut.completion == RttWriteCompletion::Unknown &&
+               !lateOut.retryable,
+           "rtt32-unknown-wroff-outcome-no-retry");
+    expect(xrSamplingRoute("writeRtt") == XrSamplingRoute::Suspend,
+           "rtt32-xr-route-suspends");
+  }
+
   std::cout << "{\"selftest\":\"" << (failures == 0 ? "ok" : "fail")
-            << "\",\"cases\":" << 204 << ",\"failures\":" << failures << "}\n"
+            << "\",\"cases\":" << 209 << ",\"failures\":" << failures << "}\n"
             << std::flush;
   return failures == 0 ? 0 : 1;
 }

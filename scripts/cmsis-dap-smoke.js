@@ -154,7 +154,8 @@ async function runMockMatrix() {
     && hello.data.capabilities.includes('readMemoryBatch')
     && hello.data.capabilities.includes('readMemoryBlock')
     && hello.data.capabilities.includes('rtt')
-    && hello.data.capabilities.includes('rttEnumerate'), JSON.stringify(hello.data.capabilities));
+    && hello.data.capabilities.includes('rttEnumerate')
+    && hello.data.capabilities.includes('rttWrite'), JSON.stringify(hello.data.capabilities));
 
   const enumAll = await request('enumDevices', { transport: 'mock' });
   check('enumDevices: all', enumAll.ok && enumAll.data.devices.length === 26,
@@ -1692,6 +1693,207 @@ async function runRttStage31Matrix() {
   await closeDevice('rtt31-f103');
 }
 
+async function runRttStage32Matrix() {
+  // 1. H723 AXI SRAM (0x24000000): linear, wrapped, Mode 0 skip, Mode 1 trim,
+  //    Mode 2 WriteTimeout, invalid fields, and coexistence with RTT Log (startRtt/readRtt).
+  await openAndInfo('1234', '5690', 'rtt32-h723');
+  const h7Connect = await request('connect', { port: 'SWD' });
+  check('rtt32-h723: connect', h7Connect.ok, JSON.stringify(h7Connect));
+  if (h7Connect.ok) {
+    await request('halt', { timeoutMs: 100 });
+    const h7RamRanges = [{ address: 0x24000000, size: 320 * 1024 }];
+    const cb = 0x24000100;
+    const up0Buf = 0x24001000;
+    const down0Buf = 0x24002000;  // Mode 0 SKIP, size 8
+    const down1Buf = 0x24002100;  // Mode 1 TRIM, size 8
+    const down2Buf = 0x24002200;  // Mode 2 BLOCK, size 8
+    const downDesc0 = cb + 24 * 2;
+    const downDesc1 = cb + 24 * 3;
+    const downDesc2 = cb + 24 * 4;
+
+    await request('writeMemory', { address: up0Buf, bytes: [0x48, 0x49, 0x21] });
+    await request('writeMemory', { address: down0Buf, bytes: [0x00, 0x00, 0xEE, 0xCC, 0xDD, 0xAA, 0x00, 0x00] });
+    await request('writeMemory', { address: down1Buf, bytes: new Array(8).fill(0x55) });
+    await request('writeMemory', { address: down2Buf, bytes: new Array(8).fill(0x77) });
+    await request('writeMemory', { address: cb, bytes: [
+      ...rttHeaderBytes(1, 3),
+      ...rttDescriptorBytes(0, up0Buf, 16, 3, 0, 0),    // Up[0]: "HI!"
+      ...rttDescriptorBytes(0, down0Buf, 8, 6, 3, 0),   // Down[0]: Mode 0 SKIP, avail=4 (6,7,0,1; slot 2 sentinel)
+      ...rttDescriptorBytes(0, down1Buf, 8, 6, 2, 1),   // Down[1]: Mode 1 TRIM, avail=3 (6,7,0; slot 1 sentinel)
+      ...rttDescriptorBytes(0, down2Buf, 8, 7, 0, 2),   // Down[2]: Mode 2 BLOCK, full (avail=0)
+    ] });
+
+    // Start RTT Log on Up[0] first, then write Down[0] omitting controlBlockAddress/ramRanges
+    const started = await request('startRtt', { controlBlockAddress: cb, ramRanges: h7RamRanges });
+    check('rtt32-h723: startRtt for RTT Log coexistence', started.ok, JSON.stringify(started));
+
+    const skipFull = await request('writeRtt', {
+      bufferIndex: 0,
+      bytes: [1, 2, 3, 4, 5],
+    });
+    check('rtt32-h723: Mode 0 skip when insufficient space leaves WrOff untouched',
+      skipFull.ok && skipFull.data.shortWrite === true && skipFull.data.skipped === true
+      && skipFull.data.committedBytes === 0 && skipFull.data.committedWrOff === 6
+      && skipFull.data.completion === 'not-started',
+    JSON.stringify(skipFull));
+
+    const wrapOk = await request('writeRtt', {
+      bufferIndex: 0,
+      bytes: [0x11, 0x22, 0x33, 0x44],
+    });
+    const down0Mem = await request('readMemory', { address: down0Buf, size: 8 });
+    const down0Desc = await request('readMemory', { address: downDesc0, size: 24 });
+    check('rtt32-h723: wrapped write commits WrOff=2 and preserves RdOff=3',
+      wrapOk.ok && wrapOk.data.wrapped === true && wrapOk.data.shortWrite === false
+      && wrapOk.data.committedBytes === 4 && wrapOk.data.committedWrOff === 2
+      && wrapOk.data.rdOff === 3 && wrapOk.data.wrOffCommitted === true
+      && wrapOk.data.completion === 'completed'
+      && down0Mem.ok && down0Mem.data.bytes.join(',') === [0x33, 0x44, 0xEE, 0xCC, 0xDD, 0xAA, 0x11, 0x22].join(',')
+      && down0Desc.ok && down0Desc.data.bytes[12] === 2 && down0Desc.data.bytes[16] === 3,
+    JSON.stringify({ wrapOk, down0Mem, down0Desc }));
+
+    // Verify RTT Log Up[0] still reads intact after Down[0] write
+    const readUp = await request('readRtt', { bufferIndex: 0, size: 16 });
+    check('rtt32-h723: existing RTT Log readRtt unaffected by writeRtt',
+      readUp.ok && readUp.data.bytes.join(',') === '72,73,33' && readUp.data.committedRdOff === 3,
+    JSON.stringify(readUp));
+
+    // Mode 1 TRIM short write with wrap-around
+    const trimShort = await request('writeRtt', {
+      controlBlockAddress: cb,
+      ramRanges: h7RamRanges,
+      bufferIndex: 1,
+      bytes: [0xA1, 0xA2, 0xA3, 0xA4, 0xA5],
+    });
+    const down1Mem = await request('readMemory', { address: down1Buf, size: 8 });
+    const down1Desc = await request('readMemory', { address: downDesc1, size: 24 });
+    check('rtt32-h723: Mode 1 trim determinable short write wrapped',
+      trimShort.ok && trimShort.data.shortWrite === true && trimShort.data.skipped === false
+      && trimShort.data.wrapped === true && trimShort.data.committedBytes === 3
+      && trimShort.data.committedWrOff === 1 && trimShort.data.completion === 'partial'
+      && down1Mem.ok && down1Mem.data.bytes.join(',') === [0xA3, 0x55, 0x55, 0x55, 0x55, 0x55, 0xA1, 0xA2].join(',')
+      && down1Desc.ok && down1Desc.data.bytes[12] === 1 && down1Desc.data.bytes[16] === 2,
+    JSON.stringify({ trimShort, down1Mem, down1Desc }));
+
+    // Mode 2 BLOCK bounded WriteTimeout on full Down[2]
+    const blockTimeout = await request('writeRtt', {
+      controlBlockAddress: cb,
+      ramRanges: h7RamRanges,
+      bufferIndex: 2,
+      bytes: [0x5A, 0x5B],
+      timeoutMs: 10,
+    });
+    const down2Desc = await request('readMemory', { address: downDesc2, size: 24 });
+    check('rtt32-h723: Mode 2 full buffer times out boundedly without mutating WrOff',
+      !blockTimeout.ok && blockTimeout.errorCode === 'WriteTimeout'
+      && blockTimeout.diagnostics && blockTimeout.diagnostics.rtt
+      && blockTimeout.diagnostics.rtt.failureStage === 'poll-wait'
+      && blockTimeout.diagnostics.rtt.completion === 'not-started'
+      && blockTimeout.diagnostics.rtt.committedBytes === 0
+      && down2Desc.ok && down2Desc.data.bytes[12] === 7 && down2Desc.data.bytes[16] === 0,
+    JSON.stringify({ blockTimeout, down2Desc }));
+
+    // Reject Down ring overlapping RTT control block (header / Up descriptor / Down descriptor)
+    // while allowing a ring immediately adjacent to the descriptor table end.
+    const cbEnd = cb + 24 * 5;
+    for (const [label, overlapAddr] of [
+      ['cb-header', cb],
+      ['up-descriptor', cb + 24 + 4],
+      ['down-descriptor', downDesc2 + 12],
+    ]) {
+      const overlapTable = Buffer.from([
+        ...rttHeaderBytes(1, 3),
+        ...rttDescriptorBytes(0, up0Buf, 16, 3, 0, 0),
+        ...rttDescriptorBytes(0, overlapAddr, 8, 0, 0, 1),
+        ...rttDescriptorBytes(0, down1Buf, 8, 6, 2, 1),
+        ...rttDescriptorBytes(0, down2Buf, 8, 7, 0, 2),
+      ]);
+      await request('writeMemory', { address: cb, bytes: [...overlapTable] });
+      const overlapRes = await request('writeRtt', {
+        controlBlockAddress: cb,
+        ramRanges: h7RamRanges,
+        bufferIndex: 0,
+        bytes: [0x12, 0x34, 0x56, 0x78],
+      });
+      const cbAfter = await request('readMemory', { address: cb, size: overlapTable.length });
+      check(`rtt32-h723: writeRtt rejects ring overlapping ${label} without mutating CB`,
+        !overlapRes.ok && overlapRes.errorCode === 'RttInvalidBufferLayout'
+        && overlapRes.diagnostics && overlapRes.diagnostics.rtt
+        && overlapRes.diagnostics.rtt.failureStage === 'descriptor'
+        && overlapRes.diagnostics.rtt.completion === 'not-started'
+        && overlapRes.diagnostics.rtt.committedBytes === 0
+        && cbAfter.ok && Buffer.from(cbAfter.data.bytes).equals(overlapTable),
+      JSON.stringify({ overlapRes, cbMatched: cbAfter.ok && Buffer.from(cbAfter.data.bytes).equals(overlapTable) }));
+    }
+
+    // Immediately adjacent ring at cbEnd is valid
+    await request('writeMemory', { address: cbEnd, bytes: new Array(8).fill(0xCC) });
+    await request('writeMemory', { address: cb, bytes: [
+      ...rttHeaderBytes(1, 3),
+      ...rttDescriptorBytes(0, up0Buf, 16, 3, 0, 0),
+      ...rttDescriptorBytes(0, cbEnd, 8, 0, 0, 1),
+      ...rttDescriptorBytes(0, down1Buf, 8, 6, 2, 1),
+      ...rttDescriptorBytes(0, down2Buf, 8, 7, 0, 2),
+    ] });
+    const adjOk = await request('writeRtt', {
+      controlBlockAddress: cb,
+      ramRanges: h7RamRanges,
+      bufferIndex: 0,
+      bytes: [0xDE, 0xAD],
+    });
+    const adjRingMem = await request('readMemory', { address: cbEnd, size: 8 });
+    const adjDescMem = await request('readMemory', { address: downDesc0, size: 24 });
+    check('rtt32-h723: writeRtt allows ring immediately adjacent to CB table end',
+      adjOk.ok && adjOk.data.committedBytes === 2 && adjOk.data.committedWrOff === 2
+      && adjRingMem.ok && adjRingMem.data.bytes.slice(0, 2).join(',') === '222,173'
+      && adjDescMem.ok && adjDescMem.data.bytes[12] === 2 && adjDescMem.data.bytes[16] === 0,
+    JSON.stringify({ adjOk, adjRingMem, adjDescMem }));
+
+    // Strict invalid parameter rejection (omitted vs explicit invalid)
+    for (const [label, badParams] of [
+      ['controlBlockAddress=null', { controlBlockAddress: null, ramRanges: h7RamRanges, bufferIndex: 0, bytes: [1] }],
+      ['controlBlockAddress=0', { controlBlockAddress: 0, ramRanges: h7RamRanges, bufferIndex: 0, bytes: [1] }],
+      ['bytes=empty', { controlBlockAddress: cb, ramRanges: h7RamRanges, bufferIndex: 0, bytes: [] }],
+      ['timeoutMs=null', { controlBlockAddress: cb, ramRanges: h7RamRanges, bufferIndex: 0, bytes: [1], timeoutMs: null }],
+      ['timeoutMs=0', { controlBlockAddress: cb, ramRanges: h7RamRanges, bufferIndex: 0, bytes: [1], timeoutMs: 0 }],
+    ]) {
+      const rej = await request('writeRtt', badParams);
+      check(`rtt32-h723: writeRtt rejects ${label}`, !rej.ok && rej.errorCode === 'DapInvalidRequest', JSON.stringify(rej));
+    }
+
+    await request('stopRtt', {});
+  }
+  await closeDevice('rtt32-h723');
+
+  // 2. F103 20 KiB SRAM: cross-boundary Down buffer descriptor rejected with zero writes
+  await openAndInfo('1234', '5691', 'rtt32-f103');
+  const f1Connect = await request('connect', { port: 'SWD' });
+  check('rtt32-f103: connect', f1Connect.ok, JSON.stringify(f1Connect));
+  if (f1Connect.ok) {
+    await request('halt', { timeoutMs: 100 });
+    const f1RamRanges = [{ address: 0x20000000, size: 20 * 1024 }];
+    const f1Cb = 0x20000100;
+    await request('writeMemory', { address: f1Cb, bytes: [
+      ...rttHeaderBytes(1, 1),
+      ...rttDescriptorBytes(0, 0x20001000, 16, 0, 0, 0),
+      ...rttDescriptorBytes(0, 0x20004FF8, 16, 0, 0, 0),  // Down[0] crosses 20 KiB end!
+    ] });
+    const badDown = await request('writeRtt', {
+      controlBlockAddress: f1Cb,
+      ramRanges: f1RamRanges,
+      bufferIndex: 0,
+      bytes: [1, 2],
+    });
+    check('rtt32-f103: Down buffer crossing 20 KiB boundary rejected',
+      !badDown.ok && badDown.errorCode === 'RttInvalidBufferLayout'
+      && badDown.diagnostics && badDown.diagnostics.rtt
+      && badDown.diagnostics.rtt.completion === 'not-started'
+      && badDown.diagnostics.rtt.committedBytes === 0,
+    JSON.stringify(badDown));
+  }
+  await closeDevice('rtt32-f103');
+}
+
 async function main() {
   try {
     if (useMock) {
@@ -1701,6 +1903,7 @@ async function main() {
     await runDap11H723Matrix();
     await runF103C8Matrix();
     await runRttStage31Matrix();
+    await runRttStage32Matrix();
       await runDap04Matrix();
       await runDap05Matrix();
       await runDap05CleanupMatrix();

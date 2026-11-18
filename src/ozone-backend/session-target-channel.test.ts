@@ -330,6 +330,43 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
             elapsedMs: 1,
             data: { started: false },
           };
+        case 'writeRtt': {
+          const requested = Array.isArray(params.bytes) ? params.bytes.length : 0;
+          return {
+            ok: true,
+            message: 'RTT down write committed',
+            targetState: 'Running' as const,
+            elapsedMs: 2,
+            data: {
+              controlBlockAddress: (params.controlBlockAddress as number) ?? 0x20000100,
+              bufferIndex: (params.bufferIndex as number) ?? 0,
+              descriptorAddress: 0x20000148,
+              bufferAddress: 0x20002000,
+              bufferSize: 128,
+              initialWrOff: 0,
+              initialRdOff: 0,
+              rdOff: 0,
+              committedWrOff: requested,
+              flags: 0,
+              mode: 0,
+              availableSpace: 127,
+              requestedBytes: requested,
+              writtenBytes: requested,
+              committedBytes: requested,
+              wrapped: false,
+              shortWrite: false,
+              skipped: false,
+              firstSegmentWritten: true,
+              secondSegmentWritten: false,
+              wrOffWriteAttempted: true,
+              wrOffCommitted: true,
+              completion: 'completed',
+              failureStage: 'none',
+              retryable: false,
+            },
+            diagnostics: { ownerKind: 'cmsis-dap' },
+          };
+        }
         case 'disconnect':
         case 'close':
           return {
@@ -792,6 +829,241 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(createNative).not.toHaveBeenCalled();
     expect(createLegacy).not.toHaveBeenCalled();
     await selector.dispose(false);
+  });
+
+  it('forwards registered target RAM ranges to writeRtt at control priority and coexists with RTT Log', async () => {
+    const helper = fakeCmsisDapHelper({
+      start: vi.fn(async () => ({
+        ok: true,
+        message: 'hello',
+        targetState: 'Disconnected' as const,
+        elapsedMs: 0,
+        data: {
+          protocol: 1,
+          helperVersion: 'test',
+          platform: 'win32-x64',
+          capabilities: ['rtt', 'rttEnumerate', 'rttWrite'],
+        },
+      })),
+    });
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    await selector.connect({
+      probe: 'cmsis-dap', device: 'STM32H723VGT6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    expect(channel.getHelperCapabilities()).toEqual(['rtt', 'rttEnumerate', 'rttWrite']);
+    const started = await selector.startRtt(0x24000100);
+    const written = await selector.writeRtt(0, Uint8Array.from([1, 2, 3]), { timeoutMs: 500 });
+    const readUp = await selector.readRtt(0, 8);
+    await selector.stopRtt();
+
+    expect(started.ok).toBe(true);
+    expect(written).toMatchObject({
+      ok: true,
+      data: {
+        controlBlockAddress: 0x20000100,
+        committedBytes: 3,
+        wrOffCommitted: true,
+        completion: 'completed',
+      },
+      diagnostics: { ownerKind: 'cmsis-dap', method: 'writeRtt' },
+    });
+    expect(readUp.ok).toBe(true);
+    expect(helper.controlRequest).toHaveBeenCalledWith('writeRtt', {
+      bufferIndex: 0,
+      bytes: [1, 2, 3],
+      ramRanges: [
+        { address: 0x00000000, size: 65536 },
+        { address: 0x20000000, size: 131072 },
+        { address: 0x24000000, size: 327680 },
+        { address: 0x30000000, size: 278528 },
+        { address: 0x38000000, size: 16384 },
+        { address: 0x38800000, size: 4096 },
+      ],
+      timeoutMs: 500,
+    });
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
+    await selector.dispose(false);
+  });
+
+  it('rejects invalid writeRtt inputs, missing capability, and malformed helper results', async () => {
+    // Missing rttWrite capability advertised by helper
+    const noCapHelper = fakeCmsisDapHelper({
+      start: vi.fn(async () => ({
+        ok: true,
+        message: 'hello',
+        targetState: 'Disconnected' as const,
+        elapsedMs: 0,
+        data: { protocol: 1, helperVersion: 'test', platform: 'win32-x64', capabilities: ['rtt', 'rttEnumerate'] },
+      })),
+    });
+    const noCapChannel = new CmsisDapTargetChannel({ helperClient: noCapHelper });
+    await noCapChannel.connect({
+      probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+    await expect(noCapChannel.writeRtt(0, Uint8Array.from([1]))).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+    await noCapChannel.disconnect();
+
+    // Unregistered device without explicit ramRanges -> UnsupportedCapability
+    const unregChannel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper() });
+    await unregChannel.connect({
+      probe: 'cmsis-dap', device: 'UNKNOWN_MCU', interface: 'SWD', speedKHz: 1000,
+    });
+    await expect(unregChannel.writeRtt(0, Uint8Array.from([1]), { controlBlockAddress: 0x20000100 }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+
+    // Invalid bufferIndex, empty bytes, invalid controlBlockAddress, invalid timeoutMs, invalid ramRanges
+    await expect(unregChannel.writeRtt(-1, Uint8Array.from([1]), { ramRanges: [{ address: 0x20000000, size: 4096 }] }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+    await expect(unregChannel.writeRtt(0, new Uint8Array(0), { ramRanges: [{ address: 0x20000000, size: 4096 }] }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+    await expect(unregChannel.writeRtt(0, Uint8Array.from([1]), {
+      controlBlockAddress: 0, ramRanges: [{ address: 0x20000000, size: 4096 }],
+    })).resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+    await expect(unregChannel.writeRtt(0, Uint8Array.from([1]), {
+      ramRanges: [{ address: 0x20000000, size: 4096 }], timeoutMs: 0,
+    })).resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+    await expect(unregChannel.writeRtt(0, Uint8Array.from([1]), { ramRanges: [] }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+
+    // Malformed helper success (committedBytes > 0 while wrOffCommitted=false)
+    const base = fakeCmsisDapHelper();
+    const tamperedHelper = fakeCmsisDapHelper({
+      request: vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+        if (method === 'writeRtt') {
+          const okRes = await (base.request as any)(method, params);
+          okRes.data.wrOffCommitted = false;
+          return okRes;
+        }
+        return (base.request as any)(method, params);
+      }) as any,
+    });
+    const tamperedChannel = new CmsisDapTargetChannel({ helperClient: tamperedHelper });
+    await tamperedChannel.connect({
+      probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+    await expect(tamperedChannel.writeRtt(0, Uint8Array.from([1, 2]))).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'MalformedResponse',
+    });
+
+    // Selector owner without writeRtt returns UnsupportedCapability
+    const jlink = owner('jlink-native', vi.fn(async () => ({
+      ok: true, message: 'connected', targetState: 'Halted' as const, elapsedMs: 0, data: { channel: 'cpp' as const },
+    })));
+    const selector = new SessionTargetSelector(() => jlink, vi.fn());
+    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'native');
+    await expect(selector.writeRtt(0, Uint8Array.from([1]))).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+  });
+
+  it('preserves writeRtt unknown-completion diagnostics and terminates cleanly on DeviceRemoved without J-Link fallback', async () => {
+    const base = fakeCmsisDapHelper();
+    let mode: 'unknown' | 'removed' = 'unknown';
+    const helper = fakeCmsisDapHelper({
+      request: vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+        if (method === 'writeRtt') {
+          if (mode === 'unknown') {
+            return {
+              ok: false,
+              message: 'DAP_TransferBlock write failed (completion state unknown)',
+              errorCode: 'WriteCompletedLate',
+              targetState: 'Running' as const,
+              elapsedMs: 12,
+              diagnostics: {
+                rtt: {
+                  controlBlockAddress: 0x20000100,
+                  bufferIndex: 0,
+                  committedBytes: 0,
+                  writtenBytes: 4,
+                  firstSegmentWritten: true,
+                  secondSegmentWritten: true,
+                  wrOffWriteAttempted: true,
+                  wrOffCommitted: false,
+                  completion: 'unknown',
+                  failureStage: 'commit-wroff',
+                  retryable: false,
+                },
+              },
+            };
+          }
+          return {
+            ok: false,
+            message: 'CMSIS-DAP device removed during writeRtt',
+            errorCode: 'DeviceRemoved',
+            targetState: 'Error' as const,
+            elapsedMs: 4,
+            diagnostics: {
+              rtt: {
+                committedBytes: 0,
+                completion: 'unknown',
+                failureStage: 'data-second',
+                firstSegmentWritten: true,
+                secondSegmentWritten: false,
+                wrOffCommitted: false,
+              },
+            },
+          };
+        }
+        return (base.request as any)(method, params);
+      }) as any,
+    });
+    const createNative = vi.fn();
+    const createLegacy = vi.fn();
+    const channel = new CmsisDapTargetChannel({ helperClient: helper });
+    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    await selector.connect({
+      probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
+    });
+
+    // WriteCompletedLate keeps the single owner alive and preserves completion=unknown diagnostics
+    await expect(selector.writeRtt(0, Uint8Array.from([1, 2, 3, 4]))).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'WriteCompletedLate',
+      diagnostics: {
+        ownerKind: 'cmsis-dap',
+        method: 'writeRtt',
+        rtt: {
+          wrOffWriteAttempted: true,
+          wrOffCommitted: false,
+          committedBytes: 0,
+          completion: 'unknown',
+          failureStage: 'commit-wroff',
+          retryable: false,
+        },
+      },
+    });
+    expect(selector.ownerKind).toBe('cmsis-dap');
+
+    // DeviceRemoved triggers single-owner termination (NativeOwnerLost) with preserved diagnostics and no J-Link fallback
+    mode = 'removed';
+    await expect(selector.writeRtt(0, Uint8Array.from([1, 2]))).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'NativeOwnerLost',
+      diagnostics: {
+        causeErrorCode: 'DeviceRemoved',
+        rtt: {
+          completion: 'unknown',
+          failureStage: 'data-second',
+          firstSegmentWritten: true,
+          secondSegmentWritten: false,
+          wrOffCommitted: false,
+        },
+      },
+    });
+    expect(selector.ownerKind).toBe('none');
+    expect(helper.dispose).toHaveBeenCalledWith(false);
+    expect(createNative).not.toHaveBeenCalled();
+    expect(createLegacy).not.toHaveBeenCalled();
   });
 
   it('never constructs or connects legacy when the native owner succeeds', async () => {

@@ -1000,4 +1000,95 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       errorCode: 'UnsupportedCapability',
     });
   });
+
+  it('routes writeRtt through the single CMSIS-DAP owner and preserves structured failure diagnostics', async () => {
+    const writeRtt = vi.fn(async () => ({
+      ok: true,
+      message: 'RTT down write committed',
+      targetState: 'Running' as const,
+      elapsedMs: 2,
+      data: {
+        controlBlockAddress: 0x24000100,
+        bufferIndex: 0,
+        descriptorAddress: 0x24000148,
+        bufferAddress: 0x24002000,
+        bufferSize: 64,
+        initialWrOff: 0,
+        initialRdOff: 0,
+        rdOff: 0,
+        committedWrOff: 2,
+        flags: 0,
+        mode: 0,
+        availableSpace: 63,
+        requestedBytes: 2,
+        writtenBytes: 2,
+        committedBytes: 2,
+        wrapped: false,
+        shortWrite: false,
+        skipped: false,
+        firstSegmentWritten: true,
+        secondSegmentWritten: false,
+        wrOffWriteAttempted: true,
+        wrOffCommitted: true,
+        completion: 'completed' as const,
+        failureStage: 'none' as const,
+        retryable: false,
+      },
+    }));
+    const owner = cmsisOwner({ writeRtt } as any);
+    const backend = new OzoneBackend(undefined, owner);
+    const ramRanges = [{ address: 0x24000000, size: 327680 }];
+
+    await expect(backend.execute({
+      cmd: 'writeRtt',
+      bufferIndex: 0,
+      bytes: [0x01, 0x7F],
+      options: { controlBlockAddress: 0x24000100, ramRanges, timeoutMs: 300 },
+    })).resolves.toMatchObject({
+      ok: true,
+      data: { committedBytes: 2, committedWrOff: 2, completion: 'completed' },
+    });
+    expect(writeRtt).toHaveBeenCalledWith(0, Uint8Array.from([0x01, 0x7F]), {
+      controlBlockAddress: 0x24000100,
+      ramRanges,
+      timeoutMs: 300,
+    });
+
+    await expect(backend.execute({
+      cmd: 'writeRtt',
+      bufferIndex: 0,
+      bytes: [256],
+    })).resolves.toMatchObject({ ok: false, errorCode: 'DapInvalidRequest' });
+
+    const failingOwner = cmsisOwner({
+      writeRtt: vi.fn(async () => ({
+        ok: false,
+        message: 'RTT Down WrOff commit failed',
+        errorCode: 'OutcomeUnknown',
+        targetState: 'Running' as const,
+        elapsedMs: 5,
+        diagnostics: { rtt: { completion: 'unknown', failureStage: 'commit-wroff', committedBytes: 0 } },
+      })),
+    } as any);
+    const failingBackend = new OzoneBackend(undefined, failingOwner);
+    await expect(failingBackend.execute({
+      cmd: 'writeRtt',
+      bufferIndex: 0,
+      bytes: Uint8Array.from([1]),
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'OutcomeUnknown',
+      diagnostics: { rtt: { completion: 'unknown', failureStage: 'commit-wroff', committedBytes: 0 } },
+    });
+
+    const unsupportedBackend = new OzoneBackend(undefined, cmsisOwner());
+    await expect(unsupportedBackend.execute({
+      cmd: 'writeRtt',
+      bufferIndex: 0,
+      bytes: Uint8Array.from([1]),
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+  });
 });

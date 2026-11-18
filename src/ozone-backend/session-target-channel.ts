@@ -25,6 +25,8 @@ import {
   CmsisDapRttMemoryRange,
   CmsisDapRttReadResult,
   CmsisDapRttStartOptions,
+  CmsisDapRttWriteOptions,
+  CmsisDapRttWriteResult,
   CmsisDapCoreStateResult,
   CmsisDapRunToAddressResult,
   CmsisDapStepInstructionResult,
@@ -118,6 +120,11 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   enumerateRtt?(controlBlockAddress?: number, options?: CmsisDapRttEnumOptions): Promise<CppJLinkResult<CmsisDapRttEnumResult>>;
   stopRtt(): Promise<CppJLinkResult<any>>;
   readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions): Promise<CppJLinkResult<{ bytes: Uint8Array }>>;
+  writeRtt?(
+    bufferIndex: number,
+    bytes: Uint8Array,
+    options?: CmsisDapRttWriteOptions,
+  ): Promise<CppJLinkResult<CmsisDapRttWriteResult>>;
   flash?(elfPath: string, device: string, options?: CmsisDapFlashOptions): Promise<CppJLinkResult<CmsisDapFlashResult>>;
   /**
    * Registry definition of the session device, resolved at connect. Null when
@@ -382,6 +389,15 @@ export class SessionTargetSelector {
   async readRtt(bufferIndex: number, size: number, options?: CppJLinkReadOptions) {
     return this.call('readRtt', owner => owner.readRtt(bufferIndex, size, options));
   }
+  async writeRtt(bufferIndex: number, bytes: Uint8Array, options?: CmsisDapRttWriteOptions) {
+    return this.call('writeRtt', owner => owner.writeRtt
+      ? owner.writeRtt(bufferIndex, bytes, options)
+      : Promise.resolve(failure<CmsisDapRttWriteResult>(
+        'selected target owner does not support RTT down-buffer writes',
+        'UnsupportedCapability',
+        { ownerKind: owner.kind, capability: 'writeRtt' },
+      )));
+  }
   async flash(elfPath: string, device: string, options?: CmsisDapFlashOptions) {
     return this.call('flash', owner => owner.flash
       ? owner.flash(elfPath, device, options)
@@ -592,6 +608,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   private probeSamplingSupport: boolean | null = null;
   private xrSamplingEnabled = false;
   private flashTargetDef: FlashTargetDefinition | null = null;
+  private helperCapabilities: Set<string> | null = null;
   private timelineBatchLogAt = performance.now();
   private timelineBatchTotals = { requests: 0, reads: 0, bytes: 0, queueMs: 0, rpcMs: 0, helperMs: 0, packets: 0, waitRetries: 0, faultClears: 0 };
 
@@ -654,6 +671,8 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
         'start',
       );
     }
+    const caps = hello.data?.capabilities;
+    this.helperCapabilities = Array.isArray(caps) && caps.length > 0 ? new Set(caps) : null;
 
     const selector = this.deviceSelector(config, effectiveTransport);
 
@@ -771,6 +790,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     this.state = 'idle';
     this.lastDevice = null;
     this.flashTargetDef = null;
+    this.helperCapabilities = null;
     log.dll('[cmsis-dap] disconnected owner=cmsis-dap');
     return { ok: true, message: 'CMSIS-DAP disconnected', targetState: 'Disconnected', elapsedMs: 0, data: {} };
   }
@@ -1289,6 +1309,126 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       + ' wrapped=' + (metadata.wrapped ?? false) + ' overrun=' + (metadata.overrun ?? false));
     return mapped;
   }
+  getHelperCapabilities(): readonly string[] {
+    return this.helperCapabilities ? Array.from(this.helperCapabilities) : [];
+  }
+  async writeRtt(
+    bufferIndex: number,
+    bytes: Uint8Array,
+    options?: CmsisDapRttWriteOptions,
+  ): Promise<CppJLinkResult<CmsisDapRttWriteResult>> {
+    if (this.state !== 'connected') return this.invalidState<CmsisDapRttWriteResult>('writeRtt');
+    if (this.helperCapabilities && !this.helperCapabilities.has('rttWrite')) {
+      return failure<CmsisDapRttWriteResult>(
+        'CMSIS-DAP helper does not advertise rttWrite capability',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+    if (!Number.isInteger(bufferIndex) || bufferIndex < 0 || bufferIndex > 0xFFFFFFFF) {
+      return failure<CmsisDapRttWriteResult>(
+        'CMSIS-DAP RTT Down bufferIndex must be a uint32',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > 65536) {
+      return failure<CmsisDapRttWriteResult>(
+        'CMSIS-DAP RTT write requires bytes in 1..65536',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+    if (options?.controlBlockAddress !== undefined
+      && (!Number.isInteger(options.controlBlockAddress) || options.controlBlockAddress <= 0 || options.controlBlockAddress > 0xFFFFFFFF)) {
+      return failure<CmsisDapRttWriteResult>(
+        'CMSIS-DAP RTT control block address must be a positive uint32',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+
+    let ramRanges: CmsisDapRttMemoryRange[];
+    if (options?.ramRanges !== undefined) {
+      const checked = validateRttMemoryRanges(options.ramRanges, false, 'ramRanges');
+      if (!checked.ok) {
+        return failure<CmsisDapRttWriteResult>(checked.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'writeRtt',
+        });
+      }
+      ramRanges = checked.normalized;
+    } else if (this.flashTargetDef) {
+      ramRanges = this.flashTargetDef.ramRegions.map(region => ({
+        address: region.address,
+        size: region.size,
+      }));
+    } else {
+      return failure<CmsisDapRttWriteResult>(
+        'CMSIS-DAP RTT Down-buffer write requires a registered target or explicit ramRanges',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+
+    let timeoutMs = 2000;
+    if (options?.timeoutMs !== undefined) {
+      if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0 || options.timeoutMs > 10000) {
+        return failure<CmsisDapRttWriteResult>(
+          'CMSIS-DAP writeRtt timeoutMs must be an integer in 1..10000',
+          'DapInvalidRequest',
+          { ownerKind: this.kind, capability: 'writeRtt' },
+        );
+      }
+      timeoutMs = options.timeoutMs;
+    }
+
+    const result = await this.controlViaHelper<CmsisDapRttWriteResult>('writeRtt', {
+      ...(options?.controlBlockAddress !== undefined
+        ? { controlBlockAddress: options.controlBlockAddress >>> 0 }
+        : {}),
+      bufferIndex: bufferIndex >>> 0,
+      bytes: Array.from(bytes),
+      ramRanges,
+      timeoutMs,
+    });
+    if (!result.ok) {
+      const rttDiag = (result.diagnostics as { rtt?: Partial<CmsisDapRttWriteResult> } | undefined)?.rtt;
+      log.dap('[cmsis-dap] writeRtt failed owner=cmsis-dap buffer=' + bufferIndex
+        + ' requested=' + bytes.length
+        + ' errorCode=' + (result.errorCode || 'unknown')
+        + ' completion=' + (rttDiag?.completion || 'unknown')
+        + ' failureStage=' + (rttDiag?.failureStage || 'unknown')
+        + ' committed=' + (rttDiag?.committedBytes ?? 0));
+      return {
+        ...result,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'writeRtt' },
+      };
+    }
+    if (!isValidRttWriteResult(result.data, bytes.length, bufferIndex)) {
+      return {
+        ok: false,
+        message: 'CMSIS-DAP writeRtt returned a malformed result',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error',
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'writeRtt' },
+      };
+    }
+    log.dap('[cmsis-dap] writeRtt buffer=' + bufferIndex
+      + ' requested=' + result.data.requestedBytes
+      + ' written=' + result.data.writtenBytes
+      + ' committed=' + result.data.committedBytes
+      + ' committedWrOff=' + result.data.committedWrOff
+      + ' mode=' + result.data.mode
+      + ' shortWrite=' + result.data.shortWrite
+      + ' wrapped=' + result.data.wrapped
+      + ' completion=' + result.data.completion);
+    return {
+      ...result,
+      diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'writeRtt' },
+    };
+  }
   async stepIntoInstruction(): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {
     const result = await this.controlViaHelper<CmsisDapStepInstructionResult>('stepInstruction', {});
     if (!result.ok || !result.data) return result as unknown as CppJLinkResult<NativeStepIntoDiagnostics>;
@@ -1336,6 +1476,7 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
       if (this.state !== 'failed') this.state = 'idle';
       this.lastDevice = null;
       this.flashTargetDef = null;
+      this.helperCapabilities = null;
       await this.helper.dispose(false).catch(() => {});
       log.dll(`[cmsis-dap] disposed owner=cmsis-dap graceful=false state=${this.state}`);
       return;
@@ -1644,4 +1785,40 @@ function isValidRttEnumResult(data: unknown): data is CmsisDapRttEnumResult {
   }
   return value.upBuffers.every((item, index) => isValidRttDescriptor(item, 'up', index))
     && value.downBuffers.every((item, index) => isValidRttDescriptor(item, 'down', index));
+}
+
+const VALID_RTT_WRITE_COMPLETION = new Set(['not-started', 'partial', 'completed', 'unknown']);
+const VALID_RTT_WRITE_STAGE = new Set([
+  'none', 'validation', 'control-block', 'descriptor', 'data-first', 'data-second', 'commit-wroff', 'poll-wait',
+]);
+
+function isValidRttWriteResult(
+  data: unknown,
+  expectedRequestedBytes: number,
+  expectedBufferIndex: number,
+): data is CmsisDapRttWriteResult {
+  if (!data || typeof data !== 'object') return false;
+  const value = data as Partial<CmsisDapRttWriteResult>;
+  if (!Number.isInteger(value.controlBlockAddress) || (value.controlBlockAddress as number) <= 0) return false;
+  if (value.bufferIndex !== expectedBufferIndex) return false;
+  if (!Number.isInteger(value.descriptorAddress) || !Number.isInteger(value.bufferAddress)) return false;
+  if (!Number.isInteger(value.bufferSize) || (value.bufferSize as number) <= 0) return false;
+  if (!Number.isInteger(value.initialWrOff) || (value.initialWrOff as number) < 0 || (value.initialWrOff as number) >= (value.bufferSize as number)) return false;
+  if (!Number.isInteger(value.initialRdOff) || (value.initialRdOff as number) < 0 || (value.initialRdOff as number) >= (value.bufferSize as number)) return false;
+  if (!Number.isInteger(value.rdOff) || (value.rdOff as number) < 0 || (value.rdOff as number) >= (value.bufferSize as number)) return false;
+  if (!Number.isInteger(value.committedWrOff) || (value.committedWrOff as number) < 0 || (value.committedWrOff as number) >= (value.bufferSize as number)) return false;
+  if (!Number.isInteger(value.flags) || !Number.isInteger(value.mode)) return false;
+  if (!Number.isInteger(value.availableSpace) || (value.availableSpace as number) < 0) return false;
+  if (value.requestedBytes !== expectedRequestedBytes) return false;
+  if (!Number.isInteger(value.writtenBytes) || (value.writtenBytes as number) < 0 || (value.writtenBytes as number) > expectedRequestedBytes) return false;
+  if (!Number.isInteger(value.committedBytes) || (value.committedBytes as number) < 0 || (value.committedBytes as number) > (value.writtenBytes as number)) return false;
+  if (typeof value.wrapped !== 'boolean' || typeof value.shortWrite !== 'boolean' || typeof value.skipped !== 'boolean') return false;
+  if (typeof value.firstSegmentWritten !== 'boolean' || typeof value.secondSegmentWritten !== 'boolean') return false;
+  if (typeof value.wrOffWriteAttempted !== 'boolean' || typeof value.wrOffCommitted !== 'boolean') return false;
+  if (typeof value.completion !== 'string' || !VALID_RTT_WRITE_COMPLETION.has(value.completion)) return false;
+  if (typeof value.failureStage !== 'string' || !VALID_RTT_WRITE_STAGE.has(value.failureStage)) return false;
+  if (typeof value.retryable !== 'boolean') return false;
+  if ((value.committedBytes as number) > 0 && !value.wrOffCommitted) return false;
+  if (value.committedBytes === 0 && value.committedWrOff !== value.initialWrOff) return false;
+  return true;
 }

@@ -129,3 +129,14 @@
 - 证据：native/cmsis-dap-helper/src/segger_rtt_test.cpp、scripts/cmsis-dap-smoke.js、out/rtos-stage3/acceptance-3.1/manual-enumerate-rpc.cjs、src/ozone-backend/session-target-channel.test.ts、src/ozone-backend/cmsis-dap-helper-channel.test.ts、src/ozone-backend/commander-cmsis-dap.test.ts、src/debug/dap-session-rtt.test.ts。
 - 独立复验覆盖原生构建、CMSIS-DAP 与 J-Link mock、五个聚焦 Vitest 文件的 121 项用例，以及原两个失败用例的复跑。下一小部分为 3.2（CMSIS-DAP Down-buffer 写入）。
 - 提交：`实现 RTOS 阶段 3.1：完善 RTT 内存范围与通道枚举`。
+
+## 3.2 / 2026-11-18
+
+- 状态：已完成，独立 mock 验收通过。实板回环验证归 3.4。
+- 实现：native/cmsis-dap-helper/src/cmsis_dap_target.cpp（writeMemory/writeMemoryBlock 共享 deadline 期限控制）、segger_rtt.h、segger_rtt.cpp（SeggerRttReader::writeDown 复用 3.1 合法 RAM 范围与 control block/descriptor 校验，并按无溢出 64 位区间校验拒绝 ring 与整个 RTT 控制块 [controlBlockAddress, +24+(maxUp+maxDown)*24) 重叠的元数据——含初始与 Mode 2 轮询重校验——紧邻表前/表尾不相交的 ring 仍合法；实现可用空间计算、环绕写入、Mode 0 SKIP / Mode 1 TRIM 可判定短写、Mode 2 BLOCK_IF_FIFO_FULL 有界超时、严格先写数据段后写 WrOff 并保留目标侧 RdOff，以及 data-first / data-second / commit-wroff / poll-wait 结构化结果与 completion 状态；downWriteFailure 保留 WriteTimeout/ReadTimeout/WriteCompletedLate/OutcomeUnknown/MalformedResponse/DeviceRemoved/DapAckNoAck/DapAckWait/DapAckFault 且禁止盲目重试与伪报已提交）、main.cpp（hello capabilities 新增 rttWrite、handleWriteRtt RPC、dispatch 与 selftest）；src/ozone-backend/cmsis-dap-helper-channel.ts（CmsisDapRttWriteOptions/Result 类型、writeRtt 控制优先级）、session-target-channel.ts（SessionTargetOwner/Selector/CmsisDapTargetChannel.writeRtt、helperCapabilities 同步校验与 isValidRttWriteResult 校验）、types.ts 与 commander.ts（writeRtt 命令路由与不支持能力返回 UnsupportedCapability）。
+- 设计变更：无；沿用 3.1 的合法 RAM 范围校验规则，未注册目标无显式 ramRanges 时返回 UnsupportedCapability，省略 controlBlockAddress 时复用已启动 startRtt 控制块而不破坏已有 RTT Log 状态；未提前实现 3.3（J-Link RTT 统一）或 3.4（并发消费者）。
+- 检查：node out/rtos-stage3/acceptance-3.2/independent-down-rpc.cjs 复验通过（正常环绕短写通过；pBuffer=controlBlockAddress 返回 RttInvalidBufferLayout，控制块与 WrOff/RdOff 完全不变）；orbit-cmsis-dap-rtt-tests.exe、npm run test:cmsis-dap:mock、npm run test:cpp-channel:mock、npm run typecheck、npm run build、聚焦 Vitest（5 文件）与 git diff --check 均在最终修改后通过（具体计数见交付报告）。
+- 硬件：未执行；3.2 仅涉及 CMSIS-DAP Down-buffer 离线/mock 实现与验证，实板回环归 3.4。
+- 证据：native/cmsis-dap-helper/src/segger_rtt_test.cpp（DownBufferMockMemory 独立原始内存与写序列核对，含控制块头/Up/Down 描述符相交、紧邻合法边界与高地址无溢出边界、Mode 2 轮询重校验重叠）、native/cmsis-dap-helper/src/main.cpp（--selftest 209 项）、scripts/cmsis-dap-smoke.js（runRttStage32Matrix）、out/rtos-stage3/acceptance-3.2/independent-down-rpc.cjs、src/ozone-backend/cmsis-dap-helper-channel.test.ts、src/ozone-backend/session-target-channel.test.ts、src/ozone-backend/commander-cmsis-dap.test.ts。
+- 独立复验确认非法重叠的写入完整保留原控制块，正常环绕和短写仍通过。另有原生构建、CMSIS-DAP 与 J-Link mock、五个聚焦 Vitest 文件的 127 项用例通过。下一小部分为 3.3。
+- 提交：`实现 RTOS 阶段 3.2：增加 RTT 下行控制能力`。

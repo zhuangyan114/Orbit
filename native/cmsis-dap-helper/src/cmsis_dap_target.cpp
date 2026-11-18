@@ -562,11 +562,24 @@ Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint
   // [0x06][dap][count16][request][4*N data]: at most (packetSize - 5) / 4
   // words fit into one command; the write response is a fixed 4 bytes.
   const uint32_t maxBlockWrite = packetSize_ >= 9 ? (packetSize_ - 5) / 4 : 1;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto remainingTimeout = [&]() -> std::chrono::milliseconds {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return std::chrono::milliseconds(0);
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+  };
 
   uint32_t position = address;
   size_t offset = 0;
   bool setupRequired = true;
   while (offset < words.size()) {
+    const std::chrono::milliseconds chunkTimeout = remainingTimeout();
+    if (chunkTimeout.count() <= 0) {
+      return Result::error(ErrorCodes::kWriteTimeout,
+                           "writeMemoryBlock deadline exceeded at 0x" + std::to_string(position));
+    }
     const size_t chunk = std::min<size_t>(
         std::min<size_t>(words.size() - offset, maxBlockWrite), wordsUntilBoundary(position));
     ++diag.chunks;
@@ -574,9 +587,22 @@ Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint
     uint32_t attempt = 0;
     for (;;) {
       if (setupRequired) {
-        const Result setupResult = setupMemoryAccess(position, diag, timeout);
+        const std::chrono::milliseconds setupTimeout = remainingTimeout();
+        if (setupTimeout.count() <= 0) {
+          return Result::error(ErrorCodes::kWriteTimeout,
+                               "writeMemoryBlock deadline exceeded before setup at 0x" +
+                                   std::to_string(position));
+        }
+        const Result setupResult = setupMemoryAccess(position, diag, setupTimeout);
         if (!setupResult.ok) return setupResult;
         setupRequired = false;
+      }
+
+      const std::chrono::milliseconds blockTimeout = remainingTimeout();
+      if (blockTimeout.count() <= 0) {
+        return Result::error(ErrorCodes::kWriteTimeout,
+                             "writeMemoryBlock deadline exceeded before block write at 0x" +
+                                 std::to_string(position));
       }
 
       std::vector<uint32_t> chunkWords(words.begin() + static_cast<long>(offset),
@@ -590,7 +616,7 @@ Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint
           static_cast<uint8_t>(kRequestApnDp | ((kApRegDrw >> 2) << 2));
       Result blockResult = protocol_->dapTransferBlockWrite(
           0, blockRequest, chunkWords, ack, completed,
-          timeout);
+          blockTimeout);
       if (blockResult.ok) break;
       // Never retry when the write's completion state is unknown. Only an
       // explicit WAIT/FAULT ACK (write not accepted) may be retried.
@@ -608,7 +634,12 @@ Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint
       }
       if (blockResult.errorCode == ErrorCodes::kDapAckFault) {
         diag.faultClears++;
-        Result clearResult = clearStickyErrors(diag, timeout);
+        const std::chrono::milliseconds clearTimeout = remainingTimeout();
+        if (clearTimeout.count() <= 0) {
+          return Result::error(ErrorCodes::kWriteTimeout,
+                               "writeMemoryBlock deadline exceeded before FAULT clear");
+        }
+        Result clearResult = clearStickyErrors(diag, clearTimeout);
         if (!clearResult.ok) return clearResult;
       }
       setupRequired = true;
@@ -639,13 +670,27 @@ Result CmsisDapTarget::writeMemory(uint32_t address, const std::vector<uint8_t>&
                          "writeMemory range overflows the 32-bit address space");
   }
 
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto remainingTimeout = [&]() -> std::chrono::milliseconds {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return std::chrono::milliseconds(0);
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+  };
+
   const uint32_t firstWord = address & ~3u;
   const uint32_t lastWord = static_cast<uint32_t>((end - 1) / 4);
   const uint32_t wordCount = lastWord - firstWord / 4 + 1;
   std::vector<uint32_t> words(wordCount, 0);
   const bool partial = (address & 3u) != 0 || (end & 3u) != 0;
   if (partial) {
-    const Result readResult = readMemoryBlock(firstWord, wordCount, words, diag, timeout);
+    const std::chrono::milliseconds readTimeout = remainingTimeout();
+    if (readTimeout.count() <= 0) {
+      return Result::error(ErrorCodes::kWriteTimeout,
+                           "writeMemory deadline exceeded before RMW pre-read");
+    }
+    const Result readResult = readMemoryBlock(firstWord, wordCount, words, diag, readTimeout);
     if (!readResult.ok) return readResult;
   }
 
@@ -656,7 +701,12 @@ Result CmsisDapTarget::writeMemory(uint32_t address, const std::vector<uint8_t>&
     words[wordIndex] = (words[wordIndex] & ~(0xFFu << shift)) |
                        (static_cast<uint32_t>(bytes[index]) << shift);
   }
-  const Result writeResult = writeMemoryBlock(firstWord, words, diag, timeout);
+  const std::chrono::milliseconds writeTimeout = remainingTimeout();
+  if (writeTimeout.count() <= 0) {
+    return Result::error(ErrorCodes::kWriteTimeout,
+                         "writeMemory deadline exceeded before block write");
+  }
+  const Result writeResult = writeMemoryBlock(firstWord, words, diag, writeTimeout);
   if (!writeResult.ok) return writeResult;
   return Result::success();
 }

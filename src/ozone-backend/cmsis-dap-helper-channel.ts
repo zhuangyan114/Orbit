@@ -292,6 +292,51 @@ export interface CmsisDapRttReadResult {
   writerAdvanced: boolean;
 }
 
+export type CmsisDapRttWriteCompletion = 'not-started' | 'partial' | 'completed' | 'unknown';
+export type CmsisDapRttWriteFailureStage =
+  | 'none'
+  | 'validation'
+  | 'control-block'
+  | 'descriptor'
+  | 'data-first'
+  | 'data-second'
+  | 'commit-wroff'
+  | 'poll-wait';
+
+export interface CmsisDapRttWriteOptions {
+  controlBlockAddress?: number;
+  ramRanges?: readonly CmsisDapRttMemoryRange[];
+  timeoutMs?: number;
+}
+
+export interface CmsisDapRttWriteResult {
+  controlBlockAddress: number;
+  bufferIndex: number;
+  descriptorAddress: number;
+  bufferAddress: number;
+  bufferSize: number;
+  initialWrOff: number;
+  initialRdOff: number;
+  rdOff: number;
+  committedWrOff: number;
+  flags: number;
+  mode: number;
+  availableSpace: number;
+  requestedBytes: number;
+  writtenBytes: number;
+  committedBytes: number;
+  wrapped: boolean;
+  shortWrite: boolean;
+  skipped: boolean;
+  firstSegmentWritten: boolean;
+  secondSegmentWritten: boolean;
+  wrOffWriteAttempted: boolean;
+  wrOffCommitted: boolean;
+  completion: CmsisDapRttWriteCompletion;
+  failureStage: CmsisDapRttWriteFailureStage;
+  retryable: boolean;
+}
+
 export interface CmsisDapMemoryWriteResult {
   address: number;
   bytesWritten: number;
@@ -758,6 +803,7 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'flashAlgorithm':
     case 'startRtt':
     case 'stopRtt':
+    case 'writeRtt':
       return 'control';
     case 'dpRead':
     case 'apRead':

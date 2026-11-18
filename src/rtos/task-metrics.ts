@@ -1,4 +1,4 @@
-import { Field, known, unknown, RtosSnapshot } from './model';
+import { Field, known, RtosError, unknown, RtosSnapshot } from './model';
 import { SnapshotReadResult } from './snapshot-reader';
 
 /** Explicit port evidence; neither DWARF nor CPU model proves a fill pattern/timebase. */
@@ -9,6 +9,11 @@ export interface PortContract {
   runtime?: { frequencyHz: number; countsDuringSleep: boolean; source: string };
 }
 export interface StackScanOptions { taskAddresses?: number[]; maxBytesPerTask?: number; }
+
+export interface StackScanOutcome {
+  budgetExceeded: boolean;
+  budgetMessage?: string;
+}
 
 export function parsePortContract(value: unknown): PortContract | undefined {
   if (value === undefined) return;
@@ -23,9 +28,15 @@ export function parsePortContract(value: unknown): PortContract | undefined {
   return structuredClone(port);
 }
 
-export async function addStackMetrics(result: SnapshotReadResult, port: PortContract | undefined, options: StackScanOptions = {}) {
+export async function addStackMetrics(
+  result: SnapshotReadResult,
+  port: PortContract | undefined,
+  options: StackScanOptions = {},
+): Promise<StackScanOutcome> {
   const { snapshot, memory } = result;
-  if (!port?.stackGrowth || !port.source || snapshot.consistency === 'unavailable') return;
+  if (!port?.stackGrowth || !port.source || snapshot.consistency === 'unavailable') return { budgetExceeded: false };
+  let budgetExceeded = false;
+  let budgetMessage: string | undefined;
   for (const task of snapshot.tasks) {
     const stack = task.stack;
     stack.growthDirection = known(port.stackGrowth, port.source, 'enum');
@@ -43,6 +54,10 @@ export async function addStackMetrics(result: SnapshotReadResult, port: PortCont
     }
     stack.capacityBytes = known(capacity, `TCB.pxStack/pxEndOfStack; ${port.source}`, 'bytes');
     if (!options.taskAddresses?.includes(task.tcbAddress) || !stack.fillByte.available) continue;
+    if (budgetExceeded) {
+      stack.watermarkBytes = unknown(budgetMessage || 'Detail refresh budget exhausted', 'Stack fill scan', 'bytes');
+      continue;
+    }
     const started = Date.now(), fill = stack.fillByte.value;
     const maxBytes = Math.min(capacity, 16384, Math.max(1, options.maxBytesPerTask ?? 4096));
     let untouched = 0, done = false;
@@ -61,10 +76,18 @@ export async function addStackMetrics(result: SnapshotReadResult, port: PortCont
         ? known(Math.floor(untouched / word) * word, `FreeRTOS unused stack fill scan; ${port.source}`, 'bytes')
         : unknown(`Scan budget reached after ${stack.scannedBytes} bytes; unused prefix >= ${untouched}`, 'Stack fill scan', 'bytes');
     } catch (error) {
-      stack.watermarkBytes = unknown(error instanceof Error ? error.message : String(error), 'Stack fill scan', 'bytes');
-      if (memory.request.signal.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      stack.watermarkBytes = unknown(message, 'Stack fill scan', 'bytes');
+      if (memory.request.signal.aborted || (error instanceof RtosError && ['TargetReadCancelled', 'SessionChanged'].includes(error.errorCode))) {
+        throw error;
+      }
+      if (error instanceof RtosError && error.errorCode === 'BudgetExceeded') {
+        budgetExceeded = true;
+        budgetMessage = message;
+      }
     } finally { stack.scanMs = Date.now() - started; }
   }
+  return { budgetExceeded, budgetMessage };
 }
 
 export function counterDelta(previous: bigint, current: bigint, bits: number, maxDelta: bigint): bigint | undefined {

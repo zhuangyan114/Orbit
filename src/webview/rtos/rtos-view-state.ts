@@ -1,10 +1,21 @@
-import type { Capability, Consistency, Field, QueueObjectKind, RtosSnapshot, SyncObjectSnapshot, TaskSnapshot } from '../../rtos/model';
+import type {
+  Capability,
+  Consistency,
+  Field,
+  QueueObjectKind,
+  RtosSnapshot,
+  SyncObjectSnapshot,
+  TaskSnapshot,
+  TimerListState,
+  TimerSnapshot,
+} from '../../rtos/model';
 
 export const RTOS_VIEW_SETTINGS_KEY = 'orbitRtosViewSettings';
 
 export type RtosSubPage = 'tasks' | 'trace' | 'contexts';
-export type RtosTasksSubTab = 'tasks' | 'objects';
+export type RtosTasksSubTab = 'tasks' | 'objects' | 'timers';
 export type RtosObjectKindFilter = 'all' | 'queue' | 'mutex' | 'semaphore' | 'issues';
+export type RtosTimerFilter = 'all' | 'active' | 'stopped';
 export type RtosTaskSortKey = 'state' | 'priority' | 'name' | 'stack' | 'cpu' | 'address';
 export type RtosSortDirection = 'asc' | 'desc';
 export type RtosTaskStateFilter = 'all' | TaskSnapshot['state'];
@@ -18,6 +29,8 @@ export interface RtosCapabilitiesMap {
   runtimeCounters: Capability;
   runtimePercent: Capability;
   objects?: Capability;
+  timers?: Capability;
+  heap?: Capability;
 }
 
 export interface RtosCapabilitiesPayload {
@@ -43,9 +56,12 @@ export interface RtosViewSettings {
   searchQuery: string;
   objectKindFilter: RtosObjectKindFilter;
   objectSearchQuery: string;
+  timerFilter: RtosTimerFilter;
+  timerSearchQuery: string;
   selectedTaskAddress: number | null;
   selectedObjectAddress: number | null;
   maxStackScanBytes: number;
+  detailBudgetBytes: number;
   showDiagnostics: boolean;
 }
 
@@ -62,9 +78,12 @@ export const DEFAULT_RTOS_VIEW_SETTINGS: RtosViewSettings = {
   searchQuery: '',
   objectKindFilter: 'all',
   objectSearchQuery: '',
+  timerFilter: 'all',
+  timerSearchQuery: '',
   selectedTaskAddress: null,
   selectedObjectAddress: null,
   maxStackScanBytes: 4096,
+  detailBudgetBytes: 65536,
   showDiagnostics: false,
 };
 
@@ -97,8 +116,9 @@ export interface RtosPanelState {
 }
 
 const VALID_PAGES = new Set<RtosSubPage>(['tasks', 'trace', 'contexts']);
-const VALID_SUB_TABS = new Set<RtosTasksSubTab>(['tasks', 'objects']);
+const VALID_SUB_TABS = new Set<RtosTasksSubTab>(['tasks', 'objects', 'timers']);
 const VALID_OBJ_FILTERS = new Set<RtosObjectKindFilter>(['all', 'queue', 'mutex', 'semaphore', 'issues']);
+const VALID_TIMER_FILTERS = new Set<RtosTimerFilter>(['all', 'active', 'stopped']);
 const VALID_SORT_KEYS = new Set<RtosTaskSortKey>(['state', 'priority', 'name', 'stack', 'cpu', 'address']);
 const VALID_STATES = new Set<RtosTaskStateFilter>(['all', 'running', 'ready', 'blocked', 'suspended', 'termination', 'unknown']);
 
@@ -114,6 +134,12 @@ export function clampMaxStackScanBytes(value: unknown): number {
   return Math.max(64, Math.min(16384, Math.round(num)));
 }
 
+export function clampDetailBudgetBytes(value: unknown): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) return DEFAULT_RTOS_VIEW_SETTINGS.detailBudgetBytes;
+  return Math.max(4096, Math.min(131072, Math.round(num)));
+}
+
 export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings = DEFAULT_RTOS_VIEW_SETTINGS): RtosViewSettings {
   const raw = input && typeof input === 'object' ? input as Record<string, unknown> : {};
   const activePage = VALID_PAGES.has(raw.activePage as RtosSubPage) ? raw.activePage as RtosSubPage : base.activePage;
@@ -122,11 +148,13 @@ export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings 
   const sortDir: RtosSortDirection = raw.sortDir === 'desc' ? 'desc' : raw.sortDir === 'asc' ? 'asc' : base.sortDir;
   const stateFilter = VALID_STATES.has(raw.stateFilter as RtosTaskStateFilter) ? raw.stateFilter as RtosTaskStateFilter : base.stateFilter;
   const objectKindFilter = VALID_OBJ_FILTERS.has(raw.objectKindFilter as RtosObjectKindFilter) ? raw.objectKindFilter as RtosObjectKindFilter : base.objectKindFilter;
+  const timerFilter = VALID_TIMER_FILTERS.has(raw.timerFilter as RtosTimerFilter) ? raw.timerFilter as RtosTimerFilter : base.timerFilter;
   const liveEnabled = typeof raw.liveEnabled === 'boolean' ? raw.liveEnabled : base.liveEnabled;
   const liveIntervalMs = raw.liveIntervalMs !== undefined ? clampLiveIntervalMs(raw.liveIntervalMs) : base.liveIntervalMs;
   const includeObjectsInLive = typeof raw.includeObjectsInLive === 'boolean' ? raw.includeObjectsInLive : base.includeObjectsInLive;
   const searchQuery = typeof raw.searchQuery === 'string' ? raw.searchQuery.slice(0, 128) : base.searchQuery;
   const objectSearchQuery = typeof raw.objectSearchQuery === 'string' ? raw.objectSearchQuery.slice(0, 128) : base.objectSearchQuery;
+  const timerSearchQuery = typeof raw.timerSearchQuery === 'string' ? raw.timerSearchQuery.slice(0, 128) : base.timerSearchQuery;
   const selectedTaskAddress = raw.selectedTaskAddress === null
     ? null
     : typeof raw.selectedTaskAddress === 'number' && Number.isSafeInteger(raw.selectedTaskAddress) && raw.selectedTaskAddress > 0
@@ -138,6 +166,7 @@ export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings 
       ? raw.selectedObjectAddress
       : base.selectedObjectAddress;
   const maxStackScanBytes = raw.maxStackScanBytes !== undefined ? clampMaxStackScanBytes(raw.maxStackScanBytes) : base.maxStackScanBytes;
+  const detailBudgetBytes = raw.detailBudgetBytes !== undefined ? clampDetailBudgetBytes(raw.detailBudgetBytes) : base.detailBudgetBytes;
   const showDiagnostics = typeof raw.showDiagnostics === 'boolean' ? raw.showDiagnostics : base.showDiagnostics;
   return {
     version: 1,
@@ -152,9 +181,12 @@ export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings 
     searchQuery,
     objectKindFilter,
     objectSearchQuery,
+    timerFilter,
+    timerSearchQuery,
     selectedTaskAddress,
     selectedObjectAddress,
     maxStackScanBytes,
+    detailBudgetBytes,
     showDiagnostics,
   };
 }
@@ -311,6 +343,10 @@ export function objectKindLabel(kind: QueueObjectKind): string {
   }
 }
 
+function matchesHex(address: number, needle: string): boolean {
+  return formatHex32(address).toLowerCase().includes(needle) || address.toString(16).includes(needle);
+}
+
 export function filterSyncObjects(
   objects: readonly SyncObjectSnapshot[],
   kindFilter: RtosObjectKindFilter,
@@ -325,9 +361,37 @@ export function filterSyncObjects(
     if (!needle) return true;
     const name = obj.name.available ? obj.name.value.toLowerCase() : '';
     const sym = (obj.symbolName || '').toLowerCase();
-    const hex = `0x${obj.address.toString(16)}`;
     const holder = obj.holder?.taskName?.toLowerCase() || '';
     const kind = objectKindLabel(obj.kind).toLowerCase();
-    return name.includes(needle) || sym.includes(needle) || hex.includes(needle) || holder.includes(needle) || kind.includes(needle);
+    return name.includes(needle) || sym.includes(needle) || matchesHex(obj.address, needle) || holder.includes(needle) || kind.includes(needle);
+  });
+}
+
+export function timerStateLabel(state: TimerListState): string {
+  switch (state) {
+    case 'active-current': return '当前活动';
+    case 'active-overflow': return '溢出列表';
+    case 'stopped-global': return '全局已停';
+    default: return '状态待定';
+  }
+}
+
+export function filterTimers(
+  timers: readonly TimerSnapshot[],
+  timerFilter: RtosTimerFilter,
+  query: string,
+): TimerSnapshot[] {
+  const needle = query.trim().toLowerCase();
+  return timers.filter(timer => {
+    const isActive = timer.listState === 'active-current' || timer.listState === 'active-overflow' || (timer.active.available && timer.active.value);
+    if (timerFilter === 'active' && !isActive) return false;
+    if (timerFilter === 'stopped' && isActive) return false;
+    if (!needle) return true;
+    const name = timer.name.available ? timer.name.value.toLowerCase() : '';
+    const sym = (timer.symbolName || '').toLowerCase();
+    return name.includes(needle)
+      || sym.includes(needle)
+      || matchesHex(timer.address, needle)
+      || (timer.callbackAddress.available && matchesHex(timer.callbackAddress.value, needle));
   });
 }

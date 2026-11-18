@@ -128,9 +128,68 @@ export interface TaskSnapshot {
   };
   runtime: { counter: Field<string>; bits: Field<number>; percent: Field<number>; intervalMs: Field<number>; readWindowMs?: Field<number>; };
 }
+export interface DetailRefreshBudget {
+  limitBytes: number;
+  usedBytes: number;
+  stackBytes: number;
+  objectBytes: number;
+  timerBytes: number;
+  heapBytes: number;
+  exhausted: boolean;
+}
+
+export type TimerListState = 'active-current' | 'active-overflow' | 'stopped-global' | 'unknown';
+
+export interface TimerSnapshot {
+  address: number;
+  name: Field<string>;
+  symbolName?: string;
+  discoverySources: ('list' | 'global')[];
+  listState: TimerListState;
+  active: Field<boolean>;
+  autoReload: Field<boolean>;
+  staticallyAllocated: Field<boolean>;
+  periodTicks: Field<number>;
+  expiryTick: Field<number>;
+  timerId: Field<number>;
+  callbackAddress: Field<number>;
+  timerNumber: Field<number>;
+  health: ObjectHealth;
+  healthReason?: string;
+}
+
+export interface TimersDiscoverySummary {
+  enabled: boolean;
+  unavailableReason?: string;
+  tickCount?: Field<number>;
+  activeCurrentCount: number;
+  activeOverflowCount: number;
+  globalStoppedCount: number;
+  coverageNote: string;
+  timers: TimerSnapshot[];
+}
+
+export type HeapAllocatorKind = 'heap_4' | 'heap_1' | 'heap_2' | 'heap_3' | 'heap_5' | 'custom-or-disabled' | 'unknown';
+
+export interface HeapOverview {
+  allocator: HeapAllocatorKind;
+  supported: boolean;
+  initialized: boolean;
+  unavailableReason?: string;
+  note: string;
+  configuredBytes: Field<number>;
+  usableBytes: Field<number>;
+  usedBytes: Field<number>;
+  freeBytes: Field<number>;
+  minimumEverFreeBytes: Field<number>;
+  successfulAllocations: Field<number>;
+  successfulFrees: Field<number>;
+}
+
 export interface SnapshotDiagnostics {
   bytes: number; batches: number; rounds: number; nodes: number; coveredLists: string[];
   queueWaitMs: number; ioMs: number; parseMs: number; totalMs: number;
+  detailBudget?: DetailRefreshBudget;
 }
 export interface RtosSnapshot extends SnapshotIdentity {
   version: 1;
@@ -144,6 +203,8 @@ export interface RtosSnapshot extends SnapshotIdentity {
   runtimeTotal: Field<string>;
   runtimeTotalBits: Field<number>;
   objects?: ObjectsDiscoverySummary;
+  timers?: TimersDiscoverySummary;
+  heap?: HeapOverview;
   issues: RtosIssue[];
   diagnostics: SnapshotDiagnostics;
 }

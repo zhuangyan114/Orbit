@@ -409,7 +409,19 @@ describe('RtosWebviewProvider', () => {
       intervalMs: 500,
       includeObjects: true,
       includeWaitDetails: true,
+      includeTimers: true,
+      includeHeap: true,
+      detailBudgetBytes: 65536,
     }));
+
+    inspected.length = 0;
+    await (provider as any).handleMessage({ command: 'inspectTimersHeap' });
+    expect(inspected.at(-1)).toMatchObject({
+      action: 'refresh',
+      includeTimers: true,
+      includeHeap: true,
+      detailBudgetBytes: 65536,
+    });
     provider.dispose();
   });
 });

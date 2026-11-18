@@ -95,4 +95,15 @@
 - 硬件：未执行；未针对队列/互斥锁/Semaphore 执行物理目标操作。
 - 证据：src/rtos/object-reader.test.ts、src/rtos/freertos-layout.test.ts、out/rtos-stage2/vscode-ui/report.json。
 - 剩余事项：2.3 增加 Software Timers 与 Heap 概览及统一刷新预算；2.4 清理旧 RTOS Views 专属集成。
-- 提交：实现 RTOS 阶段 2.2：增加队列锁与任务等待关系；hash 用 git log 查询本记录所在提交。
+- 提交：实现 RTOS 阶段 2.2：增加队列锁与任务等待关系；hash 用 git log 查询本记录所在提交（3711561）。
+
+## 2.3 / 2026-11-18
+
+- 状态：已完成（L1/L3/L4 自动化验收通过；硬件未执行）。
+- 实现：src/rtos/model.ts、src/rtos/reader-helpers.ts、src/rtos/freertos-layout.ts、src/rtos/timer-heap-reader.ts、src/rtos/task-metrics.ts、src/rtos/snapshot-service.ts 与 src/debug/dap-session.ts 实现 ListItem_t.xItemValue、tmrTimerControl/xActiveTimerList1/2/pxCurrentTimerList/pxOverflowTimerList/xTickCount/TimerHandle_t/StaticTimer_t 布局编译与读写，区分 heap_4（ucHeap、xStart、pxEnd、xFreeBytesRemaining、xMinimumEverFreeBytesRemaining、成功分配与释放计数；含 pxEnd==NULL 未初始化态）与 heap_1/heap_2/heap_5/自定义或关闭状态，并将栈扫描、对象等待链、定时器与堆详情纳入统一的 SnapshotMemory detailBudgetBytes 刷新预算；src/webview/rtos/timers-heap-view.tsx、app.tsx、rtos-view-state.ts 与 rtos-provider.ts 增加“定时器与堆”子页签、能力状态徽章及诊断区详情预算分解展示。
+- 设计变更：将栈扫描与对象/定时器/堆读取共用的字节上限直接收敛到单帧 SnapshotMemory.limits.bytes（baselineBytes + detailBudgetBytes），在任一详情段触发 BudgetExceeded 时记录问题、保留已收集的任务与轻量元数据、并按 partial 降级；对未引用且处于停止态的动态定时器明确不生成全量列表，对 heap 仅展示已记录计数而不猜测碎片率或泄漏。
+- 检查：npm run typecheck 与 npm run build 通过；聚焦 Vitest 9 文件 71 项通过（含 7 个含 DWARF 阶段 0 ELF 变体的 Timer/Heap 布局校验、timer-heap-reader.test.ts 活动/溢出/全局停止/关闭配置/heap_4 初始化前后/非 heap_4 降级与统一预算溢出测试、rtos-view-state.test.ts、rtos-provider.test.ts 与 dap-session-rtos-snapshot.test.ts）；scripts/rtos/verify-stage2-vscode.js 在真实 VS Code 中通过定时器与堆子页签切换、inspectTimersHeap、heap_4 与 detailBudgetBytes 设置持久化验证。
+- 硬件：未执行；未针对 Timer/Heap 执行物理目标操作。
+- 证据：src/rtos/timer-heap-reader.test.ts、src/rtos/freertos-layout.test.ts、out/rtos-stage2/vscode-ui/report.json。
+- 剩余事项：2.4 清理旧 mcu-debug.rtos-views 专属集成并执行阶段 2 出口回归与 VSIX 检查。
+- 提交：实现 RTOS 阶段 2.3：增加定时器与堆概览；hash 用 git log 查询本记录所在提交。

@@ -102,6 +102,38 @@ describe('FreeRTOS layout compiler', () => {
     expect(degradedDef.queue).toBeUndefined();
     expect(degradedDef.queueUnavailableReason).toContain('Conflicting QueueDefinition');
   });
+
+  it('discriminates heap allocators (heap_1/heap_2/heap_5/custom/disabled) and disables timers when symbols are absent', () => {
+    const noTimers = testCatalog();
+    const noTimerLayout = compileFreeRtosLayout(noTimers, 'nt');
+    expect(noTimerLayout.timer).toBeUndefined();
+    expect(noTimerLayout.timerUnavailableReason).toContain('Software timers disabled');
+    expect(noTimerLayout.heap).toMatchObject({ allocator: 'custom-or-disabled', supported: false });
+
+    const heap1 = testCatalog();
+    heap1.types.heapBuf = { name: '', kind: 'array', byteSize: 4096, arrayCount: 4096, typeOffset: 'char' };
+    heap1.roots.push(
+      { id: '91', expression: 'ucHeap', address: 0x4000, typeOffset: 'heapBuf', size: 4096, file: 'heap_1.c', pointerDepth: 0 },
+      { id: '92', expression: 'xNextFreeByte', address: 0x3f00, typeOffset: 'u32', size: 4, file: 'heap_1.c', pointerDepth: 0 },
+    );
+    expect(compileFreeRtosLayout(heap1, 'h1').heap).toMatchObject({ allocator: 'heap_1', supported: false });
+
+    const heap2 = testCatalog();
+    heap2.types.heapBuf = { name: '', kind: 'array', byteSize: 4096, arrayCount: 4096, typeOffset: 'char' };
+    heap2.roots.push(
+      { id: '91', expression: 'ucHeap', address: 0x4000, typeOffset: 'heapBuf', size: 4096, file: 'heap_2.c', pointerDepth: 0 },
+      { id: '92', expression: 'xEnd', address: 0x3f00, typeOffset: 'u32', size: 4, file: 'heap_2.c', pointerDepth: 0 },
+    );
+    expect(compileFreeRtosLayout(heap2, 'h2').heap).toMatchObject({ allocator: 'heap_2', supported: false });
+
+    const heap5 = testCatalog();
+    heap5.roots.push(
+      { id: '91', expression: 'xFreeBytesRemaining', address: 0x3f00, typeOffset: 'u32', size: 4, file: 'heap_5.c', pointerDepth: 0 },
+      { id: '92', expression: 'pxEnd', address: 0x3f04, typeOffset: 'ptr', size: 4, file: 'heap_5.c', pointerDepth: 0 },
+      { id: '93', expression: 'xStart', address: 0x3f08, typeOffset: 'u32', size: 4, file: 'heap_5.c', pointerDepth: 0 },
+    );
+    expect(compileFreeRtosLayout(heap5, 'h5').heap).toMatchObject({ allocator: 'heap_5', supported: false });
+  });
 });
 
 const fixtureRoot = process.env.ORBIT_RTOS_FIXTURES || 'out/rtos-stage0/fixtures/arm';
@@ -122,6 +154,12 @@ describe('fixed stage-0 ELF layouts (requires offline fixture build)', () => {
       expect(layout.queue?.fields.uxMessagesWaiting.size).toBe(4);
       expect(layout.queue?.fields.ucQueueType).toBeDefined();
       expect(layout.queueRegistry?.count).toBe(12);
+      expect(layout.item.itemValue).toBeDefined();
+      expect(layout.timer).toBeDefined();
+      expect(layout.timer?.fields.ucStatus).toBeDefined();
+      expect(layout.timerGlobals.some(g => g.name === 'fixtureTimer')).toBe(true);
+      expect(layout.heap).toMatchObject({ allocator: 'heap_4', supported: true });
+      expect(layout.heap?.ucHeap?.size).toBe(65536);
     }, 30000);
   }
 });

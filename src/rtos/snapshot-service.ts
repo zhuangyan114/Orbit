@@ -4,6 +4,7 @@ import { Capability, RtosError, RtosSnapshot, SnapshotIdentity } from './model';
 import { ObjectReadOptions, readObjectSnapshot } from './object-reader';
 import { AddressRange, readTaskSnapshot, SnapshotLimits } from './snapshot-reader';
 import { addStackMetrics, PortContract, StackScanOptions, TaskRuntimeTracker } from './task-metrics';
+import { readHeapOverview, readTimerSnapshot } from './timer-heap-reader';
 
 export interface SnapshotHost {
   identity(): Omit<SnapshotIdentity, 'layoutId'>;
@@ -20,6 +21,9 @@ export interface SnapshotHost {
 export interface SnapshotOptions extends StackScanOptions, Omit<ObjectReadOptions, 'readRodata'> {
   limits?: Partial<SnapshotLimits>;
   includeObjects?: boolean;
+  includeTimers?: boolean;
+  includeHeap?: boolean;
+  detailBudgetBytes?: number;
 }
 
 /** One in-flight refresh, no queued ticks, and a fence on every asynchronous boundary. */
@@ -54,6 +58,8 @@ export class RtosSnapshotService {
       runtimeCounters: capability(!!layout.tcb.fields.ulRunTimeCounter, 'Kernel runtime statistics disabled or missing'),
       runtimePercent: capability(!!layout.runtimeTotal && !!layout.tcb.fields.ulRunTimeCounter && !!this.host.port?.runtime, 'Counter total or verified timebase unavailable'),
       objects: capability(!!layout.queue && this.host.ram.length > 0, layout.queueUnavailableReason || 'RAM description unavailable'),
+      timers: capability(!!layout.timer && this.host.ram.length > 0, layout.timerUnavailableReason || 'RAM description unavailable'),
+      heap: capability(!!layout.heap?.supported && this.host.ram.length > 0, layout.heap?.unavailableReason || 'RAM description unavailable'),
     } };
   }
   invalidate(reason: string) {
@@ -84,8 +90,58 @@ export class RtosSnapshotService {
         read: async (address, size) => { fence(); const result = await this.host.read(address, size, controller.signal); fence(); queueWaitMs += result.queueWaitMs; return result.bytes; },
         ...(this.host.readMany ? { readMany: async (ranges: AddressRange[]) => { fence(); const result = await this.host.readMany!(ranges, controller.signal); fence(); queueWaitMs += result.queueWaitMs; return result.bytes; } } : {}) });
       fence();
-      await addStackMetrics(result, this.host.port, options); fence();
+
+      // Enforce a unified detail refresh budget across Heap, Stack Scan, Objects, and Timers.
+      const baselineBytes = result.snapshot.diagnostics.bytes;
+      const detailLimit = options.detailBudgetBytes !== undefined
+        ? Math.max(1, Math.min(result.memory.limits.bytes, Math.floor(options.detailBudgetBytes)))
+        : Math.min(64 * 1024, result.memory.limits.bytes - Math.min(baselineBytes, result.memory.limits.bytes - 1));
+      const originalByteLimit = result.memory.limits.bytes;
+      result.memory.limits.bytes = Math.min(originalByteLimit, baselineBytes + detailLimit);
+
+      let heapBytes = 0;
+      let stackBytes = 0;
+      let objectBytes = 0;
+      let timerBytes = 0;
+      let detailBudgetExhausted = false;
+
+      const recordDetailIssue = (operation: string, error: unknown) => {
+        if (controller.signal.aborted || (error instanceof RtosError && ['SessionChanged', 'TargetReadCancelled'].includes(error.errorCode))) {
+          throw error;
+        }
+        const errorCode = error instanceof RtosError ? error.errorCode : 'MemoryReadFailed';
+        const message = error instanceof Error ? error.message : String(error);
+        if (errorCode === 'BudgetExceeded') detailBudgetExhausted = true;
+        result.snapshot.issues.push({ errorCode, operation, message, retryable: false, completion: 'completed' });
+        if (['halted-consistent', 'live-best-effort'].includes(result.snapshot.consistency)) {
+          result.snapshot.consistency = 'partial';
+          result.snapshot.reason = result.snapshot.reason || message;
+        }
+      };
+
+      if (options.includeHeap) {
+        const before = result.snapshot.diagnostics.bytes;
+        try {
+          result.snapshot.heap = await readHeapOverview(layout, result.memory);
+        } catch (error) {
+          recordDetailIssue('heapOverview', error);
+        } finally {
+          heapBytes = result.snapshot.diagnostics.bytes - before;
+        }
+        fence();
+      }
+
+      const beforeStack = result.snapshot.diagnostics.bytes;
+      const stackOutcome = await addStackMetrics(result, this.host.port, options);
+      stackBytes = result.snapshot.diagnostics.bytes - beforeStack;
+      if (stackOutcome.budgetExceeded) {
+        detailBudgetExhausted = true;
+        recordDetailIssue('stackScan', new RtosError('BudgetExceeded', stackOutcome.budgetMessage || 'Stack scan budget exhausted'));
+      }
+      fence();
+
       if (options.includeObjects || options.objectAddresses?.length) {
+        const before = result.snapshot.diagnostics.bytes;
         try {
           result.snapshot.objects = await readObjectSnapshot(layout, result, {
             includeWaitDetails: options.includeWaitDetails,
@@ -93,24 +149,39 @@ export class RtosSnapshotService {
             readRodata: this.host.readRodata,
           });
         } catch (error) {
-          if (controller.signal.aborted || (error instanceof RtosError && ['SessionChanged', 'TargetReadCancelled'].includes(error.errorCode))) {
-            throw error;
-          }
-          const message = error instanceof Error ? error.message : String(error);
-          result.snapshot.issues.push({
-            errorCode: error instanceof RtosError ? error.errorCode : 'MemoryReadFailed',
-            operation: 'objectSnapshot',
-            message,
-            retryable: false,
-            completion: 'completed',
-          });
-          if (['halted-consistent', 'live-best-effort'].includes(result.snapshot.consistency)) {
-            result.snapshot.consistency = 'partial';
-            result.snapshot.reason = result.snapshot.reason || message;
-          }
+          recordDetailIssue('objectSnapshot', error);
+        } finally {
+          objectBytes = result.snapshot.diagnostics.bytes - before;
         }
         fence();
       }
+
+      if (options.includeTimers) {
+        const before = result.snapshot.diagnostics.bytes;
+        try {
+          result.snapshot.timers = await readTimerSnapshot(layout, result, {
+            readRodata: this.host.readRodata,
+          });
+        } catch (error) {
+          recordDetailIssue('timerSnapshot', error);
+        } finally {
+          timerBytes = result.snapshot.diagnostics.bytes - before;
+        }
+        fence();
+      }
+
+      if (options.includeHeap || (options.taskAddresses?.length ?? 0) > 0 || options.includeObjects || (options.objectAddresses?.length ?? 0) > 0 || options.includeTimers) {
+        result.snapshot.diagnostics.detailBudget = {
+          limitBytes: detailLimit,
+          usedBytes: heapBytes + stackBytes + objectBytes + timerBytes,
+          stackBytes,
+          objectBytes,
+          timerBytes,
+          heapBytes,
+          exhausted: detailBudgetExhausted,
+        };
+      }
+
       result.snapshot.completedAt = Date.now();
       result.snapshot.diagnostics.queueWaitMs = queueWaitMs;
       result.snapshot.diagnostics.ioMs = Math.max(0, result.snapshot.diagnostics.ioMs - queueWaitMs);
@@ -141,7 +212,11 @@ export class RtosSnapshotService {
       || this.last.bootGeneration !== identity.bootGeneration || this.last.elfSha256 !== identity.elfSha256) return;
     return { ...structuredClone(this.last), consistency: 'stale', reason };
   }
-  start(publish: (snapshot: RtosSnapshot) => void, intervalMs = 500, options: Pick<SnapshotOptions, 'includeObjects' | 'includeWaitDetails'> = {}) {
+  start(
+    publish: (snapshot: RtosSnapshot) => void,
+    intervalMs = 500,
+    options: Pick<SnapshotOptions, 'includeObjects' | 'includeWaitDetails' | 'includeTimers' | 'includeHeap' | 'detailBudgetBytes'> = {},
+  ) {
     this.stop();
     this.live = true;
     const interval = Math.max(200, Math.min(10000, Number.isFinite(intervalMs) ? intervalMs : 500)), generation = this.pollingGeneration;

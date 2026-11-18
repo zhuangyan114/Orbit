@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { TaskSnapshot } from '../../rtos/model';
 import { ObjectsView } from './objects-view';
+import { TimersHeapView } from './timers-heap-view';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   describeConsistency,
@@ -136,6 +137,9 @@ export function RtosApp() {
   const tasks = snapshot?.tasks ?? [];
   const objectsSummary = snapshot?.objects;
   const objectsCount = objectsSummary?.objects.length ?? 0;
+  const timersSummary = snapshot?.timers;
+  const timersCount = timersSummary?.timers.length ?? 0;
+  const heapOverview = snapshot?.heap;
   const displayedTasks = useMemo(
     () => (panel.visible ? filterAndSortTasks(tasks, settings) : []),
     [panel.visible, tasks, settings.stateFilter, settings.searchQuery, settings.sortBy, settings.sortDir],
@@ -253,13 +257,13 @@ export function RtosApp() {
             <span>Live{panel.liveActive ? ' ●' : ''}</span>
           </label>
 
-          <label className="rtos-live-toggle" title="Live 轮询时同步读取队列、互斥锁与信号量（会增加每轮总线读取量）">
+          <label className="rtos-live-toggle" title="Live 轮询时同步读取队列、互斥锁、信号量、定时器与堆（会增加每轮总线读取量）">
             <input
               type="checkbox"
               checked={settings.includeObjectsInLive}
               onChange={event => updateSettings({ includeObjectsInLive: event.target.checked })}
             />
-            <span>Live含对象</span>
+            <span>Live含扩展</span>
           </label>
 
           <select
@@ -305,6 +309,8 @@ export function RtosApp() {
               <CapabilityChip label="运行计数" cap={caps.runtimeCounters} />
               <CapabilityChip label="CPU%" cap={caps.runtimePercent} />
               {caps.objects && <CapabilityChip label="队列与锁" cap={caps.objects} />}
+              {caps.timers && <CapabilityChip label="定时器" cap={caps.timers} />}
+              {caps.heap && <CapabilityChip label="堆概览" cap={caps.heap} />}
             </div>
           )}
           <div className="rtos-timing">
@@ -375,6 +381,7 @@ export function RtosApp() {
               {([
                 ['tasks', `任务 (${tasks.length})`],
                 ['objects', `队列与锁 (${objectsCount})`],
+                ['timers', `定时器与堆 (${timersCount})`],
               ] as [RtosTasksSubTab, string][]).map(([id, label]) => (
                 <button
                   key={id}
@@ -403,6 +410,16 @@ export function RtosApp() {
                 onUpdateSettings={updateSettings}
                 onInspectObject={address => vscodeApi.postMessage(address ? { command: 'inspectObject', address } : { command: 'inspectObject', all: true })}
                 onSelectTask={taskAddress => updateSettings({ tasksSubTab: 'tasks', selectedTaskAddress: taskAddress })}
+              />
+            ) : settings.tasksSubTab === 'timers' ? (
+              <TimersHeapView
+                timers={timersSummary}
+                heap={heapOverview}
+                settings={settings}
+                canRefresh={canQueryTarget && !panel.loading.capabilities}
+                refreshing={panel.loading.refresh}
+                onUpdateSettings={updateSettings}
+                onRefreshTimersHeap={() => vscodeApi.postMessage({ command: 'inspectTimersHeap' })}
               />
             ) : (
               <div className="rtos-workspace">
@@ -669,6 +686,14 @@ export function RtosApp() {
                 <div><strong>会话/代次：</strong>{snapshot.sessionId.slice(0, 8)} · seg={snapshot.sessionGeneration} · boot={snapshot.bootGeneration} · op={snapshot.operationGeneration}</div>
                 <div><strong>ELF / Layout：</strong>{snapshot.elfSha256.slice(0, 12)} / {snapshot.layoutId.slice(0, 12)}</div>
                 <div><strong>读取统计：</strong>{snapshot.diagnostics.rounds} 轮 / {snapshot.diagnostics.batches} 批 / {snapshot.diagnostics.nodes} 节点 / {snapshot.diagnostics.bytes} B</div>
+                {snapshot.diagnostics.detailBudget && (
+                  <div>
+                    <strong>详情预算：</strong>
+                    {snapshot.diagnostics.detailBudget.usedBytes} / {snapshot.diagnostics.detailBudget.limitBytes} B
+                    {snapshot.diagnostics.detailBudget.exhausted ? '（已达上限）' : ''}
+                    （栈 {snapshot.diagnostics.detailBudget.stackBytes} / 对象 {snapshot.diagnostics.detailBudget.objectBytes} / 定时器 {snapshot.diagnostics.detailBudget.timerBytes} / 堆 {snapshot.diagnostics.detailBudget.heapBytes}）
+                  </div>
+                )}
                 <div><strong>覆盖列表：</strong>{snapshot.diagnostics.coveredLists.join(', ') || '—'}</div>
                 <div><strong>问题清单：</strong>{snapshot.issues.length ? snapshot.issues.map(i => `${i.errorCode}(${i.completion}): ${i.message}`).join(' | ') : '无'}</div>
               </div>
@@ -831,4 +856,10 @@ const STYLES = `
 .rtos-link-btn { border:0; padding:0; background:transparent; color:var(--vscode-textLink-foreground, #3794ff); cursor:pointer; font:inherit; text-decoration:underline; }
 .rtos-link-btn:hover { color:var(--vscode-textLink-activeForeground, #4fc1ff); }
 .rtos-waiter-row { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.rtos-heap-card { display:flex; flex-direction:column; gap:6px; padding:8px 10px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; }
+.rtos-heap-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; }
+.rtos-heap-metrics { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:8px 12px; }
+.rtos-heap-stat { display:flex; flex-direction:column; gap:1px; }
+.rtos-heap-bar-wrap { display:flex; align-items:center; gap:8px; }
+.rtos-heap-bar { width:100%; max-width:360px; height:7px; }
 `;

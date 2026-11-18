@@ -289,7 +289,13 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       const response = await session.customRequest('orbitRtosSnapshot', {
         action: 'start',
         intervalMs: this.settings.liveIntervalMs,
-        ...(includeObjects ? { includeObjects: true, includeWaitDetails: this.settings.tasksSubTab === 'objects' } : {}),
+        detailBudgetBytes: this.settings.detailBudgetBytes,
+        ...(includeObjects ? {
+          includeObjects: true,
+          includeWaitDetails: this.settings.tasksSubTab === 'objects',
+          includeTimers: true,
+          includeHeap: true,
+        } : {}),
       });
       if (!this.isCurrentBinding(generation, session) || !this.settings.liveEnabled || !this.isVisible) {
         void session.customRequest('orbitRtosSnapshot', { action: 'stop' }).then(undefined, () => {});
@@ -334,6 +340,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     includeObjects?: boolean;
     includeWaitDetails?: boolean;
     objectAddresses?: number[];
+    includeTimers?: boolean;
+    includeHeap?: boolean;
     retryOnCoalescedScan?: boolean;
   } = {}): Promise<void> {
     const generation = options.generation ?? this.sessionGeneration;
@@ -348,6 +356,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     const isObjectDetail = Array.isArray(options.objectAddresses) && options.objectAddresses.length > 0;
     const includeObjects = options.includeObjects ?? true;
     const includeWaitDetails = options.includeWaitDetails ?? (this.settings.tasksSubTab === 'objects' || isObjectDetail);
+    const includeTimers = options.includeTimers ?? !isStackScan;
+    const includeHeap = options.includeHeap ?? !isStackScan;
     this.loading.refresh = true;
     if (isStackScan) this.loading.stackScan = true;
     this.postState();
@@ -355,7 +365,10 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     try {
       const args: Record<string, unknown> = {
         action: 'refresh',
+        detailBudgetBytes: this.settings.detailBudgetBytes,
         ...(includeObjects ? { includeObjects: true, includeWaitDetails } : {}),
+        ...(includeTimers ? { includeTimers: true } : {}),
+        ...(includeHeap ? { includeHeap: true } : {}),
       };
       if (isStackScan) {
         args.taskAddresses = options.taskAddresses;
@@ -467,7 +480,13 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
             ? msg.taskAddresses.filter((address: unknown): address is number => typeof address === 'number' && Number.isSafeInteger(address) && address > 0)
             : [];
         if (addresses.length > 0) {
-          await this.refreshSnapshot({ taskAddresses: addresses, maxBytesPerTask: this.settings.maxStackScanBytes, includeObjects: false });
+          await this.refreshSnapshot({
+            taskAddresses: addresses,
+            maxBytesPerTask: this.settings.maxStackScanBytes,
+            includeObjects: false,
+            includeTimers: false,
+            includeHeap: false,
+          });
         }
         break;
       }
@@ -477,9 +496,18 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           : Array.isArray(msg.objectAddresses)
             ? msg.objectAddresses.filter((address: unknown): address is number => typeof address === 'number' && Number.isSafeInteger(address) && address > 0)
             : (typeof msg.address === 'number' && Number.isSafeInteger(msg.address) && msg.address > 0 ? [msg.address] : undefined);
-        await this.refreshSnapshot({ includeObjects: true, includeWaitDetails: true, ...(addresses?.length ? { objectAddresses: addresses } : {}) });
+        await this.refreshSnapshot({
+          includeObjects: true,
+          includeWaitDetails: true,
+          includeTimers: false,
+          includeHeap: false,
+          ...(addresses?.length ? { objectAddresses: addresses } : {}),
+        });
         break;
       }
+      case 'inspectTimersHeap':
+        await this.refreshSnapshot({ includeObjects: false, includeTimers: true, includeHeap: true });
+        break;
       case 'setLive': {
         const nextLive = Boolean(msg.enabled);
         const nextInterval = msg.intervalMs !== undefined ? msg.intervalMs : this.settings.liveIntervalMs;
@@ -496,15 +524,20 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
         const previousInterval = this.settings.liveIntervalMs;
         const previousIncludeObjects = this.settings.includeObjectsInLive;
         const previousSubTab = this.settings.tasksSubTab;
+        const previousBudget = this.settings.detailBudgetBytes;
         await this.updateSettings(msg.settings);
         if (this.liveActive && this.settings.liveEnabled && this.activeSession && this.isVisible
           && (this.settings.liveIntervalMs !== previousInterval
             || this.settings.includeObjectsInLive !== previousIncludeObjects
+            || this.settings.detailBudgetBytes !== previousBudget
             || (this.settings.includeObjectsInLive && this.settings.tasksSubTab !== previousSubTab))) {
           await this.startLiveOnSession(this.sessionGeneration);
         } else if (this.settings.tasksSubTab === 'objects' && previousSubTab !== 'objects' && this.activeSession && this.isVisible
           && (!this.snapshot?.objects || this.snapshot.objects.objects.every(o => o.waitListEvidence === 'summary-only'))) {
-          await this.refreshSnapshot({ includeObjects: true, includeWaitDetails: true });
+          await this.refreshSnapshot({ includeObjects: true, includeWaitDetails: true, includeTimers: false, includeHeap: false });
+        } else if (this.settings.tasksSubTab === 'timers' && previousSubTab !== 'timers' && this.activeSession && this.isVisible
+          && (!this.snapshot?.timers || !this.snapshot?.heap)) {
+          await this.refreshSnapshot({ includeObjects: false, includeTimers: true, includeHeap: true });
         }
         break;
       }

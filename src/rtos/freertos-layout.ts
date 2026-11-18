@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import type { SymbolCatalog, SymbolNode, SymbolType } from '../symbols/symbol-catalog';
 import { symbolByteSize, symbolType } from '../symbols/symbol-catalog';
-import { RtosError } from './model';
+import { HeapAllocatorKind, RtosError } from './model';
 
 export interface Member { offset: number; size: number; typeOffset: string; }
 export interface ListRoot { name: string; address: number; state: 'ready' | 'blocked' | 'suspended' | 'termination' | 'pending'; }
@@ -38,6 +38,39 @@ export interface FreeRtosQueueLayout {
     pxQueueSetContainer?: Member;
   };
 }
+export interface FreeRtosTimerLayout {
+  size: number;
+  typeOffset: string;
+  source: string;
+  activeList1Address: number;
+  activeList2Address: number;
+  currentListPtrAddress: number;
+  overflowListPtrAddress: number;
+  tickCount?: { address: number; size: number };
+  fields: {
+    pcTimerName: Member;
+    xTimerListItem: Member;
+    xTimerPeriodInTicks: Member;
+    pvTimerID: Member;
+    pxCallbackFunction: Member;
+    ucStatus?: Member;
+    uxTimerNumber?: Member;
+  };
+}
+export interface FreeRtosHeapLayout {
+  allocator: HeapAllocatorKind;
+  supported: boolean;
+  unavailableReason?: string;
+  source: string;
+  ucHeap?: { address: number; size: number };
+  blockLinkSize?: number;
+  xStartAddress?: number;
+  pxEnd?: { address: number; size: number };
+  freeBytesRemaining?: { address: number; size: number };
+  minimumEverFreeBytesRemaining?: { address: number; size: number };
+  successfulAllocations?: { address: number; size: number };
+  successfulFrees?: { address: number; size: number };
+}
 export interface FreeRtosLayout {
   elfSha256: string; layoutId: string;
   source: string;
@@ -45,12 +78,16 @@ export interface FreeRtosLayout {
   runtimeTotal?: { address: number; size: number };
   lists: ListRoot[];
   list: { size: number; count: Member; end: Member; endNext: Member; endPrevious: Member };
-  item: { size: number; next: Member; previous: Member; owner: Member; container: Member };
+  item: { size: number; next: Member; previous: Member; owner: Member; container: Member; itemValue?: Member };
   tcb: { size: number; typeOffset: string; fields: Record<string, Member>; nameBytes: number; stackWordBytes: number };
   queue?: FreeRtosQueueLayout;
   queueRegistry?: QueueRegistryLayout;
   queueGlobals: QueueGlobalHandle[];
   queueUnavailableReason?: string;
+  timer?: FreeRtosTimerLayout;
+  timerGlobals: QueueGlobalHandle[];
+  timerUnavailableReason?: string;
+  heap?: FreeRtosHeapLayout;
 }
 
 /** Resolve from the variable DIE (name + address), never from a same-named type. */
@@ -109,8 +146,15 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
   const nameType = type(fields.pcTaskName.typeOffset);
   if (nameType.kind !== 'array' || fields.pcTaskName.size > 256 || symbolByteSize(catalog, nameType.typeOffset!) !== 1) fail('LayoutIncomplete', 'Invalid task name');
   const itemOffset = fields.xStateListItem.typeOffset;
-  const item = { size: type(itemOffset).byteSize, next: member(itemOffset, 'pxNext'), previous: member(itemOffset, 'pxPrevious'),
-    owner: member(itemOffset, 'pvOwner'), container: member(itemOffset, 'pvContainer') };
+  const itemType = type(itemOffset);
+  const item = {
+    size: itemType.byteSize,
+    next: member(itemOffset, 'pxNext'),
+    previous: member(itemOffset, 'pxPrevious'),
+    owner: member(itemOffset, 'pvOwner'),
+    container: member(itemOffset, 'pvContainer'),
+    ...(itemType.fields?.some(f => f.name === 'xItemValue') ? { itemValue: integer(member(itemOffset, 'xItemValue'), 'xItemValue') } : {}),
+  };
   for (const field of [item.next, item.previous, item.owner, item.container]) pointer(field.typeOffset);
   if (symbolByteSize(catalog, fields.xEventListItem.typeOffset) !== item.size) fail('LayoutIncomplete', 'Event item size mismatch');
   for (const [name, expected] of [['pxNext', item.next], ['pxPrevious', item.previous], ['pvOwner', item.owner], ['pvContainer', item.container]] as const) {
@@ -144,6 +188,20 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
     }
     lists.push({ name, address: node.address!, state });
   }
+  const verifyListType = (listTypeOffset: string, label: string, expectedByteSize = list.size) => {
+    const t = type(listTypeOffset);
+    if (t.byteSize !== expectedByteSize) fail('LayoutAmbiguous', `Conflicting list size in ${label}`);
+    for (const [fieldName, expected] of [['uxNumberOfItems', list.count], ['xListEnd', list.end]] as const) {
+      const actual = member(listTypeOffset, fieldName);
+      if (actual.offset !== expected.offset || actual.size !== expected.size) fail('LayoutAmbiguous', `Conflicting ${label}.${fieldName}`);
+    }
+    const actualEnd = member(listTypeOffset, 'xListEnd');
+    for (const [subName, expected] of [['pxNext', endNext], ['pxPrevious', endPrevious]] as const) {
+      const actual = member(actualEnd.typeOffset, subName);
+      pointer(actual.typeOffset);
+      if (actual.offset !== expected.offset || actual.size !== expected.size) fail('LayoutAmbiguous', `Conflicting ${label} sentinel.${subName}`);
+    }
+  };
   const taskCountBytes = symbolByteSize(catalog, count.typeOffset);
   if (!['base', 'enum'].includes(type(count.typeOffset).kind) || ![1, 2, 4].includes(taskCountBytes) || count.size !== taskCountBytes) fail('LayoutIncomplete', 'Invalid task count');
   // An optional total-counter DIE may be stripped/ambiguous independently of
@@ -317,13 +375,225 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
     queueUnavailableReason = err instanceof Error ? err.message : String(err);
   }
 
+  let timer: FreeRtosTimerLayout | undefined;
+  let timerUnavailableReason: string | undefined;
+  const timerGlobals: QueueGlobalHandle[] = [];
+  try {
+    const active1 = root('xActiveTimerList1', false);
+    const active2 = root('xActiveTimerList2', false);
+    const curPtr = root('pxCurrentTimerList', false);
+    const ovfPtr = root('pxOverflowTimerList', false);
+    if (!active1 || !active2 || !curPtr || !ovfPtr) {
+      timerUnavailableReason = 'Software timers disabled (missing xActiveTimerList1/2 or pxCurrentTimerList/pxOverflowTimerList)';
+    } else {
+      verifyListType(active1.typeOffset, 'xActiveTimerList1', active1.size);
+      verifyListType(active2.typeOffset, 'xActiveTimerList2', active2.size);
+      for (const listPtr of [curPtr, ovfPtr]) {
+        const ptrType = pointer(listPtr.typeOffset);
+        verifyListType(ptrType.typeOffset!, listPtr.expression);
+      }
+      const compileTimerStruct = (timerTypeOffset: string, source: string): FreeRtosTimerLayout => {
+        const timerType = type(timerTypeOffset);
+        if (timerType.kind !== 'struct' || timerType.byteSize <= 0 || timerType.byteSize > 512) {
+          fail('LayoutIncomplete', 'Invalid tmrTimerControl type');
+        }
+        const pcTimerName = member(timerTypeOffset, 'pcTimerName');
+        pointer(pcTimerName.typeOffset);
+        const xTimerListItem = member(timerTypeOffset, 'xTimerListItem');
+        if (xTimerListItem.size !== item.size) fail('LayoutAmbiguous', 'Timer list item size mismatch');
+        for (const [subName, expected] of [['pxNext', item.next], ['pxPrevious', item.previous], ['pvOwner', item.owner], ['pvContainer', item.container]] as const) {
+          const actual = member(xTimerListItem.typeOffset, subName);
+          pointer(actual.typeOffset);
+          if (actual.offset !== expected.offset || actual.size !== expected.size) fail('LayoutAmbiguous', `Conflicting Timer.xTimerListItem.${subName}`);
+        }
+        const xTimerPeriodInTicks = integer(member(timerTypeOffset, 'xTimerPeriodInTicks'), 'xTimerPeriodInTicks');
+        const pvTimerID = member(timerTypeOffset, 'pvTimerID');
+        pointer(pvTimerID.typeOffset);
+        const pxCallbackFunction = member(timerTypeOffset, 'pxCallbackFunction');
+        pointer(pxCallbackFunction.typeOffset);
+        const ucStatus = timerType.fields?.some(f => f.name === 'ucStatus') ? integer(member(timerTypeOffset, 'ucStatus'), 'ucStatus') : undefined;
+        const uxTimerNumber = timerType.fields?.some(f => f.name === 'uxTimerNumber') ? integer(member(timerTypeOffset, 'uxTimerNumber'), 'uxTimerNumber') : undefined;
+
+        const tickCandidates = catalog.roots.filter(node => node.expression === 'xTickCount' && node.address !== undefined && node.typeOffset && !node.unavailable);
+        let tickNode = tickCandidates.length === 1 ? tickCandidates[0] : undefined;
+        const tickSize = tickNode ? symbolByteSize(catalog, tickNode.typeOffset) : 0;
+        if (tickNode && (!['base', 'enum'].includes(type(tickNode.typeOffset).kind) || ![2, 4, 8].includes(tickSize))) {
+          tickNode = undefined;
+        }
+        return {
+          size: timerType.byteSize,
+          typeOffset: timerTypeOffset,
+          source,
+          activeList1Address: active1.address!,
+          activeList2Address: active2.address!,
+          currentListPtrAddress: curPtr.address!,
+          overflowListPtrAddress: ovfPtr.address!,
+          ...(tickNode ? { tickCount: { address: tickNode.address!, size: tickSize } } : {}),
+          fields: {
+            pcTimerName,
+            xTimerListItem,
+            xTimerPeriodInTicks,
+            pvTimerID,
+            pxCallbackFunction,
+            ...(ucStatus ? { ucStatus } : {}),
+            ...(uxTimerNumber ? { uxTimerNumber } : {}),
+          },
+        };
+      };
+
+      const candidates = Object.entries(catalog.types).filter(([, def]) =>
+        def.kind === 'struct' && def.name === 'tmrTimerControl' && def.byteSize > 0
+        && def.fields?.some(f => f.name === 'pcTimerName')
+        && def.fields?.some(f => f.name === 'xTimerListItem'));
+      if (!candidates.length) {
+        timerUnavailableReason = 'tmrTimerControl DWARF type unavailable';
+      } else {
+        const compiled = candidates.map(([offset]) => compileTimerStruct(offset, `DWARF:tmrTimerControl:${offset}`));
+        const sig = (t: FreeRtosTimerLayout) => JSON.stringify({ size: t.size, fields: Object.fromEntries(Object.entries(t.fields).map(([k, v]) => [k, v ? { offset: v.offset, size: v.size } : undefined])) });
+        if (compiled.some(c => sig(c) !== sig(compiled[0]))) {
+          timerUnavailableReason = 'Conflicting tmrTimerControl layouts across compilation units';
+        } else {
+          timer = compiled[0];
+          for (const node of catalog.roots) {
+            if (node.address === undefined || node.unavailable || !node.typeOffset) continue;
+            const t = symbolType(catalog, node.typeOffset);
+            if (!t) continue;
+            if (t.kind === 'pointer' && t.byteSize === 4 && t.typeOffset) {
+              const pointee = symbolType(catalog, t.typeOffset);
+              if (pointee?.kind === 'struct' && (pointee.name === 'tmrTimerControl' || pointee.name === 'xTIMER')) {
+                timerGlobals.push({ name: node.expression, address: node.address, isPointer: true });
+              }
+            } else if (t.kind === 'struct' && t.name === 'xSTATIC_TIMER' && t.byteSize === timer.size) {
+              timerGlobals.push({ name: node.expression, address: node.address, isPointer: false });
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    timer = undefined;
+    timerUnavailableReason = err instanceof Error ? err.message : String(err);
+  }
+
+  let heap: FreeRtosHeapLayout;
+  try {
+    const singleScalarRoot = (name: string) => {
+      const node = root(name, false);
+      if (!node) return undefined;
+      const t = type(node.typeOffset);
+      const sz = symbolByteSize(catalog, node.typeOffset);
+      if (!['base', 'enum'].includes(t.kind) || ![4, 8].includes(sz) || node.size !== sz) {
+        fail('LayoutIncomplete', `Invalid scalar ${name}`);
+      }
+      return { address: node.address!, size: sz, node };
+    };
+    const ucHeapMatches = catalog.roots.filter(node => node.expression === 'ucHeap');
+    const freeMatches = catalog.roots.filter(node => node.expression === 'xFreeBytesRemaining');
+    const endMatches = catalog.roots.filter(node => node.expression === 'pxEnd');
+    const startMatches = catalog.roots.filter(node => node.expression === 'xStart');
+    const nextFreeMatches = catalog.roots.filter(node => node.expression === 'xNextFreeByte');
+    const xEndMatches = catalog.roots.filter(node => node.expression === 'xEnd');
+
+    if (ucHeapMatches.length > 1 || freeMatches.length > 1 || endMatches.length > 1 || startMatches.length > 1) {
+      heap = {
+        allocator: 'unknown',
+        supported: false,
+        unavailableReason: 'Ambiguous multiple heap symbols found in ELF',
+        source: 'SymbolCatalog',
+      };
+    } else if (ucHeapMatches.length === 1 && nextFreeMatches.length > 0 && endMatches.length === 0 && freeMatches.length === 0) {
+      heap = {
+        allocator: 'heap_1',
+        supported: false,
+        unavailableReason: '检测到 heap_1（仅支持递增分配，无释放/标准 heap_4 结构）；首版仅验证 heap_4',
+        source: `DWARF:${ucHeapMatches[0].file}`,
+      };
+    } else if (ucHeapMatches.length === 1 && xEndMatches.length > 0 && endMatches.length === 0) {
+      heap = {
+        allocator: 'heap_2',
+        supported: false,
+        unavailableReason: '检测到 heap_2（使用静态尾块 xEnd）；首版仅验证 heap_4',
+        source: `DWARF:${ucHeapMatches[0].file}`,
+      };
+    } else if (ucHeapMatches.length === 0 && freeMatches.length === 1 && endMatches.length === 1 && startMatches.length === 1) {
+      heap = {
+        allocator: 'heap_5',
+        supported: false,
+        unavailableReason: '检测到 heap_5（多非连续区域动态配置，无固定 ucHeap 缓冲）；首版仅支持已验证的 heap_4',
+        source: `DWARF:${freeMatches[0].file}`,
+      };
+    } else if (ucHeapMatches.length === 1 && freeMatches.length === 1 && endMatches.length === 1 && startMatches.length === 1) {
+      const ucHeapNode = ucHeapMatches[0];
+      if (ucHeapNode.address === undefined || ucHeapNode.unavailable || !ucHeapNode.typeOffset) {
+        fail('LayoutIncomplete', 'ucHeap symbol or DWARF type unavailable');
+      }
+      const ucHeapType = type(ucHeapNode.typeOffset);
+      if (ucHeapType.kind !== 'array' || !ucHeapType.typeOffset || symbolByteSize(catalog, ucHeapType.typeOffset) !== 1 || !ucHeapNode.size || ucHeapNode.size <= 0) {
+        fail('LayoutIncomplete', 'Invalid ucHeap array layout');
+      }
+      const ucHeapSize = ucHeapNode.size!;
+      const freeInfo = singleScalarRoot('xFreeBytesRemaining')!;
+      const endNode = root('pxEnd', true)!;
+      const startNode = root('xStart', true)!;
+      const endPtr = pointer(endNode.typeOffset);
+      const blockLinkType = type(endPtr.typeOffset!);
+      if (blockLinkType.kind !== 'struct' || blockLinkType.byteSize < 8 || startNode.size !== blockLinkType.byteSize) {
+        fail('LayoutIncomplete', 'Invalid BlockLink_t layout in heap_4');
+      }
+      pointer(member(endPtr.typeOffset!, 'pxNextFreeBlock').typeOffset);
+      integer(member(endPtr.typeOffset!, 'xBlockSize'), 'BlockLink_t.xBlockSize');
+
+      const minEver = singleScalarRoot('xMinimumEverFreeBytesRemaining');
+      const allocs = singleScalarRoot('xNumberOfSuccessfulAllocations');
+      const frees = singleScalarRoot('xNumberOfSuccessfulFrees');
+      heap = {
+        allocator: 'heap_4',
+        supported: true,
+        source: `DWARF:${freeInfo.node.file}`,
+        ucHeap: { address: ucHeapNode.address!, size: ucHeapSize },
+        blockLinkSize: blockLinkType.byteSize,
+        xStartAddress: startNode.address!,
+        pxEnd: { address: endNode.address!, size: 4 },
+        freeBytesRemaining: { address: freeInfo.address, size: freeInfo.size },
+        ...(minEver ? { minimumEverFreeBytesRemaining: { address: minEver.address, size: minEver.size } } : {}),
+        ...(allocs ? { successfulAllocations: { address: allocs.address, size: allocs.size } } : {}),
+        ...(frees ? { successfulFrees: { address: frees.address, size: frees.size } } : {}),
+      };
+    } else if (ucHeapMatches.length === 0 && freeMatches.length === 0 && endMatches.length === 0 && startMatches.length === 0) {
+      heap = {
+        allocator: 'custom-or-disabled',
+        supported: false,
+        unavailableReason: '未检测到 FreeRTOS heap_4 符号（可能使用 heap_3、标准库 malloc 或已关闭动态堆）',
+        source: 'SymbolCatalog',
+      };
+    } else {
+      heap = {
+        allocator: 'unknown',
+        supported: false,
+        unavailableReason: 'Heap symbols incomplete (missing one of ucHeap, xStart, pxEnd, or xFreeBytesRemaining)',
+        source: 'SymbolCatalog',
+      };
+    }
+  } catch (err) {
+    heap = {
+      allocator: 'unknown',
+      supported: false,
+      unavailableReason: err instanceof Error ? err.message : String(err),
+      source: 'SymbolCatalog',
+    };
+  }
+
   const plan = { elfSha256, source: `DWARF:${current.file}:${tcbOffset}`, current: current.address!, taskCount: count.address!, taskCountBytes,
     ...(total ? { runtimeTotal: { address: total.address!, size: totalSize } } : {}),
     lists, list, item, tcb: { size: tcbType.byteSize, typeOffset: tcbOffset, fields, nameBytes: fields.pcTaskName.size, stackWordBytes },
     ...(queue ? { queue } : {}),
     ...(queueRegistry ? { queueRegistry } : {}),
     queueGlobals,
-    ...(queueUnavailableReason ? { queueUnavailableReason } : {}) };
+    ...(queueUnavailableReason ? { queueUnavailableReason } : {}),
+    ...(timer ? { timer } : {}),
+    timerGlobals,
+    ...(timerUnavailableReason ? { timerUnavailableReason } : {}),
+    heap };
   return { ...plan, layoutId: createHash('sha256').update(JSON.stringify(plan)).digest('hex') };
 }
 

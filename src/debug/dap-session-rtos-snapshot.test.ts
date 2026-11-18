@@ -67,12 +67,17 @@ describe('DAP RTOS snapshot ownership and fences', () => {
       consistency: 'unavailable',
       errorCode: 'InvalidAddress',
     });
-    (session as any).phase = 'terminating'; await request(3);
-    expect(messages.find(message => message.request_seq === 3)?.success).toBe(false);
+    await request(3, { action: 'refresh', detailBudgetBytes: 0 }); expect(backend.execute).not.toHaveBeenCalled();
+    expect(messages.find(message => message.request_seq === 3)?.body).toMatchObject({
+      consistency: 'unavailable',
+      errorCode: 'BudgetExceeded',
+    });
+    (session as any).phase = 'terminating'; await request(4);
+    expect(messages.find(message => message.request_seq === 4)?.success).toBe(false);
   });
-  it('includes object summary on request and forwards valid objectAddresses', async () => {
+  it('includes object, timer, heap summary on request and forwards valid options', async () => {
     const { session, messages, request } = setup();
-    await request(1, { action: 'refresh', includeObjects: true, includeWaitDetails: true, objectAddresses: [0x24005000] });
+    await request(1, { action: 'refresh', includeObjects: true, includeWaitDetails: true, includeTimers: true, includeHeap: true, detailBudgetBytes: 32768, objectAddresses: [0x24005000] });
     const body = messages.find(message => message.request_seq === 1)?.body;
     expect(body).toMatchObject({
       consistency: 'halted-consistent',
@@ -81,6 +86,20 @@ describe('DAP RTOS snapshot ownership and fences', () => {
         globalCount: 0,
         listDiscoveredCount: 0,
         objects: [],
+      },
+      timers: {
+        enabled: false,
+        timers: [],
+      },
+      heap: {
+        allocator: 'custom-or-disabled',
+        supported: false,
+      },
+      diagnostics: {
+        detailBudget: {
+          limitBytes: 32768,
+          exhausted: false,
+        },
       },
     });
   });

@@ -105,6 +105,8 @@ class MockRtosDebugAdapter {
               runtimeCounters: ok,
               runtimePercent: ok,
               objects: ok,
+              timers: ok,
+              heap: ok,
             },
           });
         }
@@ -113,6 +115,8 @@ class MockRtosDebugAdapter {
         }
         this.snapshotSeq++;
         const includeObjects = msg.arguments?.includeObjects !== false;
+        const includeTimers = msg.arguments?.includeTimers !== false;
+        const includeHeap = msg.arguments?.includeHeap !== false;
         const traversedObject = Boolean(msg.arguments?.includeWaitDetails);
         return this.sendResponse(msg, {
           version: 1,
@@ -202,8 +206,60 @@ class MockRtosDebugAdapter {
               unresolvedWaits: [],
             },
           } : {}),
+          ...(includeTimers ? {
+            timers: {
+              enabled: true,
+              tickCount: { available: true, value: 420, source: 'xTickCount', unit: 'ticks' },
+              activeCurrentCount: 1,
+              activeOverflowCount: 0,
+              globalStoppedCount: 0,
+              coverageNote: '已扫描 xActiveTimerList1/2 与全局定时器句柄',
+              timers: [{
+                address: 0x20006000,
+                name: { available: true, value: 'fixtureTimer', source: 'Timer_t.pcTimerName (ELF .rodata)', unit: 'text' },
+                symbolName: 'fixtureTimer',
+                discoverySources: ['list', 'global'],
+                listState: 'active-current',
+                active: { available: true, value: true, source: 'Timer_t.ucStatus (bit 0)', unit: 'boolean' },
+                autoReload: { available: true, value: true, source: 'Timer_t.ucStatus (bit 2)', unit: 'boolean' },
+                staticallyAllocated: { available: true, value: false, source: 'Timer_t.ucStatus (bit 1)', unit: 'boolean' },
+                periodTicks: { available: true, value: 100, source: 'Timer_t.xTimerPeriodInTicks', unit: 'ticks' },
+                expiryTick: { available: true, value: 520, source: 'xActiveTimerList1.xTimerListItem.xItemValue', unit: 'ticks' },
+                timerId: { available: true, value: 1, source: 'Timer_t.pvTimerID', unit: 'address' },
+                callbackAddress: { available: true, value: 0x08000501, source: 'Timer_t.pxCallbackFunction', unit: 'address' },
+                timerNumber: { available: true, value: 1, source: 'Timer_t.uxTimerNumber', unit: 'count' },
+                health: 'valid',
+              }],
+            },
+          } : {}),
+          ...(includeHeap ? {
+            heap: {
+              allocator: 'heap_4',
+              supported: true,
+              initialized: true,
+              note: '已核对 heap_4 元数据（不基于块链表猜测碎片率或内存泄漏）。',
+              configuredBytes: { available: true, value: 65536, source: 'ucHeap ELF array', unit: 'bytes' },
+              usableBytes: { available: true, value: 65528, source: 'heap_4.pxEnd - ucHeap', unit: 'bytes' },
+              usedBytes: { available: true, value: 8192, source: 'usableBytes - xFreeBytesRemaining', unit: 'bytes' },
+              freeBytes: { available: true, value: 57336, source: 'heap_4.xFreeBytesRemaining', unit: 'bytes' },
+              minimumEverFreeBytes: { available: true, value: 56000, source: 'heap_4.xMinimumEverFreeBytesRemaining', unit: 'bytes' },
+              successfulAllocations: { available: true, value: 12, source: 'heap_4.xNumberOfSuccessfulAllocations', unit: 'count' },
+              successfulFrees: { available: true, value: 2, source: 'heap_4.xNumberOfSuccessfulFrees', unit: 'count' },
+            },
+          } : {}),
           issues: [],
-          diagnostics: { bytes: 256, batches: 2, rounds: 2, nodes: 1, coveredLists: ['ready[2]'], queueWaitMs: 0, ioMs: 5, parseMs: 1, totalMs: 8 },
+          diagnostics: {
+            bytes: 256,
+            batches: 2,
+            rounds: 2,
+            nodes: 1,
+            coveredLists: ['ready[2]'],
+            queueWaitMs: 0,
+            ioMs: 5,
+            parseMs: 1,
+            totalMs: 8,
+            detailBudget: { limitBytes: msg.arguments?.detailBudgetBytes ?? 65536, usedBytes: 96, stackBytes: 0, objectBytes: 48, timerBytes: 32, heapBytes: 16, exhausted: false },
+          },
         });
       }
       default:
@@ -322,13 +378,18 @@ exports.run = async function run() {
       });
       await waitFor(() => provider.currentState.snapshot?.objects?.objects?.[0]?.waitListEvidence === 'traversed', 10000, 'objects wait details auto-loaded on subtab switch');
       await provider.handleMessage({ command: 'inspectObject', address: 0x20005000 });
+      await provider.handleMessage({ command: 'updateSettings', settings: { tasksSubTab: 'timers', detailBudgetBytes: 32768 } });
+      await provider.handleMessage({ command: 'inspectTimersHeap' });
       const stored = extensionContext.workspaceState.get('orbitRtosViewSettings');
       assert.equal(stored?.sortBy, 'cpu');
       assert.equal(stored?.sortDir, 'desc');
       assert.equal(stored?.stateFilter, 'ready');
       assert.equal(stored?.liveIntervalMs, 200);
-      assert.equal(stored?.tasksSubTab, 'objects');
+      assert.equal(stored?.tasksSubTab, 'timers');
+      assert.equal(stored?.detailBudgetBytes, 32768);
       assert.equal(provider.currentState.snapshot?.objects?.objects?.[0]?.name?.value, 'busLock');
+      assert.equal(provider.currentState.snapshot?.timers?.timers?.[0]?.name?.value, 'fixtureTimer');
+      assert.equal(provider.currentState.snapshot?.heap?.allocator, 'heap_4');
 
       // Terminate remaining mock session cleanly.
       if (sessionFreeRtosB) await vscode.debug.stopDebugging(sessionFreeRtosB);
@@ -344,6 +405,8 @@ exports.run = async function run() {
       emptyErrorCode: 'DwarfUnavailable',
       switchedTasks: ['ctrlA', 'ctrlB'],
       objectsVerified: ['busLock'],
+      timersVerified: ['fixtureTimer'],
+      heapVerified: 'heap_4',
       themesTested: ['Default Light Modern', 'Default Dark Modern'],
       hideShowRecreateVerified: true,
       persistedSettings: provider.currentSettings,

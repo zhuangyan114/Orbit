@@ -1815,6 +1815,7 @@ export class DapSession extends EventEmitter {
       if (args.objectAddresses !== undefined && (!Array.isArray(args.objectAddresses) || args.objectAddresses.length > 256
         || args.objectAddresses.some((address: unknown) => !Number.isSafeInteger(address) || Number(address) <= 0))) throw new RtosError('InvalidAddress', 'Invalid object addresses');
       if (args.maxBytesPerTask !== undefined && (!Number.isSafeInteger(args.maxBytesPerTask) || args.maxBytesPerTask <= 0)) throw new RtosError('BudgetExceeded', 'Invalid stack scan budget');
+      if (args.detailBudgetBytes !== undefined && (!Number.isSafeInteger(args.detailBudgetBytes) || args.detailBudgetBytes <= 0 || args.detailBudgetBytes > 128 * 1024)) throw new RtosError('BudgetExceeded', 'Invalid detail refresh budget');
       if (args.intervalMs !== undefined && (!Number.isFinite(args.intervalMs) || args.intervalMs < 200 || args.intervalMs > 10000)) throw new RtosError('InvalidConfiguration', 'Refresh interval must be 200..10000 ms');
       if (!this.rtosSnapshots) this.rtosSnapshots = this.createRtosSnapshotService();
       if (args.action === 'capabilities') return this.sendResponse(msg, await this.rtosSnapshots.capabilities());
@@ -1823,7 +1824,13 @@ export class DapSession extends EventEmitter {
         this.rtosSnapshots.start(
           snapshot => this.sendEvent('orbitRtosSnapshot', snapshot),
           args.intervalMs,
-          { includeObjects: Boolean(args.includeObjects), includeWaitDetails: args.includeWaitDetails !== false },
+          {
+            includeObjects: Boolean(args.includeObjects),
+            includeWaitDetails: args.includeWaitDetails !== false,
+            includeTimers: Boolean(args.includeTimers),
+            includeHeap: Boolean(args.includeHeap),
+            ...(args.detailBudgetBytes !== undefined ? { detailBudgetBytes: args.detailBudgetBytes } : {}),
+          },
         );
         return this.sendResponse(msg, { started: true, intervalMs: args.intervalMs ?? 500 });
       }
@@ -1834,6 +1841,9 @@ export class DapSession extends EventEmitter {
         includeObjects: Boolean(args.includeObjects),
         includeWaitDetails: args.includeWaitDetails !== false,
         objectAddresses: args.objectAddresses,
+        includeTimers: Boolean(args.includeTimers),
+        includeHeap: Boolean(args.includeHeap),
+        ...(args.detailBudgetBytes !== undefined ? { detailBudgetBytes: args.detailBudgetBytes } : {}),
       });
       this.sendResponse(msg, snapshot);
     } catch (error) {

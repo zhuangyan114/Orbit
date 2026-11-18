@@ -1,15 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { known, unknown, type SyncObjectSnapshot, type TaskSnapshot } from '../../rtos/model';
+import { known, unknown, type SyncObjectSnapshot, type TaskSnapshot, type TimerSnapshot } from '../../rtos/model';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   describeConsistency,
   describeDiagnosticIssue,
   filterAndSortTasks,
   filterSyncObjects,
+  filterTimers,
   objectKindLabel,
   sanitizeRtosViewSettings,
   stackUsedBytes,
   stackUsedRatio,
+  timerStateLabel,
 } from './rtos-view-state';
 
 function makeTask(overrides: Partial<TaskSnapshot> & { tcbAddress: number }): TaskSnapshot {
@@ -72,23 +74,32 @@ describe('RTOS view state helpers', () => {
       searchQuery: 'motor',
       objectKindFilter: 'all',
       objectSearchQuery: '',
+      timerFilter: 'all',
+      timerSearchQuery: '',
       selectedTaskAddress: 0x20002000,
       selectedObjectAddress: null,
       maxStackScanBytes: 16384,
+      detailBudgetBytes: 65536,
       showDiagnostics: true,
     });
 
     const withObjectFields = sanitizeRtosViewSettings({
-      tasksSubTab: 'objects',
+      tasksSubTab: 'timers',
       includeObjectsInLive: true,
       objectKindFilter: 'mutex',
       objectSearchQuery: 'bus',
+      timerFilter: 'active',
+      timerSearchQuery: 'heartbeat',
+      detailBudgetBytes: 1000,
       selectedObjectAddress: 0x20004000,
     });
-    expect(withObjectFields.tasksSubTab).toBe('objects');
+    expect(withObjectFields.tasksSubTab).toBe('timers');
     expect(withObjectFields.includeObjectsInLive).toBe(true);
     expect(withObjectFields.objectKindFilter).toBe('mutex');
     expect(withObjectFields.objectSearchQuery).toBe('bus');
+    expect(withObjectFields.timerFilter).toBe('active');
+    expect(withObjectFields.timerSearchQuery).toBe('heartbeat');
+    expect(withObjectFields.detailBudgetBytes).toBe(4096);
     expect(withObjectFields.selectedObjectAddress).toBe(0x20004000);
 
     expect(sanitizeRtosViewSettings({
@@ -98,8 +109,45 @@ describe('RTOS view state helpers', () => {
       selectedTaskAddress: -5,
       selectedObjectAddress: 0,
       objectKindFilter: 'unknown-kind',
+      timerFilter: 'bad',
       sortBy: 'bogus',
     })).toEqual(DEFAULT_RTOS_VIEW_SETTINGS);
+  });
+
+  it('filters timers by activity and text/address/callback query', () => {
+    const activeTimer: TimerSnapshot = {
+      address: 0x20006000,
+      name: known('heartbeat', 'Timer_t', 'text'),
+      symbolName: 'fixtureTimer',
+      discoverySources: ['list', 'global'],
+      listState: 'active-current',
+      active: known(true, 'ucStatus', 'boolean'),
+      autoReload: known(true, 'ucStatus', 'boolean'),
+      staticallyAllocated: known(false, 'ucStatus', 'boolean'),
+      periodTicks: known(100, 'Timer_t', 'ticks'),
+      expiryTick: known(1500, 'xTimerListItem', 'ticks'),
+      timerId: known(1, 'Timer_t', 'address'),
+      callbackAddress: known(0x08001234, 'Timer_t', 'address'),
+      timerNumber: known(2, 'Timer_t', 'count'),
+      health: 'valid',
+    };
+    const stoppedTimer: TimerSnapshot = {
+      ...activeTimer,
+      address: 0x20006100,
+      name: known('oneShotTimeout', 'Timer_t', 'text'),
+      symbolName: 'gStoppedTimer',
+      discoverySources: ['global'],
+      listState: 'stopped-global',
+      active: known(false, 'ucStatus', 'boolean'),
+      autoReload: known(false, 'ucStatus', 'boolean'),
+      callbackAddress: known(0x08005678, 'Timer_t', 'address'),
+      expiryTick: unknown('stopped', 'Timer_t', 'ticks'),
+    };
+    expect(timerStateLabel('active-overflow')).toBe('溢出列表');
+    expect(filterTimers([activeTimer, stoppedTimer], 'active', '').map(t => t.address)).toEqual([0x20006000]);
+    expect(filterTimers([activeTimer, stoppedTimer], 'stopped', '').map(t => t.address)).toEqual([0x20006100]);
+    expect(filterTimers([activeTimer, stoppedTimer], 'all', '08001234').map(t => t.address)).toEqual([0x20006000]);
+    expect(filterTimers([activeTimer, stoppedTimer], 'all', 'gstoppedtimer').map(t => t.address)).toEqual([0x20006100]);
   });
 
   it('filters sync objects by kind, issue status, symbol, name, address and holder', () => {

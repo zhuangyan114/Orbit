@@ -24,7 +24,6 @@ import { AUTOMATION_CONTROL_EVENT, AUTOMATION_LIFECYCLE_EVENT } from './debug/da
 import { configureLogger, log } from './utils/logger';
 import { getOrbitConfiguration, migrateLegacyOrbitSettings } from './utils/orbit-settings';
 import { isOrbitDebugSessionType, ORBIT_DAP_TYPE } from './utils/debug-session-type';
-import { createRtosViewsRefreshHandler } from './debug/rtos-views-tracker';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -273,17 +272,14 @@ export async function activate(context: vscode.ExtensionContext) {
       sessionRegistry.onStarted(initialSession);
     }
 
-    // Track both the canonical Orbit DAP type and the legacy ozone alias.
-    for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
+    // Track both the canonical Orbit DAP type and the legacy ozone alias for
+    // Memory View and debug-tracker compatibility. Built-in RTOS panel is used for RTOS inspection.
+    for (const section of ['memory-view', 'mcu-debug.debug-tracker-vscode']) {
       for (const debuggerType of [ORBIT_DAP_TYPE, 'ozone'] as const) {
         appendWorkspaceArraySetting(section, 'trackDebuggers', debuggerType).catch((err) => {
           console.error(`[Orbit] Failed to register ${debuggerType} with ${section}.trackDebuggers:`, err);
         });
       }
-    }
-
-    if (getOrbitConfiguration().get<boolean>('rtosViewsAutoRefresh', false)) {
-      setupRtosViewsAutoRefresh(context);
     }
 
     // 激活时自动检测 .elf/.axf，写入设置
@@ -598,52 +594,6 @@ function stopWatchPolling() {
   if (watchPollTimer) { clearTimeout(watchPollTimer); watchPollTimer = null; }
 }
 
-function setupRtosViewsAutoRefresh(context: vscode.ExtensionContext) {
-  const diagChannel = vscode.window.createOutputChannel('Orbit RTOS Views');
-
-  vscode.extensions.getExtension("mcu-debug.debug-tracker-vscode")?.activate().then((trackerApi: any) => {
-    if (!trackerApi || typeof trackerApi.subscribe !== 'function') {
-      diagChannel.appendLine('Debug tracker API has no subscribe method');
-      return;
-    }
-    try {
-      const result = trackerApi.subscribe({
-        version: 1,
-        body: {
-          debuggers: [ORBIT_DAP_TYPE, 'ozone'],
-          handler: createRtosViewsRefreshHandler(() => {
-              // Trigger RTOS Views detection: the 'refresh' command calls
-              // RTOSTracker.update() → updateRTOSInfo() → rtosSession.refresh()
-              // → onStopped(lastFrameId) → tryDetect()
-              //
-              // Optional compatibility path only; normal debug flow should not
-              // wait for RTOS Views detection.
-            setTimeout(() => {
-              vscode.commands.executeCommand('rtos-views.rtos.focus').then(() => {
-                  // Wait for resolveWebviewView to render the panel
-                setTimeout(() => {
-                  vscode.commands.executeCommand('mcu-debug.rtos-views.refresh').then(undefined, (e2: any) => {
-                    diagChannel.appendLine(`RTOS Views refresh failed: ${e2?.message || e2}`);
-                  });
-                }, 500);
-              }, () => {
-                diagChannel.appendLine('RTOS Views panel not found (not installed?)');
-              });
-            }, 1000);
-          }),
-          wantCurrentStatus: true,
-          notifyAllEvents: false,
-        }
-      });
-      diagChannel.appendLine(`Subscribed: clientId=${result?.clientId || 'unknown'}`);
-    } catch (e: any) {
-      diagChannel.appendLine(`Subscribe failed: ${e.message}`);
-    }
-  }, (e: any) => {
-    diagChannel.appendLine(`Activation failed: ${e.message}`);
-  });
-}
-
 async function appendWorkspaceArraySetting(section: string, key: string, value: string): Promise<boolean> {
   const cfg = vscode.workspace.getConfiguration(section);
   const current = cfg.get<unknown>(key);
@@ -659,7 +609,7 @@ async function appendWorkspaceArraySetting(section: string, key: string, value: 
 
 async function enableMcuDebugViewsIntegration() {
   const changed: string[] = [];
-  for (const section of ['memory-view', 'mcu-debug.rtos-views', 'mcu-debug.debug-tracker-vscode']) {
+  for (const section of ['memory-view', 'mcu-debug.debug-tracker-vscode']) {
     for (const debuggerType of [ORBIT_DAP_TYPE, 'ozone'] as const) {
       if (await appendWorkspaceArraySetting(section, 'trackDebuggers', debuggerType)) {
         changed.push(`${section}.trackDebuggers`);

@@ -488,12 +488,7 @@
         "orbit.defaultRtos": {
           "type": "string",
           "default": "",
-          "description": "RTOS Views 使用的默认 RTOS 名称，例如 FreeRTOS"
-        },
-        "orbit.rtosViewsAutoRefresh": {
-          "type": "boolean",
-          "default": false,
-          "description": "首次获取调用栈后，自动聚焦并刷新 MCU Debug RTOS Views。默认关闭，因为会增加调试会话开销。"
+          "description": "默认目标 RTOS 类型（例如 FreeRTOS），用于 Orbit 内建 RTOS 面板及标准 DAP rtosInfo 报告"
         },
         "orbit.rttLogEnabled": {
           "type": "boolean",

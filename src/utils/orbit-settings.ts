@@ -15,7 +15,6 @@ export const ORBIT_SETTING_KEYS = [
   'defaultProgram',
   'defaultSvdFile',
   'defaultRtos',
-  'rtosViewsAutoRefresh',
   'rttLogEnabled',
   'logging.enabled',
   'logging.clearOnStart',

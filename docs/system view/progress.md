@@ -106,4 +106,15 @@
 - 硬件：未执行；未针对 Timer/Heap 执行物理目标操作。
 - 证据：src/rtos/timer-heap-reader.test.ts、src/rtos/freertos-layout.test.ts、out/rtos-stage2/vscode-ui/report.json。
 - 剩余事项：2.4 清理旧 mcu-debug.rtos-views 专属集成并执行阶段 2 出口回归与 VSIX 检查。
-- 提交：实现 RTOS 阶段 2.3：增加定时器与堆概览；hash 用 git log 查询本记录所在提交。
+- 提交：实现 RTOS 阶段 2.3：增加定时器与堆概览；hash 用 git log 查询本记录所在提交（20421da）。
+
+## 2.4 / 2026-11-18
+
+- 状态：已完成，阶段 2.1～2.4 出口通过；硬件未执行（沿用阶段 1.4 实板基线）。
+- 实现：删除 src/debug/rtos-views-tracker.ts、src/debug/rtos-views-tracker.test.ts 及旧 RTOS Views 专属脚本 scripts/check-config.js、verify-config.js、debug-tracker-test.js、rtos-fix-test.ps1；更新 src/extension.ts、package.json 与 src/utils/orbit-settings.ts，移除 mcu-debug.rtos-views.trackDebuggers 注入与 orbit.rtosViewsAutoRefresh（保留 memory-view、mcu-debug.debug-tracker-vscode、orbit.defaultRtos、rtosInfo、rtosExpansion 及标准 DAP 变量/内存读写路径）；更新 docs/rtos-debug-guide.md 为内建 RTOS 面板说明，并新增 src/utils/orbit-settings.test.ts。
+- 设计变更：无；不修改 docs/bug-fix-log.md 中的历史故障记录。
+- 检查：npm run typecheck 与 npm run build 通过；全量 Vitest（--minWorkers=1 --maxWorkers=2）108 文件、1401 项通过、1 项跳过；npm run test:cpp-channel:mock 与 npm run test:cmsis-dap:mock 通过；scripts/rtos/verify-stage2-vscode.js 在真实 VS Code 中通过挂载/隐藏/重建、亮暗主题、会话切换、Objects/Timers/Heap 子页签与未向工作区写入 mcu-debug.rtos-views.trackDebuggers 检查；out/rtos-stage2/orbit-stage2.4.vsix zip 检查确认包含 extension/dist/rtos.js 与 ozoneRtos 视图并排除 orbit.rtosViewsAutoRefresh。
+- 硬件：未执行；阶段 2 未触发物理目标烧录、halt/run 或 RAM 写操作，实板任务快照基线见阶段 1.4 与 stage1-validation.md。
+- 证据：src/utils/orbit-settings.test.ts、scripts/rtos/vscode-stage2-driver.js、out/rtos-stage2/vscode-ui/report.json、out/rtos-stage2/orbit-stage2.4.vsix。
+- 剩余事项：阶段 2 已关闭，下一阶段为阶段 3（RTT 多通道枚举与下行写入）。
+- 提交：清理 RTOS 阶段 2.4：移除旧 RTOS Views 专属集成；hash 用 git log 查询本记录所在提交。

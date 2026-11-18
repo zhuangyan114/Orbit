@@ -1,122 +1,29 @@
-# RTOS Views 调试指南
+# Orbit RTOS 调试指南
 
-## 问题分析
+Orbit 内置底部 **RTOS** 面板（`Tasks & Objects`），直接通过当前活动调试会话的芯片接入通道获取 FreeRTOS 内核状态，不需要安装或注入第三方 `mcu-debug.rtos-views` 扩展。
 
-根据我对 RTOS Views 插件源代码的分析，问题的根本原因是：
+## 前置条件
 
-### RTOS Views 插件的工作原理
+1. 编译固件时保留完整的 DWARF 调试信息（例如 GCC 使用 `-g` 或 `-g3`），不要对加载到调试器的 ELF 执行 `strip`。
+2. 当前预览版本针对单核 ARM Cortex-M **FreeRTOS**（已在 STM32CubeH7 FreeRTOS 10.3.1 / ARM_CM4F 与 `heap_4` 矩阵校验），从 ELF DWARF 类型信息解析内核偏移，不依赖固定结构体偏移假设。
+3. 目标芯片名称需能在 Orbit 设备数据库中解析对应 RAM 区域（在 `launch.json` 中配置 `device` 或在工作区配置 `orbit.defaultDevice`）。
 
-1. **订阅机制**：RTOS Views 插件使用 `debug-tracker-vscode` 扩展来跟踪调试会话
-2. **订阅时机**：RTOS Views 插件在激活时调用 `subscribeToTracker()` 方法订阅调试器事件
-3. **调试器列表**：订阅时使用的是硬编码的 `TrackedDebuggers` 数组
+## 启动与查看
 
-### 问题所在
+1. 正常配置并启动 Orbit 调试会话（支持 J-Link 与 CMSIS-DAP/DAPLink）。如需显式指定默认 RTOS 名称，可在 `launch.json` 设置 `"rtos": "FreeRTOS"` 或在 VS Code 设置中配置 `orbit.defaultRtos`。
+2. 打开底部面板区的 **RTOS** 视图（视图 ID：`ozoneRtos`）。
+3. 可按页签查看：
+   - **任务**：按状态/关键字筛选并排序任务、查看每行列表发现证据（`遍历` / `TCB校验`）、按需扫描指定或全部任务栈高水位，以及基于内核运行时间计数的 CPU% 估算与采集窗口说明。
+   - **队列与锁**：查看可通过 `xQueueRegistry`、全局队列/信号量句柄或阻塞任务等待链表发现的 Queue、Mutex、Recursive Mutex 与 Semaphore，支持查看互斥锁持有者、递归层级、候选等待环及未解析等待列表。
+   - **定时器与堆**：查看活动/全局可见的 Software Timers，以及经校验的 `heap_4` 容量、当前空余、历史最低空余与分配/释放统计。
 
-1. `TrackedDebuggers` 数组是硬编码的，不包括 'ozone'
-2. `updateTrackedDebuggersFromSettings(false)` 会将 'ozone' 添加到 `TrackedDebuggers` 数组
-3. 但是 `subscribe()` 已经调用了，不会重新订阅
-4. 即使配置改变，RTOS Views 插件也不会重新订阅
+## 常见状态说明
 
-### 解决方案
+- **缺少 DWARF 调试信息 (`DwarfUnavailable`)**：加载的 ELF 缺少 `.debug_info` 或核心符号类型。请检查编译选项与 `program` 路径。
+- **未检测到 FreeRTOS 内核 (`RtosNotDetected`)**：ELF 中缺少 `pxCurrentTCB`、`uxCurrentNumberOfTasks` 或 `pxReadyTasksLists`。
+- **部分结果 (`partial`)**：目标运行中读取期间链表发生变动，或单帧详情预算达到上限；界面会明确标示降级原因并保留已独立校验的数据。
 
-1. 确保配置正确
-2. 重新加载 VS Code 窗口
+## 外部视图扩展兼容性
 
-## 验证步骤
-
-### 步骤 1：检查配置文件
-
-确保 `D:\STM32\RoboMaster\26Lao_ShaoBin\Down-cmake\.vscode\settings.json` 包含以下内容：
-
-```json
-{
-"orbit.defaultProgram": "d:\\STM32\\RoboMaster\\26Lao_ShaoBin\\Down-cmake\\build\\Debug\\frame.elf",
-    "memory-view.trackDebuggers": [
-        "ozone"
-    ],
-    "mcu-debug.rtos-views.trackDebuggers": [
-        "ozone"
-    ],
-    "mcu-debug.debug-tracker-vscode.trackDebuggers": [
-        "ozone"
-    ]
-}
-```
-
-### 步骤 2：重新加载 VS Code 窗口
-
-1. 按 `Ctrl+Shift+P` 打开命令面板
-2. 输入 "Reload Window" 并选择 "Developer: Reload Window"
-3. 等待窗口重新加载完成
-
-### 步骤 3：验证配置是否生效
-
-1. 按 `Ctrl+Shift+P` 打开命令面板
-2. 输入 "Preferences: Open Workspace Settings (JSON)"
-3. 检查配置文件是否包含以下内容：
-
-```json
-{
-    "mcu-debug.rtos-views.trackDebuggers": ["ozone"],
-    "mcu-debug.debug-tracker-vscode.trackDebuggers": ["ozone"]
-}
-```
-
-### 步骤 4：启动调试会话
-
-1. 打开测试工程 `D:\STM32\RoboMaster\26Lao_ShaoBin\Down-cmake`
-2. 按 `F5` 启动 Orbit 调试会话
-3. 等待调试会话启动并停止在断点处
-
-### 步骤 5：检查 RTOS Views
-
-1. 打开 RTOS Views 面板（XRTOS 标签）
-2. 检查是否显示 "RTOS detected" 而不是 "No RTOS detected"
-
-### 步骤 6：验证 RTOS 检测
-
-如果 RTOS Views 显示 "RTOS detected"，则修复成功。如果仍然显示 "No RTOS detected"，请继续下面的步骤。
-
-## 高级调试
-
-### 检查 debug-tracker-vscode 扩展
-
-1. 按 `Ctrl+Shift+P` 打开命令面板
-2. 输入 "Extensions: Show Installed Extensions"
-3. 检查 "debug-tracker-vscode" 扩展是否已安装并激活
-
-### 检查 RTOS Views 插件
-
-1. 按 `Ctrl+Shift+P` 打开命令面板
-2. 输入 "Extensions: Show Installed Extensions"
-3. 检查 "RTOS Views" 扩展是否已安装并激活
-
-### 检查 VS Code 输出窗口
-
-1. 按 `Ctrl+Shift+U` 打开输出窗口
-2. 选择 "Mcu-debug Tracker" 频道
-3. 检查是否有调试信息
-
-### 手动配置 debug-tracker-vscode
-
-如果上述步骤不起作用，可以尝试手动配置 debug-tracker-vscode：
-
-1. 打开 VS Code 设置
-2. 搜索 "mcu-debug.debug-tracker-vscode.trackDebuggers"
-3. 添加 'ozone' 到列表中
-4. 重新加载 VS Code 窗口
-
-## 预期结果
-
-RTOS Views 应该能够检测到 FreeRTOS 并显示任务列表。
-
-## 联系支持
-
-如果问题仍然存在，请联系 Orbit 扩展支持团队，并提供以下信息：
-
-1. VS Code 版本
-2. Orbit 扩展版本
-3. RTOS Views 插件版本
-4. debug-tracker-vscode 扩展版本
-5. 测试工程的配置文件（launch.json 和 settings.json）
-6. VS Code 输出窗口中的调试信息
+- Memory View（`memory-view`）、Peripheral Viewer 及 `mcu-debug.debug-tracker-vscode` 等外部扩展仍可通过 Orbit 提供的标准 DAP 能力（`supportsReadMemoryRequest`、`readMemory`、`writeMemory`、`variables`、`evaluate` 与 `memoryReference`）独立工作。
+- Orbit 不再注册、依赖或向工作区写入 `mcu-debug.rtos-views.trackDebuggers` 与 `orbit.rtosViewsAutoRefresh`。

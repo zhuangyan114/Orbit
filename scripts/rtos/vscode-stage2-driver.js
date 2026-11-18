@@ -394,6 +394,16 @@ exports.run = async function run() {
       // Terminate remaining mock session cleanly.
       if (sessionFreeRtosB) await vscode.debug.stopDebugging(sessionFreeRtosB);
       await waitFor(() => provider.currentState.session.phase === 'none', 10000, 'all debug sessions terminated');
+
+      // 8. Stage 2.4 regression guard: Orbit must never inject mcu-debug.rtos-views.trackDebuggers
+      // into workspace settings, while defaultRtos configuration remains available.
+      const path = require('node:path');
+      const wsSettingsPath = path.join(folder.uri.fsPath, '.vscode', 'settings.json');
+      const wsSettings = JSON.parse(await fs.readFile(wsSettingsPath, 'utf8'));
+      assert.equal(Object.prototype.hasOwnProperty.call(wsSettings, 'mcu-debug.rtos-views.trackDebuggers'), false);
+      const orbitPkg = ext.packageJSON;
+      assert.equal(Boolean(orbitPkg.contributes?.configuration?.properties?.['orbit.rtosViewsAutoRefresh']), false);
+      assert.equal(Boolean(orbitPkg.contributes?.configuration?.properties?.['orbit.defaultRtos']), true);
     } finally {
       trackStart.dispose();
     }
@@ -407,6 +417,7 @@ exports.run = async function run() {
       objectsVerified: ['busLock'],
       timersVerified: ['fixtureTimer'],
       heapVerified: 'heap_4',
+      noLegacyRtosViewsInjection: true,
       themesTested: ['Default Light Modern', 'Default Dark Modern'],
       hideShowRecreateVerified: true,
       persistedSettings: provider.currentSettings,

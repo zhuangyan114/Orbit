@@ -189,3 +189,29 @@
 - 独立复验：用固定原厂记录器核对 8 段独占切片、3 个 Ready 等待和 1 个 Marker；IRQ17/18 独占分别为 15/5 ticks。传输缺口后同址实例和名称重新识别，遗漏批次被拒绝，8 地址预算内淘汰时仍分配唯一实例 ID。全量 1470 项通过、1 项跳过。
 - 剩余事项：下一小部分为 4.3，完成 Trace 存储、LOD 与 Worker 接线。
 - 提交：`实现 RTOS 阶段 4.2：重建任务中断与等待区间`。
+
+## 4.3 / 2026-11-19
+
+- 状态：已完成。Trace 归档、范围索引、LOD 与 Worker 已通过独立复验和全量回归。
+- 实现：
+  - 新增 `src/trace/trace-format.ts`：定义 Orbit 内部 Trace 归档格式 `orbit-trace-v1`（版本 `1`，明确标注非 SEGGER `.SVDat`）。目录包含 `manifest.json`（元数据、生命周期状态与提交统计）、`raw.otbin`（与源输入逐字节一致的原始分块流）、`data.otd`（`OTD1` 字符串驻留与任意精度 BigInt 编码的二进制数据页，含页负载 CRC32）、`journal.otj`（`OTJ1` 提交边界日志，含帧头 CRC32、整帧 CRC32、raw/data 偏移与 CRC32）与 `index.otidx`（`OTI1` 有序关闭索引快照，含 BigInt 转字符串及还原）。`inspectRecordingDirectory` 按 `journal.otj` 帧序列交叉校验 `raw.otbin`/`data.otd`/`manifest.json` 区分 `completed`、`interrupted`（含未完整关闭、尾部截断与未提交尾部字节及可恢复前缀长度）、`failed`（ENOSPC/短写/后写失败但保留已提交前缀）和 `corrupted`。
+  - 新增 `src/trace/trace-range-index.ts`：`TraceRangeIndex` 按 `(bootGeneration, segmentId)` 分区隔离多段相对 tick 回零；常规页用紧致边界与前缀 `maxEnd` 二分剪枝，跨时间页长区间归入 `longSlices`/`longActivations`/`longReadyWaits`/`longMarkers` 专用分页；支持 `relative-ticks`、`absolute-ticks`、`ns`、`relative-ns`、`byte-offset` 半开范围 `[start, end)` 精确相交及未锚定段显式排除；支持超限后将较早页目录溢写至 `index-spill.otidx` 并维持可量化内存上限；提供仅用于展示的 LOD 桶摘要聚合。
+  - 新增 `src/trace/trace-recording-store.ts`：`TraceRecordingStore` 驱动或消费 4.1/4.2 批次，具备有界写缓冲、有界 LRU 页缓存、有界内存索引、精确原始流导出（逐块 CRC32 校验，仅写入尚不存在的非录制目标且通过独占临时文件原子重命名提交，拒绝自导出、同 `dev/ino` 别名与已有目标）、原子目录创建（`wx+` 独占建档与目录锁，拒绝覆盖非空目录并在初始化失败时仅回滚本次新建文件）、前置无副作用校验（身份/boot/序列拒绝不推进解码状态；不可回滚派生超预算时立即终止为 `failed` 并保留既有提交前缀）、`ENOSPC`/短写/后写 EIO 回滚、幂等关闭及支持 `AbortSignal`/`SharedArrayBuffer` 协作让步的可取消分页查询。`finish()` 封存写日志后保留只读句柄至 `close()`。
+  - 新增 `src/trace/trace-worker-protocol.ts`、`src/trace/trace-worker.ts`、`src/trace/trace-worker-client.ts` 与 `esbuild.config.js`（新增 `dist/trace-worker.js` 打包入口，且支持 `tsc` 编译产物直接由 `node` 运行）；同步更新 `.vscodeignore` 排除 `out/rtos-stage*` 阶段验收目录并保留 `dist/trace-worker.js` 与原有 native 产物：`TraceWorkerRuntime` 按 `recordId` 严格隔离录制槽位、消费队列、单槽聚合 `progress` 通知与拉模式原始导出流；`TraceWorkerClient` 对 `ingestChunk`/`ingestDecoded` 施加在途与等待双预算（超限立即拒绝且不保留输入引用）、在发送前强制 `maxPendingQueries` 上限、管理无二次 release 的 `SharedArrayBuffer` 取消槽位，并实现幂等有序关闭。
+- 设计变更：将 `TraceRecordingStore.finish()` 与 `close()` 职责解耦，`finish()` 仅封存写日志并转换状态为 `completed` 以便同一录制实例在显式 `closeRecording` 前继续响应范围查询、LOD 与原始导出；`orbit-trace-v1` 采用多文件录制目录以便 `raw.otbin` 直接对应纯源字节流并用 `journal.otj` 界定提交边界；尚未接入硬件、DAP/RTT 录制协调（4.4）、UI 泳道（4.5）及统计/公开 API（5）。
+- 检查：
+  - `npm run typecheck` 通过；`npm run build`（含 `dist/trace-worker.js`）通过；`git diff --check` 通过；`npx @vscode/vsce ls --no-dependencies` 核对确认排除全部 `out/rtos-stage*` 且保留 `dist/trace-worker.js` 及 `out/native/win32-x64/*.exe/.bin`。
+  - 聚焦 Vitest（5 文件 44 项：`systemview-decoder.test.ts`、`systemview-reconstructor.test.ts`、`trace-format.test.ts`、`trace-recording-store.test.ts`、`trace-worker.test.ts`）全部通过（`trace-worker.test.ts` 改用已提交 `continuous.bin` 构造内存循环流，耗时 617 ms，无 `out/` 依赖）。
+  - 默认 `npm test`（116 文件、1486 项通过、1 项已有跳过，12.20s）全部通过。
+  - 独立验收脚本（均在 `out/rtos-stage4/acceptance-4.3/`）：
+    - `node out/rtos-stage4/acceptance-4.3/independent-worker-million.cjs`（1,002,005 事件 / 167,000 周期 / 2,505,036 字节，SHA256 `9cda46b51f5a0a952a50ef96360fcacd83866943409a2b1945d10cf9a1ae8548`）：`ingestedMs=9619.05 ms`、`finishMs=13.43 ms`；`data.otd=194,527,030 B`、`index.otidx=489,387 B`、`journal.otj=569,443 B`、`raw.otbin=2,505,036 B`、`manifest.json=1,328 B`；查询 `[2700103, 2700132)` 命中精确 oracle `[2700103, 2700106, 2700111, 2700118, 2700129, 2700131]`（4 页）及切片 `isr [2700111, 2700118)`、`task [2700118, 2700129)`；Worker 峰值堆 `183,193,176 B`、峰值 RSS `420,593,664 B`、Host 峰值 RSS `423,100,416 B`、LRU 缓存峰值 `2/8` 页（`277,236 / 1,048,576 B`）、内存页描述符 `951 / 16,384`。
+    - `node out/rtos-stage4/acceptance-4.3/independent-worker-million.cjs --smoke`：100 周期 1,536 字节通过。
+    - `node out/rtos-stage4/acceptance-4.3/independent-host-waiters.cjs`：96 并发批（1 批 / 64 KiB 限制）仅保留 1 个 waiter（65,536 B），2 次成功、94 次即时背压拒绝，通过。
+    - `node out/rtos-stage4/acceptance-4.3/independent-recording-path-integrity.cjs`：已有目录重创建返回 `RecordingDirectoryNotEmpty` 且 68 B 原文件 SHA256 不变，自导出 `raw.otbin` 返回 `ExportPathConflict` 且原文件无截断，通过。
+    - `node out/rtos-stage4/acceptance-4.3/independent-rejected-batch.cjs`：seq=3 乱序被 `BatchSequenceGap` 拒绝后重送 seq=2/3，首任务 offset=35/ticks=110、末包 offset=66/ticks=210 与手算 oracle 一致，原始导出精确 68 字节，通过。
+    - `node out/rtos-stage4/acceptance-4.3/verify-tsc-node.cjs`：以 `tsc` 编译产物直接由 `node` 拉起 `worker_threads` 并完成录制、查询、导出与退出码 0 关停，通过。
+- 硬件：未执行；4.3 为离线存储、索引与 Worker 接线阶段，不连接或操作实板。
+- 证据：`src/trace/trace-format.ts`、`src/trace/trace-range-index.ts`、`src/trace/trace-recording-store.ts`、`src/trace/trace-worker-protocol.ts`、`src/trace/trace-worker.ts`、`src/trace/trace-worker-client.ts`、`src/trace/*.test.ts`、`esbuild.config.js`、`out/rtos-stage4/acceptance-4.3/independent-worker-million.json`、`independent-worker-smoke.json`、`independent-host-waiters.json`、`independent-recording-path-integrity.json`、`independent-rejected-batch.json`、`tsc-node-verify.json`。
+- 独立复验：用 1,002,005 事件核对精确分页和 2,505,036 字节原始导出的一致性，复验主机等待预算、目录与自导出保护、乱序后重试与查询取消。实际强制退出 Worker 后，档案标记 interrupted，准确导出已提交的 65 B 前缀，保留 13 B 未提交尾部的诊断。默认全量 1486 项通过、1 项跳过。打包清单保留 Worker 和原生 helper，排除阶段验收目录。
+- 剩余事项：4.4 接入 DAP/RTT 录制协调器并实测 Continuous、Single-Shot 和 Post-Mortem。
+- 提交：`实现 RTOS 阶段 4.3：增加 Trace 存储与范围查询`。

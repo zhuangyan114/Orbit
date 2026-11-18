@@ -85,21 +85,35 @@ const debugAdapterConfig = {
   minify: false,
 };
 
+/** @type {esbuild.BuildOptions} */
+const traceWorkerConfig = {
+  entryPoints: [path.resolve('src/trace/trace-worker.ts')],
+  bundle: true,
+  outfile: path.resolve('dist/trace-worker.js'),
+  external: ['vscode', 'koffi'],
+  format: 'cjs',
+  platform: 'node',
+  target: 'node20',
+  sourcemap: true,
+  minify: false,
+};
+
 async function build() {
   try {
     if (isWatch) {
       const extCtx = await esbuild.context(extConfig);
       const webviewCtx = await esbuild.context(webviewConfig);
       const daCtx = await esbuild.context(debugAdapterConfig);
+      const twCtx = await esbuild.context(traceWorkerConfig);
       const tlCtx = await esbuild.context(timelineConfig);
       const wCtx = await esbuild.context(watchConfig);
       const rtosCtx = await esbuild.context(rtosConfig);
       const spCtx = await esbuild.context(symbolPickerConfig);
-      await Promise.all([extCtx.watch(), webviewCtx.watch(), daCtx.watch(), tlCtx.watch(), wCtx.watch(), rtosCtx.watch(), spCtx.watch()]);
-      console.log('[watch] extension + webview + debugadapter + timeline + watch + rtos + symbol-picker — waiting for changes...');
+      await Promise.all([extCtx.watch(), webviewCtx.watch(), daCtx.watch(), twCtx.watch(), tlCtx.watch(), wCtx.watch(), rtosCtx.watch(), spCtx.watch()]);
+      console.log('[watch] extension + webview + debugadapter + trace-worker + timeline + watch + rtos + symbol-picker — waiting for changes...');
     } else {
-      await Promise.all([esbuild.build(extConfig), esbuild.build(webviewConfig), esbuild.build(debugAdapterConfig), esbuild.build(timelineConfig), esbuild.build(watchConfig), esbuild.build(rtosConfig), esbuild.build(symbolPickerConfig)]);
-      console.log('[build] extension + webview + debugadapter + timeline + watch + rtos + symbol-picker — done');
+      await Promise.all([esbuild.build(extConfig), esbuild.build(webviewConfig), esbuild.build(debugAdapterConfig), esbuild.build(traceWorkerConfig), esbuild.build(timelineConfig), esbuild.build(watchConfig), esbuild.build(rtosConfig), esbuild.build(symbolPickerConfig)]);
+      console.log('[build] extension + webview + debugadapter + trace-worker + timeline + watch + rtos + symbol-picker — done');
     }
   } catch (err) {
     console.error(err);

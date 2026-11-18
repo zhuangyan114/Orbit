@@ -25,6 +25,8 @@ out/native/cmsis-dap-rtt-tdd/**
 out/native/cmsis-dap-rtt-tdd-red/**
 out/native/win32-x64/test/**
 out/native/*.log
+out/rtos-stage*/**
+out/rtos-stage*
 native/jlink-helper/**
 Releases/Log/**
 Releases/mcp/**

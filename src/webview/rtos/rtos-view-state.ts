@@ -272,6 +272,12 @@ export function formatFieldValue<T>(field: Field<T>, formatter: (value: T) => st
   return field.available ? formatter(field.value) : '—';
 }
 
+export function formatDurationMs(value: number | undefined, decimals = 0): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  const clamped = Math.max(0, value);
+  return decimals > 0 ? clamped.toFixed(decimals) : String(Math.round(clamped));
+}
+
 export function describeConsistency(consistency: Consistency): { label: string; tone: 'ok' | 'info' | 'warn' | 'error'; detail: string } {
   switch (consistency) {
     case 'halted-consistent':

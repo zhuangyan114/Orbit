@@ -7,6 +7,7 @@ import {
   describeConsistency,
   describeDiagnosticIssue,
   filterAndSortTasks,
+  formatDurationMs,
   formatFieldValue,
   formatHex32,
   objectKindLabel,
@@ -206,7 +207,7 @@ export function RtosApp() {
           )}
 
           {consistencyMeta && (
-            <span className={`rtos-pill rtos-tone-${consistencyMeta.tone}`} title={consistencyMeta.detail}>
+            <span className={`rtos-pill rtos-pill-consistency rtos-tone-${consistencyMeta.tone}`} title={consistencyMeta.detail}>
               {consistencyMeta.label}
             </span>
           )}
@@ -233,13 +234,13 @@ export function RtosApp() {
 
         <div className="rtos-toolbar-group rtos-toolbar-actions">
           {panel.loading.refresh ? (
-            <button type="button" className="rtos-btn rtos-btn-secondary" onClick={() => vscodeApi.postMessage({ command: 'cancel' })}>
+            <button type="button" className="rtos-btn rtos-btn-secondary rtos-btn-action" onClick={() => vscodeApi.postMessage({ command: 'cancel' })}>
               取消
             </button>
           ) : (
             <button
               type="button"
-              className="rtos-btn"
+              className="rtos-btn rtos-btn-action"
               disabled={!canQueryTarget || panel.loading.capabilities}
               title="立即执行一次快照刷新"
               onClick={() => vscodeApi.postMessage({ command: 'refresh' })}
@@ -254,7 +255,8 @@ export function RtosApp() {
               checked={settings.liveEnabled}
               onChange={event => toggleLive(event.target.checked)}
             />
-            <span>Live{panel.liveActive ? ' ●' : ''}</span>
+            <span>Live</span>
+            <span className={`rtos-live-dot${panel.liveActive ? ' active' : ''}`} aria-hidden="true">●</span>
           </label>
 
           <label className="rtos-live-toggle" title="Live 轮询时同步读取队列、互斥锁、信号量、定时器与堆（会增加每轮总线读取量）">
@@ -279,7 +281,7 @@ export function RtosApp() {
 
           <button
             type="button"
-            className="rtos-btn rtos-btn-secondary"
+            className="rtos-btn rtos-btn-secondary rtos-btn-scan"
             disabled={!canScanStacks}
             title={caps?.stackWatermark.available ? `按需扫描全部任务栈填充区（每任务上限 ${settings.maxStackScanBytes} B）` : (caps?.stackWatermark.reason || '当前配置不支持栈水位扫描')}
             onClick={() => vscodeApi.postMessage({ command: 'scanStack', all: true })}
@@ -298,7 +300,7 @@ export function RtosApp() {
         </div>
       </header>
 
-      {/* 能力与状态提示条 */}
+      {/* 能力与状态提示条（固定两行布局，防止实时刷新时换行跳动） */}
       {(caps || snapshot || panel.lastError) && (
         <div className="rtos-status-strip">
           {caps && (
@@ -314,12 +316,16 @@ export function RtosApp() {
             </div>
           )}
           <div className="rtos-timing">
-            {snapshot && (
+            {snapshot ? (
               <>
-                <span>#{snapshot.snapshotSequence} · {formatTime(snapshot.completedAt)}</span>
-                <span>总耗时 {snapshot.diagnostics.totalMs} ms（I/O {snapshot.diagnostics.ioMs} / 排队 {snapshot.diagnostics.queueWaitMs}）</span>
-                <span>读取 {snapshot.diagnostics.bytes} B / {snapshot.diagnostics.batches} 批</span>
+                <span className="rtos-timing-item">#{snapshot.snapshotSequence} · {formatTime(snapshot.completedAt)}</span>
+                <span className="rtos-timing-item">
+                  总耗时 {formatDurationMs(snapshot.diagnostics.totalMs, 0)} ms（I/O {formatDurationMs(snapshot.diagnostics.ioMs, 1)} / 排队 {formatDurationMs(snapshot.diagnostics.queueWaitMs, 1)}）
+                </span>
+                <span className="rtos-timing-item">读取 {snapshot.diagnostics.bytes} B / {snapshot.diagnostics.batches} 批</span>
               </>
+            ) : (
+              <span className="rtos-timing-item rtos-muted">等待快照…</span>
             )}
             {panel.lastError && (
               <span className="rtos-inline-warn" title={panel.lastError.message}>
@@ -765,9 +771,10 @@ const STYLES = `
 .rtos-root { display:flex; flex-direction:column; height:100%; min-height:0; background:var(--vscode-panel-background, var(--vscode-editor-background)); color:var(--vscode-foreground); }
 .rtos-root button, .rtos-root input, .rtos-root select { font-family:inherit; font-size:12px; }
 .rtos-root button:focus-visible, .rtos-root input:focus-visible, .rtos-root select:focus-visible, .rtos-row:focus-visible { outline:1px solid var(--vscode-focusBorder, #007fd4); outline-offset:-1px; }
-.rtos-toolbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; border-bottom:1px solid var(--vscode-panel-border, var(--vscode-sideBar-border)); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); flex-shrink:0; }
-.rtos-toolbar-group { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.rtos-toolbar { display:flex; flex-wrap:nowrap; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; min-height:36px; border-bottom:1px solid var(--vscode-panel-border, var(--vscode-sideBar-border)); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); flex-shrink:0; overflow-x:auto; scrollbar-width:none; }
+.rtos-toolbar-group { display:flex; flex-wrap:nowrap; align-items:center; gap:6px; flex-shrink:0; }
 .rtos-pill { display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:10px; font-size:11px; border:1px solid var(--vscode-panel-border, transparent); background:var(--vscode-badge-background); color:var(--vscode-badge-foreground); white-space:nowrap; }
+.rtos-pill-consistency { min-width:96px; justify-content:center; }
 .rtos-dot { width:7px; height:7px; border-radius:50%; background:var(--vscode-descriptionForeground); }
 .rtos-dot-connected { background:var(--vscode-charts-green, #4ec9b0); }
 .rtos-dot-starting { background:var(--vscode-charts-yellow, #cca700); }
@@ -776,36 +783,41 @@ const STYLES = `
 .rtos-tone-info { border-color:var(--vscode-charts-blue, #3794ff); }
 .rtos-tone-warn { border-color:var(--vscode-charts-yellow, #cca700); color:var(--vscode-editorWarning-foreground, inherit); }
 .rtos-tone-error { border-color:var(--vscode-errorForeground, #f48771); color:var(--vscode-errorForeground, #f48771); }
-.rtos-subtabs { display:flex; align-items:center; gap:2px; }
+.rtos-subtabs { display:flex; align-items:center; gap:2px; flex-shrink:0; }
 .rtos-subtab { border:0; border-bottom:2px solid transparent; background:transparent; color:var(--vscode-descriptionForeground); padding:4px 8px; cursor:pointer; white-space:nowrap; }
 .rtos-subtab.active { color:var(--vscode-foreground); border-bottom-color:var(--vscode-focusBorder, #007fd4); font-weight:600; }
 .rtos-subtab:hover { color:var(--vscode-foreground); background:var(--vscode-list-hoverBackground); }
 .rtos-btn { border:1px solid var(--vscode-button-border, transparent); border-radius:3px; padding:3px 9px; background:var(--vscode-button-background); color:var(--vscode-button-foreground); cursor:pointer; white-space:nowrap; }
+.rtos-btn-action { min-width:50px; text-align:center; }
+.rtos-btn-scan { min-width:82px; text-align:center; }
 .rtos-btn:hover:not(:disabled) { background:var(--vscode-button-hoverBackground); }
 .rtos-btn:disabled { opacity:.45; cursor:default; }
 .rtos-btn-secondary { background:var(--vscode-button-secondaryBackground); color:var(--vscode-button-secondaryForeground); }
 .rtos-btn-secondary:hover:not(:disabled) { background:var(--vscode-button-secondaryHoverBackground); }
 .rtos-btn-secondary.active { border-color:var(--vscode-focusBorder, #007fd4); }
 .rtos-live-toggle { display:inline-flex; align-items:center; gap:4px; cursor:pointer; user-select:none; white-space:nowrap; }
+.rtos-live-dot { font-size:10px; line-height:1; opacity:.25; transition:opacity .12s; }
+.rtos-live-dot.active { opacity:1; color:var(--vscode-charts-green, #4ec9b0); }
 .rtos-select, .rtos-search { border:1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius:3px; padding:2px 6px; background:var(--vscode-input-background); color:var(--vscode-input-foreground); }
-.rtos-status-strip { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-descriptionForeground); flex-shrink:0; }
-.rtos-caps { display:flex; flex-wrap:wrap; gap:6px; }
-.rtos-cap { padding:1px 6px; border-radius:3px; border:1px solid var(--vscode-panel-border); }
+.rtos-status-strip { display:flex; flex-direction:column; gap:4px; padding:5px 10px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-descriptionForeground); flex-shrink:0; }
+.rtos-caps { display:flex; flex-wrap:nowrap; align-items:center; gap:6px; min-height:20px; overflow-x:auto; scrollbar-width:none; white-space:nowrap; }
+.rtos-cap { padding:1px 6px; border-radius:3px; border:1px solid var(--vscode-panel-border); flex-shrink:0; }
 .rtos-cap.ok { color:var(--vscode-foreground); }
 .rtos-cap.off { opacity:.65; }
-.rtos-timing { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-.rtos-inline-warn { color:var(--vscode-editorWarning-foreground, var(--vscode-errorForeground)); max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rtos-timing { display:flex; flex-wrap:nowrap; gap:10px; align-items:center; min-height:20px; height:20px; overflow:hidden; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.rtos-timing-item { flex-shrink:0; white-space:nowrap; }
+.rtos-inline-warn { flex:1 1 0; min-width:0; color:var(--vscode-editorWarning-foreground, var(--vscode-errorForeground)); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .rtos-main { flex:1; min-height:0; display:flex; flex-direction:column; }
 .rtos-workspace { flex:1; min-height:0; display:flex; overflow:hidden; }
 .rtos-table-pane { flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; }
-.rtos-filter-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid var(--vscode-panel-border); flex-shrink:0; }
-.rtos-search { min-width:180px; flex:1; max-width:300px; }
-.rtos-filter-chips { display:flex; flex-wrap:wrap; gap:4px; }
-.rtos-chip { border:1px solid var(--vscode-panel-border); border-radius:10px; padding:2px 8px; background:transparent; color:var(--vscode-foreground); cursor:pointer; font-size:11px; }
+.rtos-filter-bar { display:flex; flex-wrap:nowrap; align-items:center; gap:8px; padding:6px 10px; min-height:33px; border-bottom:1px solid var(--vscode-panel-border); flex-shrink:0; overflow-x:auto; scrollbar-width:none; }
+.rtos-search { min-width:160px; flex:1 1 180px; max-width:300px; }
+.rtos-filter-chips { display:flex; flex-wrap:nowrap; gap:4px; flex-shrink:0; }
+.rtos-chip { border:1px solid var(--vscode-panel-border); border-radius:10px; padding:2px 8px; background:transparent; color:var(--vscode-foreground); cursor:pointer; font-size:11px; white-space:nowrap; flex-shrink:0; }
 .rtos-chip.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:var(--vscode-button-background); }
-.rtos-count { margin-left:auto; color:var(--vscode-descriptionForeground); font-size:11px; }
+.rtos-count { margin-left:auto; color:var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; flex-shrink:0; font-variant-numeric:tabular-nums; }
 .rtos-table-scroll { flex:1; min-height:0; overflow:auto; }
-.rtos-table { width:100%; border-collapse:collapse; table-layout:auto; font-size:12px; }
+.rtos-table { width:100%; border-collapse:collapse; table-layout:auto; font-size:12px; font-variant-numeric:tabular-nums; }
 .rtos-table th { position:sticky; top:0; z-index:1; text-align:left; font-weight:600; padding:5px 8px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); border-bottom:1px solid var(--vscode-panel-border); white-space:nowrap; }
 .rtos-sort-btn { border:0; background:transparent; color:inherit; font:inherit; font-weight:600; cursor:pointer; padding:0; }
 .rtos-table td { padding:4px 8px; border-bottom:1px solid var(--vscode-panel-border); vertical-align:middle; }
@@ -815,7 +827,7 @@ const STYLES = `
 .rtos-table-empty { text-align:center; padding:24px !important; color:var(--vscode-descriptionForeground); }
 .rtos-mono { font-family:var(--vscode-editor-font-family, monospace); font-variant-numeric:tabular-nums; }
 .rtos-muted { color:var(--vscode-descriptionForeground); }
-.rtos-state-badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:11px; font-weight:600; white-space:nowrap; border:1px solid var(--vscode-panel-border); }
+.rtos-state-badge { display:inline-block; min-width:84px; text-align:center; padding:1px 6px; border-radius:3px; font-size:11px; font-weight:600; white-space:nowrap; border:1px solid var(--vscode-panel-border); }
 .rtos-state-running { border-color:var(--vscode-charts-green, #4ec9b0); color:var(--vscode-charts-green, #4ec9b0); }
 .rtos-state-ready { border-color:var(--vscode-charts-blue, #3794ff); }
 .rtos-state-blocked { border-color:var(--vscode-charts-yellow, #cca700); }
@@ -825,12 +837,12 @@ const STYLES = `
 .rtos-task-id { font-size:11px; color:var(--vscode-descriptionForeground); }
 .rtos-row.selected .rtos-task-id, .rtos-row.selected .rtos-muted { color:inherit; opacity:.85; }
 .rtos-list-cell, .rtos-stack-cell, .rtos-cpu-cell { display:flex; align-items:center; gap:6px; white-space:nowrap; }
-.rtos-evidence { font-size:10px; padding:0 5px; border-radius:3px; border:1px solid var(--vscode-panel-border); }
+.rtos-evidence { font-size:10px; min-width:48px; text-align:center; padding:0 5px; border-radius:3px; border:1px solid var(--vscode-panel-border); }
 .rtos-evidence-validated-tcb { border-color:var(--vscode-charts-yellow, #cca700); }
 .rtos-bar { display:inline-block; width:48px; height:6px; border-radius:3px; background:var(--vscode-progressBar-background, rgba(127,127,127,.25)); background:color-mix(in srgb, var(--vscode-foreground) 15%, transparent); overflow:hidden; }
 .rtos-bar-fill { display:block; height:100%; background:var(--vscode-charts-blue, #3794ff); }
 .rtos-bar-fill.warn { background:var(--vscode-charts-red, #f48771); }
-.rtos-mini-btn { border:1px solid var(--vscode-panel-border); border-radius:3px; padding:1px 6px; background:transparent; color:inherit; cursor:pointer; font-size:11px; }
+.rtos-mini-btn { border:1px solid var(--vscode-panel-border); border-radius:3px; padding:1px 6px; background:transparent; color:inherit; cursor:pointer; font-size:11px; white-space:nowrap; }
 .rtos-mini-btn:hover:not(:disabled) { background:var(--vscode-list-hoverBackground); }
 .rtos-mini-btn:disabled { opacity:.45; cursor:default; }
 .rtos-detail-pane { width:310px; max-width:42%; border-left:1px solid var(--vscode-panel-border); padding:10px; overflow:auto; display:flex; flex-direction:column; gap:10px; background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; }
@@ -844,14 +856,15 @@ const STYLES = `
 .rtos-empty p { margin:4px 0; }
 .rtos-empty ul { margin:8px 0 12px; padding-left:18px; }
 .rtos-empty-error h3 { color:var(--vscode-errorForeground, #f48771); }
-.rtos-diagnostics { border-top:1px solid var(--vscode-panel-border); padding:8px 10px; font-size:11px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); max-height:140px; overflow:auto; flex-shrink:0; }
+.rtos-diagnostics { border-top:1px solid var(--vscode-panel-border); padding:8px 10px; font-size:11px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); height:88px; min-height:88px; max-height:88px; overflow:auto; flex-shrink:0; }
 .rtos-diag-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:4px 12px; }
 .rtos-subview-shell { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
-.rtos-sub-bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:5px 10px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); flex-shrink:0; }
-.rtos-coverage-bar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-descriptionForeground); flex-shrink:0; }
-.rtos-cycle-banner { padding:6px 10px; border-bottom:1px solid var(--vscode-charts-yellow, #cca700); background:color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 12%, transparent); font-size:11px; flex-shrink:0; display:flex; flex-direction:column; gap:4px; }
+.rtos-sub-bar { display:flex; flex-wrap:nowrap; align-items:center; gap:6px; padding:5px 10px; min-height:30px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); flex-shrink:0; overflow-x:auto; scrollbar-width:none; }
+.rtos-coverage-bar { display:flex; flex-wrap:nowrap; align-items:center; justify-content:space-between; gap:8px; padding:4px 10px; min-height:24px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-descriptionForeground); flex-shrink:0; overflow:hidden; white-space:nowrap; }
+.rtos-coverage-bar > span:first-child { flex:1 1 0; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.rtos-cycle-banner { padding:6px 10px; max-height:84px; overflow:auto; border-bottom:1px solid var(--vscode-charts-yellow, #cca700); background:color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 12%, transparent); font-size:11px; flex-shrink:0; display:flex; flex-direction:column; gap:4px; }
 .rtos-cycle-item { display:flex; flex-direction:column; gap:2px; }
-.rtos-unresolved-bar { padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground)); flex-shrink:0; }
+.rtos-unresolved-bar { padding:4px 10px; max-height:72px; overflow:auto; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground)); flex-shrink:0; }
 .rtos-source-chips { display:flex; flex-wrap:wrap; gap:4px; }
 .rtos-link-btn { border:0; padding:0; background:transparent; color:var(--vscode-textLink-foreground, #3794ff); cursor:pointer; font:inherit; text-decoration:underline; }
 .rtos-link-btn:hover { color:var(--vscode-textLink-activeForeground, #4fc1ff); }

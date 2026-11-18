@@ -182,11 +182,12 @@ export class RtosSnapshotService {
         };
       }
 
+      const roundMs = (ms: number) => Math.round(Math.max(0, ms) * 10) / 10;
       result.snapshot.completedAt = Date.now();
-      result.snapshot.diagnostics.queueWaitMs = queueWaitMs;
-      result.snapshot.diagnostics.ioMs = Math.max(0, result.snapshot.diagnostics.ioMs - queueWaitMs);
-      result.snapshot.diagnostics.totalMs = result.snapshot.completedAt - result.snapshot.startedAt;
-      result.snapshot.diagnostics.parseMs = Math.max(0, result.snapshot.diagnostics.totalMs - result.snapshot.diagnostics.ioMs - queueWaitMs);
+      result.snapshot.diagnostics.queueWaitMs = roundMs(queueWaitMs);
+      result.snapshot.diagnostics.ioMs = roundMs(result.snapshot.diagnostics.ioMs - queueWaitMs);
+      result.snapshot.diagnostics.totalMs = roundMs(result.snapshot.completedAt - result.snapshot.startedAt);
+      result.snapshot.diagnostics.parseMs = roundMs(result.snapshot.diagnostics.totalMs - result.snapshot.diagnostics.ioMs - result.snapshot.diagnostics.queueWaitMs);
       this.runtime.update(result.snapshot, this.host.port);
       if (result.snapshot.consistency !== 'unavailable' && result.snapshot.tasks.length) this.hints = result.snapshot.tasks.map(task => task.tcbAddress);
       if (['halted-consistent', 'live-best-effort'].includes(result.snapshot.consistency)) {

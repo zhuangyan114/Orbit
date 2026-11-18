@@ -53,4 +53,18 @@ describe('RTOS snapshot refresh service', () => {
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(publish).not.toHaveBeenCalled(); service.dispose();
   });
+
+  it('rounds diagnostic timings cleanly to prevent sub-millisecond IEEE-754 float jitter in the UI', async () => {
+    const { target, host, service } = setup();
+    host.read = async (address, size) => ({
+      bytes: await target.request.read(address, size),
+      queueWaitMs: 0.005123456789,
+    });
+    const snapshot = await service.refresh();
+    expect(String(snapshot.diagnostics.queueWaitMs).length).toBeLessThanOrEqual(5);
+    expect(String(snapshot.diagnostics.ioMs).length).toBeLessThanOrEqual(7);
+    expect(String(snapshot.diagnostics.parseMs).length).toBeLessThanOrEqual(7);
+    expect(String(snapshot.diagnostics.totalMs).length).toBeLessThanOrEqual(7);
+    service.dispose();
+  });
 });

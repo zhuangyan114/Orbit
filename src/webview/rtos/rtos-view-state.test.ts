@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { known, unknown, type SyncObjectSnapshot, type TaskSnapshot, type TimerSnapshot } from '../../rtos/model';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
@@ -7,6 +9,7 @@ import {
   filterAndSortTasks,
   filterSyncObjects,
   filterTimers,
+  formatDurationMs,
   objectKindLabel,
   sanitizeRtosViewSettings,
   stackUsedBytes,
@@ -273,5 +276,25 @@ describe('RTOS view state helpers', () => {
     expect(describeConsistency('halted-consistent').tone).toBe('ok');
     expect(describeDiagnosticIssue({ errorCode: 'DwarfUnavailable', message: 'No DWARF' })?.title).toContain('DWARF');
     expect(describeDiagnosticIssue({ errorCode: 'RtosNotDetected', message: 'Missing pxCurrentTCB' })?.title).toContain('FreeRTOS');
+  });
+
+  it('formats timing durations compactly without raw float noise and keeps anti-jump layout CSS rules intact', () => {
+    expect(formatDurationMs(262.96435546875, 1)).toBe('263.0');
+    expect(formatDurationMs(0.03564453125, 1)).toBe('0.0');
+    expect(formatDurationMs(265.4, 0)).toBe('265');
+    expect(formatDurationMs(-5, 1)).toBe('0.0');
+    expect(formatDurationMs(Number.NaN, 1)).toBe('—');
+    expect(formatDurationMs(undefined, 0)).toBe('—');
+
+    const appSrc = readFileSync(resolve(__dirname, 'app.tsx'), 'utf8');
+    expect(appSrc).toContain('.rtos-status-strip { display:flex; flex-direction:column;');
+    expect(appSrc).toContain('.rtos-timing { display:flex; flex-wrap:nowrap;');
+    expect(appSrc).toContain('.rtos-inline-warn { flex:1 1 0; min-width:0;');
+    expect(appSrc).toContain('white-space:nowrap; }');
+    expect(appSrc).toContain('.rtos-toolbar { display:flex; flex-wrap:nowrap;');
+    expect(appSrc).toContain('.rtos-sub-bar { display:flex; flex-wrap:nowrap;');
+    expect(appSrc).toContain('.rtos-filter-bar { display:flex; flex-wrap:nowrap;');
+    expect(appSrc).toContain('.rtos-coverage-bar { display:flex; flex-wrap:nowrap;');
+    expect(appSrc).toContain('.rtos-diagnostics { border-top:1px solid var(--vscode-panel-border); padding:8px 10px; font-size:11px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); height:88px;');
   });
 });

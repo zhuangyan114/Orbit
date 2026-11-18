@@ -20,12 +20,15 @@ export class JLinkDLL {
   private _targetLinkProbeEnabled = false;
   private bpSlots: (number | null)[] = [null, null, null, null, null, null];
 
+  constructor(private readonly dllPathOverride?: string) {}
+
   get connected() { return this._state !== 'disconnected'; }
   get state() { return this._state; }
   get device() { return this._device; }
   get breakpointSlots(): readonly (number | null)[] { return this.bpSlots; }
 
   private getDllPath(): string {
+    if (this.dllPathOverride) return this.dllPathOverride;
     try {
       const vscode = require('vscode') as typeof import('vscode');
       const config = vscode.workspace.getConfiguration('orbit');
@@ -479,6 +482,27 @@ export class JLinkDLL {
       return buf.slice(0, ret);
     } catch {
       return null;
+    }
+  }
+
+  getRttApiAvailability(): { control: boolean; read: boolean; write: boolean } {
+    if (!this.lib) {
+      return { control: false, read: false, write: false };
+    }
+    return {
+      control: this.hasExport('int JLINK_RTTERMINAL_Control(uint32, void*)'),
+      read: this.hasExport('int JLINK_RTTERMINAL_Read(uint32, uint8*, uint32)'),
+      write: this.hasExport('int JLINK_RTTERMINAL_Write(uint32, const uint8*, uint32)'),
+    };
+  }
+
+  private hasExport(signature: string): boolean {
+    if (!this.lib) return false;
+    try {
+      this.lib.func(signature);
+      return true;
+    } catch {
+      return false;
     }
   }
 

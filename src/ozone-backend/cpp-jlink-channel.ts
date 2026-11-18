@@ -8,6 +8,26 @@ import {
   NativeSchedulerCancelledError,
   NativeTaskPriority,
 } from './native-scheduler';
+import { FlashTargetDefinition, resolveFlashTarget } from './cmsis-dap-flasher';
+import type {
+  CmsisDapRttEnumOptions,
+  CmsisDapRttEnumResult,
+  CmsisDapRttMemoryRange,
+  CmsisDapRttStartOptions,
+  CmsisDapRttWriteOptions,
+  CmsisDapRttWriteResult,
+} from './cmsis-dap-helper-channel';
+import {
+  RttCapabilities,
+  isValidRttCapabilities,
+  isValidRttEnumResult,
+  isValidRttWriteResult,
+  rttCapability,
+  unavailableRttCapabilities,
+  validateRttMemoryRanges,
+} from './rtt-contract';
+import type { Capability } from '../rtos/model';
+import { log } from '../utils/logger';
 
 export type CppJLinkTargetState = 'Disconnected' | 'Unknown' | 'Halted' | 'Running' | 'Stepping' | 'Error';
 
@@ -37,6 +57,7 @@ export interface CppJLinkResult<T = Record<string, never>> {
 }
 
 export interface CppJLinkChannelOptions {
+  helperClient?: CppJLinkHelperClient;
   helperPath?: string;
   requestTimeoutMs?: number;
   onDiagnostic?: (message: string) => void;
@@ -366,18 +387,68 @@ export class ExperimentalCppJLinkChannel {
   readonly kind = 'jlink-native' as const;
   private readonly helper: CppJLinkHelperClient;
   private nativeConnected = false;
+  private helperCapabilities: Set<string> | null = null;
+  private dllCapabilities: Set<string> | null = null;
+  private dllRttCapabilities: Pick<RttCapabilities, 'rttStart' | 'rttEnumerate' | 'rttUpRead' | 'rttDownWrite'> | null = null;
+  private dllApis: Record<string, boolean> | null = null;
+  private flashTargetDef: FlashTargetDefinition | null = null;
 
   constructor(options: CppJLinkChannelOptions = {}) {
     const helperPath = options.helperPath || findDefaultHelperPath();
-    this.helper = new CppJLinkHelperClient(helperPath, options.requestTimeoutMs, options.onDiagnostic);
+    this.helper = options.helperClient
+      ?? new CppJLinkHelperClient(helperPath, options.requestTimeoutMs, options.onDiagnostic);
   }
 
   get usingNative() { return this.nativeConnected; }
+  get flashTarget(): FlashTargetDefinition | null { return this.flashTargetDef; }
+  getHelperCapabilities(): readonly string[] {
+    return this.helperCapabilities ? Array.from(this.helperCapabilities) : [];
+  }
+
+  getRttCapabilities(): RttCapabilities {
+    if (!this.nativeConnected) {
+      return unavailableRttCapabilities(this.kind, 'J-Link native helper is not connected');
+    }
+    const resolveCap = (
+      helperCap: string | null,
+      dllCap: Capability | undefined,
+      missingHelperReason: string,
+    ): Capability => {
+      if (helperCap && this.helperCapabilities && !this.helperCapabilities.has(helperCap)) {
+        return rttCapability(false, missingHelperReason);
+      }
+      if (dllCap) return dllCap;
+      return rttCapability(true);
+    };
+    return {
+      ownerKind: this.kind,
+      rttStart: resolveCap('rtt', this.dllRttCapabilities?.rttStart, 'J-Link helper does not advertise rtt capability'),
+      rttEnumerate: resolveCap(
+        'rttEnumerate',
+        this.dllRttCapabilities?.rttEnumerate,
+        'J-Link helper does not advertise rttEnumerate capability',
+      ),
+      rttUpRead: resolveCap('rtt', this.dllRttCapabilities?.rttUpRead, 'J-Link helper does not advertise rtt capability'),
+      rttDownWrite: resolveCap(
+        'rttWrite',
+        this.dllRttCapabilities?.rttDownWrite,
+        'J-Link helper does not advertise rttWrite capability',
+      ),
+      details: {
+        dllApis: this.dllApis,
+        dllCapabilities: this.dllCapabilities ? Array.from(this.dllCapabilities) : null,
+        registeredTarget: Boolean(this.flashTargetDef),
+        requiresExplicitRamRanges: !this.flashTargetDef,
+      },
+    };
+  }
 
   async detectProbe(config: CppJLinkConnectConfig): Promise<CppJLinkResult<ProbeDiscoveryResult>> {
     try {
       const hello = await this.helper.start();
       if (!hello.ok) return this.failNative<ProbeDiscoveryResult>(`helper handshake failed: ${hello.message}`);
+      const caps = hello.data?.capabilities;
+      this.helperCapabilities = Array.isArray(caps) && caps.length > 0 ? new Set(caps) : null;
       return await this.helper.request<ProbeDiscoveryResult>('probe', { dllPath: config.dllPath });
     } catch (error) {
       return this.failNative<ProbeDiscoveryResult>(error instanceof Error ? error.message : String(error));
@@ -389,12 +460,32 @@ export class ExperimentalCppJLinkChannel {
       if (!this.helper.started) {
         const hello = await this.helper.start();
         if (!hello.ok) return this.failNative(`helper handshake failed: ${hello.message}`);
+        const caps = hello.data?.capabilities;
+        this.helperCapabilities = Array.isArray(caps) && caps.length > 0 ? new Set(caps) : null;
       }
-      const result = await this.helper.request<{ dllPath: string }>('connect', { ...config });
+      const result = await this.helper.request<{
+        dllPath: string;
+        capabilities?: string[];
+        dllApis?: Record<string, boolean>;
+        rttCapabilities?: Pick<RttCapabilities, 'rttStart' | 'rttEnumerate' | 'rttUpRead' | 'rttDownWrite'>;
+      }>('connect', { ...config });
       if (result.ok) {
         this.nativeConnected = true;
+        const dllCaps = result.data?.capabilities;
+        this.dllCapabilities = Array.isArray(dllCaps) && dllCaps.length > 0 ? new Set(dllCaps) : null;
+        this.dllApis = result.data?.dllApis ?? null;
+        const rawRttCaps = result.data?.rttCapabilities;
+        this.dllRttCapabilities = rawRttCaps && isValidRttCapabilities({ ownerKind: this.kind, ...rawRttCaps })
+          ? rawRttCaps
+          : null;
+        try {
+          this.flashTargetDef = config.device ? resolveFlashTarget(config.device) : null;
+        } catch {
+          this.flashTargetDef = null;
+        }
         return { ...result, data: { channel: 'cpp' as const, dllPath: result.data?.dllPath } };
       }
+      this.resetSessionCapabilities();
       await this.helper.dispose(false);
       return this.failure(`${result.errorCode || 'NativeConnectFailed'}: ${result.message}`, 'NativeChannelUnavailable');
     } catch (error) {
@@ -469,20 +560,311 @@ export class ExperimentalCppJLinkChannel {
   }
 
   async clearAllBreakpoints(): Promise<CppJLinkResult> { return this.callNative('clearAllBreakpoints', {}); }
-  async startRtt(controlBlockAddress?: number): Promise<CppJLinkResult> { return this.callNative('startRtt', { controlBlockAddress }); }
+  async startRtt(controlBlockAddress?: number, options?: CmsisDapRttStartOptions): Promise<CppJLinkResult> {
+    if (!this.usingNative) return this.failure('native startRtt channel is unavailable', 'NativeChannelUnavailable');
+    const rttCaps = this.getRttCapabilities();
+    if (!rttCaps.rttStart.available) {
+      return this.failureWithCode(rttCaps.rttStart.reason || 'J-Link RTT start is unavailable', 'UnsupportedCapability', {
+        ownerKind: this.kind,
+        capability: 'startRtt',
+      });
+    }
+    let ramRanges: CmsisDapRttMemoryRange[] | undefined;
+    if (options?.ramRanges !== undefined) {
+      const checked = validateRttMemoryRanges(options.ramRanges, false, 'ramRanges');
+      if (!checked.ok) {
+        return this.failureWithCode(checked.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'startRtt',
+        });
+      }
+      ramRanges = checked.normalized;
+    } else if (this.flashTargetDef) {
+      ramRanges = this.flashTargetDef.ramRegions.map(region => ({
+        address: region.address,
+        size: region.size,
+      }));
+    }
+    return this.callNative('startRtt', {
+      controlBlockAddress,
+      ...(ramRanges ? { ramRanges } : {}),
+    });
+  }
+
+  async enumerateRtt(
+    controlBlockAddress?: number,
+    options?: CmsisDapRttEnumOptions,
+  ): Promise<CppJLinkResult<CmsisDapRttEnumResult>> {
+    if (!this.usingNative) return this.failure('native enumerateRtt channel is unavailable', 'NativeChannelUnavailable');
+    const rttCaps = this.getRttCapabilities();
+    if (!rttCaps.rttEnumerate.available) {
+      return this.failureWithCode(
+        rttCaps.rttEnumerate.reason || 'J-Link RTT channel enumeration is unavailable',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'enumerateRtt' },
+      );
+    }
+    if (controlBlockAddress !== undefined
+      && (!Number.isInteger(controlBlockAddress) || controlBlockAddress <= 0 || controlBlockAddress > 0xFFFFFFFF)) {
+      return this.failureWithCode(
+        'J-Link RTT control block address must be a positive uint32',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'enumerateRtt' },
+      );
+    }
+
+    let ramRanges: CmsisDapRttMemoryRange[];
+    if (options?.ramRanges !== undefined) {
+      const checked = validateRttMemoryRanges(options.ramRanges, false, 'ramRanges');
+      if (!checked.ok) {
+        return this.failureWithCode(checked.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'enumerateRtt',
+        });
+      }
+      ramRanges = checked.normalized;
+    } else if (this.flashTargetDef) {
+      ramRanges = this.flashTargetDef.ramRegions.map(region => ({
+        address: region.address,
+        size: region.size,
+      }));
+    } else {
+      return this.failureWithCode(
+        'J-Link RTT channel enumeration requires a registered target or explicit ramRanges',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'enumerateRtt' },
+      );
+    }
+
+    let roRanges: CmsisDapRttMemoryRange[] | undefined;
+    if (options?.roRanges !== undefined) {
+      const checkedRo = validateRttMemoryRanges(options.roRanges, true, 'roRanges');
+      if (!checkedRo.ok) {
+        return this.failureWithCode(checkedRo.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'enumerateRtt',
+        });
+      }
+      roRanges = checkedRo.normalized;
+    } else if (this.flashTargetDef) {
+      roRanges = [{ address: this.flashTargetDef.flashBase, size: this.flashTargetDef.flashSize }];
+    }
+
+    let timeoutMs = 2000;
+    if (options?.timeoutMs !== undefined) {
+      if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0 || options.timeoutMs > 10000) {
+        return this.failureWithCode(
+          'J-Link enumerateRtt timeoutMs must be an integer in 1..10000',
+          'DapInvalidRequest',
+          { ownerKind: this.kind, capability: 'enumerateRtt' },
+        );
+      }
+      timeoutMs = options.timeoutMs;
+    }
+
+    let result: CppJLinkResult<CmsisDapRttEnumResult>;
+    try {
+      result = await this.callNative<CmsisDapRttEnumResult>(
+        'enumerateRtt',
+        {
+          ...(controlBlockAddress !== undefined ? { controlBlockAddress: controlBlockAddress >>> 0 } : {}),
+          ramRanges,
+          ...(roRanges ? { roRanges } : {}),
+          timeoutMs,
+        },
+        { priority: 'watch', label: 'RTT channel enumeration' },
+      );
+    } catch (error) {
+      if (error instanceof NativeSchedulerCancelledError) {
+        return {
+          ok: false,
+          message: 'J-Link enumerateRtt was cancelled',
+          errorCode: 'RequestCancelled',
+          targetState: 'Unknown',
+          elapsedMs: 0,
+          diagnostics: { ownerKind: this.kind, method: 'enumerateRtt' },
+        };
+      }
+      throw error;
+    }
+    if (!result.ok) {
+      log.dap('[rtt] enumerateRtt failed owner=jlink-native errorCode=' + (result.errorCode || 'unknown')
+        + ' message=' + result.message);
+      return {
+        ...result,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'enumerateRtt' },
+      };
+    }
+    if (!isValidRttEnumResult(result.data)) {
+      return {
+        ok: false,
+        message: 'J-Link enumerateRtt returned a malformed result',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error',
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'enumerateRtt' },
+      };
+    }
+    log.dap('[rtt] enumerateRtt owner=jlink-native controlBlock=0x'
+      + (result.data.controlBlockAddress >>> 0).toString(16)
+      + ' up=' + result.data.validUpCount + '/' + result.data.maxUpBuffers
+      + ' down=' + result.data.validDownCount + '/' + result.data.maxDownBuffers
+      + ' corrupt=' + result.data.corruptCount + ' unused=' + result.data.unusedCount);
+    return {
+      ...result,
+      diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'enumerateRtt' },
+    };
+  }
+
   async stopRtt(): Promise<CppJLinkResult> { return this.callNative('stopRtt', {}); }
+
   async readRtt(
     bufferIndex: number,
     size: number,
     options: CppJLinkReadOptions = {},
   ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
-    const result = await this.callNative<{ bytesBase64: string }>(
+    if (!this.usingNative) return this.failure('native readRtt channel is unavailable', 'NativeChannelUnavailable');
+    const rttCaps = this.getRttCapabilities();
+    if (!rttCaps.rttUpRead.available) {
+      return this.failureWithCode(
+        rttCaps.rttUpRead.reason || 'J-Link RTT reading is unavailable',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'readRtt' },
+      );
+    }
+    const result = await this.callNative<{ bytesBase64: string } & Record<string, unknown>>(
       'readRtt',
       { bufferIndex, size },
       { priority: 'background', coalesceKey: 'rtt-read', signal: options.signal },
     );
     if (!result.ok || !result.data) return withoutData(result);
-    return { ...result, data: { bytes: Uint8Array.from(Buffer.from(result.data.bytesBase64, 'base64')) } };
+    const { bytesBase64, ...metadata } = result.data;
+    return {
+      ...result,
+      data: {
+        ...metadata,
+        bytes: Uint8Array.from(Buffer.from(bytesBase64, 'base64')),
+      },
+    };
+  }
+
+  async writeRtt(
+    bufferIndex: number,
+    bytes: Uint8Array,
+    options?: CmsisDapRttWriteOptions,
+  ): Promise<CppJLinkResult<CmsisDapRttWriteResult>> {
+    if (!this.usingNative) return this.failure('native writeRtt channel is unavailable', 'NativeChannelUnavailable');
+    const rttCaps = this.getRttCapabilities();
+    if (!rttCaps.rttDownWrite.available) {
+      return this.failureWithCode(
+        rttCaps.rttDownWrite.reason || 'J-Link RTT down-buffer writes are unavailable',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+    if (!Number.isInteger(bufferIndex) || bufferIndex < 0 || bufferIndex > 0xFFFFFFFF) {
+      return this.failureWithCode(
+        'J-Link RTT Down bufferIndex must be a uint32',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > 65536) {
+      return this.failureWithCode(
+        'J-Link RTT write requires bytes in 1..65536',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+    if (options?.controlBlockAddress !== undefined
+      && (!Number.isInteger(options.controlBlockAddress) || options.controlBlockAddress <= 0 || options.controlBlockAddress > 0xFFFFFFFF)) {
+      return this.failureWithCode(
+        'J-Link RTT control block address must be a positive uint32',
+        'DapInvalidRequest',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+
+    let ramRanges: CmsisDapRttMemoryRange[];
+    if (options?.ramRanges !== undefined) {
+      const checked = validateRttMemoryRanges(options.ramRanges, false, 'ramRanges');
+      if (!checked.ok) {
+        return this.failureWithCode(checked.message, 'DapInvalidRequest', {
+          ownerKind: this.kind,
+          capability: 'writeRtt',
+        });
+      }
+      ramRanges = checked.normalized;
+    } else if (this.flashTargetDef) {
+      ramRanges = this.flashTargetDef.ramRegions.map(region => ({
+        address: region.address,
+        size: region.size,
+      }));
+    } else {
+      return this.failureWithCode(
+        'J-Link RTT Down-buffer write requires a registered target or explicit ramRanges',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'writeRtt' },
+      );
+    }
+
+    let timeoutMs = 2000;
+    if (options?.timeoutMs !== undefined) {
+      if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0 || options.timeoutMs > 10000) {
+        return this.failureWithCode(
+          'J-Link writeRtt timeoutMs must be an integer in 1..10000',
+          'DapInvalidRequest',
+          { ownerKind: this.kind, capability: 'writeRtt' },
+        );
+      }
+      timeoutMs = options.timeoutMs;
+    }
+
+    const result = await this.callNative<CmsisDapRttWriteResult>('writeRtt', {
+      ...(options?.controlBlockAddress !== undefined
+        ? { controlBlockAddress: options.controlBlockAddress >>> 0 }
+        : {}),
+      bufferIndex: bufferIndex >>> 0,
+      bytesBase64: Buffer.from(bytes).toString('base64'),
+      ramRanges,
+      timeoutMs,
+    });
+    if (!result.ok) {
+      const rttDiag = (result.diagnostics as { rtt?: Partial<CmsisDapRttWriteResult> } | undefined)?.rtt;
+      log.dap('[rtt] writeRtt failed owner=jlink-native buffer=' + bufferIndex
+        + ' requested=' + bytes.length
+        + ' errorCode=' + (result.errorCode || 'unknown')
+        + ' completion=' + (rttDiag?.completion || 'unknown')
+        + ' failureStage=' + (rttDiag?.failureStage || 'unknown')
+        + ' committed=' + (rttDiag?.committedBytes ?? 0));
+      return {
+        ...result,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'writeRtt' },
+      };
+    }
+    if (!isValidRttWriteResult(result.data, bytes.length, bufferIndex)) {
+      return {
+        ok: false,
+        message: 'J-Link writeRtt returned a malformed result',
+        errorCode: 'MalformedResponse',
+        targetState: 'Error',
+        elapsedMs: result.elapsedMs,
+        diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'writeRtt' },
+      };
+    }
+    log.dap('[rtt] writeRtt owner=jlink-native buffer=' + bufferIndex
+      + ' requested=' + result.data.requestedBytes
+      + ' written=' + result.data.writtenBytes
+      + ' committed=' + result.data.committedBytes
+      + ' committedWrOff=' + result.data.committedWrOff
+      + ' mode=' + result.data.mode
+      + ' shortWrite=' + result.data.shortWrite
+      + ' wrapped=' + result.data.wrapped
+      + ' completion=' + result.data.completion);
+    return {
+      ...result,
+      diagnostics: { ...result.diagnostics, ownerKind: this.kind, method: 'writeRtt' },
+    };
   }
 
   async disconnect(): Promise<CppJLinkResult> {
@@ -493,6 +875,7 @@ export class ExperimentalCppJLinkChannel {
   async dispose(graceful = true) {
     await this.helper.dispose(graceful);
     this.nativeConnected = false;
+    this.resetSessionCapabilities();
   }
 
   private async callNative<T>(
@@ -508,6 +891,7 @@ export class ExperimentalCppJLinkChannel {
     } catch (error) {
       if (error instanceof NativeSchedulerCancelledError) throw error;
       this.nativeConnected = false;
+      this.resetSessionCapabilities();
       await this.helper.dispose(false);
       return this.failure(`native owner lost during ${method}: ${error instanceof Error ? error.message : String(error)}`, 'NativeOwnerLost');
     }
@@ -520,6 +904,7 @@ export class ExperimentalCppJLinkChannel {
     } catch (error) {
       if (error instanceof NativeSchedulerCancelledError) throw error;
       this.nativeConnected = false;
+      this.resetSessionCapabilities();
       await this.helper.dispose(false);
       return this.failure(`native owner lost during ${method}: ${error instanceof Error ? error.message : String(error)}`, 'NativeOwnerLost');
     }
@@ -527,8 +912,25 @@ export class ExperimentalCppJLinkChannel {
 
   private async failNative<T = { channel: 'cpp' }>(reason: string): Promise<CppJLinkResult<T>> {
     this.nativeConnected = false;
+    this.resetSessionCapabilities();
     await this.helper.dispose(false);
     return this.failure(`C++ channel unavailable: ${reason}`, 'NativeChannelUnavailable');
+  }
+
+  private resetSessionCapabilities() {
+    this.helperCapabilities = null;
+    this.dllCapabilities = null;
+    this.dllRttCapabilities = null;
+    this.dllApis = null;
+    this.flashTargetDef = null;
+  }
+
+  private failureWithCode<T = Record<string, never>>(
+    message: string,
+    errorCode: string,
+    diagnostics?: Record<string, unknown>,
+  ): CppJLinkResult<T> {
+    return { ok: false, message, errorCode, diagnostics, targetState: 'Error', elapsedMs: 0 };
   }
 
   private failure<T = Record<string, never>>(message: string, errorCode = 'JLinkCallFailed'): CppJLinkResult<T> {
@@ -556,6 +958,7 @@ function priorityForMethod(method: string): NativeTaskPriority {
     case 'writeMemory':
     case 'startRtt':
     case 'stopRtt':
+    case 'writeRtt':
       return 'control';
     case 'readRtt':
       return 'background';

@@ -10,6 +10,7 @@ import { probeSamplingItems } from './probe-sampling-plan';
 import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
 import type { CmsisDapRttMemoryRange } from './cmsis-dap-helper-channel';
+import { RttCapabilities, rttCapability, unavailableRttCapabilities } from './rtt-contract';
 import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
 import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress, buildSymbolCatalog } from './jlink-symbols';
@@ -352,6 +353,19 @@ export class OzoneBackend {
     ramRanges?: readonly CmsisDapRttMemoryRange[],
   ): Promise<CppJLinkResult<any>> {
     if (!this.sessionTarget) {
+      const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
+        ? this.jlink.getRttApiAvailability()
+        : null;
+      if (rttApis && !rttApis.control) {
+        return {
+          ok: false,
+          message: 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control',
+          errorCode: 'UnsupportedCapability',
+          targetState: 'Error',
+          elapsedMs: 0,
+          diagnostics: { ownerKind: 'jlink-legacy', capability: 'startRtt', dllRttApis: rttApis },
+        };
+      }
       const ok = this.jlink.startRtt(controlBlockAddress);
       return ok
         ? { ok: true, message: 'RTT started', targetState: 'Unknown', elapsedMs: 0, data: {} }
@@ -374,12 +388,70 @@ export class OzoneBackend {
     signal?: AbortSignal,
   ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
     if (!this.sessionTarget) {
+      const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
+        ? this.jlink.getRttApiAvailability()
+        : null;
+      if (rttApis && (!rttApis.control || !rttApis.read)) {
+        const missing = !rttApis.control ? 'JLINK_RTTERMINAL_Control' : 'JLINK_RTTERMINAL_Read';
+        return {
+          ok: false,
+          message: `Legacy J-Link DLL does not export ${missing}`,
+          errorCode: 'UnsupportedCapability',
+          targetState: 'Error',
+          elapsedMs: 0,
+          diagnostics: { ownerKind: 'jlink-legacy', capability: 'readRtt', dllRttApis: rttApis },
+        };
+      }
       const bytes = this.jlink.readRtt(bufferIndex, size);
       return bytes
         ? { ok: true, message: 'RTT read', targetState: 'Unknown', elapsedMs: 0, data: { bytes } }
         : { ok: false, message: 'legacy RTT read failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
     }
     return this.sessionTarget.readRtt(bufferIndex, size, { priority: 'background', signal });
+  }
+
+  private targetGetRttCapabilities(): RttCapabilities {
+    if (this.sessionTarget) {
+      if (typeof this.sessionTarget.getRttCapabilities === 'function') {
+        return this.sessionTarget.getRttCapabilities();
+      }
+      const ownerKind = 'ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind;
+      return {
+        ownerKind,
+        rttStart: rttCapability(typeof this.sessionTarget.startRtt === 'function', `${ownerKind} owner does not implement startRtt`),
+        rttEnumerate: rttCapability(
+          typeof this.sessionTarget.enumerateRtt === 'function',
+          `${ownerKind} owner does not implement enumerateRtt`,
+        ),
+        rttUpRead: rttCapability(typeof this.sessionTarget.readRtt === 'function', `${ownerKind} owner does not implement readRtt`),
+        rttDownWrite: rttCapability(
+          typeof this.sessionTarget.writeRtt === 'function',
+          `${ownerKind} owner does not implement writeRtt`,
+        ),
+      };
+    }
+    if (!this.jlink.connected) {
+      return unavailableRttCapabilities('none', 'No target owner is connected');
+    }
+    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
+      ? this.jlink.getRttApiAvailability()
+      : null;
+    const startAvailable = !rttApis || rttApis.control;
+    const readAvailable = !rttApis || (rttApis.control && rttApis.read);
+    const readReason = rttApis && !rttApis.control
+      ? 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'
+      : 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Read';
+    return {
+      ownerKind: 'jlink-legacy',
+      rttStart: rttCapability(startAvailable, 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'),
+      rttEnumerate: rttCapability(false, 'Legacy koffi J-Link owner does not support multi-channel RTT enumeration'),
+      rttUpRead: rttCapability(readAvailable, readReason),
+      rttDownWrite: rttCapability(false, 'Legacy koffi J-Link owner does not support RTT down-buffer writes'),
+      details: {
+        channel: 'koffi',
+        ...(rttApis ? { dllRttApis: rttApis } : {}),
+      },
+    };
   }
 
   configureNativeSteps(enabled = true): void {
@@ -572,6 +644,11 @@ case 'readVariableRuntime':
           return await this.doWriteMemory(command.address, command.data, command.liveAccess === true);
         case 'setWatchValue':
           return await this.doSetWatchValue(command.expression, command.value, command.address, command.typeName);
+        case 'getRttCapabilities':
+          return {
+            ok: true,
+            data: this.targetGetRttCapabilities(),
+          };
         case 'startRtt':
           {
             const result = await this.targetStartRtt(command.controlBlockAddress, command.ramRanges);

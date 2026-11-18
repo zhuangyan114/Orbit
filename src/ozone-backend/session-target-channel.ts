@@ -57,6 +57,14 @@ import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
 import { CmsisDapTransport, DebugProbe, DebugProbePreference, ProbeSamplingStats } from './types';
 import { RMLinkTargetChannel } from './rmlink-target-channel';
+import {
+  RttCapabilities,
+  isValidRttEnumResult,
+  isValidRttWriteResult,
+  rttCapability,
+  unavailableRttCapabilities,
+  validateRttMemoryRanges,
+} from './rtt-contract';
 import type { CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 
 export type SessionTargetOwnerKind = 'none' | 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
@@ -116,6 +124,7 @@ export interface SessionTargetOwner extends NativeStepExecutor {
   setBreakpoint(address: number, preferredSlot?: number): Promise<CppJLinkResult<{ id: number }>>;
   clearBreakpoint(id: number): Promise<CppJLinkResult<any>>;
   clearAllBreakpoints(): Promise<CppJLinkResult<any>>;
+  getRttCapabilities?(): RttCapabilities;
   startRtt(controlBlockAddress?: number, options?: CmsisDapRttStartOptions): Promise<CppJLinkResult<any>>;
   enumerateRtt?(controlBlockAddress?: number, options?: CmsisDapRttEnumOptions): Promise<CppJLinkResult<CmsisDapRttEnumResult>>;
   stopRtt(): Promise<CppJLinkResult<any>>;
@@ -373,6 +382,28 @@ export class SessionTargetSelector {
     if (result.ok) this.breakpointSlots.fill(null);
     return result;
   }
+  getRttCapabilities(): RttCapabilities {
+    if (!this.owner) {
+      return unavailableRttCapabilities('none', 'No session target owner is selected');
+    }
+    if (this.owner.getRttCapabilities) {
+      return this.owner.getRttCapabilities();
+    }
+    const ownerKind = this.owner.kind;
+    return {
+      ownerKind,
+      rttStart: rttCapability(typeof this.owner.startRtt === 'function', `${ownerKind} owner does not implement startRtt`),
+      rttEnumerate: rttCapability(
+        typeof this.owner.enumerateRtt === 'function',
+        `${ownerKind} owner does not implement enumerateRtt`,
+      ),
+      rttUpRead: rttCapability(typeof this.owner.readRtt === 'function', `${ownerKind} owner does not implement readRtt`),
+      rttDownWrite: rttCapability(
+        typeof this.owner.writeRtt === 'function',
+        `${ownerKind} owner does not implement writeRtt`,
+      ),
+    };
+  }
   async startRtt(controlBlockAddress?: number, options?: CmsisDapRttStartOptions) {
     return this.call('startRtt', owner => owner.startRtt(controlBlockAddress, options));
   }
@@ -539,18 +570,77 @@ export class LegacyJLinkTargetChannel implements SessionTargetOwner {
     this.jlink.clearAllBreakpoints();
     return this.success({}, 'all breakpoints cleared');
   }
+  getRttCapabilities(): RttCapabilities {
+    if (!this.jlink.connected) {
+      return unavailableRttCapabilities(this.kind, 'Legacy J-Link owner is not connected');
+    }
+    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
+      ? this.jlink.getRttApiAvailability()
+      : null;
+    const startAvailable = !rttApis || rttApis.control;
+    const readAvailable = !rttApis || (rttApis.control && rttApis.read);
+    const readReason = rttApis && !rttApis.control
+      ? 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'
+      : 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Read';
+    return {
+      ownerKind: this.kind,
+      rttStart: rttCapability(startAvailable, 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'),
+      rttEnumerate: rttCapability(false, 'Legacy koffi J-Link owner does not support multi-channel RTT enumeration'),
+      rttUpRead: rttCapability(readAvailable, readReason),
+      rttDownWrite: rttCapability(false, 'Legacy koffi J-Link owner does not support RTT down-buffer writes'),
+      details: {
+        channel: 'koffi',
+        ...(rttApis ? { dllRttApis: rttApis } : {}),
+      },
+    };
+  }
   async startRtt(controlBlockAddress?: number) {
+    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
+      ? this.jlink.getRttApiAvailability()
+      : null;
+    if (rttApis && !rttApis.control) {
+      return failure(
+        'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'startRtt', dllRttApis: rttApis },
+      );
+    }
     return this.booleanCall(() => this.jlink.startRtt(controlBlockAddress), 'start RTT');
+  }
+  async enumerateRtt(): Promise<CppJLinkResult<CmsisDapRttEnumResult>> {
+    return failure<CmsisDapRttEnumResult>(
+      'Legacy koffi J-Link owner does not support multi-channel RTT enumeration',
+      'UnsupportedCapability',
+      { ownerKind: this.kind, capability: 'enumerateRtt' },
+    );
   }
   async stopRtt() {
     this.jlink.stopRtt();
     return this.success({}, 'RTT stopped');
   }
   async readRtt(bufferIndex: number, size: number, _options?: CppJLinkReadOptions) {
+    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
+      ? this.jlink.getRttApiAvailability()
+      : null;
+    if (rttApis && (!rttApis.control || !rttApis.read)) {
+      const missing = !rttApis.control ? 'JLINK_RTTERMINAL_Control' : 'JLINK_RTTERMINAL_Read';
+      return failure<{ bytes: Uint8Array }>(
+        `Legacy J-Link DLL does not export ${missing}`,
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'readRtt', dllRttApis: rttApis },
+      );
+    }
     const bytes = this.jlink.readRtt(bufferIndex, size);
     return bytes
       ? this.success({ bytes }, 'RTT read')
       : failure<{ bytes: Uint8Array }>('legacy RTT read failed', 'JLinkCallFailed');
+  }
+  async writeRtt(): Promise<CppJLinkResult<CmsisDapRttWriteResult>> {
+    return failure<CmsisDapRttWriteResult>(
+      'Legacy koffi J-Link owner does not support RTT down-buffer writes',
+      'UnsupportedCapability',
+      { ownerKind: this.kind, capability: 'writeRtt' },
+    );
   }
   async stepIntoInstruction(): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> { return this.nativeUnsupported(); }
   async stepIntoSourceLine(_request: NativeStepIntoSourceLineRequest): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {
@@ -1103,6 +1193,13 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
     options?: CmsisDapRttEnumOptions,
   ): Promise<CppJLinkResult<CmsisDapRttEnumResult>> {
     if (this.state !== 'connected') return this.invalidState<CmsisDapRttEnumResult>('enumerateRtt');
+    if (this.helperCapabilities && !this.helperCapabilities.has('rttEnumerate')) {
+      return failure<CmsisDapRttEnumResult>(
+        'CMSIS-DAP helper does not advertise rttEnumerate capability',
+        'UnsupportedCapability',
+        { ownerKind: this.kind, capability: 'enumerateRtt' },
+      );
+    }
     if (controlBlockAddress !== undefined
       && (!Number.isInteger(controlBlockAddress) || controlBlockAddress <= 0 || controlBlockAddress > 0xFFFFFFFF)) {
       return failure<CmsisDapRttEnumResult>(
@@ -1311,6 +1408,35 @@ export class CmsisDapTargetChannel implements SessionTargetOwner {
   }
   getHelperCapabilities(): readonly string[] {
     return this.helperCapabilities ? Array.from(this.helperCapabilities) : [];
+  }
+  getRttCapabilities(): RttCapabilities {
+    if (this.state !== 'connected') {
+      return unavailableRttCapabilities(this.kind, 'CMSIS-DAP target is not connected');
+    }
+    return {
+      ownerKind: this.kind,
+      rttStart: rttCapability(
+        !this.helperCapabilities || this.helperCapabilities.has('rtt'),
+        'CMSIS-DAP helper does not advertise rtt capability',
+      ),
+      rttEnumerate: rttCapability(
+        !this.helperCapabilities || this.helperCapabilities.has('rttEnumerate'),
+        'CMSIS-DAP helper does not advertise rttEnumerate capability',
+      ),
+      rttUpRead: rttCapability(
+        !this.helperCapabilities || this.helperCapabilities.has('rtt'),
+        'CMSIS-DAP helper does not advertise rtt capability',
+      ),
+      rttDownWrite: rttCapability(
+        !this.helperCapabilities || this.helperCapabilities.has('rttWrite'),
+        'CMSIS-DAP helper does not advertise rttWrite capability',
+      ),
+      details: {
+        transport: this.lastDevice?.transport || null,
+        registeredTarget: Boolean(this.flashTargetDef),
+        requiresExplicitRamRanges: !this.flashTargetDef,
+      },
+    };
   }
   async writeRtt(
     bufferIndex: number,
@@ -1703,122 +1829,4 @@ function failure<T = Record<string, never>>(
   diagnostics?: Record<string, unknown>,
 ): CppJLinkResult<T> {
   return { ok: false, message, errorCode, diagnostics, targetState: 'Error', elapsedMs: 0 };
-}
-
-const MAX_RTT_MEMORY_RANGES = 32;
-const MAX_RTT_BUFFERS = 64;
-const VALID_RTT_STATUS = new Set(['valid', 'unused', 'corrupt']);
-const VALID_RTT_NAME_STATUS = new Set([
-  'ok', 'null', 'empty', 'short-read', 'unterminated', 'invalid-address', 'read-failed', 'none',
-]);
-
-function validateRttMemoryRanges(
-  ranges: readonly CmsisDapRttMemoryRange[],
-  allowEmpty: boolean,
-  label: string,
-): { ok: true; normalized: CmsisDapRttMemoryRange[] } | { ok: false; message: string } {
-  if (!Array.isArray(ranges)) {
-    return { ok: false, message: `${label} must be an array of {address, size}` };
-  }
-  if (!allowEmpty && ranges.length === 0) {
-    return { ok: false, message: `${label} must not be empty` };
-  }
-  if (ranges.length > MAX_RTT_MEMORY_RANGES) {
-    return { ok: false, message: `${label} exceeds maximum of ${MAX_RTT_MEMORY_RANGES} entries` };
-  }
-  const normalized: CmsisDapRttMemoryRange[] = [];
-  for (const entry of ranges) {
-    if (!entry || typeof entry !== 'object'
-      || !Number.isSafeInteger(entry.address) || entry.address < 0 || entry.address > 0xFFFFFFFF
-      || !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.address + entry.size > 0x100000000) {
-      return { ok: false, message: `${label} entries require uint32 address and positive size within 32-bit space` };
-    }
-    normalized.push({ address: entry.address, size: entry.size });
-  }
-  const sorted = [...normalized].sort((a, b) => a.address - b.address);
-  for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i].address < sorted[i - 1].address + sorted[i - 1].size) {
-      return { ok: false, message: `${label} entries must not overlap` };
-    }
-  }
-  return { ok: true, normalized };
-}
-
-function isValidRttDescriptor(entry: unknown, expectedDirection: 'up' | 'down', expectedIndex: number): entry is CmsisDapRttChannelDescriptor {
-  if (!entry || typeof entry !== 'object') return false;
-  const item = entry as Partial<CmsisDapRttChannelDescriptor>;
-  return item.direction === expectedDirection
-    && item.index === expectedIndex
-    && typeof item.descriptorAddress === 'number' && Number.isInteger(item.descriptorAddress)
-    && typeof item.configured === 'boolean'
-    && typeof item.valid === 'boolean'
-    && typeof item.status === 'string' && VALID_RTT_STATUS.has(item.status)
-    && typeof item.name === 'string'
-    && typeof item.nameAddress === 'number' && Number.isInteger(item.nameAddress)
-    && typeof item.nameStatus === 'string' && VALID_RTT_NAME_STATUS.has(item.nameStatus)
-    && typeof item.duplicateName === 'boolean'
-    && typeof item.bufferAddress === 'number' && Number.isInteger(item.bufferAddress)
-    && typeof item.bufferSize === 'number' && Number.isInteger(item.bufferSize)
-    && typeof item.wrOff === 'number' && Number.isInteger(item.wrOff)
-    && typeof item.rdOff === 'number' && Number.isInteger(item.rdOff)
-    && typeof item.flags === 'number' && Number.isInteger(item.flags)
-    && typeof item.mode === 'number' && Number.isInteger(item.mode);
-}
-
-function isValidRttEnumResult(data: unknown): data is CmsisDapRttEnumResult {
-  if (!data || typeof data !== 'object') return false;
-  const value = data as Partial<CmsisDapRttEnumResult>;
-  if (!Number.isInteger(value.controlBlockAddress) || (value.controlBlockAddress as number) <= 0) return false;
-  if (!Number.isInteger(value.maxUpBuffers) || (value.maxUpBuffers as number) <= 0 || (value.maxUpBuffers as number) > MAX_RTT_BUFFERS) {
-    return false;
-  }
-  if (!Number.isInteger(value.maxDownBuffers) || (value.maxDownBuffers as number) < 0 || (value.maxDownBuffers as number) > MAX_RTT_BUFFERS) {
-    return false;
-  }
-  if (!Array.isArray(value.upBuffers) || value.upBuffers.length !== value.maxUpBuffers) return false;
-  if (!Array.isArray(value.downBuffers) || value.downBuffers.length !== value.maxDownBuffers) return false;
-  if (!Array.isArray(value.duplicateUpNames) || !value.duplicateUpNames.every(name => typeof name === 'string')) return false;
-  if (!Array.isArray(value.duplicateDownNames) || !value.duplicateDownNames.every(name => typeof name === 'string')) return false;
-  if (!Number.isInteger(value.validUpCount) || !Number.isInteger(value.validDownCount)
-    || !Number.isInteger(value.corruptCount) || !Number.isInteger(value.unusedCount)) {
-    return false;
-  }
-  return value.upBuffers.every((item, index) => isValidRttDescriptor(item, 'up', index))
-    && value.downBuffers.every((item, index) => isValidRttDescriptor(item, 'down', index));
-}
-
-const VALID_RTT_WRITE_COMPLETION = new Set(['not-started', 'partial', 'completed', 'unknown']);
-const VALID_RTT_WRITE_STAGE = new Set([
-  'none', 'validation', 'control-block', 'descriptor', 'data-first', 'data-second', 'commit-wroff', 'poll-wait',
-]);
-
-function isValidRttWriteResult(
-  data: unknown,
-  expectedRequestedBytes: number,
-  expectedBufferIndex: number,
-): data is CmsisDapRttWriteResult {
-  if (!data || typeof data !== 'object') return false;
-  const value = data as Partial<CmsisDapRttWriteResult>;
-  if (!Number.isInteger(value.controlBlockAddress) || (value.controlBlockAddress as number) <= 0) return false;
-  if (value.bufferIndex !== expectedBufferIndex) return false;
-  if (!Number.isInteger(value.descriptorAddress) || !Number.isInteger(value.bufferAddress)) return false;
-  if (!Number.isInteger(value.bufferSize) || (value.bufferSize as number) <= 0) return false;
-  if (!Number.isInteger(value.initialWrOff) || (value.initialWrOff as number) < 0 || (value.initialWrOff as number) >= (value.bufferSize as number)) return false;
-  if (!Number.isInteger(value.initialRdOff) || (value.initialRdOff as number) < 0 || (value.initialRdOff as number) >= (value.bufferSize as number)) return false;
-  if (!Number.isInteger(value.rdOff) || (value.rdOff as number) < 0 || (value.rdOff as number) >= (value.bufferSize as number)) return false;
-  if (!Number.isInteger(value.committedWrOff) || (value.committedWrOff as number) < 0 || (value.committedWrOff as number) >= (value.bufferSize as number)) return false;
-  if (!Number.isInteger(value.flags) || !Number.isInteger(value.mode)) return false;
-  if (!Number.isInteger(value.availableSpace) || (value.availableSpace as number) < 0) return false;
-  if (value.requestedBytes !== expectedRequestedBytes) return false;
-  if (!Number.isInteger(value.writtenBytes) || (value.writtenBytes as number) < 0 || (value.writtenBytes as number) > expectedRequestedBytes) return false;
-  if (!Number.isInteger(value.committedBytes) || (value.committedBytes as number) < 0 || (value.committedBytes as number) > (value.writtenBytes as number)) return false;
-  if (typeof value.wrapped !== 'boolean' || typeof value.shortWrite !== 'boolean' || typeof value.skipped !== 'boolean') return false;
-  if (typeof value.firstSegmentWritten !== 'boolean' || typeof value.secondSegmentWritten !== 'boolean') return false;
-  if (typeof value.wrOffWriteAttempted !== 'boolean' || typeof value.wrOffCommitted !== 'boolean') return false;
-  if (typeof value.completion !== 'string' || !VALID_RTT_WRITE_COMPLETION.has(value.completion)) return false;
-  if (typeof value.failureStage !== 'string' || !VALID_RTT_WRITE_STAGE.has(value.failureStage)) return false;
-  if (typeof value.retryable !== 'boolean') return false;
-  if ((value.committedBytes as number) > 0 && !value.wrOffCommitted) return false;
-  if (value.committedBytes === 0 && value.committedWrOff !== value.initialWrOff) return false;
-  return true;
 }

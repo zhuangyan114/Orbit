@@ -358,4 +358,135 @@ describe('OzoneBackend extension-host ownership guard', () => {
     if (!result.ok) expect(result.error).toContain('J-Link');
     expect(jlinkOwner.connect).not.toHaveBeenCalled();
   });
+
+  it('routes getRttCapabilities, enumerateRtt, writeRtt, startRtt, and readRtt through the single selected J-Link owner', async () => {
+    const rttCaps = {
+      ownerKind: 'jlink-native' as const,
+      rttStart: { available: true, evidence: 'source' as const },
+      rttEnumerate: { available: true, evidence: 'source' as const },
+      rttUpRead: { available: true, evidence: 'source' as const },
+      rttDownWrite: { available: true, evidence: 'source' as const },
+    };
+    const nativeOwner = {
+      kind: 'jlink-native' as const,
+      usingNative: true,
+      getRttCapabilities: vi.fn(() => rttCaps),
+      startRtt: vi.fn(async () => ({ ok: true, message: 'RTT started', targetState: 'Running' as const, elapsedMs: 1, data: { controlBlockAddress: 0x24000100 } })),
+      enumerateRtt: vi.fn(async () => ({
+        ok: true,
+        message: 'RTT channels enumerated',
+        targetState: 'Running' as const,
+        elapsedMs: 1,
+        data: {
+          controlBlockAddress: 0x24000100,
+          maxUpBuffers: 1,
+          maxDownBuffers: 1,
+          upBuffers: [],
+          downBuffers: [],
+          duplicateUpNames: [],
+          duplicateDownNames: [],
+          validUpCount: 0,
+          validDownCount: 0,
+          corruptCount: 0,
+          unusedCount: 0,
+        },
+      })),
+      readRtt: vi.fn(async () => ({
+        ok: true,
+        message: 'RTT read',
+        targetState: 'Running' as const,
+        elapsedMs: 1,
+        data: { bytes: Uint8Array.from([0x41, 0x42]) },
+      })),
+      writeRtt: vi.fn(async () => ({
+        ok: true,
+        message: 'RTT down write committed',
+        targetState: 'Running' as const,
+        elapsedMs: 1,
+        data: {
+          controlBlockAddress: 0x24000100,
+          bufferIndex: 0,
+          descriptorAddress: 0x24000130,
+          bufferAddress: 0x24002000,
+          bufferSize: 64,
+          initialWrOff: 0,
+          initialRdOff: 0,
+          rdOff: 0,
+          committedWrOff: 2,
+          flags: 1,
+          mode: 1,
+          availableSpace: 63,
+          requestedBytes: 2,
+          writtenBytes: 2,
+          committedBytes: 2,
+          wrapped: false,
+          shortWrite: false,
+          skipped: false,
+          firstSegmentWritten: true,
+          secondSegmentWritten: false,
+          wrOffWriteAttempted: true,
+          wrOffCommitted: true,
+          completion: 'completed' as const,
+          failureStage: 'none' as const,
+          retryable: false,
+        },
+      })),
+      stopRtt: vi.fn(async () => ({ ok: true, message: 'RTT stopped', targetState: 'Running' as const, elapsedMs: 0, data: {} })),
+    } as unknown as SessionTargetOwner;
+
+    const backend = new OzoneBackend(nativeOwner, nativeOwner);
+    const directJlink = { startRtt: vi.fn(), readRtt: vi.fn(), stopRtt: vi.fn() };
+    (backend as any).jlink = directJlink;
+
+    await expect(backend.execute({ cmd: 'getRttCapabilities' })).resolves.toEqual({ ok: true, data: rttCaps });
+    await expect(backend.execute({ cmd: 'startRtt', controlBlockAddress: 0x24000100 })).resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({ cmd: 'enumerateRtt', controlBlockAddress: 0x24000100 })).resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({ cmd: 'readRtt', bufferIndex: 1, size: 32 })).resolves.toMatchObject({
+      ok: true,
+      data: { bytes: [0x41, 0x42] },
+    });
+    await expect(backend.execute({ cmd: 'writeRtt', bufferIndex: 0, bytes: [0x01, 0x02] })).resolves.toMatchObject({
+      ok: true,
+      data: { committedBytes: 2, completion: 'completed' },
+    });
+    await expect(backend.execute({ cmd: 'stopRtt' })).resolves.toMatchObject({ ok: true });
+
+    expect(directJlink.startRtt).not.toHaveBeenCalled();
+    expect(directJlink.readRtt).not.toHaveBeenCalled();
+    expect(directJlink.stopRtt).not.toHaveBeenCalled();
+  });
+
+  it('reports legacy RTT capabilities and UnsupportedCapability cleanly when no native RTT owner exists', async () => {
+    const backend = new OzoneBackend();
+    (backend as any).jlink = {
+      connected: true,
+      getRttApiAvailability: vi.fn(() => ({ control: true, read: false, write: false })),
+      startRtt: vi.fn(() => true),
+      readRtt: vi.fn(() => null),
+      stopRtt: vi.fn(),
+    };
+
+    await expect(backend.execute({ cmd: 'getRttCapabilities' })).resolves.toMatchObject({
+      ok: true,
+      data: {
+        ownerKind: 'jlink-legacy',
+        rttStart: { available: true },
+        rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Read') },
+        rttEnumerate: { available: false },
+        rttDownWrite: { available: false },
+      },
+    });
+    await expect(backend.execute({ cmd: 'readRtt', bufferIndex: 0, size: 8 })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+    await expect(backend.execute({ cmd: 'enumerateRtt', controlBlockAddress: 0x20000100 })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+    await expect(backend.execute({ cmd: 'writeRtt', bufferIndex: 0, bytes: [1] })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'UnsupportedCapability',
+    });
+  });
 });

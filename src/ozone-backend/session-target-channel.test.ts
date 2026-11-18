@@ -1,9 +1,14 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CmsisDapTargetChannel,
+  LegacyJLinkTargetChannel,
   SessionTargetOwner,
   SessionTargetSelector,
 } from './session-target-channel';
+import { ExperimentalCppJLinkChannel } from './cpp-jlink-channel';
+import { JLinkDLL } from './jlink-dll';
 import { CmsisDapDeviceInfo, CmsisDapHelperClient } from './cmsis-dap-helper-channel';
 import type { FlashAlgorithmRunRequest } from './cmsis-dap-flasher';
 
@@ -2127,5 +2132,192 @@ describe('SessionTargetSelector owner lifecycle', () => {
       errorCode: 'InvalidState',
       diagnostics: { capability: 'readMemory', state: 'idle' },
     });
+  });
+
+  it('unifies selector RTT capabilities and single-owner routing across jlink-native, jlink-legacy, and cmsis-dap', async () => {
+    // 1. Disconnected selector reports ownerKind='none' with all capabilities unavailable
+    const disconnectedSelector = new SessionTargetSelector(vi.fn(), vi.fn());
+    expect(disconnectedSelector.getRttCapabilities()).toMatchObject({
+      ownerKind: 'none',
+      rttStart: { available: false },
+      rttEnumerate: { available: false },
+      rttUpRead: { available: false },
+      rttDownWrite: { available: false },
+    });
+
+    // 2. Legacy J-Link owner declares per-item capabilities from actual DLL RTT APIs
+    const fullLegacyDll = {
+      connected: true,
+      state: 'halted' as const,
+      open: vi.fn(() => true),
+      connect: vi.fn(() => true),
+      disconnect: vi.fn(),
+      abandon: vi.fn(),
+      isHalted: vi.fn(() => true),
+      startRtt: vi.fn(() => true),
+      stopRtt: vi.fn(),
+      readRtt: vi.fn(() => Uint8Array.from([0x52, 0x54, 0x54])),
+      getRttApiAvailability: vi.fn(() => ({ control: true, read: true, write: false })),
+    };
+    const legacySelector = new SessionTargetSelector(
+      vi.fn(),
+      () => new LegacyJLinkTargetChannel(fullLegacyDll as any),
+    );
+    await legacySelector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'legacy');
+    expect(legacySelector.getRttCapabilities()).toMatchObject({
+      ownerKind: 'jlink-legacy',
+      rttStart: { available: true, evidence: 'source' },
+      rttEnumerate: { available: false, reason: expect.stringContaining('Legacy'), evidence: 'source' },
+      rttUpRead: { available: true, evidence: 'source' },
+      rttDownWrite: { available: false, reason: expect.stringContaining('Legacy'), evidence: 'source' },
+    });
+    await expect(legacySelector.startRtt(0x20000100)).resolves.toMatchObject({ ok: true });
+    const legacyRead = await legacySelector.readRtt(0, 16);
+    expect(legacyRead.ok && Buffer.from(legacyRead.data!.bytes).toString('utf8')).toBe('RTT');
+    await expect(legacySelector.enumerateRtt(0x20000100)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    await expect(legacySelector.writeRtt(0, Uint8Array.from([1]))).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    await legacySelector.dispose(false);
+
+    // 3. Legacy J-Link DLL missing JLINK_RTTERMINAL_Control / JLINK_RTTERMINAL_Read returns UnsupportedCapability
+    const missingLegacyDll = {
+      ...fullLegacyDll,
+      getRttApiAvailability: vi.fn(() => ({ control: true, read: false, write: false })),
+    };
+    const partialLegacy = new LegacyJLinkTargetChannel(missingLegacyDll as any);
+    expect(partialLegacy.getRttCapabilities()).toMatchObject({
+      ownerKind: 'jlink-legacy',
+      rttStart: { available: true },
+      rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Read') },
+      rttEnumerate: { available: false },
+      rttDownWrite: { available: false },
+    });
+    await expect(partialLegacy.readRtt(0, 16)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+
+    const noControlDll = {
+      ...fullLegacyDll,
+      getRttApiAvailability: vi.fn(() => ({ control: false, read: false, write: false })),
+    };
+    const noControlLegacy = new LegacyJLinkTargetChannel(noControlDll as any);
+    expect(noControlLegacy.getRttCapabilities()).toMatchObject({
+      ownerKind: 'jlink-legacy',
+      rttStart: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
+      rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
+    });
+    await expect(noControlLegacy.startRtt(0x20000100)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+
+    // 4. CMSIS-DAP owner exposes matching RttCapabilities shape
+    const cmsisHelper = fakeCmsisDapHelper({
+      start: vi.fn(async () => ({
+        ok: true,
+        message: 'hello',
+        targetState: 'Disconnected' as const,
+        elapsedMs: 0,
+        data: { protocol: 1, helperVersion: 'test', platform: 'win32-x64', capabilities: ['rtt', 'rttEnumerate'] },
+      })),
+    });
+    const cmsisSelector = new SessionTargetSelector(
+      vi.fn(),
+      vi.fn(),
+      () => new CmsisDapTargetChannel({ helperClient: cmsisHelper }),
+    );
+    await cmsisSelector.connect({ probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000 });
+    expect(cmsisSelector.getRttCapabilities()).toMatchObject({
+      ownerKind: 'cmsis-dap',
+      rttStart: { available: true },
+      rttEnumerate: { available: true },
+      rttUpRead: { available: true },
+      rttDownWrite: { available: false, reason: expect.stringContaining('rttWrite') },
+    });
+    await cmsisSelector.dispose(false);
+  });
+
+  it('never creates a second DLL owner or falls back to legacy when jlink-native loses owner during RTT', async () => {
+    const helper = {
+      started: false,
+      start: vi.fn(async () => ({
+        ok: true,
+        message: 'hello',
+        targetState: 'Disconnected' as const,
+        elapsedMs: 0,
+        data: {
+          protocol: 2,
+          helperVersion: '0.2.0',
+          capabilities: ['probeDiscovery', 'basicDebug', 'readMemory', 'writeMemory', 'rtt', 'rttEnumerate', 'rttWrite'],
+        },
+      })),
+      request: vi.fn(async (method: string) => {
+        if (method === 'connect') {
+          return {
+            ok: true,
+            message: 'connected',
+            targetState: 'Unknown' as const,
+            elapsedMs: 1,
+            data: {
+              dllPath: 'mock/JLink_x64.dll',
+              dllVersion: 99901,
+              rttCapabilities: {
+                rttStart: { available: true, evidence: 'source' },
+                rttEnumerate: { available: true, evidence: 'source' },
+                rttUpRead: { available: true, evidence: 'source' },
+                rttDownWrite: { available: true, evidence: 'source' },
+              },
+            },
+          };
+        }
+        return { ok: true, message: method, targetState: 'Running' as const, elapsedMs: 0, data: {} };
+      }),
+      controlRequest: vi.fn(async (method: string) => {
+        if (method === 'writeRtt') {
+          throw new Error('C++ J-Link helper exited during writeRtt');
+        }
+        return { ok: true, message: method, targetState: 'Running' as const, elapsedMs: 0, data: {} };
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    const createNative = vi.fn(() => new ExperimentalCppJLinkChannel({ helperClient: helper as any }));
+    const createLegacy = vi.fn();
+    const createCmsis = vi.fn();
+    const selector = new SessionTargetSelector(createNative, createLegacy, createCmsis);
+
+    await selector.connect({ device: 'STM32H723VGT6', interface: 'SWD', speedKHz: 4000 }, 'auto');
+    expect(createNative).toHaveBeenCalledTimes(1);
+    expect(createLegacy).not.toHaveBeenCalled();
+    expect(createCmsis).not.toHaveBeenCalled();
+
+    const lost = await selector.writeRtt(0, Uint8Array.from([0x01, 0x02]));
+    expect(lost).toMatchObject({ ok: false, errorCode: 'NativeOwnerLost' });
+    expect(selector.ownerKind).toBe('none');
+    expect(selector.getRttCapabilities()).toMatchObject({
+      ownerKind: 'none',
+      rttStart: { available: false },
+      rttEnumerate: { available: false },
+      rttUpRead: { available: false },
+      rttDownWrite: { available: false },
+    });
+    await expect(selector.enumerateRtt(0x24000100)).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'TargetOwnerUnavailable',
+    });
+    expect(createNative).toHaveBeenCalledTimes(1);
+    expect(createLegacy).not.toHaveBeenCalled();
+    expect(createCmsis).not.toHaveBeenCalled();
+  });
+
+  const noWriteMockDll = path.resolve(__dirname, '..', '..', 'out', 'native', 'win32-x64', 'test', 'JLink_x64_no_write.dll');
+  it.skipIf(!fs.existsSync(noWriteMockDll))('detects missing RTT exports on a real compiled JLink mock DLL in legacy koffi mode', async () => {
+    const dll = new JLinkDLL(noWriteMockDll);
+    const legacy = new LegacyJLinkTargetChannel(dll);
+    const conn = await legacy.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 });
+    expect(conn.ok).toBe(true);
+    expect(legacy.getRttCapabilities()).toMatchObject({
+      ownerKind: 'jlink-legacy',
+      rttStart: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
+      rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
+      rttEnumerate: { available: false },
+      rttDownWrite: { available: false },
+    });
+    await expect(legacy.startRtt(0x20000100)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    await expect(legacy.readRtt(0, 16)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
+    await legacy.disconnect();
   });
 });

@@ -10,6 +10,7 @@ import { log } from '../utils/logger';
 import {readFile} from 'node:fs/promises';
 import {parseElf32LoadSegments,calculateEraseSectors,coalesceFlashProgramRanges,resolveFlashTarget,CmsisDapFlashOptions,CmsisDapFlashResult,FlashTargetDefinition} from './cmsis-dap-flasher';
 import type { CmsisDapRunToAddressResult } from './cmsis-dap-helper-channel';
+import { RttCapabilities, rttCapability, unavailableRttCapabilities } from './rtt-contract';
 import { createRMLinkFlashProgressReporter } from './rmlink-flash-progress';
 
 export class RMLinkTargetChannel implements SessionTargetOwner {
@@ -163,6 +164,19 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     const task=this.streamTask,abort=this.streamAbort;abort?.abort();
     if(task)await task;
     if(this.streamAbort===abort){this.streamTask=null;this.streamAbort=null;}
+  }
+  getRttCapabilities(): RttCapabilities {
+    if (!this.connected) {
+      return unavailableRttCapabilities(this.kind, 'RMLink target owner is not connected');
+    }
+    return {
+      ownerKind: this.kind,
+      rttStart: rttCapability(true),
+      rttEnumerate: rttCapability(false, 'RMLink target owner does not support RTT channel enumeration'),
+      rttUpRead: rttCapability(true),
+      rttDownWrite: rttCapability(false, 'RMLink target owner does not support RTT down-buffer writes'),
+      details: { transport: 'rmlink-service', subscriptions: true },
+    };
   }
   async startRtt(controlBlockAddress?:number) {
     if(controlBlockAddress===undefined)return this.failure('RTT control block address required','InvalidConfiguration');

@@ -3,6 +3,7 @@ import type {
   CmsisDapRttMemoryRange,
   CmsisDapRttWriteOptions,
 } from './cmsis-dap-helper-channel';
+export type { RttCapabilities, RttCapabilityOwnerKind } from './rtt-contract';
 
 export type DebugProbe = 'jlink' | 'cmsis-dap' | 'rmlink';
 export type DebugProbePreference = DebugProbe | 'auto';
@@ -258,6 +259,7 @@ export type OzoneCommand =
   | { cmd: 'getPerformanceDiagnostics' }
   | { cmd: 'getSchedulerSnapshot' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
+  | { cmd: 'getRttCapabilities' }
   | { cmd: 'startRtt'; controlBlockAddress?: number; ramRanges?: readonly CmsisDapRttMemoryRange[] }
   | { cmd: 'enumerateRtt'; controlBlockAddress?: number; options?: CmsisDapRttEnumOptions }
   | { cmd: 'stopRtt' }

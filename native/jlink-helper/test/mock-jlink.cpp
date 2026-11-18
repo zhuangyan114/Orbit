@@ -22,8 +22,20 @@ std::unordered_map<std::uint32_t, std::uint8_t> memory;
 bool rttStarted = false;
 bool haltStateError = false;
 bool targetLinkError = false;
+std::uint32_t failWriteAddress = 0;
+std::int32_t failWriteReturnCode = -1;
+std::uint32_t failWriteMode = 0;
+std::uint32_t failReadAddress = 0;
 std::uint32_t loopIterations = 0;
 std::uint32_t hitBreakpoint = 0;
+
+std::uint32_t readLittleEndianWord(const std::uint8_t* bytes, std::uint32_t size) {
+  std::uint32_t value = 0;
+  for (std::uint32_t i = 0; i < 4 && i < size; ++i) {
+    value |= static_cast<std::uint32_t>(bytes[i]) << (i * 8u);
+  }
+  return value;
+}
 
 void writeMemoryWord(std::uint32_t address, std::uint32_t value) {
   for (std::uint32_t i = 0; i < 4; ++i) {
@@ -162,6 +174,9 @@ int __cdecl JLINK_ReadReg(int index) {
 
 int __cdecl JLINK_ReadMem(std::uint32_t address, std::uint32_t size, void* destination) {
   if (!connected || !destination) return -1;
+  if (failReadAddress != 0 && address == failReadAddress) {
+    return -1;
+  }
   auto* bytes = static_cast<std::uint8_t*>(destination);
   for (std::uint32_t i = 0; i < size; ++i) {
     const auto stored = memory.find(address + i);
@@ -198,6 +213,35 @@ int __cdecl JLINK_WriteMem(std::uint32_t address, std::uint32_t size, const void
   const auto* bytes = static_cast<const std::uint8_t*>(source);
   if (address == 0xFFFF0000u && size > 0) haltStateError = bytes[0] != 0;
   if (address == 0xFFFF0004u && size > 0) targetLinkError = bytes[0] != 0;
+  if (address == 0xFFFF0008u && size >= 4) {
+    failWriteAddress = readLittleEndianWord(bytes, size);
+    return static_cast<int>(size);
+  }
+  if (address == 0xFFFF000Cu && size >= 4) {
+    failWriteReturnCode = static_cast<std::int32_t>(readLittleEndianWord(bytes, size));
+    return static_cast<int>(size);
+  }
+  if (address == 0xFFFF0010u && size >= 4) {
+    failReadAddress = readLittleEndianWord(bytes, size);
+    return static_cast<int>(size);
+  }
+  if (address == 0xFFFF0014u && size >= 4) {
+    failWriteMode = readLittleEndianWord(bytes, size);
+    return static_cast<int>(size);
+  }
+  if (failWriteMode != 0 && failWriteAddress != 0 && address == failWriteAddress) {
+    const std::int32_t injectedCode = failWriteReturnCode;
+    if (failWriteMode == 1u) {
+      failWriteMode = 0u;
+      failWriteAddress = 0u;
+    }
+    if (injectedCode < 0) return injectedCode;
+    const std::uint32_t written = static_cast<std::uint32_t>(injectedCode) < size
+        ? static_cast<std::uint32_t>(injectedCode)
+        : size;
+    for (std::uint32_t i = 0; i < written; ++i) memory[address + i] = bytes[i];
+    return static_cast<int>(written);
+  }
   for (std::uint32_t i = 0; i < size; ++i) memory[address + i] = bytes[i];
   if (address == 0x20000100u + 24u + 16u) return 0;
   return static_cast<int>(size);

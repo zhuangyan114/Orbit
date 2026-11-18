@@ -18,6 +18,10 @@ add_library(ozone-jlink-mock SHARED test/mock-jlink.cpp test/mock-jlink.def)
 target_compile_features(ozone-jlink-mock PRIVATE cxx_std_17)
 set_target_properties(ozone-jlink-mock PROPERTIES PREFIX "" OUTPUT_NAME "JLink_x64")
 
+add_library(ozone-jlink-mock-no-write SHARED test/mock-jlink-no-write.cpp test/mock-jlink-no-write.def)
+target_compile_features(ozone-jlink-mock-no-write PRIVATE cxx_std_17)
+set_target_properties(ozone-jlink-mock-no-write PROPERTIES PREFIX "" OUTPUT_NAME "JLink_x64_no_write")
+
 if(MSVC)
   target_compile_options(orbit-jlink-helper PRIVATE /W4 /permissive- /EHsc /utf-8)
   set_property(TARGET orbit-jlink-helper PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -37,7 +41,7 @@ set_target_properties(orbit-jlink-helper PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/bin"
 )
 
-set_target_properties(ozone-jlink-mock PROPERTIES
+set_target_properties(ozone-jlink-mock ozone-jlink-mock-no-write PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/mock"
   RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin/mock"
   RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin/mock"

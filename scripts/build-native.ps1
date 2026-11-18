@@ -77,6 +77,9 @@ function Build-NativeProject {
       throw "Mock J-Link DLL was not produced at $builtMockDll"
     }
     Copy-Item -LiteralPath $builtMockDll -Destination (Join-Path $mockOutputDir 'JLink_x64.dll') -Force
+    Get-ChildItem -LiteralPath (Join-Path $buildDir 'bin/mock') -Filter '*.dll' | ForEach-Object {
+      Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $mockOutputDir $_.Name) -Force
+    }
   }
   Write-Host "Native helper: $outputExe"
 }

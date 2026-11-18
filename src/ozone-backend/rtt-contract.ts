@@ -54,7 +54,7 @@ const VALID_RTT_WRITE_STAGE = new Set([
 ]);
 
 export function validateRttMemoryRanges(
-  ranges: readonly CmsisDapRttMemoryRange[],
+  ranges: unknown,
   allowEmpty: boolean,
   label: string,
 ): { ok: true; normalized: CmsisDapRttMemoryRange[] } | { ok: false; message: string } {
@@ -68,10 +68,11 @@ export function validateRttMemoryRanges(
     return { ok: false, message: `${label} exceeds maximum of ${MAX_RTT_MEMORY_RANGES} entries` };
   }
   const normalized: CmsisDapRttMemoryRange[] = [];
-  for (const entry of ranges) {
+  for (const rawEntry of ranges) {
+    const entry = rawEntry as { address?: unknown; size?: unknown } | null;
     if (!entry || typeof entry !== 'object'
-      || !Number.isSafeInteger(entry.address) || entry.address < 0 || entry.address > 0xFFFFFFFF
-      || !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.address + entry.size > 0x100000000) {
+      || typeof entry.address !== 'number' || !Number.isSafeInteger(entry.address) || entry.address < 0 || entry.address > 0xFFFFFFFF
+      || typeof entry.size !== 'number' || !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.address + entry.size > 0x100000000) {
       return { ok: false, message: `${label} entries require uint32 address and positive size within 32-bit space` };
     }
     normalized.push({ address: entry.address, size: entry.size });

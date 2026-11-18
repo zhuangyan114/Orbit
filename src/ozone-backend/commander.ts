@@ -351,6 +351,7 @@ export class OzoneBackend {
   private async targetStartRtt(
     controlBlockAddress?: number,
     ramRanges?: readonly CmsisDapRttMemoryRange[],
+    memoryBacked?: boolean,
   ): Promise<CppJLinkResult<any>> {
     if (!this.sessionTarget) {
       const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
@@ -371,7 +372,13 @@ export class OzoneBackend {
         ? { ok: true, message: 'RTT started', targetState: 'Unknown', elapsedMs: 0, data: {} }
         : { ok: false, message: 'legacy RTT start failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
     }
-    return this.sessionTarget.startRtt(controlBlockAddress, ramRanges ? { ramRanges } : undefined);
+    const startOptions = (ramRanges || memoryBacked !== undefined)
+      ? {
+        ...(ramRanges ? { ramRanges } : {}),
+        ...(memoryBacked !== undefined ? { memoryBacked } : {}),
+      }
+      : undefined;
+    return this.sessionTarget.startRtt(controlBlockAddress, startOptions);
   }
 
   private async targetStopRtt(): Promise<CppJLinkResult<any>> {
@@ -651,7 +658,7 @@ case 'readVariableRuntime':
           };
         case 'startRtt':
           {
-            const result = await this.targetStartRtt(command.controlBlockAddress, command.ramRanges);
+            const result = await this.targetStartRtt(command.controlBlockAddress, command.ramRanges, command.memoryBacked);
             if (!result.ok) return this.sessionOwnerFailure(result, 'RttStartFailed');
             return {
               ok: true,
@@ -698,9 +705,10 @@ case 'readVariableRuntime':
         case 'readRtt': {
           const result = await this.targetReadRtt(command.bufferIndex, command.size, command.signal);
           if (!result.ok) return this.sessionOwnerFailure(result, 'RttReadFailed');
+          const rawData = result.data && typeof result.data === 'object' ? result.data as Record<string, unknown> : {};
           return {
             ok: true,
-            data: { bytes: Array.from(result.data?.bytes || []) },
+            data: { ...rawData, bytes: Array.from(result.data?.bytes || []) },
             message: result.message,
             targetState: result.targetState,
             elapsedMs: result.elapsedMs,

@@ -216,6 +216,7 @@ export interface CmsisDapRttMemoryRange {
 
 export interface CmsisDapRttStartOptions {
   ramRanges?: readonly CmsisDapRttMemoryRange[];
+  memoryBacked?: boolean;
 }
 
 export interface CmsisDapRttEnumOptions {

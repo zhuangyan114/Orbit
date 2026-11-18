@@ -260,7 +260,7 @@ export type OzoneCommand =
   | { cmd: 'getSchedulerSnapshot' }
   | { cmd: 'setWatchValue'; expression: string; value: number; address?: number; typeName?: string }
   | { cmd: 'getRttCapabilities' }
-  | { cmd: 'startRtt'; controlBlockAddress?: number; ramRanges?: readonly CmsisDapRttMemoryRange[] }
+  | { cmd: 'startRtt'; controlBlockAddress?: number; ramRanges?: readonly CmsisDapRttMemoryRange[]; memoryBacked?: boolean }
   | { cmd: 'enumerateRtt'; controlBlockAddress?: number; options?: CmsisDapRttEnumOptions }
   | { cmd: 'stopRtt' }
   | { cmd: 'readRtt'; bufferIndex: number; size: number; signal?: AbortSignal }

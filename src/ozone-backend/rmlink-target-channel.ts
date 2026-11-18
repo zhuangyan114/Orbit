@@ -9,9 +9,10 @@ import type { CppJLinkReadOptions } from './cpp-jlink-channel';
 import { log } from '../utils/logger';
 import {readFile} from 'node:fs/promises';
 import {parseElf32LoadSegments,calculateEraseSectors,coalesceFlashProgramRanges,resolveFlashTarget,CmsisDapFlashOptions,CmsisDapFlashResult,FlashTargetDefinition} from './cmsis-dap-flasher';
-import type { CmsisDapRunToAddressResult } from './cmsis-dap-helper-channel';
-import { RttCapabilities, rttCapability, unavailableRttCapabilities } from './rtt-contract';
+import { CmsisDapRttEnumOptions, CmsisDapRttEnumResult, CmsisDapRttMemoryRange, CmsisDapRttStartOptions, CmsisDapRttWriteOptions, CmsisDapRttWriteResult, CmsisDapRunToAddressResult } from './cmsis-dap-helper-channel';
+import { isValidRttEnumResult, isValidRttWriteResult, RttCapabilities, rttCapability, unavailableRttCapabilities, validateRttMemoryRanges } from './rtt-contract';
 import { createRMLinkFlashProgressReporter } from './rmlink-flash-progress';
+import { SeggerRttMemoryEngine } from './segger-rtt-memory';
 
 export class RMLinkTargetChannel implements SessionTargetOwner {
   readonly kind = 'cmsis-dap' as const;
@@ -29,8 +30,19 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   private readonly rttIds = new Set<number>();
   private readonly activeCaptures=new Map<number,number>();
   private rttCacheDropped=0;
+  private rttControlBlockAddress:number|undefined;
+  private rttCustomRamRanges:readonly CmsisDapRttMemoryRange[]|undefined;
+  private rttMemoryOnly=false;
+  private readonly rttMemoryEngine: SeggerRttMemoryEngine;
+  private rttWriteChain: Promise<unknown> = Promise.resolve();
   private flashing=false;
-  constructor(client = new RMLinkClient()) { this.client = client; }
+  constructor(client = new RMLinkClient()) {
+    this.client = client;
+    this.rttMemoryEngine = new SeggerRttMemoryEngine({
+      read: (address, size, priority, signal) => this.readMemoryWithPriority(address, size, priority, signal),
+      write: (address, bytes, priority) => this.writeMemoryWithPriority(address, bytes, priority),
+    }, { maxChunkBytes: 128, writeAlignmentBytes: 4 });
+  }
   get usingNative() { return this.connected; }
   async connect(config: SessionTargetConnectConfig): Promise<CppJLinkResult<TargetChannelInfo>> {
     if (config.interface && config.interface!=='SWD') return this.failure('RMLink currently requires interface: SWD','InvalidConfiguration');
@@ -88,7 +100,10 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   getState() { return this.control<{state:string}>('state'); }
   readRegister(index:number) { return this.control<{value:number}>('read_register',{index}); }
   async readMemory(address:number,size:number,options:CppJLinkReadOptions={}):Promise<CppJLinkResult<{bytes:Uint8Array}>> {
-    const r=await this.control<{data:string}>('read_memory',{address,byte_length:size},{...options,priority:options.priority || 'watch'});
+    return this.readMemoryWithPriority(address, size, options.priority || 'watch', options.signal);
+  }
+  private async readMemoryWithPriority(address:number,size:number,priority:'watch'|'timeline'|'background'|'control',signal?:AbortSignal):Promise<CppJLinkResult<{bytes:Uint8Array}>> {
+    const r=await this.control<{data:string}>('read_memory',{address,byte_length:size},{priority,signal});
     return r.ok && r.data?{...r,data:{bytes:Buffer.from(r.data.data,'hex')}}:this.failure(r.message,r.errorCode);
   }
   async readMemoryBatch(reads:Array<{address:number;size:number}>,options:CppJLinkReadOptions={}):Promise<CppJLinkResult<{reads:Array<{address:number;bytes:Uint8Array}>}>> {
@@ -96,7 +111,15 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     return r.ok && r.data?{...r,data:{reads:r.data.reads.map(v=>({address:v.address,bytes:Buffer.from(v.data,'hex')}))}}:this.failure(r.message,r.errorCode);
   }
   async writeMemory(address:number,bytes:Uint8Array):Promise<CppJLinkResult<{address:number;bytesWritten:number}>> {
-    const r=await this.control<{bytes_written:number}>('write_memory',{address,data:Buffer.from(bytes).toString('hex')});
+    return this.writeMemoryWithPriority(address, bytes, 'control');
+  }
+  private async writeMemoryWithPriority(address:number,bytes:Uint8Array,priority:'control'|'background'):Promise<CppJLinkResult<{address:number;bytesWritten:number}>> {
+    if (!Number.isInteger(address) || address < 0 || (address % 4) !== 0
+      || bytes.length === 0 || (bytes.length % 4) !== 0 || bytes.length > 4096
+      || address + bytes.length > 0x100000000) {
+      return this.failure('RMLink write_memory requires 4-byte aligned uint32 address and non-zero 4-byte aligned length <= 4096', 'UnsupportedCapability');
+    }
+    const r=await this.control<{bytes_written:number}>('write_memory',{address,data:Buffer.from(bytes).toString('hex')},{priority});
     return r.ok && r.data?{...r,data:{address,bytesWritten:r.data.bytes_written}}:this.failure(r.message,r.errorCode);
   }
   async setBreakpoint(address:number) {
@@ -172,19 +195,141 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     return {
       ownerKind: this.kind,
       rttStart: rttCapability(true),
-      rttEnumerate: rttCapability(false, 'RMLink target owner does not support RTT channel enumeration'),
+      rttEnumerate: rttCapability(true),
       rttUpRead: rttCapability(true),
-      rttDownWrite: rttCapability(false, 'RMLink target owner does not support RTT down-buffer writes'),
-      details: { transport: 'rmlink-service', subscriptions: true },
+      rttDownWrite: rttCapability(true),
+      details: {
+        transport: 'rmlink-service',
+        subscriptions: true,
+        registeredTarget: Boolean(this.flashTarget),
+        requiresExplicitRamRanges: !this.flashTarget,
+        writeMemoryAlignmentBytes: 4,
+        rttDownWriteMode: 'aligned-word-rmw-within-down-buffer',
+      },
     };
   }
-  async startRtt(controlBlockAddress?:number) {
+  private resolveRttRamRanges(explicit?: readonly CmsisDapRttMemoryRange[], label = 'ramRanges'):
+    { ok: true; ranges: CmsisDapRttMemoryRange[] } | { ok: false; result: CppJLinkResult<any> } {
+    if (explicit !== undefined) {
+      const checked = validateRttMemoryRanges(explicit, false, label);
+      if (!checked.ok) return { ok: false, result: this.failure(checked.message, 'DapInvalidRequest') };
+      return { ok: true, ranges: checked.normalized };
+    }
+    if (this.flashTarget) {
+      return { ok: true, ranges: this.flashTarget.ramRegions.map(r => ({ address: r.address, size: r.size })) };
+    }
+    return {
+      ok: false,
+      result: this.failure('RMLink RTT requires a registered target or explicit ramRanges', 'UnsupportedCapability'),
+    };
+  }
+  async startRtt(controlBlockAddress?:number,options?:CmsisDapRttStartOptions) {
     if(controlBlockAddress===undefined)return this.failure('RTT control block address required','InvalidConfiguration');
-    try {const r=await this.subscribe('rtt_stream',{control_block_address:controlBlockAddress});this.rttIds.add(r.subscription_id);return this.success({});}
+    if(!Number.isInteger(controlBlockAddress) || controlBlockAddress<=0 || controlBlockAddress>0xFFFFFFFF) {
+      return this.failure('RTT control block address must be a positive uint32','DapInvalidRequest');
+    }
+    if(options?.ramRanges!==undefined) {
+      const checked=validateRttMemoryRanges(options.ramRanges,false,'ramRanges');
+      if(!checked.ok)return this.failure(checked.message,'DapInvalidRequest');
+      this.rttCustomRamRanges=checked.normalized;
+    } else {
+      this.rttCustomRamRanges=undefined;
+    }
+    this.rttControlBlockAddress=controlBlockAddress>>>0;
+    if(options?.memoryBacked) {
+      const resolved=this.resolveRttRamRanges(this.rttCustomRamRanges);
+      if(!resolved.ok)return resolved.result;
+      const started=await this.rttMemoryEngine.start(this.rttControlBlockAddress,resolved.ranges);
+      if(!started.ok)return started;
+      this.rttMemoryOnly=true;
+      return this.success({controlBlockAddress:this.rttControlBlockAddress,memoryBacked:true});
+    }
+    this.rttMemoryOnly=false;
+    try {const r=await this.subscribe('rtt_stream',{control_block_address:this.rttControlBlockAddress});this.rttIds.add(r.subscription_id);return this.success({});}
     catch(error){return this.failure(String(error),'RMLinkRttFailed');}
   }
-  async stopRtt() { for(const id of this.rttIds)await this.unsubscribe(id);this.rttIds.clear();this.rttData.clear();return this.success({}); }
-  async readRtt(channel:number,size:number) { const data=this.rttData.get(channel)||Buffer.alloc(0);const bytes=data.subarray(0,size);this.rttData.set(channel,data.subarray(bytes.length));return this.success({bytes}); }
+  async enumerateRtt(controlBlockAddress?:number,options?:CmsisDapRttEnumOptions):Promise<CppJLinkResult<CmsisDapRttEnumResult>> {
+    if(!this.connected)return this.failure('RMLink owner unavailable','NativeOwnerLost');
+    let cbAddr:number;
+    if(controlBlockAddress!==undefined) {
+      if(!Number.isInteger(controlBlockAddress) || controlBlockAddress<=0 || controlBlockAddress>0xFFFFFFFF) {
+        return this.failure('RMLink enumerateRtt controlBlockAddress must be a positive uint32','DapInvalidRequest');
+      }
+      cbAddr=controlBlockAddress>>>0;
+    } else if(this.rttControlBlockAddress!==undefined) {
+      cbAddr=this.rttControlBlockAddress;
+    } else {
+      return this.failure('RMLink enumerateRtt requires controlBlockAddress when RTT is not started','RttInvalidControlBlock');
+    }
+    const ram=this.resolveRttRamRanges(options?.ramRanges??this.rttCustomRamRanges);
+    if(!ram.ok)return ram.result;
+    let roRanges:CmsisDapRttMemoryRange[]=[];
+    if(options?.roRanges!==undefined) {
+      const roChecked=validateRttMemoryRanges(options.roRanges,true,'roRanges');
+      if(!roChecked.ok)return this.failure(roChecked.message,'DapInvalidRequest');
+      roRanges=roChecked.normalized;
+    } else if(this.flashTarget) {
+      roRanges=[{address:this.flashTarget.flashBase,size:this.flashTarget.flashSize}];
+    }
+    const timeoutMs=options?.timeoutMs??2000;
+    const res=await this.rttMemoryEngine.enumerate(cbAddr,ram.ranges,roRanges,timeoutMs);
+    if(res.ok && res.data && !isValidRttEnumResult(res.data)) {
+      return this.failure('RMLink enumerateRtt returned a malformed result','MalformedResponse');
+    }
+    return res;
+  }
+  async stopRtt() {
+    for(const id of this.rttIds)await this.unsubscribe(id);
+    this.rttIds.clear();this.rttData.clear();
+    this.rttMemoryEngine.stop();this.rttMemoryOnly=false;
+    return this.success({});
+  }
+  async readRtt(channel:number,size:number,options?:CppJLinkReadOptions) {
+    if(!this.connected)return this.failure<{bytes:Uint8Array}>('RMLink owner unavailable','NativeOwnerLost');
+    if(channel===0 && !this.rttMemoryOnly && this.rttIds.size>0) {
+      const data=this.rttData.get(channel)||Buffer.alloc(0);
+      const bytes=data.subarray(0,size);
+      this.rttData.set(channel,data.subarray(bytes.length));
+      const res=this.success({bytes,bufferIndex:0,requestedBytes:size,readBytes:bytes.length,committedBytes:bytes.length});
+      res.diagnostics={transport:'rmlink-rtt-stream',cacheDroppedBytes:this.rttCacheDropped};
+      return res;
+    }
+    if(!this.rttMemoryEngine.isStarted) {
+      if(this.rttControlBlockAddress===undefined)return this.failure<{bytes:Uint8Array}>('RTT is not started','RttStopped');
+      const ram=this.resolveRttRamRanges(this.rttCustomRamRanges);
+      if(!ram.ok)return ram.result;
+      const started=await this.rttMemoryEngine.start(this.rttControlBlockAddress,ram.ranges);
+      if(!started.ok)return started as unknown as CppJLinkResult<{bytes:Uint8Array}>;
+    }
+    return this.rttMemoryEngine.readUp(channel,size,options?.signal);
+  }
+  async writeRtt(bufferIndex:number,bytes:Uint8Array,options?:CmsisDapRttWriteOptions):Promise<CppJLinkResult<CmsisDapRttWriteResult>> {
+    if(!this.connected)return this.failure<CmsisDapRttWriteResult>('RMLink owner unavailable','NativeOwnerLost');
+    let cbAddr:number;
+    if(options?.controlBlockAddress!==undefined) {
+      if(!Number.isInteger(options.controlBlockAddress) || options.controlBlockAddress<=0 || options.controlBlockAddress>0xFFFFFFFF) {
+        return this.failure('RMLink RTT control block address must be a positive uint32','DapInvalidRequest');
+      }
+      cbAddr=options.controlBlockAddress>>>0;
+    } else if(this.rttControlBlockAddress!==undefined) {
+      cbAddr=this.rttControlBlockAddress;
+    } else {
+      return this.failure('RMLink writeRtt requires controlBlockAddress when RTT is not started','RttInvalidControlBlock');
+    }
+    const ram=this.resolveRttRamRanges(options?.ramRanges??this.rttCustomRamRanges);
+    if(!ram.ok)return ram.result;
+    const timeoutMs=options?.timeoutMs??2000;
+    const run = this.rttWriteChain.then(async () => {
+      if (!this.connected) return this.failure<CmsisDapRttWriteResult>('RMLink owner unavailable', 'NativeOwnerLost');
+      const res = await this.rttMemoryEngine.writeDown(cbAddr, ram.ranges, bufferIndex, bytes, timeoutMs);
+      if (res.ok && res.data && !isValidRttWriteResult(res.data, bytes.length, bufferIndex)) {
+        return this.failure<CmsisDapRttWriteResult>('RMLink writeRtt returned a malformed result', 'MalformedResponse');
+      }
+      return res;
+    });
+    this.rttWriteChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
   async flash(elfPath:string,device:string,options:CmsisDapFlashOptions={}):Promise<CppJLinkResult<CmsisDapFlashResult>> {
     if(!this.connected)return this.failure('RMLink owner unavailable','NativeOwnerLost');
     if(this.flashing)return this.failure('Flash operation already running','RequestBusy');
@@ -237,6 +382,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
           for(const id of this.activeCaptures.keys())await this.client.unsubscribe(id).catch(()=>{});
           await this.stopCaptureStream();this.activeCaptures.clear();
           this.rttIds.clear();this.rttData.clear();
+          this.rttMemoryEngine.stop();this.rttMemoryOnly=false;
         }
       },{priority:'control'});
         if(result.verified!==true)throw new Error('Flash did not report a complete image verification');
@@ -279,6 +425,7 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     await this.stopCaptureStream();
     await this.client.close().catch(()=>{});this.connected=false;this.scheduler.dispose();
     this.listeners.clear();this.rttData.clear();
+    this.rttMemoryEngine.stop();this.rttControlBlockAddress=undefined;this.rttMemoryOnly=false;
     this.streamLostListeners.clear();
     this.activeCaptures.clear();
   }

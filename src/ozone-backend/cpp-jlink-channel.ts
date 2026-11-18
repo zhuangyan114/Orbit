@@ -735,7 +735,7 @@ export class ExperimentalCppJLinkChannel {
     const result = await this.callNative<{ bytesBase64: string } & Record<string, unknown>>(
       'readRtt',
       { bufferIndex, size },
-      { priority: 'background', coalesceKey: 'rtt-read', signal: options.signal },
+      { priority: 'background', coalesceKey: bufferIndex === 0 ? 'rtt-read' : `rtt-read-${bufferIndex}`, signal: options.signal },
     );
     if (!result.ok || !result.data) return withoutData(result);
     const { bytesBase64, ...metadata } = result.data;

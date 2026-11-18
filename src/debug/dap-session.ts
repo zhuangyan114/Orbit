@@ -14,6 +14,24 @@ import type { SymbolCatalog } from '../symbols/symbol-catalog';
 import { RtosSnapshotService } from '../rtos/snapshot-service';
 import { RtosError } from '../rtos/model';
 import { parsePortContract, PortContract } from '../rtos/task-metrics';
+import {
+  RTT_BACKPRESSURE_POLICIES,
+  RTT_CONFLICT_POLICIES,
+  RTT_DELIVERY_KINDS,
+  RTT_DELIVERY_MODES,
+  RttChannelBatch,
+  RttConsumptionCoordinator,
+  validateEnum,
+  validateNonEmptyString,
+  validatePositiveUint32,
+  validateStrictInt,
+} from '../rtos/rtt-coordinator';
+import {
+  isValidRttCapabilities,
+  RttCapabilities,
+  unavailableRttCapabilities,
+  validateRttMemoryRanges,
+} from '../ozone-backend/rtt-contract';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { ProbeTimelineSampler } from './probe-timeline-sampler';
@@ -209,6 +227,9 @@ export class DapSession extends EventEmitter {
   private rttReadSize = 4096;
   private rttControlBlockAddress: number | undefined;
   private rttControlBlockSource: 'elf-symbol' | 'config' = 'elf-symbol';
+  private rttCoordinator: RttConsumptionCoordinator | null = null;
+  private rttOwnerKind = 'none';
+  private rttTransportKind = '';
   private dapStepProfileSeq = 0;
   private rttStripAnsi = true;
   // Automation RTT is a distinct logical consumer from the UI RTT Log (plan
@@ -420,6 +441,7 @@ export class DapSession extends EventEmitter {
       this.cancelActiveTargetReads('target connection lost');
       this.stopDataSampling();
       this.stopRttLogPolling(false);
+      this.rttCoordinator?.dispose(false);
       this.stopPolling();
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('target connection lost');
@@ -455,6 +477,7 @@ export class DapSession extends EventEmitter {
       this.cancelActiveTargetReads('launch failed');
       this.stopDataSampling();
       this.stopRttLogPolling(false);
+      this.rttCoordinator?.dispose(false);
       this.stopPolling();
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('launch failed');
@@ -505,6 +528,7 @@ export class DapSession extends EventEmitter {
     this.controlInProgress = true;
     this.advanceReadCancelEpoch();
     this.variableHandles.clear();
+    this.rttCoordinator?.onControlStarted();
     this.cancelActiveTargetReads('DAP control request started');
   }
 
@@ -547,6 +571,7 @@ export class DapSession extends EventEmitter {
   private endControl() {
     this.controlInProgress = false;
     this.dispatchTargetReadWaiters();
+    this.rttCoordinator?.onControlEnded();
   }
 
   private shouldDeferTargetRead(): boolean {
@@ -1351,109 +1376,182 @@ export class DapSession extends EventEmitter {
     }
   }
 
+  private acquireRttReadGate(
+    priority: 'watch' | 'background',
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): boolean | Promise<boolean> {
+    if (signal?.aborted || this.controlInProgress || this.isSessionTerminating()) {
+      return false;
+    }
+    this.cancelInvalidTargetReadWaiters();
+    if (!this.targetReadInProgress
+      && this.pendingForegroundTargetReads === 0
+      && this.pendingWatchTargetReads === 0
+      && !this.hasQueuedTargetReadAtOrAbove(priority)) {
+      this.acquireTargetRead(priority, this.nowMs());
+      return true;
+    }
+    return this.beginTargetReadWhenAvailable(priority, timeoutMs, signal);
+  }
+
+  private getOrCreateRttCoordinator(): RttConsumptionCoordinator {
+    if (this.rttCoordinator) return this.rttCoordinator;
+    this.rttCoordinator = new RttConsumptionCoordinator({
+      identity: () => ({
+        sessionId: this.rtosSessionId,
+        sessionGeneration: this.rtosSessionGeneration,
+        bootGeneration: this.rtosBootGeneration,
+        operationGeneration: this.rtosOperationGeneration,
+      }),
+      ownerKind: () => this.rttOwnerKind !== 'none'
+        ? this.rttOwnerKind
+        : (this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-native'),
+      transportKind: () => this.rttTransportKind
+        || (this.backend.supportsProbeSubscriptions ? 'rmlink-service' : ''),
+      getRttCapabilities: async () => {
+        const res = await this.backend.execute({ cmd: 'getRttCapabilities' });
+        if (res.ok && isValidRttCapabilities(res.data)) {
+          return res.data;
+        }
+        if (!res.ok) {
+          return unavailableRttCapabilities(
+            this.rttOwnerKind as RttCapabilities['ownerKind'],
+            res.error || 'RTT capabilities unavailable',
+          );
+        }
+        return {
+          ownerKind: (this.rttOwnerKind as RttCapabilities['ownerKind']) || 'none',
+          rttStart: { available: true, evidence: 'source' },
+          rttEnumerate: { available: false, reason: 'Owner does not advertise RTT channel enumeration', evidence: 'source' },
+          rttUpRead: { available: true, evidence: 'source' },
+          rttDownWrite: { available: false, reason: 'Owner does not advertise RTT down-buffer write', evidence: 'source' },
+        };
+      },
+      ensureControlBlockAddress: async () => {
+        if (this.rttControlBlockAddress !== undefined) {
+          return { ok: true, address: this.rttControlBlockAddress, source: this.rttControlBlockSource };
+        }
+        const ok = await this.ensureRttControlBlockAddress();
+        if (!ok || this.rttControlBlockAddress === undefined) {
+          return {
+            ok: false,
+            errorCode: 'RttControlBlockUnavailable',
+            message: 'RTT control block (_SEGGER_RTT) could not be resolved',
+          };
+        }
+        return { ok: true, address: this.rttControlBlockAddress, source: this.rttControlBlockSource };
+      },
+      isTargetAvailable: () => !this.isSessionTerminating() && !this.controlInProgress,
+      isControlInProgress: () => this.controlInProgress,
+      isTerminating: () => this.isSessionTerminating(),
+      isXrSamplingActive: () => this.probeSampler?.active === true,
+      acquireReadGate: (priority, timeoutMs, signal) => this.acquireRttReadGate(priority, timeoutMs, signal),
+      releaseReadGate: () => this.endTargetRead(),
+      startRtt: (controlBlockAddress, options) => this.backend.execute({
+        cmd: 'startRtt',
+        controlBlockAddress,
+        ...(options?.ramRanges ? { ramRanges: options.ramRanges } : {}),
+        ...(options?.memoryBacked !== undefined ? { memoryBacked: options.memoryBacked } : {}),
+      }),
+      stopRtt: () => this.backend.execute({ cmd: 'stopRtt' }),
+      enumerateRtt: (controlBlockAddress, options) => this.backend.execute({
+        cmd: 'enumerateRtt',
+        controlBlockAddress,
+        options,
+      }),
+      readRtt: (bufferIndex, size, signal) => this.backend.execute({
+        cmd: 'readRtt',
+        bufferIndex,
+        size,
+        signal,
+      }),
+      writeRtt: (bufferIndex, bytes, options) => this.backend.execute({
+        cmd: 'writeRtt',
+        bufferIndex,
+        bytes,
+        options,
+      }),
+      withWriteControlGate: run => this.withStepLock(async () => {
+        if (!(await this.beginTargetWrite())) {
+          return { ok: false, error: 'Target busy', errorCode: 'TargetBusy' } as OzoneCommandResult;
+        }
+        try {
+          this.flushDataSampling();
+          return await run();
+        } finally {
+          this.endTargetWrite();
+        }
+      }),
+      onOwnerLost: errorCode => {
+        void this.terminateForConnectionLoss(errorCode || 'RttOwnerLost');
+      },
+      onRttUnavailable: (errorCode, message, diagnostics) => {
+        this.disableRttForSession({ ok: false, errorCode, error: message, diagnostics }, this.rttControlBlockSource);
+      },
+      onStartTransientRetry: (errorCode, message, intervalMs, diagnostics) => {
+        const diagText = diagnostics ? ' diagnostics=' + JSON.stringify(diagnostics) : '';
+        log.dap(
+          '[rtt] startRtt transient errorCode=' + errorCode
+          + ' error=' + message
+          + ' action=retry'
+          + ' intervalMs=' + intervalMs
+          + diagText,
+        );
+      },
+      onTimerStateChanged: () => {
+        this.rttPollTimer = this.rttCoordinator?.getChannelTimer(this.rttBufferIndex) ?? null;
+        this.rttStarted = this.rttCoordinator?.isOwnerStarted ?? false;
+      },
+      nowMs: () => this.nowMs(),
+    });
+    return this.rttCoordinator;
+  }
+
   private startRttLogPolling(options: { retryInvalidControlBlock?: boolean } = {}) {
     if (!this.rttLogEnabled || !this.rttAvailable) return;
-    this.stopRttLogPolling();
-    const generation = this.rttPollGeneration;
-    const retryInvalidControlBlock = options.retryInvalidControlBlock === true;
-    let transientStartFailureLogged = false;
-    const abortController = new AbortController();
-    this.rttPollAbortController = abortController;
-    const signal = abortController.signal;
-    this.rttStarted = false;
+    this.stopRttLogPolling(false);
+    this.rttPollGeneration++;
+    const coordinator = this.getOrCreateRttCoordinator();
+    coordinator.setRttAvailable(this.rttAvailable);
+    if (this.rttControlBlockAddress !== undefined) {
+      coordinator.setControlBlockAddress(this.rttControlBlockAddress);
+    }
+    this.rttStarted = coordinator.isOwnerStarted;
     this.rttDecoder = new StringDecoder('utf8');
     this.rttControlCarry = '';
     this.rttLineCarry = '';
     this.pRtLogDecoder.resetFrames();
     this.emitRttTerminalStarted();
 
-    const pollLoop = async () => {
-      if (this.rttPollTimer === null || generation !== this.rttPollGeneration || signal.aborted) return;
-      try {
-        if (!this.rttStarted) {
-          const startResult = await this.backend.execute({
-            cmd: 'startRtt',
-            controlBlockAddress: this.rttControlBlockAddress,
-          });
-          if (this.rttPollTimer === null || generation !== this.rttPollGeneration || signal.aborted) return;
-          if (!startResult.ok) {
-            if (retryInvalidControlBlock && startResult.errorCode === 'RttInvalidControlBlock') {
-              if (!transientStartFailureLogged) {
-                transientStartFailureLogged = true;
-                const diagnostics = startResult.diagnostics
-                  ? ' diagnostics=' + JSON.stringify(startResult.diagnostics)
-                  : '';
-                log.dap(
-                  '[rtt] startRtt transient errorCode=RttInvalidControlBlock'
-                  + ' error=' + startResult.error
-                  + ' action=retry'
-                  + ' intervalMs=' + this.rttPollIntervalMs
-                  + diagnostics,
-                );
-              }
-            } else {
-              this.handleRttFailure('startRtt', startResult);
-            }
-            this.rttStarted = false;
-          } else {
-            this.rttStarted = true;
-            log.dap('[rtt] startRtt ok');
-          }
+    const sub = coordinator.subscribeByIndexSync({
+      consumerId: 'rtt-log',
+      channelIndex: this.rttBufferIndex,
+      deliveryKind: 'text',
+      deliveryMode: 'callback',
+      pollIntervalMs: this.rttPollIntervalMs,
+      maxBatchBytes: this.rttReadSize,
+      conflictPolicy: 'pause-on-xr',
+      retryInvalidControlBlock: options.retryInvalidControlBlock === true,
+      controlBlockAddress: this.rttControlBlockAddress,
+      onBatch: (batch: RttChannelBatch) => {
+        if (batch.bytes.length > 0) {
+          this.emitRttBytes(Buffer.from(batch.bytes));
         }
-
-        // Host-polled Timeline sampling starves background RTT reads through the
-        // scheduler; probe-side sampling leaves the queue idle, so pause RTT
-        // explicitly rather than stopping the probe for every RTT read.
-        if (this.rttStarted && !this.probeSampler?.active) {
-          const readResult = await this.backend.execute({
-            cmd: 'readRtt',
-            bufferIndex: this.rttBufferIndex,
-            size: this.rttReadSize,
-            signal,
-          });
-          if (this.rttPollTimer === null || generation !== this.rttPollGeneration || signal.aborted) return;
-          if (readResult.ok) {
-            const bytes = (readResult.data as any)?.bytes;
-            log.dap('[rtt] readRtt ok bytes=' + (Array.isArray(bytes) || bytes instanceof Uint8Array ? bytes.length : 0));
-            if ((Array.isArray(bytes) || bytes instanceof Uint8Array) && bytes.length > 0) {
-              this.emitRttBytes(Buffer.from(bytes));
-            }
-          } else {
-            this.handleRttFailure('readRtt', readResult);
-            this.rttStarted = false;
-          }
-        }
-      } catch (error) {
-        if (signal.aborted || generation !== this.rttPollGeneration || this.rttPollTimer === null) return;
-        const errorCode = typeof (error as any)?.errorCode === 'string'
-          ? (error as any).errorCode
-          : 'RttPollingException';
-        const failure: OzoneCommandResult = {
-          ok: false,
-          errorCode,
-          error: error instanceof Error ? error.message : String(error),
-          diagnostics: (error as any)?.diagnostics,
-        };
-        this.handleRttFailure('polling', failure);
-        this.rttStarted = false;
-      }
-
-      if (this.rttPollTimer !== null && generation === this.rttPollGeneration && !signal.aborted) {
-        this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
-      }
-    };
-
-    this.rttPollTimer = setTimeout(pollLoop, this.rttPollIntervalMs);
+      },
+    });
+    if (!sub.ok) {
+      log.dap(`[rtt] startRttLogPolling failed errorCode=${sub.errorCode} error=${sub.message}`);
+    }
+    this.rttPollTimer = coordinator.getChannelTimer(this.rttBufferIndex);
   }
 
   private stopRttLogPolling(notifyOwner = true) {
     this.rttPollGeneration++;
     this.rttPollAbortController?.abort();
     this.rttPollAbortController = null;
-    if (this.rttPollTimer) {
-      clearTimeout(this.rttPollTimer);
-      this.rttPollTimer = null;
-    }
+    this.rttCoordinator?.unsubscribeImmediate('rtt-log', this.rttBufferIndex, notifyOwner);
+    this.rttPollTimer = this.rttCoordinator?.getChannelTimer(this.rttBufferIndex) ?? null;
     const trailing = this.rttDecoder.end();
     if (trailing) {
       this.emitRttOutput(trailing);
@@ -1472,8 +1570,7 @@ export class DapSession extends EventEmitter {
     this.rttDecoder = new StringDecoder('utf8');
     this.rttControlCarry = '';
     this.rttLineCarry = '';
-    this.rttStarted = false;
-    if (notifyOwner) void this.backend.execute({ cmd: 'stopRtt' });
+    this.rttStarted = this.rttCoordinator?.isOwnerStarted ?? false;
   }
 
   private handleRttFailure(operation: string, result: OzoneCommandResult) {
@@ -1496,7 +1593,9 @@ export class DapSession extends EventEmitter {
   ) {
     if (!this.rttAvailable) return;
     this.rttAvailable = false;
+    this.rttCoordinator?.setRttAvailable(false);
     this.stopRttLogPolling(false);
+    this.rttCoordinator?.dispose(false);
     const diagnostics = result.diagnostics ? ' diagnostics=' + JSON.stringify(result.diagnostics) : '';
     log.dap(
       '[rtt] unavailable errorCode=' + (result.errorCode || 'RttUnavailable')
@@ -1779,6 +1878,8 @@ export class DapSession extends EventEmitter {
           return this.handleRtosInfo(msg);
         case 'orbitRtosSnapshot':
           return this.handleRtosSnapshot(msg);
+        case 'orbitRttTransport':
+          return this.handleRttTransport(msg);
         case AUTOMATION_CONTROL_COMMAND:
           return this.handleAutomationControl(msg);
         case AUTOMATION_BREAKPOINTS_COMMAND:
@@ -2050,6 +2151,10 @@ export class DapSession extends EventEmitter {
       const targetConfig = normalizeDapLaunchConfig(args);
       this.rtosSnapshots?.dispose();
       this.rtosSnapshots = undefined;
+      this.rttCoordinator?.dispose(false);
+      this.rttCoordinator = null;
+      this.rttOwnerKind = 'none';
+      this.rttTransportKind = '';
       this.rtosSessionGeneration++;
       this.rtosBootGeneration++;
       this.rtosPort = parsePortContract(args.rtosSnapshotPort);
@@ -2215,6 +2320,10 @@ export class DapSession extends EventEmitter {
       const connectedDevice = connectResult.diagnostics?.device as {
         transport?: string; product?: string; serial?: string;
       } | undefined;
+      this.rttOwnerKind = ownerKind;
+      this.rttTransportKind = connectedDevice?.transport
+        || (typeof connectResult.diagnostics?.transport === 'string' ? connectResult.diagnostics.transport : '')
+        || (resolvedProbe === 'rmlink' ? 'rmlink-service' : '');
       let debugPath = ownerKind === 'jlink-native'
         ? 'J-Link / native C++ helper'
         : ownerKind === 'jlink-legacy' ? 'J-Link / legacy koffi' : '未知路径';
@@ -2401,7 +2510,8 @@ export class DapSession extends EventEmitter {
     this.targetConnectionEstablished = false;
     this.beginControl();
     this.cancelTargetReadGateWaiters();
-    this.stopRttLogPolling();
+    this.stopRttLogPolling(false);
+    this.rttCoordinator?.dispose(true);
     this.stopPolling();
     this.stopConnectionMonitor();
     this.stopDataSampling();
@@ -3281,7 +3391,10 @@ export class DapSession extends EventEmitter {
     this.rtosBootGeneration++;
     await this.withStepLock(async () => {
       this.beginControl();
-      this.stopRttLogPolling();
+      this.stopRttLogPolling(false);
+      await (this.rttCoordinator
+        ? this.rttCoordinator.suspendForTargetReset(true)
+        : this.backend.execute({ cmd: 'stopRtt' }));
       this.stopPolling();
       this.setTargetRunning(false);
 
@@ -3355,6 +3468,7 @@ export class DapSession extends EventEmitter {
                 if (stateResult.ok && stateResult.data === TargetState.Halted) {
                   this.markStoppedForUi();
                   this.lastHaltReason = 'pause';
+                  this.rttCoordinator?.resumeAfterTargetReset();
                   if (this.rttLogEnabled) this.startRttLogPolling();
                   this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
                 } else if (stateResult.ok && stateResult.data === TargetState.Running) {
@@ -3451,6 +3565,7 @@ export class DapSession extends EventEmitter {
           this.setTargetRunning(true);
           this.advanceReadCancelEpoch();
           this.lastHaltReason = 'breakpoint';
+          this.rttCoordinator?.resumeAfterTargetReset();
           if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
           this.sendResponse(msg);
           this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
@@ -3464,6 +3579,7 @@ export class DapSession extends EventEmitter {
         }
         this.markStoppedForUi();
         this.lastHaltReason = 'entry';
+        this.rttCoordinator?.resumeAfterTargetReset();
         if (this.rttLogEnabled) {
           this.startRttLogPolling({ retryInvalidControlBlock: true });
         }
@@ -4229,12 +4345,15 @@ export class DapSession extends EventEmitter {
     this.automationRttPollIntervalMs = request.pollIntervalMs ?? this.automationRttPollIntervalMs;
     this.automationRttAnsi = request.ansi ?? this.automationRttAnsi;
     if (request.targetName !== undefined) this.automationRttTargetName = request.targetName;
-    const result = await this.backend.execute({ cmd: 'startRtt', controlBlockAddress: this.rttControlBlockAddress });
+    const coordinator = this.getOrCreateRttCoordinator();
+    coordinator.setRttAvailable(this.rttAvailable);
+    const result = await coordinator.ensureStarted(this.rttControlBlockAddress);
     if (!result.ok) {
       this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
       return;
     }
     this.automationRttStarted = true;
+    this.rttStarted = true;
     const snapshot = await this.buildAutomationRttSnapshot(bufferIndex);
     this.sendResponse(msg, { snapshot, targetState: this.automationTargetState(), elapsedMs: Date.now() - startedAt });
   }
@@ -4245,7 +4364,15 @@ export class DapSession extends EventEmitter {
     startedAt: number,
   ): Promise<void> {
     const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
-    const result = await this.backend.execute({ cmd: 'stopRtt' });
+    const coordinator = this.rttCoordinator;
+    if (coordinator?.hasConsumer('automation-rtt', bufferIndex)) {
+      await coordinator.unsubscribe('automation-rtt', bufferIndex, { drainLastBatch: false });
+    }
+    let result: OzoneCommandResult = { ok: true, data: {} };
+    if (!coordinator || coordinator.snapshot().activeChannelCount === 0) {
+      result = await this.backend.execute({ cmd: 'stopRtt' });
+      this.rttStarted = false;
+    }
     this.automationRttStarted = false;
     if (!result.ok) {
       this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
@@ -4266,12 +4393,12 @@ export class DapSession extends EventEmitter {
     }
     const bufferIndex = request.bufferIndex ?? this.automationRttBufferIndex;
     const size = Math.max(1, Math.min(request.maxBytes ?? this.rttReadSize, 1048576));
-    const result = await this.backend.execute({
-      cmd: 'readRtt',
-      bufferIndex,
-      size,
-      signal: undefined,
-    });
+    const coordinator = this.getOrCreateRttCoordinator();
+    coordinator.setRttAvailable(this.rttAvailable);
+    if (this.rttControlBlockAddress !== undefined) {
+      coordinator.setControlBlockAddress(this.rttControlBlockAddress);
+    }
+    const result = await coordinator.readOnceCoordinated('automation-rtt', bufferIndex, size);
     if (!result.ok) {
       this.sendAutomationRttFailure(msg, result.errorCode ?? 'InternalError', result.error, startedAt);
       return;
@@ -4290,6 +4417,562 @@ export class DapSession extends EventEmitter {
       targetState: this.automationTargetState(),
       elapsedMs: Date.now() - startedAt,
     });
+  }
+
+  /**
+   * Internal DAP-to-Host RTT transport protocol (`orbitRttTransport`) for
+   * Stage 3.4 multi-channel consumption, name-based SysView selection,
+   * bounded backpressure, and Down-buffer writes through the session's
+   * single selected target owner.
+   */
+  private async handleRttTransport(msg: DebugProtocolMessage): Promise<void> {
+    const sendRttTransportFailure = (
+      errorCode: string,
+      rawMessage: unknown,
+      extras?: {
+        diagnostics?: unknown;
+        targetState?: unknown;
+        elapsedMs?: unknown;
+        extraFields?: Record<string, unknown>;
+      },
+    ) => {
+      const msgText = typeof rawMessage === 'string' && rawMessage.length > 0 ? rawMessage : errorCode;
+      const formatted = msgText.includes(errorCode) ? msgText : `${errorCode}: ${msgText}`;
+      const diagRtt = extras?.diagnostics && typeof extras.diagnostics === 'object'
+        ? (extras.diagnostics as { rtt?: Record<string, unknown> }).rtt
+        : undefined;
+      const completion = diagRtt && typeof diagRtt.completion === 'string' ? diagRtt.completion : undefined;
+      const failureStage = diagRtt && typeof diagRtt.failureStage === 'string' ? diagRtt.failureStage : undefined;
+      this.sendResponse(
+        msg,
+        {
+          ok: false,
+          errorCode,
+          message: msgText,
+          error: {
+            id: 1,
+            format: '{_message}',
+            variables: { _message: formatted },
+            showUser: false,
+          },
+          ...(completion !== undefined ? { completion } : {}),
+          ...(failureStage !== undefined ? { failureStage } : {}),
+          ...(extras?.diagnostics !== undefined ? { diagnostics: extras.diagnostics } : {}),
+          ...(extras?.targetState !== undefined ? { targetState: extras.targetState } : {}),
+          ...(extras?.elapsedMs !== undefined ? { elapsedMs: extras.elapsedMs } : {}),
+          ...(extras?.extraFields ?? {}),
+        },
+        false,
+        formatted,
+      );
+    };
+    const rejectInvalid = (errorCode: string, message: string, diagnostics?: Record<string, unknown>) => {
+      sendRttTransportFailure(errorCode, message, diagnostics ? { diagnostics } : undefined);
+    };
+
+    if (msg.arguments !== undefined && (msg.arguments === null || typeof msg.arguments !== 'object' || Array.isArray(msg.arguments))) {
+      sendRttTransportFailure('InvalidRequest', 'orbitRttTransport arguments must be an object');
+      return;
+    }
+    const args = (msg.arguments ?? {}) as Record<string, unknown>;
+    const action = args.action === undefined ? 'status' : args.action;
+    if (typeof action !== 'string' || !action) {
+      sendRttTransportFailure('InvalidRequest', 'orbitRttTransport action must be a non-empty string');
+      return;
+    }
+    if (this.isSessionTerminating()) {
+      sendRttTransportFailure('SessionTerminating', 'Debug session is terminating');
+      return;
+    }
+
+    const serializeBatch = (batch: RttChannelBatch) => ({
+      sessionId: batch.sessionId,
+      sessionGeneration: batch.sessionGeneration,
+      bootGeneration: batch.bootGeneration,
+      bufferIndex: batch.bufferIndex,
+      ...(batch.channelName !== undefined ? { channelName: batch.channelName } : {}),
+      batchSequence: batch.batchSequence,
+      dataBase64: Buffer.from(batch.bytes).toString('base64'),
+      byteLength: batch.bytes.length,
+      ...(batch.rdOff !== undefined ? { rdOff: batch.rdOff } : {}),
+      ...(batch.wrOff !== undefined ? { wrOff: batch.wrOff } : {}),
+      ...(batch.committedRdOff !== undefined ? { committedRdOff: batch.committedRdOff } : {}),
+      ...(batch.bufferSize !== undefined ? { bufferSize: batch.bufferSize } : {}),
+      ...(batch.wrapped !== undefined ? { wrapped: batch.wrapped } : {}),
+      ...(batch.overrun !== undefined ? { overrun: batch.overrun } : {}),
+      ...(batch.writerAdvanced !== undefined ? { writerAdvanced: batch.writerAdvanced } : {}),
+      congested: batch.congested,
+      backlogLikely: batch.backlogLikely,
+      isFinal: batch.isFinal,
+      timestampMs: batch.timestampMs,
+    });
+
+    const getBoundCoordinator = () => {
+      const coordinator = this.getOrCreateRttCoordinator();
+      coordinator.setRttAvailable(this.rttAvailable);
+      if (this.rttControlBlockAddress !== undefined && coordinator.snapshot().controlBlockAddress === undefined) {
+        coordinator.setControlBlockAddress(this.rttControlBlockAddress);
+      }
+      return coordinator;
+    };
+
+    if (action === 'status') {
+      const coordinator = getBoundCoordinator();
+      this.sendResponse(msg, { ok: true, status: coordinator.snapshot() });
+      return;
+    }
+    if (action === 'capabilities') {
+      const coordinator = getBoundCoordinator();
+      const capsRes = await this.backend.execute({ cmd: 'getRttCapabilities' });
+      const rttCapabilities = capsRes.ok && isValidRttCapabilities(capsRes.data)
+        ? capsRes.data
+        : unavailableRttCapabilities(this.rttOwnerKind as RttCapabilities['ownerKind'], 'RTT capabilities unavailable');
+      this.sendResponse(msg, {
+        ok: true,
+        ownerKind: rttCapabilities.ownerKind,
+        rttCapabilities,
+        budgets: {
+          channel0: coordinator.getBudget(0, false),
+          binaryChannel: coordinator.getBudget(1, true),
+        },
+        status: coordinator.snapshot(),
+      });
+      return;
+    }
+    if (action === 'enumerate') {
+      let explicitCb: number | undefined;
+      if (args.controlBlockAddress !== undefined) {
+        const v = validatePositiveUint32(args.controlBlockAddress, 'controlBlockAddress');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        explicitCb = v.value >>> 0;
+      }
+      let ramRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.ramRanges !== undefined) {
+        ramRanges = validateRttMemoryRanges(args.ramRanges, false, 'ramRanges');
+        if (!ramRanges.ok) { rejectInvalid('DapInvalidRequest', ramRanges.message); return; }
+      }
+      let roRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.roRanges !== undefined) {
+        roRanges = validateRttMemoryRanges(args.roRanges, true, 'roRanges');
+        if (!roRanges.ok) { rejectInvalid('DapInvalidRequest', roRanges.message); return; }
+      }
+      let timeoutMs: number | undefined;
+      if (args.timeoutMs !== undefined) {
+        const v = validateStrictInt(args.timeoutMs, 'timeoutMs', 1, 60000);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        timeoutMs = v.value;
+      }
+
+      const coordinator = getBoundCoordinator();
+      const boundCb = coordinator.snapshot().controlBlockAddress ?? this.rttControlBlockAddress;
+      if (boundCb !== undefined && explicitCb !== undefined && explicitCb !== (boundCb >>> 0)) {
+        rejectInvalid('RttControlBlockConflict', `RTT session is already bound to control block 0x${boundCb.toString(16)}; conflicting 0x${explicitCb.toString(16)} rejected`);
+        return;
+      }
+
+      let cbAddr = explicitCb ?? boundCb;
+      if (cbAddr === undefined) {
+        if (!(await this.ensureRttControlBlockAddress()) || this.rttControlBlockAddress === undefined) {
+          sendRttTransportFailure('RttControlBlockUnavailable', 'RTT control block could not be resolved');
+          return;
+        }
+        cbAddr = this.rttControlBlockAddress;
+      }
+      const gateAcquired = await this.beginTargetReadWhenAvailable('watch', timeoutMs ?? 1200);
+      if (!gateAcquired) {
+        sendRttTransportFailure('TargetBusy', 'Target read gate unavailable for enumerateRtt');
+        return;
+      }
+      try {
+        const res = await this.backend.execute({
+          cmd: 'enumerateRtt',
+          controlBlockAddress: cbAddr,
+          options: {
+            ...(ramRanges?.ok ? { ramRanges: ramRanges.normalized } : {}),
+            ...(roRanges?.ok ? { roRanges: roRanges.normalized } : {}),
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          },
+        });
+        if (!res.ok) {
+          sendRttTransportFailure(res.errorCode || 'RttEnumerateFailed', res.error ?? (res as { message?: unknown }).message, {
+            diagnostics: res.diagnostics,
+            targetState: res.targetState,
+            elapsedMs: res.elapsedMs,
+          });
+          return;
+        }
+        this.sendResponse(msg, res);
+      } finally {
+        this.endTargetRead();
+      }
+      return;
+    }
+    if (action === 'resolveChannel') {
+      let direction: 'up' | 'down' = 'up';
+      if (args.direction !== undefined) {
+        const d = validateEnum(args.direction, 'direction', ['up', 'down'] as const);
+        if (!d.ok) { rejectInvalid(d.errorCode, d.message, d.diagnostics); return; }
+        direction = d.value;
+      }
+      const nameCheck = validateNonEmptyString(args.channelName, 'channelName');
+      if (!nameCheck.ok) { rejectInvalid(nameCheck.errorCode, nameCheck.message, nameCheck.diagnostics); return; }
+      let explicitCb: number | undefined;
+      if (args.controlBlockAddress !== undefined) {
+        const v = validatePositiveUint32(args.controlBlockAddress, 'controlBlockAddress');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        explicitCb = v.value >>> 0;
+      }
+      let ramRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.ramRanges !== undefined) {
+        ramRanges = validateRttMemoryRanges(args.ramRanges, false, 'ramRanges');
+        if (!ramRanges.ok) { rejectInvalid('DapInvalidRequest', ramRanges.message); return; }
+      }
+      let roRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.roRanges !== undefined) {
+        roRanges = validateRttMemoryRanges(args.roRanges, true, 'roRanges');
+        if (!roRanges.ok) { rejectInvalid('DapInvalidRequest', roRanges.message); return; }
+      }
+      let timeoutMs: number | undefined;
+      if (args.timeoutMs !== undefined) {
+        const v = validateStrictInt(args.timeoutMs, 'timeoutMs', 1, 60000);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        timeoutMs = v.value;
+      }
+
+      const coordinator = getBoundCoordinator();
+      const resolved = await coordinator.resolveChannelByName(direction, nameCheck.value, {
+        ...(explicitCb !== undefined ? { controlBlockAddress: explicitCb } : {}),
+        ...(ramRanges?.ok ? { ramRanges: ramRanges.normalized } : {}),
+        ...(roRanges?.ok ? { roRanges: roRanges.normalized } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+      if (!resolved.ok) {
+        sendRttTransportFailure(resolved.errorCode, resolved.message, {
+          diagnostics: resolved.diagnostics,
+        });
+        return;
+      }
+      this.sendResponse(msg, resolved);
+      return;
+    }
+    if (action === 'subscribe') {
+      const consumerCheck = validateNonEmptyString(args.consumerId, 'consumerId');
+      if (!consumerCheck.ok) { rejectInvalid(consumerCheck.errorCode, consumerCheck.message, consumerCheck.diagnostics); return; }
+
+      const kindCheck = validateEnum(args.deliveryKind, 'deliveryKind', RTT_DELIVERY_KINDS);
+      if (!kindCheck.ok) { rejectInvalid(kindCheck.errorCode, kindCheck.message, kindCheck.diagnostics); return; }
+
+      let deliveryMode: 'callback' | 'pull' = 'callback';
+      if (args.deliveryMode !== undefined) {
+        const modeCheck = validateEnum(args.deliveryMode, 'deliveryMode', RTT_DELIVERY_MODES);
+        if (!modeCheck.ok) { rejectInvalid(modeCheck.errorCode, modeCheck.message, modeCheck.diagnostics); return; }
+        deliveryMode = modeCheck.value;
+      }
+
+      let backpressurePolicy: 'pause-reader' | 'drop-newest' | 'drop-oldest' | undefined;
+      if (args.backpressurePolicy !== undefined) {
+        const bpCheck = validateEnum(args.backpressurePolicy, 'backpressurePolicy', RTT_BACKPRESSURE_POLICIES);
+        if (!bpCheck.ok) { rejectInvalid(bpCheck.errorCode, bpCheck.message, bpCheck.diagnostics); return; }
+        backpressurePolicy = bpCheck.value;
+      }
+
+      let conflictPolicy: 'reject-on-xr' | 'pause-on-xr' | 'best-effort' | undefined;
+      if (args.conflictPolicy !== undefined) {
+        const cpCheck = validateEnum(args.conflictPolicy, 'conflictPolicy', RTT_CONFLICT_POLICIES);
+        if (!cpCheck.ok) { rejectInvalid(cpCheck.errorCode, cpCheck.message, cpCheck.diagnostics); return; }
+        conflictPolicy = cpCheck.value;
+      }
+
+      let channelIndex: number | undefined;
+      if (args.channelIndex !== undefined) {
+        const v = validateStrictInt(args.channelIndex, 'channelIndex', 0, 63);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        channelIndex = v.value;
+      }
+
+      let channelName: string | undefined;
+      if (args.channelName !== undefined) {
+        const v = validateNonEmptyString(args.channelName, 'channelName');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        channelName = v.value;
+      }
+
+      if (channelIndex === undefined && channelName === undefined) {
+        rejectInvalid('InvalidRequest', 'subscribe requires channelIndex (0..63) or channelName');
+        return;
+      }
+
+      let pollIntervalMs: number | undefined;
+      if (args.pollIntervalMs !== undefined) {
+        const v = validateStrictInt(args.pollIntervalMs, 'pollIntervalMs', 1, 60000);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        pollIntervalMs = v.value;
+      }
+
+      let maxBatchBytes: number | undefined;
+      if (args.maxBatchBytes !== undefined) {
+        const v = validateStrictInt(args.maxBatchBytes, 'maxBatchBytes', 1, 65536);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        maxBatchBytes = v.value;
+      }
+
+      let maxQueueBytes: number | undefined;
+      if (args.maxQueueBytes !== undefined) {
+        const v = validateStrictInt(args.maxQueueBytes, 'maxQueueBytes', 1, 16 * 1024 * 1024);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        maxQueueBytes = v.value;
+      }
+
+      let maxQueueBatches: number | undefined;
+      if (args.maxQueueBatches !== undefined) {
+        const v = validateStrictInt(args.maxQueueBatches, 'maxQueueBatches', 1, 4096);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        maxQueueBatches = v.value;
+      }
+
+      let controlBlockAddress: number | undefined;
+      if (args.controlBlockAddress !== undefined) {
+        const v = validatePositiveUint32(args.controlBlockAddress, 'controlBlockAddress');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        controlBlockAddress = v.value >>> 0;
+      }
+
+      let ramRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.ramRanges !== undefined) {
+        ramRanges = validateRttMemoryRanges(args.ramRanges, false, 'ramRanges');
+        if (!ramRanges.ok) { rejectInvalid('DapInvalidRequest', ramRanges.message); return; }
+      }
+
+      let roRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.roRanges !== undefined) {
+        roRanges = validateRttMemoryRanges(args.roRanges, true, 'roRanges');
+        if (!roRanges.ok) { rejectInvalid('DapInvalidRequest', roRanges.message); return; }
+      }
+
+      if (args.memoryBacked !== undefined && typeof args.memoryBacked !== 'boolean') {
+        rejectInvalid('InvalidRequest', 'memoryBacked must be a boolean');
+        return;
+      }
+
+      const coordinator = getBoundCoordinator();
+      const sub = await coordinator.subscribe({
+        consumerId: consumerCheck.value,
+        ...(channelIndex !== undefined ? { channelIndex } : {}),
+        ...(channelName !== undefined ? { channelName } : {}),
+        deliveryKind: kindCheck.value,
+        deliveryMode,
+        ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
+        ...(maxBatchBytes !== undefined ? { maxBatchBytes } : {}),
+        ...(maxQueueBytes !== undefined ? { maxQueueBytes } : {}),
+        ...(maxQueueBatches !== undefined ? { maxQueueBatches } : {}),
+        ...(backpressurePolicy !== undefined ? { backpressurePolicy } : {}),
+        ...(conflictPolicy !== undefined ? { conflictPolicy } : {}),
+        ...(controlBlockAddress !== undefined ? { controlBlockAddress } : {}),
+        ...(ramRanges?.ok ? { ramRanges: ramRanges.normalized } : {}),
+        ...(roRanges?.ok ? { roRanges: roRanges.normalized } : {}),
+        ...(args.memoryBacked !== undefined ? { memoryBacked: args.memoryBacked } : {}),
+        ...(deliveryMode === 'callback' ? {
+          onBatch: (batch: RttChannelBatch) => {
+            if (kindCheck.value === 'text') {
+              if (batch.bytes.length > 0) this.emitRttBytes(Buffer.from(batch.bytes));
+            } else {
+              this.sendEvent('orbitRttData', {
+                consumerId: consumerCheck.value,
+                ...serializeBatch(batch),
+              });
+            }
+          },
+          onDrop: event => {
+            this.sendEvent('orbitRttDrop', event);
+          },
+          onStateChange: state => {
+            this.sendEvent('orbitRttChannelState', state);
+          },
+        } : {
+          onDrop: event => {
+            this.sendEvent('orbitRttDrop', event);
+          },
+          onStateChange: state => {
+            this.sendEvent('orbitRttChannelState', state);
+          },
+        }),
+      });
+      if (!sub.ok) {
+        sendRttTransportFailure(sub.errorCode, sub.message, {
+          diagnostics: sub.diagnostics,
+        });
+        return;
+      }
+      this.sendResponse(msg, sub);
+      return;
+    }
+    if (action === 'unsubscribe') {
+      const consumerCheck = validateNonEmptyString(args.consumerId, 'consumerId');
+      if (!consumerCheck.ok) { rejectInvalid(consumerCheck.errorCode, consumerCheck.message, consumerCheck.diagnostics); return; }
+      let bufferIndex: number | undefined;
+      if (args.bufferIndex !== undefined) {
+        const v = validateStrictInt(args.bufferIndex, 'bufferIndex', 0, 63);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        bufferIndex = v.value;
+      }
+      if (args.drainLastBatch !== undefined && typeof args.drainLastBatch !== 'boolean') {
+        rejectInvalid('InvalidRequest', 'drainLastBatch must be a boolean');
+        return;
+      }
+      let drainTimeoutMs: number | undefined;
+      if (args.drainTimeoutMs !== undefined) {
+        const v = validateStrictInt(args.drainTimeoutMs, 'drainTimeoutMs', 1, 60000);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        drainTimeoutMs = v.value;
+      }
+
+      const coordinator = getBoundCoordinator();
+      const res = await coordinator.unsubscribe(
+        consumerCheck.value,
+        bufferIndex,
+        {
+          drainLastBatch: args.drainLastBatch === true,
+          ...(drainTimeoutMs !== undefined ? { drainTimeoutMs } : {}),
+        },
+      );
+      if (!res.ok) {
+        sendRttTransportFailure(res.errorCode || 'InvalidRequest', res.message || 'unsubscribe failed', {
+          extraFields: {
+            bufferIndex: res.bufferIndex,
+            consumerId: res.consumerId,
+            remainingRefCount: res.remainingRefCount,
+            ...(res.drainedBatch ? { drainedBatch: serializeBatch(res.drainedBatch) } : {}),
+          },
+        });
+        return;
+      }
+      const wire = {
+        ...res,
+        ...(res.drainedBatch ? { drainedBatch: serializeBatch(res.drainedBatch) } : {}),
+      };
+      this.sendResponse(msg, wire);
+      return;
+    }
+    if (action === 'pull') {
+      const consumerCheck = validateNonEmptyString(args.consumerId, 'consumerId');
+      if (!consumerCheck.ok) { rejectInvalid(consumerCheck.errorCode, consumerCheck.message, consumerCheck.diagnostics); return; }
+      const idxCheck = validateStrictInt(args.bufferIndex, 'bufferIndex', 0, 63);
+      if (!idxCheck.ok) { rejectInvalid(idxCheck.errorCode, idxCheck.message, idxCheck.diagnostics); return; }
+      let maxBytes: number | undefined;
+      if (args.maxBytes !== undefined) {
+        const v = validateStrictInt(args.maxBytes, 'maxBytes', 1, 16 * 1024 * 1024);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        maxBytes = v.value;
+      }
+      const coordinator = getBoundCoordinator();
+      const pulled = coordinator.pull(consumerCheck.value, idxCheck.value, maxBytes);
+      if (!pulled.ok) {
+        sendRttTransportFailure(pulled.errorCode || 'InvalidRequest', pulled.message || 'pull failed', {
+          extraFields: {
+            batches: pulled.batches.map(serializeBatch),
+            totalBytes: pulled.totalBytes,
+            remainingQueuedBytes: pulled.remainingQueuedBytes,
+            hostDroppedBytes: pulled.hostDroppedBytes,
+            targetOverruns: pulled.targetOverruns,
+            congested: pulled.congested,
+          },
+        });
+        return;
+      }
+      this.sendResponse(msg, {
+        ...pulled,
+        batches: pulled.batches.map(serializeBatch),
+      });
+      return;
+    }
+    if (action === 'setBackpressure') {
+      const consumerCheck = validateNonEmptyString(args.consumerId, 'consumerId');
+      if (!consumerCheck.ok) { rejectInvalid(consumerCheck.errorCode, consumerCheck.message, consumerCheck.diagnostics); return; }
+      const idxCheck = validateStrictInt(args.bufferIndex, 'bufferIndex', 0, 63);
+      if (!idxCheck.ok) { rejectInvalid(idxCheck.errorCode, idxCheck.message, idxCheck.diagnostics); return; }
+      if (typeof args.paused !== 'boolean') {
+        rejectInvalid('InvalidRequest', 'paused must be a boolean');
+        return;
+      }
+      const coordinator = getBoundCoordinator();
+      const updated = coordinator.setConsumerPaused(consumerCheck.value, idxCheck.value, args.paused);
+      if (!updated) {
+        sendRttTransportFailure('InvalidRequest', `No active subscription for consumerId=${consumerCheck.value} on channel ${idxCheck.value}`, {
+          extraFields: { consumerId: consumerCheck.value, bufferIndex: idxCheck.value, paused: args.paused },
+        });
+        return;
+      }
+      this.sendResponse(msg, { ok: true, consumerId: consumerCheck.value, bufferIndex: idxCheck.value, paused: args.paused });
+      return;
+    }
+    if (action === 'writeDown') {
+      if (typeof args.dataBase64 !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(args.dataBase64)) {
+        rejectInvalid('DapInvalidRequest', 'writeDown requires a valid dataBase64 string');
+        return;
+      }
+      let bufferIndex: number | undefined;
+      if (args.bufferIndex !== undefined) {
+        const v = validateStrictInt(args.bufferIndex, 'bufferIndex', 0, 63, 'DapInvalidRequest');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        bufferIndex = v.value;
+      }
+      let channelName: string | undefined;
+      if (args.channelName !== undefined) {
+        const v = validateNonEmptyString(args.channelName, 'channelName');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        channelName = v.value;
+      }
+      if (bufferIndex === undefined && channelName === undefined) {
+        rejectInvalid('DapInvalidRequest', 'writeDown requires bufferIndex or channelName');
+        return;
+      }
+      let controlBlockAddress: number | undefined;
+      if (args.controlBlockAddress !== undefined) {
+        const v = validatePositiveUint32(args.controlBlockAddress, 'controlBlockAddress');
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        controlBlockAddress = v.value >>> 0;
+      }
+      let ramRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.ramRanges !== undefined) {
+        ramRanges = validateRttMemoryRanges(args.ramRanges, false, 'ramRanges');
+        if (!ramRanges.ok) { rejectInvalid('DapInvalidRequest', ramRanges.message); return; }
+      }
+      let roRanges: ReturnType<typeof validateRttMemoryRanges> | undefined;
+      if (args.roRanges !== undefined) {
+        roRanges = validateRttMemoryRanges(args.roRanges, true, 'roRanges');
+        if (!roRanges.ok) { rejectInvalid('DapInvalidRequest', roRanges.message); return; }
+      }
+      let timeoutMs: number | undefined;
+      if (args.timeoutMs !== undefined) {
+        const v = validateStrictInt(args.timeoutMs, 'timeoutMs', 1, 60000);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        timeoutMs = v.value;
+      }
+
+      const bytes = Uint8Array.from(Buffer.from(args.dataBase64, 'base64'));
+      const coordinator = getBoundCoordinator();
+      const res = await coordinator.writeDown({
+        ...(bufferIndex !== undefined ? { bufferIndex } : {}),
+        ...(channelName !== undefined ? { channelName } : {}),
+        bytes,
+        ...(controlBlockAddress !== undefined ? { controlBlockAddress } : {}),
+        ...(ramRanges?.ok ? { ramRanges: ramRanges.normalized } : {}),
+        ...(roRanges?.ok ? { roRanges: roRanges.normalized } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+      if (!res.ok) {
+        sendRttTransportFailure(res.errorCode || 'RttMemoryWriteFailed', res.error ?? (res as { message?: unknown }).message, {
+          diagnostics: res.diagnostics,
+          targetState: res.targetState,
+          elapsedMs: res.elapsedMs,
+        });
+        return;
+      }
+      this.sendResponse(msg, res);
+      return;
+    }
+
+    rejectInvalid('InvalidRequest', `Unsupported orbitRttTransport action: ${action}`);
   }
 
   // --- RTT log snapshot bridge (plan Task 11 extension) ----------------------
@@ -4644,7 +5327,10 @@ export class DapSession extends EventEmitter {
       // Mirror handleRestart: a re-flash invalidates the RTT control-block
       // state, so background RTT polling is paused for the whole critical
       // section and restored afterwards.
-      this.stopRttLogPolling();
+      this.stopRttLogPolling(false);
+      await (this.rttCoordinator
+        ? this.rttCoordinator.suspendForTargetReset(true)
+        : this.backend.execute({ cmd: 'stopRtt' }));
       this.stopPolling();
       this.setTargetRunning(false);
       try {
@@ -4715,10 +5401,13 @@ export class DapSession extends EventEmitter {
             if (stateResult.ok && stateResult.data === TargetState.Halted) {
               this.markStoppedForUi();
               this.lastHaltReason = 'pause';
+              this.rttCoordinator?.resumeAfterTargetReset();
               if (this.rttLogEnabled) this.startRttLogPolling();
               this.sendEvent('stopped', { reason: 'pause', threadId: 1 });
             } else if (stateResult.ok && stateResult.data === TargetState.Running) {
               this.setTargetRunning(true);
+              this.rttCoordinator?.resumeAfterTargetReset();
+              if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
               this.startPolling();
             }
           } else {
@@ -4735,12 +5424,14 @@ export class DapSession extends EventEmitter {
           if (stateResult.ok && stateResult.data === TargetState.Halted) {
             this.markStoppedForUi();
             this.lastHaltReason = 'entry';
+            this.rttCoordinator?.resumeAfterTargetReset();
             if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
             this.recordAutomationSuccess(capture);
             this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
           } else if (stateResult.ok && stateResult.data === TargetState.Running) {
             this.setTargetRunning(true);
             this.advanceReadCancelEpoch();
+            this.rttCoordinator?.resumeAfterTargetReset();
             if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
             this.recordAutomationSuccess(capture);
             this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
@@ -4775,6 +5466,7 @@ export class DapSession extends EventEmitter {
           }
           this.setTargetRunning(true);
           this.advanceReadCancelEpoch();
+          this.rttCoordinator?.resumeAfterTargetReset();
           if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
           this.recordAutomationSuccess(capture);
           this.sendEvent('continued', { threadId: 1, allThreadsContinued: true });
@@ -4798,6 +5490,7 @@ export class DapSession extends EventEmitter {
         await new Promise<void>(r => setTimeout(r, 200));
         this.markStoppedForUi();
         this.lastHaltReason = 'entry';
+        this.rttCoordinator?.resumeAfterTargetReset();
         if (this.rttLogEnabled) this.startRttLogPolling({ retryInvalidControlBlock: true });
         this.recordAutomationSuccess(capture);
         this.sendEvent('stopped', { reason: 'entry', threadId: 1 });
@@ -5270,6 +5963,7 @@ export class DapSession extends EventEmitter {
       return;
     }
     if (probeIntervalMs !== null) this.dataSamplingIntervalMs = probeIntervalMs;
+    this.rttCoordinator?.onXrSamplingStateChanged();
     const source = this.backend.supportsProbeSubscriptions ? 'rmlink' : probeIntervalMs !== null ? 'probe' : 'host';
 
     const now = this.nowMs();
@@ -5515,6 +6209,7 @@ export class DapSession extends EventEmitter {
       this.dataSamplingTimer = null;
     }
     this.probeSampler?.stop();
+    this.rttCoordinator?.onXrSamplingStateChanged();
     if (this.dataSamplingSendTimer) {
       clearInterval(this.dataSamplingSendTimer);
       this.dataSamplingSendTimer = null;
@@ -5617,7 +6312,8 @@ export class DapSession extends EventEmitter {
       this.cancelTargetReadGateWaiters();
       this.cancelActiveTargetReads('DAP session disposed');
       this.stopDataSampling();
-      this.stopRttLogPolling();
+      this.stopRttLogPolling(false);
+      this.rttCoordinator?.dispose(true);
       this.stopPolling();
       this.stopConnectionMonitor();
       this.flashAbortController?.abort('DAP session disposed');

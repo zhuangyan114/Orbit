@@ -165,3 +165,15 @@
 - 复验：在授权测试工作区的 `build/OrbitRttAcceptance` 运行 `build-loopback.ps1` 生成 `orbit-rtt-loopback.elf`，用已有扩展开发宿主运行 `node check-wifi-loopback.cjs`，可用 `--reuse` 重用已烧录 fixture、用 `--overload` 复查过载。原始证据在 `out/rtos-stage3/acceptance-3.4/independent-wifi-r2.json` 和 `independent-wifi-r2-overload.json`。本轮结束后测试探针 owner 已释放。
 - 剩余事项：Windows 未枚举到 J-Link native 或 CMSIS-DAP WinUSB/HID，保留相应传输与发布硬件门槛。阶段 4.1 先从离线样本开展。
 - 提交：`实现 RTOS 阶段 3.4：统一 RTT 消费与调度`。
+
+## 4.1 / 2026-11-19
+
+- 状态：已完成，离线与独立样本验收通过。
+- 实现：新增 `src/trace/systemview-protocol.ts`（依据固定 SEGGER SystemView 3.32.0 `SEGGER_SYSVIEW.h`/`.c`/`_Int.h` 与 `SEGGER_SYSVIEW_FreeRTOS.h` 冻结 `0..23` 短事件 schema、显式长度事件 `24..31` 及 `EX` 子事件 `0..7`、`apiID_OFFSET=32` 的 111 项 FreeRTOS API 名称与 `trace*` 宏参数签名、`expandShrunkId` 32 位防溢出还原与 `SYSDESC` 键值解析）与 `src/trace/systemview-decoder.ts`（有界增量 `SystemViewStreamDecoder` 与 `decodeSystemViewStream`，基于单包状态机避免整段流反复复制，按 `5` 字节上限与第 5 字节 `<= 0x0f` 校验 varint U32，区分短 schema、合法 `NOP + delta` 与显式长度事件，通过 `TRACE_START + 有效 INIT` 的可证明重同步窗口与 `syncedSyncProbe` 拒绝弱候选并保持合法周期 sync 与时间连续性；`OVERFLOW` 缺口保留 `rawDropCount` 与 `minDroppedPackets` 下界语义并将 `droppedPackets` 设为 `unknown`；无 `SYSTIME_CYCLES` 锚点时保持相对 tick 而 `absoluteTicks` 留空，无有效 `sysFreqHz` 时不换算微秒/纳秒；支持 32/N-bit 回绕、元数据冲突检测、`maxPayloadBytes`/`maxStringBytes`/`maxChunkBytes`/`maxPrintArgs`/`maxResyncProbeBytes`/`maxSysDescKeys`（默认 256）确定上限）；新增单元测试 `src/trace/systemview-decoder.test.ts`。
+- 设计变更：无；遵循 `plan.md` 第 8 节 4.1 边界与 `protocol.md` 协议依据，未提前实现 4.2 的任务/ISR/Ready/Marker 区间重建、存储、worker 接线、DAP 或 UI，未修改 vendor 与既有独立 fixture。
+- 检查：`npx vitest run src/trace/systemview-decoder.test.ts`（18 项通过：含 5 份独立样本及 `host/oracle.json`、逐字节与全量 2 分片边界、粘包、5 字节 U32 边界及超长/溢出 varint、已知 payload 错长、有长度未知事件、无长度未知短事件、普通 payload 内 16 零字节、假 sync 回退、截断、连续溢出、timestamp wrap、元数据冲突、NOP 非零/零 delta 与邻接真 sync、400 KB 大块与 24,596 个 SYSDESC 键有界校验）；`npm run typecheck` 通过；`npm run build` 通过；全量 `npm test -- --minWorkers=1 --maxWorkers=2`（112 文件、1460 项通过、1 项已有跳过）；独立脚本 `node out/rtos-stage4/acceptance-4.1/verify-decoder.cjs`、`node out/rtos-stage4/acceptance-4.1/independent-large-chunk-and-sync.cjs`、`node out/rtos-stage4/acceptance-4.1/independent-official-nop-and-overflow.cjs` 与 `node out/rtos-stage4/acceptance-4.1/independent-metadata-bounds.cjs` 全部通过（EXIT 0）。
+- 硬件：未执行；4.1 为离线流式解码器阶段，未连接或操作实板。
+- 证据：`src/trace/systemview-protocol.ts`、`src/trace/systemview-decoder.ts`、`src/trace/systemview-decoder.test.ts`、`out/rtos-stage4/acceptance-4.1/verify-decoder.cjs`、`out/rtos-stage4/acceptance-4.1/report.json`、`out/rtos-stage4/acceptance-4.1/independent-large-chunk-and-sync.json`、`out/rtos-stage4/acceptance-4.1/independent-official-nop-and-overflow.json`、`out/rtos-stage4/acceptance-4.1/independent-metadata-bounds.json`、`out/rtos-stage4/acceptance-4.1/independent-official-nop.bin`。
+- 独立复验：用固定原厂记录器重建五份样本并核对 SHA256，所有 24,723 个两片切分位置和逐字节流式回放结果均一致。通过手算 oracle 核对事件、tick 与任务 ID，并复验 400 KB 输入、断点后假同步、原厂 NOP、溢出计数及元数据上限。全量 1460 项通过、1 项跳过。
+- 剩余事项：下一小部分为 4.2，重建任务、ISR、Ready 区间与基础 Marker 配对。
+- 提交：`实现 RTOS 阶段 4.1：增加 SystemView 流式解码器`。

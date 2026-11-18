@@ -1,4 +1,4 @@
-# RTOS 离线验证矩阵
+# RTOS 验证矩阵
 
 - 冻结日期：2026-11-18；阶段 0 不访问目标板。
 - 基线源码：a48b46d82da3e0a458586047ce545a48ee864717。
@@ -31,7 +31,7 @@
 | native-no-dwarf | 由 native-debug 去除调试信息，保留普通符号 | 已确认没有 .debug_info，内核普通符号保留 |
 | trace-continuous / trace-single-shot / trace-post-mortem | 三种目标配置及确定性主机样本 | 目标 ELF 构建、5 份主机原始样本通过；实板未执行 |
 
-固定依赖与工程见 [fixture 使用说明](../../scripts/rtos/fixtures/README.md)。64 个源文件的来源/hash 见 vendor-manifest.json；没有虚构原始包的 Git commit。CMSIS v2 的 ready 列表总大小为 1120 bytes，其他变体为 160 bytes，对应 56/8 个优先级，不能复用固定布局。
+固定依赖与工程见 [fixture 使用说明](../../scripts/rtos/fixtures/README.md)。63 个 vendor 文件的来源/hash 见 vendor-manifest.json；没有虚构原始包的 Git commit。CMSIS v2 的 ready 列表总大小为 1120 bytes，其他变体为 160 bytes，对应 56/8 个优先级，不能复用固定布局。
 
 ## 使用条件与后续验收
 
@@ -40,3 +40,14 @@
 Trace 还需要标准记录组件、实际 SysView 通道及模式元数据。离线样本不能证明 Wi-Fi 吞吐、目标时间精度或三种录制模式在板上可用。
 
 J-Link native、CMSIS-DAP WinUSB/HID、J-Link legacy 和其他 RMLink/XR 路径的新 RTOS 能力均未实板验收；保留总计划中的首版验收要求。
+
+## 阶段 1 实板新增（2026-11-18）
+
+| 范围 | 当前证据 | 支持边界 |
+|---|---|---|
+| H723 / FreeRTOS 10.3.1 / GCC ARM_CM4F / 原生 / heap_4 | 三个独立 API 检查点各 13 任务；任务、状态、创建编号、优先级、水位和累计计数一致 | 当前固定工程；不扩展为所有版本、allocator 或 port |
+| Wi-Fi RMLink 二号机 / 0.3.4 / 4 MHz 请求时钟 | 唯一 CMSIS-DAP service owner；128-byte 后台片；运行态共存、暂停态、控制/会话隔离通过 | 实际 host 为 VS Code 1.146.0；不是 J-Link、WinUSB/HID 验收 |
+| Live 任务字段 | 三轮 180.731 s，252 帧各 13 个新鲜任务字段；4 个完整图、263 个 partial 发布帧 | 全图一致性不足仍明确 partial；CPU 为有窗口说明的已结算计数估算 |
+| 配置变体 | 新输出目录重建及类型图复验通过 | CMSIS v1/v2、优化、stats/stack-bound 关闭及 tickless 仍只有离线证据 |
+
+上文“离线选定配置/阶段 0 当前状态”是阶段 0 的冻结记录。阶段 1 的精确环境、哈希、门槛及限制见 [验收报告](stage1-validation.md) 和 [原始证据索引](stage1-evidence.json)。阶段 2 内建面板、阶段 3 RTT 扩展、阶段 4 Trace 录制与阶段 6 其他链路/长稳门槛继续保留。

@@ -4,7 +4,8 @@
 import { RMLinkClient, CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 import type { SessionTargetOwner, SessionTargetConnectConfig, TargetChannelInfo } from './session-target-channel';
 import type { CppJLinkResult, NativeStepIntoDiagnostics, NativeStepIntoSourceLineRequest, NativeStepOverDiagnostics, NativeStepOverRequest, NativeStepOutDiagnostics } from './cpp-jlink-channel';
-import { NativeScheduler } from './native-scheduler';
+import { NativeScheduler, NativeSchedulerCancelledError, NativeScheduleOptions } from './native-scheduler';
+import type { CppJLinkReadOptions } from './cpp-jlink-channel';
 import { log } from '../utils/logger';
 import {readFile} from 'node:fs/promises';
 import {parseElf32LoadSegments,calculateEraseSectors,coalesceFlashProgramRanges,resolveFlashTarget,CmsisDapFlashOptions,CmsisDapFlashResult,FlashTargetDefinition} from './cmsis-dap-flasher';
@@ -58,17 +59,20 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   }
   private success<T>(data:T):CppJLinkResult<T> { return {ok:true,message:'RMLink',targetState:this.connected?'Unknown':'Disconnected',elapsedMs:0,data}; }
   private failure<T>(message:string,errorCode='UnsupportedCapability'):CppJLinkResult<T> { return {ok:false,message,errorCode,targetState:'Error',elapsedMs:0}; }
-  private async control<T>(command:string,params:Record<string,unknown>={}):Promise<CppJLinkResult<T>> {
+  private async control<T>(command:string,params:Record<string,unknown>={},options:NativeScheduleOptions={priority:'control'}):Promise<CppJLinkResult<T>> {
     if(!this.connected) return this.failure('RMLink owner unavailable','NativeOwnerLost');
     try { return await this.scheduler.schedule(async()=>{
+      if(options.signal?.aborted)return this.failure('RMLink read cancelled','TargetReadCancelled');
       const data=await this.client.target<T>(command,params);
+      if(options.signal?.aborted)return this.failure('RMLink read cancelled','TargetReadCancelled');
       const state=data && typeof data==='object' ? (data as {state?:unknown;dhcsr?:unknown}) : {};
       const result=this.success(data);
       if(state.state==='Halted' || state.state==='Running')result.targetState=state.state;
       else if(typeof state.dhcsr==='number')result.targetState=state.dhcsr&0x20000?'Halted':'Running';
       return result;
-    },{priority:'control'}); }
+    },options); }
     catch(error) {
+      if(error instanceof NativeSchedulerCancelledError)return this.failure(String(error),'TargetReadCancelled');
       const response=error as {httpStatus?:number;errorCode?:string};
       log.dll(`[rmlink] request failed command=${command} status=${response.httpStatus ?? 'transport'} code=${response.errorCode ?? 'unknown'} error=${String(error)}`);
       if(response.httpStatus && response.httpStatus<500)return this.failure(String(error),response.errorCode || 'RMLinkRequestFailed');
@@ -82,12 +86,12 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
   runToAddress(address:number,reset:boolean) { return this.control<CmsisDapRunToAddressResult>('run_to_address',{address,reset}); }
   getState() { return this.control<{state:string}>('state'); }
   readRegister(index:number) { return this.control<{value:number}>('read_register',{index}); }
-  async readMemory(address:number,size:number):Promise<CppJLinkResult<{bytes:Uint8Array}>> {
-    const r=await this.control<{data:string}>('read_memory',{address,byte_length:size});
+  async readMemory(address:number,size:number,options:CppJLinkReadOptions={}):Promise<CppJLinkResult<{bytes:Uint8Array}>> {
+    const r=await this.control<{data:string}>('read_memory',{address,byte_length:size},{...options,priority:options.priority || 'watch'});
     return r.ok && r.data?{...r,data:{bytes:Buffer.from(r.data.data,'hex')}}:this.failure(r.message,r.errorCode);
   }
-  async readMemoryBatch(reads:Array<{address:number;size:number}>):Promise<CppJLinkResult<{reads:Array<{address:number;bytes:Uint8Array}>}>> {
-    const r=await this.control<{reads:Array<{address:number;data:string}>}>('read_batch',{reads:reads.map(r=>({address:r.address,byte_length:r.size}))});
+  async readMemoryBatch(reads:Array<{address:number;size:number}>,options:CppJLinkReadOptions={}):Promise<CppJLinkResult<{reads:Array<{address:number;bytes:Uint8Array}>}>> {
+    const r=await this.control<{reads:Array<{address:number;data:string}>}>('read_batch',{reads:reads.map(r=>({address:r.address,byte_length:r.size}))},{...options,priority:options.priority || 'watch'});
     return r.ok && r.data?{...r,data:{reads:r.data.reads.map(v=>({address:v.address,bytes:Buffer.from(v.data,'hex')}))}}:this.failure(r.message,r.errorCode);
   }
   async writeMemory(address:number,bytes:Uint8Array):Promise<CppJLinkResult<{address:number;bytesWritten:number}>> {

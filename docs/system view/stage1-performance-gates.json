@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "frozenDate": "2026-11-18",
+  "scope": "STM32H723VGT6 / FreeRTOS 10.3.1 / RMLink 0.3.4 Wi-Fi / SWD 4 MHz / 13 tasks",
+  "frozenBefore": "hardware-final combined and combined-snapshot comparison",
+  "basis": "hardware-run4 six 60-second baselines; initial 20ms stopped goal is not achievable on this wireless path; graph churn remains explicitly partial",
+  "warmHaltedSnapshotP95Ms": 1000,
+  "allThirteenStackScansMaxMs": 5000,
+  "liveRequestedRateMinHz": 1.5,
+  "liveFreshThirteenTaskFramesMinHz": 1.0,
+  "liveGraphCompleteness": "Report complete/partial/cancelled separately; no promotion of partial graph to consistent",
+  "runtimePercent": "At least one valid same-identity interval; expose acquisition window and best-effort settled-counter accounting",
+  "controlErrorsMax": 0,
+  "controlPauseContinueP95MaxMs": 1200,
+  "controlPauseContinueP95IncrementMaxMs": 80,
+  "controlStepP95MaxMs": 1200,
+  "controlRelative20Percent": "Initial recommendation retained for reporting; wireless gate uses an explicit 80ms increment, based on one bounded read slice plus observed link jitter, rather than changing thresholds after the final run",
+  "watchAndTimelineThroughputMinRatio": 0.8,
+  "rttTextMustProgress": true,
+  "lateSnapshotEventsAfterStopMax": 0,
+  "pendingRefreshesMax": 1
+}

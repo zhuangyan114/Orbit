@@ -58,3 +58,13 @@ fixture(native-tickless    0 1 1 1 0 -Og)
 fixture(trace-continuous   0 1 1 0 1 -Og)
 fixture(trace-single-shot  0 1 1 0 2 -Og)
 fixture(trace-post-mortem  0 1 1 0 3 -Og)
+
+# 阶段 1 实板基准：13 任务与 RTT 文本，可控制地停在独立内核 oracle 后。
+fixture(snapshot-benchmark 0 1 1 0 0 -Og)
+target_compile_definitions(snapshot-benchmark PRIVATE FIXTURE_BENCHMARK=1 RTT_USE_ASM=0)
+target_sources(snapshot-benchmark PRIVATE "${RTT}/SEGGER_RTT.c")
+target_include_directories(snapshot-benchmark PRIVATE "${RTT}")
+# 此变体用于本机 VS Code 源断点验收，保留真实源路径；其他离线变体仍使用固定前缀。
+get_target_property(BENCH_OPTIONS snapshot-benchmark COMPILE_OPTIONS)
+list(FILTER BENCH_OPTIONS EXCLUDE REGEX "^-f(file|debug)-prefix-map=")
+set_property(TARGET snapshot-benchmark PROPERTY COMPILE_OPTIONS ${BENCH_OPTIONS})

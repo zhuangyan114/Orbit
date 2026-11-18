@@ -210,6 +210,7 @@ export type OzoneCommand =
   | { cmd: 'getLocals'; frame?: number; signal?: AbortSignal }
   | { cmd: 'getCallStack'; signal?: AbortSignal }
   | { cmd: 'readMemory'; address: number; size: number; signal?: AbortSignal; liveAccess?: boolean }
+  | { cmd: 'readMemoryBatch'; reads: { address: number; size: number }[]; signal?: AbortSignal }
   | { cmd: 'writeMemory'; address: number; data: number[]; liveAccess?: boolean }
   | { cmd: 'readRegister'; name: string }
   | { cmd: 'getTargetState' }

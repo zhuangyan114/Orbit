@@ -1,7 +1,7 @@
 # Orbit RTOS / SystemView 开发总计划
 
 - 编写日期：2026-11-18（Asia/Shanghai）。
-- 状态：阶段 0 离线准备已完成；快照与 Trace 功能开发尚未开始，阶段状态见第 12 节。
+- 状态：阶段 0 与阶段 1 已完成并验证；阶段 2 面板与后续 Trace 尚未开始，阶段状态见第 12 节。
 - 适用项目：Orbit for VS Code，Windows。
 - 首版范围：仅支持和验证 FreeRTOS；其他 RTOS 全部放到首版之后。
 - 执行规则：按小部分实施，每部分完成相应检查后独立提交 Git，提交信息使用中文。
@@ -498,9 +498,9 @@ git diff --check
 
 | 阶段/项目 | 当前状态 | 已完成与剩余内容 |
 |---|---|---|
-| 开发总计划 | 已完成 | 本文件；只完成规划，不代表任何新快照或 Trace 功能已实现。提交通过 `git log -- "docs/system view/plan.md"` 查询。 |
+| 开发总计划 | 已完成 | 本文件是开发入口；功能实现状态以各阶段记录及验收为准。提交通过 `git log -- "docs/system view/plan.md"` 查询。 |
 | 0：基线与契约 | 已完成 | 0.1～0.3 离线交付和验证通过；实板基线归 1.4，三种模式实板采集归 4.4。 |
-| 1：快照引擎 | 未开始 | 1.1～1.4 待执行。 |
+| 1：快照引擎 | 已完成 | 1.1～1.4：布局、任务、栈/计数器、DAP 安全刷新；H723/RMLink 实板及冻结门槛通过，见 stage1-validation.md。 |
 | 2：面板与对象 | 未开始 | 2.1～2.4 待执行。 |
 | 3：RTT 传输 | 未开始 | 3.1～3.4 待执行。 |
 | 4：Trace 引擎 | 未开始 | 4.1～4.5 待执行。 |
@@ -510,7 +510,7 @@ git diff --check
 
 ### 12.2 记录要求
 
-当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)。
+当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[冻结性能门槛](stage1-performance-gates.json)。
 
 后续详细设计、证据索引、基准与交接文件统一放在 `docs/system view/` 下，在本节补相对链接。开始阶段 0 时建立 `progress.md`、`compatibility.md`、`protocol.md` 和 `validation.md`，记录已确定内容；不要预填虚假的测试结果。
 

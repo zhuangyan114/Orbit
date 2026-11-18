@@ -56,3 +56,9 @@
 本地记录为 out/rtos-stage0/fixtures-run.txt、fixtures-verify.txt、final-verify.txt、clean-build-final-run.txt，以及 fixtures/、clean-build-final/ 下的 verification.json、编译日志、符号和 DWARF 输出。工程、固定依赖、样本及摘要纳入 Git；构建产物和完整日志保留在 out/。
 
 阶段 0 离线出口已满足。阶段 1 引擎、新运行时接口、UI、实板和长稳均未开始；本次独立 fixture 改动不触发未受影响的原生 helper/Flash Algorithm 验收。
+
+## 1.4 实板基线与阶段出口（2026-11-18）
+
+阶段 1 已补齐本文件规定的六组实板场景，并在最终无线片预算上完成三轮共存对照。数据、失败记录、冻结门槛和复跑方法见 [阶段 1 验收](stage1-validation.md)，原始文件 hash 与独立复算结果见 [阶段 1 证据](stage1-evidence.json)。上文阶段 0 的“尚未开始/未执行”保留为当时记录，不代表当前进度。
+
+阶段 1 的类型检查、构建、1378 项测试（1 项跳过）、J-Link/CMSIS-DAP mock、独立工程重建、样本与实板通过。当前真实硬件证据只覆盖 H723/Wi-Fi RMLink；未把 mock 或离线配置扩展为其他路径验收。

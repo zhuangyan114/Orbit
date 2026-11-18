@@ -1,0 +1,678 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-18",
+  "scope": "STM32H723VGT6 / FreeRTOS 10.3.1 / RMLink 0.3.4 Wi-Fi / SWD 4 MHz / 13 tasks",
+  "status": "passed",
+  "performanceEnvironment": {
+    "vscode": "1.146.0",
+    "pid": 23632,
+    "workspace": [
+      "c:\\Users\\22690\\Desktop\\AI\\Orbit\\out\\rtos-stage1\\hardware-acceptance\\workspace"
+    ]
+  },
+  "deliveryEnvironment": {
+    "vscode": "1.146.0",
+    "pid": 22848,
+    "workspace": [
+      "c:\\Users\\22690\\Desktop\\AI\\Orbit\\out\\rtos-stage1\\hardware-lifecycle-final\\workspace"
+    ]
+  },
+  "gatesSha256": "b86c764a2f368d35a6e9ce1a72c5e2e8622e29d8ddef5ec7c578ddc2b29877ea",
+  "performanceBuild": {
+    "dist/debugadapter.js": {
+      "sha256": "2eeb1eef55f02a939d95c6c57f0e7ac43ca283c93b8f587a8b512ded99f375c0",
+      "bytes": 705822
+    },
+    "dist/extension.js": {
+      "sha256": "6747e780cd1bb6511f5ab32f6770a377e2f0c5226ea201284292c370f21cea0c",
+      "bytes": 1535327
+    },
+    "out/rtos-stage0/fixtures/arm/snapshot-benchmark.elf": {
+      "sha256": "b5291a5e6bc908e51deed33c1fe2f6697e6ed86c570e34b2534fe8fafaba3412",
+      "bytes": 1257580
+    },
+    "package.json": {
+      "sha256": "d6de651a1afc8f1245e9a453df59a3dce6b6300c62e075bf986f40bef414f867",
+      "bytes": 25453
+    },
+    "scripts/rtos/fixtures/CMakeLists.txt": {
+      "sha256": "4a3ca794093110b181c9442e1ea76d495b4b807d3f95203bdbcd35644bfdf6d6",
+      "bytes": 4050
+    },
+    "scripts/rtos/fixtures/firmware/main.c": {
+      "sha256": "966616558e91276b086e29788255e3e936b53e299bea15d9dde1df68ba3e74a1",
+      "bytes": 11478
+    },
+    "src/debug/dap-session.ts": {
+      "sha256": "54482f79a2c74fa147a72e499b29cc505d96c84625edeb1c383d0bfe511d4c17",
+      "bytes": 239322
+    },
+    "src/ozone-backend/commander.ts": {
+      "sha256": "2fb92c72ac4990f3bc622b870561f87b07e6c403c4cb228c819bf11ee9707796",
+      "bytes": 214007
+    },
+    "src/ozone-backend/rmlink-target-channel.ts": {
+      "sha256": "42f8bbf19df36c9178edc8496d6e8e4b6487fcdcfed0e1db18b0969c8652a6eb",
+      "bytes": 18791
+    },
+    "src/ozone-backend/types.ts": {
+      "sha256": "368ab0edebf9520f9245a6e06f4b0a87451812e7e25e2f950d47839555af8214",
+      "bytes": 7931
+    },
+    "src/rtos/freertos-layout.ts": {
+      "sha256": "f105c4f518d0b0290c5b561ffc9623e310c130258382361fa220f79cf4423a66",
+      "bytes": 9674
+    },
+    "src/rtos/model.ts": {
+      "sha256": "6d4c74263f1a70a8e9882a6ad281b01fae56feb235fa07e04318bc2f5214d176",
+      "bytes": 2599
+    },
+    "src/rtos/snapshot-reader.ts": {
+      "sha256": "a6e88c8702ccf46bf5ba87fe7b98cf91ee87eb9b11a6463783adff78177a652c",
+      "bytes": 19437
+    },
+    "src/rtos/snapshot-service.ts": {
+      "sha256": "2bb0f12dcfed1515d75b5558efa438c37b637128faf3fa537176a48f27721759",
+      "bytes": 8171
+    },
+    "src/rtos/task-metrics.ts": {
+      "sha256": "4dfe03d153e259932d54dd5691622c92323c4cd0a4cd65f5ae5b4428e8cd9b41",
+      "bytes": 8667
+    }
+  },
+  "deliveryBuild": {
+    "dist/debugadapter.js": {
+      "sha256": "2a6e5441fa2026afea97d9cc2473fa0cfe26ff842bb4cadda3478b664fc21e14",
+      "bytes": 706040
+    },
+    "dist/extension.js": {
+      "sha256": "6747e780cd1bb6511f5ab32f6770a377e2f0c5226ea201284292c370f21cea0c",
+      "bytes": 1535327
+    },
+    "out/rtos-stage0/fixtures/arm/snapshot-benchmark.elf": {
+      "sha256": "b5291a5e6bc908e51deed33c1fe2f6697e6ed86c570e34b2534fe8fafaba3412",
+      "bytes": 1257580
+    },
+    "package.json": {
+      "sha256": "d6de651a1afc8f1245e9a453df59a3dce6b6300c62e075bf986f40bef414f867",
+      "bytes": 25453
+    },
+    "scripts/rtos/fixtures/CMakeLists.txt": {
+      "sha256": "4a3ca794093110b181c9442e1ea76d495b4b807d3f95203bdbcd35644bfdf6d6",
+      "bytes": 4050
+    },
+    "scripts/rtos/fixtures/firmware/main.c": {
+      "sha256": "966616558e91276b086e29788255e3e936b53e299bea15d9dde1df68ba3e74a1",
+      "bytes": 11478
+    },
+    "src/debug/dap-session.ts": {
+      "sha256": "d4b35fc2234f766748ee0033c0b57b3023e9c25df3aedf7e353286844fecf617",
+      "bytes": 239548
+    },
+    "src/ozone-backend/commander.ts": {
+      "sha256": "2fb92c72ac4990f3bc622b870561f87b07e6c403c4cb228c819bf11ee9707796",
+      "bytes": 214007
+    },
+    "src/ozone-backend/rmlink-target-channel.ts": {
+      "sha256": "42f8bbf19df36c9178edc8496d6e8e4b6487fcdcfed0e1db18b0969c8652a6eb",
+      "bytes": 18791
+    },
+    "src/ozone-backend/types.ts": {
+      "sha256": "368ab0edebf9520f9245a6e06f4b0a87451812e7e25e2f950d47839555af8214",
+      "bytes": 7931
+    },
+    "src/rtos/freertos-layout.ts": {
+      "sha256": "f105c4f518d0b0290c5b561ffc9623e310c130258382361fa220f79cf4423a66",
+      "bytes": 9674
+    },
+    "src/rtos/model.ts": {
+      "sha256": "6d4c74263f1a70a8e9882a6ad281b01fae56feb235fa07e04318bc2f5214d176",
+      "bytes": 2599
+    },
+    "src/rtos/snapshot-reader.ts": {
+      "sha256": "a6e88c8702ccf46bf5ba87fe7b98cf91ee87eb9b11a6463783adff78177a652c",
+      "bytes": 19437
+    },
+    "src/rtos/snapshot-service.ts": {
+      "sha256": "2bb0f12dcfed1515d75b5558efa438c37b637128faf3fa537176a48f27721759",
+      "bytes": 8171
+    },
+    "src/rtos/task-metrics.ts": {
+      "sha256": "4dfe03d153e259932d54dd5691622c92323c4cd0a4cd65f5ae5b4428e8cd9b41",
+      "bytes": 8667
+    }
+  },
+  "deliveryChangeSincePerformance": [
+    "src/debug/dap-session.ts"
+  ],
+  "identity": {
+    "cpuid": {
+      "address": 3758157056,
+      "raw": "csIfQQ==",
+      "value": 1092600434
+    },
+    "dbgmcu": {
+      "address": 1543507968,
+      "raw": "g2QBEA==",
+      "value": 268526723
+    },
+    "flashSize": {
+      "address": 535947392,
+      "raw": "AAQAAA==",
+      "value": 1024
+    },
+    "SystemCoreClock": {
+      "address": 536870980,
+      "raw": "AJDQAw==",
+      "value": 64000000
+    }
+  },
+  "performance": {
+    "combined": {
+      "durationMs": 180467,
+      "controls": 198,
+      "controlErrors": 0,
+      "control": {
+        "pause": {
+          "n": 90,
+          "p50Ms": 68,
+          "p95Ms": 131,
+          "maxMs": 189
+        },
+        "continue": {
+          "n": 90,
+          "p50Ms": 79,
+          "p95Ms": 162,
+          "maxMs": 188
+        },
+        "stepIn": {
+          "n": 18,
+          "p50Ms": 67,
+          "p95Ms": 102,
+          "maxMs": 102
+        }
+      },
+      "watchPolls": 874,
+      "timelinePoints": 337572,
+      "rttTextLines": 1747,
+      "publishedFrames": 0,
+      "completeGraphFrames": 0,
+      "partialFrames": 0,
+      "fresh13TaskFrames": 0,
+      "fresh13TaskRateHz": 0.0,
+      "freshFrameP50Ms": null,
+      "freshFrameP95Ms": null,
+      "payloadBytes": 0,
+      "runtimePercentFields": 0
+    },
+    "combined-snapshot": {
+      "durationMs": 180731,
+      "controls": 198,
+      "controlErrors": 0,
+      "control": {
+        "pause": {
+          "n": 90,
+          "p50Ms": 72,
+          "p95Ms": 197,
+          "maxMs": 382
+        },
+        "continue": {
+          "n": 90,
+          "p50Ms": 75,
+          "p95Ms": 165,
+          "maxMs": 197
+        },
+        "stepIn": {
+          "n": 18,
+          "p50Ms": 65,
+          "p95Ms": 201,
+          "maxMs": 201
+        }
+      },
+      "watchPolls": 857,
+      "timelinePoints": 328890,
+      "rttTextLines": 1711,
+      "publishedFrames": 267,
+      "completeGraphFrames": 4,
+      "partialFrames": 263,
+      "fresh13TaskFrames": 252,
+      "fresh13TaskRateHz": 1.394337440726826,
+      "freshFrameP50Ms": 234,
+      "freshFrameP95Ms": 436,
+      "payloadBytes": 419916,
+      "runtimePercentFields": 2223
+    }
+  },
+  "warmHalted": {
+    "n": 20,
+    "p50Ms": 475,
+    "p95Ms": 583
+  },
+  "allStackScanMs": 3217,
+  "oracle": [
+    {
+      "phase": 1,
+      "n": 13,
+      "dapElapsedMs": 1432,
+      "mismatches": []
+    },
+    {
+      "phase": 2,
+      "n": 13,
+      "dapElapsedMs": 1383,
+      "mismatches": []
+    },
+    {
+      "phase": 3,
+      "n": 13,
+      "dapElapsedMs": 1496,
+      "mismatches": []
+    }
+  ],
+  "machine": {
+    "osVersion": "10.0.26100.0",
+    "architecture": "AMD64",
+    "cpu": {
+      "Name": "AMD Ryzen 7 7745HX with Radeon Graphics        ",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 16
+    },
+    "physicalRamBytes": 33475293184,
+    "node": "v24.15.0",
+    "npm": "11.12.1",
+    "armGcc": "arm-none-eabi-gcc.exe (Arm GNU Toolchain 13.3.Rel1 (Build arm-13.24)) 13.3.1 20240614",
+    "python": "Python 3.13.9"
+  },
+  "softwareChecks": [
+    {
+      "name": "typecheck",
+      "passed": true,
+      "log": "out/rtos-stage1-typecheck-delivery.txt",
+      "sha256": "f3192760b9b6d52e31416ce452db8530e84d1f53e37bb3fcbec81dd6e1211f30"
+    },
+    {
+      "name": "extension build",
+      "passed": true,
+      "log": "out/rtos-stage1-build-delivery.txt",
+      "sha256": "24012409890980a1fb47d588f24f2827ca86418ede4f0b93d28785c0fc52774c"
+    },
+    {
+      "name": "native build",
+      "passed": true,
+      "log": "out/rtos-stage1-native-build.txt",
+      "sha256": "924692e766f2e9c9f40a4529eb95f13bb900e62a7a19d59ffe9c1b2a9e8efe1f"
+    },
+    {
+      "name": "full Vitest",
+      "passed": true,
+      "log": "out/rtos-stage1-all-tests-delivery.txt",
+      "sha256": "9efb08284214c5c6a0b2acee8e21816ebab629cc6211e66e5c361fcc7e86211a"
+    },
+    {
+      "name": "J-Link mock",
+      "passed": true,
+      "log": "out/rtos-stage1-jlink-mock.txt",
+      "sha256": "8ab6750ad2b3c22ec16f90af9f8fddcdc887128baa0d4d087c21f3099f6e355a"
+    },
+    {
+      "name": "CMSIS-DAP mock",
+      "passed": true,
+      "log": "out/rtos-stage1-dap-mock.txt",
+      "sha256": "1c5445a29c5528c5bb2b1eb26f8f6d0b02f2834cf71f57b20cbd38ad07379288"
+    },
+    {
+      "name": "offline rebuild",
+      "passed": true,
+      "log": "out/rtos-stage1-offline-build.txt",
+      "sha256": "1f8c9fb080fc7b22ea3f52d6ef7c2690c54119b623cb489e9523dd2cb090849a"
+    },
+    {
+      "name": "fixture validators",
+      "passed": true,
+      "log": "out/rtos-stage1-fixture-tests.txt",
+      "sha256": "50963963cf872110b992d99f2891ddd7d4f4088d623d13244ed3132b72d31698"
+    },
+    {
+      "name": "rebuilt ELF layouts",
+      "passed": true,
+      "log": "out/rtos-stage1-new-elf-layout.txt",
+      "sha256": "5c45a5ea079f317842dc1ead6d5caff910b81cf00667585b817de7960977aff2"
+    }
+  ],
+  "checks": [
+    {
+      "name": "combined: three >=60s runs",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined: all controls and Watch calls succeed",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined/1: no unexpected stopped events",
+      "passed": true,
+      "detail": 36
+    },
+    {
+      "name": "combined/1: monotonic publication",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined/2: no unexpected stopped events",
+      "passed": true,
+      "detail": 36
+    },
+    {
+      "name": "combined/2: monotonic publication",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined/3: no unexpected stopped events",
+      "passed": true,
+      "detail": 36
+    },
+    {
+      "name": "combined/3: monotonic publication",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined: bounded raw reads",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined: runtime estimate has identity and read window",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot: three >=60s runs",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot: all controls and Watch calls succeed",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot/1: no unexpected stopped events",
+      "passed": true,
+      "detail": 37
+    },
+    {
+      "name": "combined-snapshot/1: monotonic publication",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot/2: no unexpected stopped events",
+      "passed": true,
+      "detail": 37
+    },
+    {
+      "name": "combined-snapshot/2: monotonic publication",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot/3: no unexpected stopped events",
+      "passed": true,
+      "detail": 37
+    },
+    {
+      "name": "combined-snapshot/3: monotonic publication",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot: bounded raw reads",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "combined-snapshot: runtime estimate has identity and read window",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "pause: p95 absolute and incremental gate",
+      "passed": true,
+      "detail": {
+        "incrementMs": 66
+      }
+    },
+    {
+      "name": "continue: p95 absolute and incremental gate",
+      "passed": true,
+      "detail": {
+        "incrementMs": 3
+      }
+    },
+    {
+      "name": "step: p95 gate",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "fresh task frame rate",
+      "passed": true,
+      "detail": 1.394337440726826
+    },
+    {
+      "name": "default Live request cadence",
+      "passed": true,
+      "detail": 349
+    },
+    {
+      "name": "watchPolls: throughput gate",
+      "passed": true,
+      "detail": 0.9805491990846682
+    },
+    {
+      "name": "timelinePoints: throughput gate",
+      "passed": true,
+      "detail": 0.9742810422665387
+    },
+    {
+      "name": "RTT progresses",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "runtime intervals observed",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "three independent kernel oracles",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "hardware lifecycle checks",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "warm halted snapshot p95",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "13 task stack scan budget",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "no late snapshot events after stop",
+      "passed": true,
+      "detail": 0
+    },
+    {
+      "name": "selected owner released",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "typecheck",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "extension build",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "native build",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "full Vitest",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "J-Link mock",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "CMSIS-DAP mock",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "offline rebuild",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "fixture validators",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "rebuilt ELF layouts",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "performance input hot paths unchanged",
+      "passed": true,
+      "detail": [
+        "src/debug/dap-session.ts"
+      ]
+    },
+    {
+      "name": "delivery change is only cancelled-read completion labeling",
+      "passed": true,
+      "detail": null
+    }
+  ],
+  "violations": [],
+  "artifacts": [
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/benchmark-combined-snapshot.json",
+      "bytes": 5424807,
+      "sha256": "f376614245b43f7bfc8bef83b2a55d0623e72f4a29a8ad1f47db5a1a8fcdcce1"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/benchmark-combined.json",
+      "bytes": 343808,
+      "sha256": "07352e6603dce1786342faa6717f74331fe1d6a4dd646ee886e7ec15fc6367b0"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/benchmark-summary.json",
+      "bytes": 3438,
+      "sha256": "3573746888b2f2c3c1af0b0b732c1b59e7f7aef83e32d37b1e8a44e0a3c2e4ab"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/build-manifest.json",
+      "bytes": 2192,
+      "sha256": "06627de2e0ed7796b4233e48c15068c76b9fa4b9cad4683a026904a9bddfbd50"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/checkpoint-breakpoint.json",
+      "bytes": 159,
+      "sha256": "f1c52026eefe69be14da8cf56adca784a7ba880b76506c42bc3e35b1b51c9229"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/dap-trace.json",
+      "bytes": 11495998,
+      "sha256": "9e83b1b54a1ed1e64d9b1dfd72cba92e48e79a335035ef76ee00f31481223db8"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/lifecycle.json",
+      "bytes": 115437,
+      "sha256": "60b1ef27850283d9e32fceed2af08238cfbb69e5d361cb20371e61e7a38b9fca"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/oracle-phase1.json",
+      "bytes": 45974,
+      "sha256": "f9302e523aab873cf0fa4e7a851dd9094e663eb6e9a41b7233cb4c989de68822"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/oracle-phase2.json",
+      "bytes": 46014,
+      "sha256": "e131f3bb3d1a42b9e1b88fe124eaef335f4f2c9f15c34cfcf1e8984c0312d43a"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/oracle-phase3.json",
+      "bytes": 45977,
+      "sha256": "f1c34c8f254984ca43e8bd8c5cda44d7e163ad0c2fbd28e8df6b73198cff04c5"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/repeat2/benchmark-combined-snapshot.json",
+      "bytes": 5014453,
+      "sha256": "ce0b21e874a809db3374548c329237298a440ea41d11c139a68bb329ac518ce2"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/repeat2/benchmark-combined.json",
+      "bytes": 339023,
+      "sha256": "94a9cc5272cdd44f228e5ad8682f9f539425e13bdf238902bff79ec429e24c26"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/repeat2/benchmark-summary.json",
+      "bytes": 3445,
+      "sha256": "646212d094484e9042ac06699aa3095951df9dce21152f0fd01c4955ce36fde1"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/repeat3/benchmark-combined-snapshot.json",
+      "bytes": 4876287,
+      "sha256": "dc9cd59e31af1d2a8f05d7c4c1a930a15d48f5a423e1688225448f0a5ecec484"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/repeat3/benchmark-combined.json",
+      "bytes": 332745,
+      "sha256": "1f93b812e05f0b14e3922de2b40b89d0e7e8a74330205127a26580a979b21dc9"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-acceptance/repeat3/benchmark-summary.json",
+      "bytes": 3440,
+      "sha256": "6eef53803a334e9f9d8c55e1ade63cbfb44dfec1bbccd5d5ada137d4571b166d"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-lifecycle-final/dap-trace.json",
+      "bytes": 775303,
+      "sha256": "050749c75edb355a7cfe27cf1507cc1cda4b19d34210a8f236e3776c75bd9c2a"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-lifecycle-final/device-after.json",
+      "bytes": 297,
+      "sha256": "bac44eba9d961bfd45296c520841cd25fa95df6126cb57c352b462f76b90fcf1"
+    },
+    {
+      "path": "out/rtos-stage1/hardware-lifecycle-final/lifecycle.json",
+      "bytes": 270226,
+      "sha256": "90c6d1396185803924c01b40d197c36ef54f30c045da5f9a5d05e1645dbc1a6e"
+    }
+  ]
+}

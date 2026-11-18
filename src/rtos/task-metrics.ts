@@ -10,6 +10,19 @@ export interface PortContract {
 }
 export interface StackScanOptions { taskAddresses?: number[]; maxBytesPerTask?: number; }
 
+export function parsePortContract(value: unknown): PortContract | undefined {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object') throw new Error('Invalid RTOS port contract');
+  const port = value as PortContract;
+  if (typeof port.source !== 'string' || !port.source.trim() || port.source.length > 1024
+    || (port.stackGrowth !== undefined && !['down', 'up'].includes(port.stackGrowth))
+    || (port.stackFillByte !== undefined && (!Number.isInteger(port.stackFillByte) || port.stackFillByte < 0 || port.stackFillByte > 255))
+    || (port.runtime !== undefined && (!port.runtime || typeof port.runtime.source !== 'string' || !port.runtime.source.trim()
+      || !Number.isFinite(port.runtime.frequencyHz) || port.runtime.frequencyHz <= 0 || port.runtime.frequencyHz > 1e10 || typeof port.runtime.countsDuringSleep !== 'boolean')))
+    throw new Error('Invalid RTOS port contract');
+  return structuredClone(port);
+}
+
 export async function addStackMetrics(result: SnapshotReadResult, port: PortContract | undefined, options: StackScanOptions = {}) {
   const { snapshot, memory } = result;
   if (!port?.stackGrowth || !port.source || snapshot.consistency === 'unavailable') return;
@@ -71,7 +84,10 @@ export class TaskRuntimeTracker {
     const key = JSON.stringify([snapshot.sessionId, snapshot.sessionGeneration, snapshot.bootGeneration, snapshot.operationGeneration,
       snapshot.elfSha256, snapshot.layoutId, contract]);
     const previous = this.previous;
-    const valid = ['halted-consistent', 'live-best-effort'].includes(snapshot.consistency);
+    const validatedPartial = snapshot.consistency === 'partial' && snapshot.targetState === 'Running'
+      && snapshot.tasks.length > 0 && snapshot.tasks.every(task => task.listEvidence === 'validated-tcb')
+      && snapshot.issues.every(issue => ['SnapshotChanged', 'CorruptList'].includes(issue.errorCode));
+    const valid = ['halted-consistent', 'live-best-effort'].includes(snapshot.consistency) || validatedPartial;
     this.previous = valid ? { snapshot: structuredClone(snapshot), monotonicMs, key } : undefined;
     if (!valid || !contract || !contract.source || !Number.isFinite(contract.frequencyHz) || contract.frequencyHz <= 0) return;
     const unavailable = (reason: string): Field<number> => unknown(reason, contract.source, 'percent');
@@ -92,8 +108,9 @@ export class TaskRuntimeTracker {
       const delta = counterDelta(BigInt(old.runtime.counter.value), BigInt(task.runtime.counter.value), task.runtime.bits.value, bound);
       if (delta === undefined || delta > total) { task.runtime.percent = unavailable('Counter reset or inconsistent accounting interval'); continue; }
       task.runtime.percent = known(Number(delta * 1000000n / total) / 10000,
-        `${contract.source}; settled kernel counters, ISR charged to current task, sleep=${contract.countsDuringSleep ? 'counted' : 'excluded'}`, 'percent');
+        `${contract.source}; best effort settled kernel counters, ISR charged to current task, sleep=${contract.countsDuringSleep ? 'counted' : 'excluded'}`, 'percent');
       task.runtime.intervalMs = known(elapsed, 'Host monotonic interval; denominator=ulTotalRunTime delta', 'ms');
+      task.runtime.readWindowMs = known(snapshot.diagnostics.totalMs + previous.snapshot.diagnostics.totalMs, 'Combined acquisition windows; percentage timing uncertainty', 'ms');
     }
   }
 }

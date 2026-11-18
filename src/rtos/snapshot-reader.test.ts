@@ -1,8 +1,58 @@
 import { describe, expect, it } from 'vitest';
 import { readTaskSnapshot } from './snapshot-reader';
 import { syntheticTarget } from './target-fixture';
+import { testCatalog } from './test-fixture';
+import { compileFreeRtosLayout } from './freertos-layout';
 
 describe('bounded FreeRTOS task reader', () => {
+  it('honors a one-packet wireless slice without holding the gate across several ranges', async () => {
+    const target = syntheticTarget(); target.request.slice = { blockBytes: 128, ranges: 1 };
+    target.request.readMany = async ranges => {
+      expect(ranges).toHaveLength(1); expect(ranges[0].size).toBeLessThanOrEqual(128);
+      return ranges.map(range => target.bytes.subarray(range.start, range.start + range.size));
+    };
+    expect((await readTaskSnapshot(target.layout, target.request)).snapshot.consistency).toBe('halted-consistent');
+  });
+  it('keeps fresh verified task details during live list churn without upgrading the graph consistency', async () => {
+    const target = syntheticTarget(); target.request.targetState = 'Running';
+    target.request.taskHints = target.tasks.map(task => task.address);
+    target.u32(0x2200 + 12 + 12, 0xdead);
+    const result = await readTaskSnapshot(target.layout, target.request);
+    expect(result.snapshot.consistency).toBe('partial'); expect(result.snapshot.tasks).toHaveLength(5);
+    expect(result.snapshot.tasks.every(task => task.listEvidence === 'validated-tcb')).toBe(true);
+    target.u32(0x2200 + 12 + 16, 0xdead);
+    const corrupt = await readTaskSnapshot(target.layout, target.request);
+    expect(corrupt.snapshot.tasks.some(task => task.tcbAddress === 0x2200)).toBe(false);
+  });
+  it('uses address hints without trusting old task data or treating a reused address as an old lifetime', async () => {
+    const target = syntheticTarget();
+    target.request.taskHints = target.tasks.map(task => task.address);
+    target.request.readMany = async ranges => ranges.map(range => target.bytes.subarray(range.start, range.start + range.size));
+    const first = await readTaskSnapshot(target.layout, target.request);
+    expect(first.snapshot.consistency).toBe('halted-consistent');
+    target.u32(0x2200 + 92, 99); target.bytes.fill(0, 0x2200 + 72, 0x2200 + 88); target.bytes.write('reused', 0x2200 + 72);
+    const next = await readTaskSnapshot(target.layout, target.request);
+    expect(next.snapshot.tasks.find(task => task.tcbAddress === 0x2200)).toMatchObject({ name: { value: 'reused' }, creationNumber: { value: '99' } });
+    target.bytes.copy(target.bytes, 0x3000, 0x2200, 0x2200 + 112); target.setList('ready[0]', [0x3000]);
+    const moved = await readTaskSnapshot(target.layout, target.request);
+    expect(moved.snapshot.consistency).toBe('halted-consistent');
+    expect(moved.snapshot.tasks.some(task => task.tcbAddress === 0x2200)).toBe(false);
+    expect(moved.snapshot.tasks.some(task => task.tcbAddress === 0x3000)).toBe(true);
+  });
+  it('uses bounded discontiguous batches and rejects a malformed batch', async () => {
+    const target = syntheticTarget(), sizes: number[] = [];
+    target.request.readMany = async ranges => {
+      expect(ranges.length).toBeLessThanOrEqual(4);
+      sizes.push(ranges.reduce((sum, range) => sum + range.size, 0));
+      return ranges.map(range => target.bytes.subarray(range.start, range.start + range.size));
+    };
+    const result = await readTaskSnapshot(target.layout, target.request);
+    expect(result.snapshot.consistency).toBe('halted-consistent');
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(1024);
+    expect(result.snapshot.diagnostics.batches).toBeLessThan(8);
+    target.request.readMany = async () => [];
+    expect((await readTaskSnapshot(target.layout, target.request)).snapshot.issues[0].errorCode).toBe('ShortRead');
+  });
   it('decodes names, states, current task and independent padded ABI', async () => {
     const target = syntheticTarget(), { snapshot } = await readTaskSnapshot(target.layout, target.request);
     expect(snapshot.consistency).toBe('halted-consistent');
@@ -19,6 +69,14 @@ describe('bounded FreeRTOS task reader', () => {
     const { snapshot } = await readTaskSnapshot(target.layout, target.request);
     expect(snapshot.consistency).toBe('halted-consistent');
     expect(snapshot.tasks.find(task => task.tcbAddress === 0x2600)).toMatchObject({ state: 'blocked', lists: ['xSuspendedTaskList', 'xPendingReadyList'] });
+  });
+  it('recognizes an indefinite task-notification wait without an event-list container', async () => {
+    const target = syntheticTarget(), catalog = testCatalog();
+    catalog.types.tcb.fields!.push({ name: 'ucNotifyState', byteOffset: 104, typeOffset: 'char' });
+    const layout = compileFreeRtosLayout(catalog, 'notification-variant');
+    target.bytes[0x2600 + 104] = 1;
+    const result = await readTaskSnapshot(layout, target.request);
+    expect(result.snapshot.tasks.find(task => task.tcbAddress === 0x2600)?.state).toBe('blocked');
   });
   it('walks a deep list in bounded rounds', async () => {
     const target = syntheticTarget(), addresses = Array.from({ length: 40 }, (_, index) => 0x3000 + index * 128);

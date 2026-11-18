@@ -13,6 +13,17 @@ async function sample() {
   return result;
 }
 describe('stack and runtime metrics', () => {
+  it('allows independently validated live counters in a partial graph and exposes the acquisition window', async () => {
+    const tracker = new TaskRuntimeTracker(), first = (await sample()).snapshot;
+    first.consistency = 'partial'; first.targetState = 'Running';
+    first.tasks.forEach(task => { task.listEvidence = 'validated-tcb'; });
+    first.issues = [{ errorCode: 'CorruptList', operation: 'taskSnapshot', message: 'Live list changed', retryable: false, completion: 'completed' }];
+    first.diagnostics.totalMs = 30; tracker.update(first, port, 1000);
+    const next = structuredClone(first); next.runtimeTotal = known('2000', 'kernel total', 'ticks');
+    next.tasks[0].runtime.counter = known('350', 'kernel task', 'ticks'); tracker.update(next, port, 2000);
+    expect(next.tasks[0].runtime.percent).toMatchObject({ available: true, value: 25 });
+    expect(next.tasks[0].runtime.readWindowMs).toMatchObject({ available: true, value: 60 });
+  });
   it('scans only requested tasks, reports unused fill bytes rather than SP delta', async () => {
     const result = await sample();
     await addStackMetrics(result, port, { taskAddresses: [0x2000] });

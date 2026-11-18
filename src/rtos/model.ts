@@ -4,6 +4,7 @@ export type Field<T> = { source: string; unit: string } &
 export const known = <T>(value: T, source: string, unit: string): Field<T> => ({ available: true, value, source, unit });
 export const unknown = <T>(reason: string, source: string, unit: string): Field<T> => ({ available: false, reason, source, unit });
 export type Consistency = 'halted-consistent' | 'live-best-effort' | 'partial' | 'stale' | 'unavailable';
+export interface Capability { available: boolean; reason?: string; evidence: 'source' | 'offline' | 'hardware'; }
 export interface SnapshotIdentity {
   sessionId: string;
   sessionGeneration: number;
@@ -23,6 +24,7 @@ export interface TaskSnapshot {
   name: Field<string>;
   state: 'running' | 'ready' | 'blocked' | 'suspended' | 'termination' | 'unknown';
   lists: string[];
+  listEvidence: 'traversed' | 'validated-tcb';
   current: boolean;
   priority: Field<number>;
   basePriority: Field<number>;
@@ -31,7 +33,7 @@ export interface TaskSnapshot {
     wordBytes: Field<number>; capacityBytes: Field<number>; watermarkBytes: Field<number>;
     fillByte: Field<number>; scannedBytes: number; scanComplete: boolean; scanMs: number;
   };
-  runtime: { counter: Field<string>; bits: Field<number>; percent: Field<number>; intervalMs: Field<number>; };
+  runtime: { counter: Field<string>; bits: Field<number>; percent: Field<number>; intervalMs: Field<number>; readWindowMs?: Field<number>; };
 }
 export interface SnapshotDiagnostics {
   bytes: number; batches: number; rounds: number; nodes: number; coveredLists: string[];

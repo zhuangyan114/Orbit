@@ -686,6 +686,19 @@ case 'readVariableRuntime':
         case 'getSymbolCatalog':
           if (!this.elfPath || this.symbols.length === 0) return { ok: false, error: '请先启动 Orbit 调试并加载 ELF 符号' };
           return { ok: true, data: buildSymbolCatalog(this.symbols, this.dwarfInfo) };
+        case 'readMemoryBatch': {
+          // RTOS background slice: bounded and always live, never halt/resume.
+          if (!command.reads.length || command.reads.length > 4 || command.reads.some(read =>
+            !Number.isSafeInteger(read.address) || read.address < 0 || !Number.isSafeInteger(read.size) || read.size <= 0 || read.size > 256
+            || read.address + read.size > 0x1_0000_0000)) return { ok: false, errorCode: 'BudgetExceeded', error: 'Invalid bounded memory batch' };
+          if (!this.sessionTarget) return { ok: false, errorCode: 'OwnerUnavailable', error: 'No selected session owner' };
+          const result = await this.sessionTarget.readMemoryBatch(command.reads, { priority: 'background', signal: command.signal });
+          if (!result.ok) return { ok: false, errorCode: result.errorCode, error: result.message, diagnostics: result.diagnostics };
+          if (!result.data || result.data.reads.length !== command.reads.length || result.data.reads.some((read, index) =>
+            read.address !== command.reads[index].address || read.bytes.length !== command.reads[index].size))
+            return { ok: false, errorCode: 'ShortRead', error: 'Bounded memory batch was incomplete' };
+          return { ok: true, data: result.data.reads.map(read => read.bytes) };
+        }
         case 'searchSymbols': {
           if (!this.elfPath || this.symbols.length === 0) {
             return {

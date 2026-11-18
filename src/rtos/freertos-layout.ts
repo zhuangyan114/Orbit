@@ -61,7 +61,7 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
   if (tcbType.kind !== 'struct' || !tcbType.byteSize || tcbType.byteSize > 4096) fail('LayoutIncomplete', 'Invalid TCB type');
   const fields: Record<string, Member> = {};
   for (const name of ['pxTopOfStack', 'xStateListItem', 'xEventListItem', 'uxPriority', 'pcTaskName', 'pxStack']) fields[name] = member(tcbOffset, name);
-  for (const name of ['uxBasePriority', 'pxEndOfStack', 'uxTCBNumber', 'ulRunTimeCounter']) {
+  for (const name of ['uxBasePriority', 'pxEndOfStack', 'uxTCBNumber', 'ulRunTimeCounter', 'ucNotifyState']) {
     if (tcbType.fields?.some(field => field.name === name)) fields[name] = member(tcbOffset, name);
   }
   for (const name of ['uxPriority', 'uxBasePriority', 'uxTCBNumber', 'ulRunTimeCounter']) if (fields[name]) integer(fields[name], name);
@@ -76,6 +76,11 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
     owner: member(itemOffset, 'pvOwner'), container: member(itemOffset, 'pvContainer') };
   for (const field of [item.next, item.previous, item.owner, item.container]) pointer(field.typeOffset);
   if (symbolByteSize(catalog, fields.xEventListItem.typeOffset) !== item.size) fail('LayoutIncomplete', 'Event item size mismatch');
+  for (const [name, expected] of [['pxNext', item.next], ['pxPrevious', item.previous], ['pvOwner', item.owner], ['pvContainer', item.container]] as const) {
+    const actual = member(fields.xEventListItem.typeOffset, name);
+    pointer(actual.typeOffset);
+    if (actual.offset !== expected.offset || actual.size !== expected.size) fail('LayoutAmbiguous', 'State/event item layouts differ');
+  }
   const end = member(listOffset, 'xListEnd');
   const endNext = member(end.typeOffset, 'pxNext'), endPrevious = member(end.typeOffset, 'pxPrevious');
   pointer(endNext.typeOffset); pointer(endPrevious.typeOffset);
@@ -94,13 +99,22 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
       const actual = member(node.typeOffset, fieldName);
       if (actual.offset !== expected.offset || actual.size !== expected.size || node.size !== list.size) fail('LayoutAmbiguous', `Conflicting list layout ${name}`);
     }
+    const actualEnd = member(node.typeOffset, 'xListEnd');
+    for (const [name, expected] of [['pxNext', endNext], ['pxPrevious', endPrevious]] as const) {
+      const actual = member(actualEnd.typeOffset, name);
+      pointer(actual.typeOffset);
+      if (actual.offset !== expected.offset || actual.size !== expected.size) fail('LayoutAmbiguous', `Conflicting sentinel layout ${node.expression}`);
+    }
     lists.push({ name, address: node.address!, state });
   }
   const taskCountBytes = symbolByteSize(catalog, count.typeOffset);
-  if (![1, 2, 4].includes(taskCountBytes) || count.size !== taskCountBytes) fail('LayoutIncomplete', 'Invalid task count');
-  const total = root('ulTotalRunTime', false);
+  if (!['base', 'enum'].includes(type(count.typeOffset).kind) || ![1, 2, 4].includes(taskCountBytes) || count.size !== taskCountBytes) fail('LayoutIncomplete', 'Invalid task count');
+  // An optional total-counter DIE may be stripped/ambiguous independently of
+  // the kernel lists. That disables percentages, not task discovery.
+  const totalCandidates = catalog.roots.filter(node => node.expression === 'ulTotalRunTime' && node.address !== undefined && node.typeOffset && !node.unavailable);
+  let total = totalCandidates.length === 1 ? totalCandidates[0] : undefined;
   const totalSize = total ? symbolByteSize(catalog, total.typeOffset) : 0;
-  if (total && ![4, 8].includes(totalSize)) fail('LayoutIncomplete', 'Invalid runtime total');
+  if (![4, 8].includes(totalSize)) total = undefined;
   const plan = { elfSha256, source: `DWARF:${current.file}:${tcbOffset}`, current: current.address!, taskCount: count.address!, taskCountBytes,
     ...(total ? { runtimeTotal: { address: total.address!, size: totalSize } } : {}),
     lists, list, item, tcb: { size: tcbType.byteSize, typeOffset: tcbOffset, fields, nameBytes: fields.pcTaskName.size, stackWordBytes } };

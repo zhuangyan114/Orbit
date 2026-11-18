@@ -9,7 +9,11 @@ import {
   DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock,
   DebugProbe, OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
 } from '../ozone-backend/types';
-import { parseElf32LoadSegments } from '../ozone-backend/cmsis-dap-flasher';
+import { parseElf32LoadSegments, resolveFlashTarget } from '../ozone-backend/cmsis-dap-flasher';
+import type { SymbolCatalog } from '../symbols/symbol-catalog';
+import { RtosSnapshotService } from '../rtos/snapshot-service';
+import { RtosError } from '../rtos/model';
+import { parsePortContract, PortContract } from '../rtos/task-metrics';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { ProbeTimelineSampler } from './probe-timeline-sampler';
@@ -236,6 +240,12 @@ export class DapSession extends EventEmitter {
   private timelineClockPausedTotalMs = 0;
   private controlInProgress = false;
   private readCancelEpoch = 0;
+  private readonly rtosSessionId = crypto.randomUUID();
+  private rtosSessionGeneration = 0;
+  private rtosBootGeneration = 0;
+  private rtosOperationGeneration = 0;
+  private rtosPort?: PortContract;
+  private rtosSnapshots?: RtosSnapshotService;
   private targetReadInProgress = false;
   private lowPriorityReadBlockedUntil = 0;
   private pendingForegroundTargetReads = 0;
@@ -499,10 +509,13 @@ export class DapSession extends EventEmitter {
 
   private advanceReadCancelEpoch() {
     this.readCancelEpoch++;
+    this.rtosOperationGeneration++;
+    this.rtosSnapshots?.invalidate('DAP control/session generation changed');
     this.cancelInvalidTargetReadWaiters();
   }
 
   private cancelActiveTargetReads(reason: string) {
+    if (this.isSessionTerminating()) this.rtosSnapshots?.dispose();
     const stoppedController = this.activeStoppedReadAbortController;
     if (stoppedController && !stoppedController.signal.aborted) {
       log.dap(`cancel stopped target read reason=control readEpoch=${this.readCancelEpoch}`);
@@ -1763,6 +1776,8 @@ export class DapSession extends EventEmitter {
           return this.handleGetTargetState(msg);
         case 'rtosInfo':
           return this.handleRtosInfo(msg);
+        case 'orbitRtosSnapshot':
+          return this.handleRtosSnapshot(msg);
         case AUTOMATION_CONTROL_COMMAND:
           return this.handleAutomationControl(msg);
         case AUTOMATION_BREAKPOINTS_COMMAND:
@@ -1782,6 +1797,88 @@ export class DapSession extends EventEmitter {
         default:
           this.sendResponse(msg, undefined, false, `Unsupported: ${msg.command}`);
     }
+  }
+
+  /** Internal provider-to-DAP protocol. No Automation/MCP endpoint or extra owner. */
+  private async handleRtosSnapshot(msg: DebugProtocolMessage) {
+    const args = msg.arguments || {};
+    let refreshEntered = false;
+    try {
+      if (args.action === 'stop') { this.rtosOperationGeneration++; this.rtosSnapshots?.stop(); return this.sendResponse(msg, { stopped: true }); }
+      if (args.action === 'status') return this.sendResponse(msg, this.rtosSnapshots?.status() || { inFlight: false, polling: false });
+      if (args.action === 'cancel') { this.rtosOperationGeneration++; this.rtosSnapshots?.invalidate('Refresh cancelled'); return this.sendResponse(msg, { cancelled: true }); }
+      if (args.action && !['refresh', 'start', 'capabilities'].includes(args.action)) throw new RtosError('InvalidConfiguration', 'Invalid RTOS snapshot action');
+      if (!this.targetConnectionEstablished || this.phase !== 'connected' || !this._loadedFirmware) throw new RtosError('SessionChanged', 'No connected session with ELF metadata');
+      if (args.taskAddresses !== undefined && (!Array.isArray(args.taskAddresses) || args.taskAddresses.length > 256
+        || args.taskAddresses.some((address: unknown) => !Number.isSafeInteger(address) || Number(address) <= 0))) throw new RtosError('InvalidAddress', 'Invalid stack task addresses');
+      if (args.maxBytesPerTask !== undefined && (!Number.isSafeInteger(args.maxBytesPerTask) || args.maxBytesPerTask <= 0)) throw new RtosError('BudgetExceeded', 'Invalid stack scan budget');
+      if (args.intervalMs !== undefined && (!Number.isFinite(args.intervalMs) || args.intervalMs < 200 || args.intervalMs > 10000)) throw new RtosError('InvalidConfiguration', 'Refresh interval must be 200..10000 ms');
+      if (!this.rtosSnapshots) this.rtosSnapshots = this.createRtosSnapshotService();
+      if (args.action === 'capabilities') return this.sendResponse(msg, await this.rtosSnapshots.capabilities());
+      if (args.action === 'start') {
+        this.rtosOperationGeneration++;
+        this.rtosSnapshots.start(snapshot => this.sendEvent('orbitRtosSnapshot', snapshot), args.intervalMs);
+        return this.sendResponse(msg, { started: true, intervalMs: args.intervalMs ?? 500 });
+      }
+      refreshEntered = true;
+      const snapshot = await this.rtosSnapshots.refresh({ taskAddresses: args.taskAddresses, maxBytesPerTask: args.maxBytesPerTask });
+      this.sendResponse(msg, snapshot);
+    } catch (error) {
+      const errorCode = error instanceof RtosError ? error.errorCode : 'MemoryReadFailed';
+      const message = error instanceof Error ? error.message : String(error);
+      const stale = errorCode === 'TargetReadUnavailable' ? this.rtosSnapshots?.stale(message) : undefined;
+      this.sendResponse(msg, stale || { version: 1, consistency: 'unavailable', tasks: [], reason: message,
+        sessionId: this.rtosSessionId, sessionGeneration: this.rtosSessionGeneration,
+        bootGeneration: this.rtosBootGeneration, operationGeneration: this.rtosOperationGeneration,
+        elfSha256: this._loadedFirmware?.sha256 || '', layoutId: '', errorCode, operation: 'taskSnapshot', retryable: false,
+        completion: !refreshEntered || ['RtosNotDetected', 'DwarfUnavailable', 'LayoutIncomplete', 'LayoutAmbiguous', 'UnsupportedCapability'].includes(errorCode) ? 'not-started' : 'unknown' });
+    }
+  }
+
+  private createRtosSnapshotService(): RtosSnapshotService {
+    let target;
+    try { target = resolveFlashTarget(this._device); }
+    catch { throw new RtosError('UnsupportedCapability', `No registered RAM description for ${this._device}`); }
+    return new RtosSnapshotService({
+      identity: () => ({ sessionId: this.rtosSessionId, sessionGeneration: this.rtosSessionGeneration,
+        operationGeneration: this.rtosOperationGeneration, bootGeneration: this.rtosBootGeneration, elfSha256: this._loadedFirmware?.sha256 || '' }),
+      available: () => this.targetConnectionEstablished && this.phase === 'connected' && !this.controlInProgress,
+      targetState: () => this.targetRunning ? 'Running' : 'Halted',
+      ram: target.ramRegions.map(region => ({ start: region.address, size: region.size })),
+      port: this.rtosPort,
+      // RMLink's bounded RAM command carries at most 128 bytes per wireless
+      // round-trip. Release both gates after every one of those packets.
+      slice: this.backend.supportsProbeSubscriptions ? { blockBytes: 128, ranges: 1 } : { blockBytes: 256, ranges: 4 },
+      readMany: async (ranges, signal) => {
+        const epoch = this.readCancelEpoch, queued = this.nowMs();
+        if (!(await this.beginTargetReadWhenAvailable('background', 700, signal))) throw new RtosError(signal.aborted ? 'TargetReadCancelled' : 'TargetReadUnavailable', 'RTOS background batch unavailable');
+        const queueWaitMs = this.nowMs() - queued;
+        try {
+          if (signal.aborted || epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) throw new RtosError('TargetReadCancelled', 'RTOS batch cancelled before dispatch');
+          const result = await this.backend.execute({ cmd: 'readMemoryBatch', reads: ranges.map(range => ({ address: range.start, size: range.size })), signal });
+          if (signal.aborted || epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) throw new RtosError('TargetReadCancelled', 'RTOS stale batch discarded');
+          if (!result.ok) throw new RtosError(result.errorCode || 'MemoryReadFailed', result.error || 'RTOS memory batch failed');
+          return { bytes: result.data as Uint8Array[], queueWaitMs };
+        } finally { this.endTargetRead(); }
+      },
+      catalog: async () => {
+        const result = await this.backend.execute({ cmd: 'getSymbolCatalog' });
+        if (!result.ok) throw new RtosError(result.errorCode || 'DwarfUnavailable', result.error || 'ELF metadata unavailable');
+        return result.data as SymbolCatalog;
+      },
+      read: async (address, size, signal) => {
+        const epoch = this.readCancelEpoch, queued = this.nowMs();
+        if (!(await this.beginTargetReadWhenAvailable('background', 700, signal))) throw new RtosError(signal.aborted ? 'TargetReadCancelled' : 'TargetReadUnavailable', 'RTOS background read unavailable');
+        const queueWaitMs = this.nowMs() - queued;
+        try {
+          if (signal.aborted || epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) throw new RtosError('TargetReadCancelled', 'RTOS read cancelled before dispatch');
+          const result = await this.backend.execute({ cmd: 'readMemory', address, size, signal, liveAccess: true });
+          if (signal.aborted || epoch !== this.readCancelEpoch || this.shouldDeferTargetRead()) throw new RtosError('TargetReadCancelled', 'RTOS stale read discarded');
+          if (!result.ok) throw new RtosError(result.errorCode || 'MemoryReadFailed', result.error || 'RTOS memory read failed');
+          return { bytes: Uint8Array.from((result.data as MemoryBlock).data), queueWaitMs };
+        } finally { this.endTargetRead(); }
+      },
+    });
   }
 
   private async handleRtosInfo(msg: DebugProtocolMessage) {
@@ -1904,6 +2001,11 @@ export class DapSession extends EventEmitter {
     try {
       const args = msg.arguments || {};
       const targetConfig = normalizeDapLaunchConfig(args);
+      this.rtosSnapshots?.dispose();
+      this.rtosSnapshots = undefined;
+      this.rtosSessionGeneration++;
+      this.rtosBootGeneration++;
+      this.rtosPort = parsePortContract(args.rtosSnapshotPort);
       configureLogger({
         enabled: args.loggingEnabled !== false,
         clearOnStart: args.clearLogsOnStart !== false,
@@ -2306,6 +2408,8 @@ export class DapSession extends EventEmitter {
   }
 
   private rememberFlashedFirmware(elfPath: string, identity?: FlashedFirmwareIdentity): void {
+    this.rtosBootGeneration++;
+    this.rtosSnapshots?.invalidate('Firmware flashed');
     this._lastFlashedFirmware = identity ?? readFirmwareIdentity(elfPath);
   }
 
@@ -2815,13 +2919,14 @@ export class DapSession extends EventEmitter {
       return;
     }
 
-    const result = await this.backend.execute({ cmd: 'writeMemory', address, data });
-    if (!result.ok) {
-      this.sendResponse(msg, { offset: 0, bytesWritten: 0 }, false, result.error);
-      return;
-    }
-
-    this.sendResponse(msg, { offset: 0, bytesWritten: data.length });
+    await this.withStepLock(async () => {
+      if (!(await this.beginTargetWrite())) return this.sendResponse(msg, undefined, false, 'Target write unavailable');
+      try {
+        const result = await this.backend.execute({ cmd: 'writeMemory', address, data });
+        if (!result.ok) return this.sendResponse(msg, { offset: 0, bytesWritten: 0 }, false, result.error);
+        this.sendResponse(msg, { offset: 0, bytesWritten: data.length });
+      } finally { this.endTargetWrite(); }
+    });
   }
 
   private async handleContinue(msg: DebugProtocolMessage) {
@@ -3126,6 +3231,7 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleRestart(msg: DebugProtocolMessage) {
+    this.rtosBootGeneration++;
     await this.withStepLock(async () => {
       this.beginControl();
       this.stopRttLogPolling();
@@ -4416,6 +4522,7 @@ export class DapSession extends EventEmitter {
     request: AutomationControlRequest,
     startedAt: number,
   ): Promise<void> {
+    this.rtosBootGeneration++;
     const mode = request.mode ?? 'halt';
     const capture: AutomationCapture = { synthetic: msg, recorded: false, success: false };
     await this.withStepLock(async () => {
@@ -5477,6 +5584,7 @@ export class DapSession extends EventEmitter {
         log.dap(`session-dispose error=${error instanceof Error ? error.message : String(error)}`);
       }
       this.phase = 'terminated';
+      this.rtosSnapshots?.dispose();
     })();
     return this.disposePromise;
   }

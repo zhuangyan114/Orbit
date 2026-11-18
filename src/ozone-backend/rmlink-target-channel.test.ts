@@ -207,4 +207,24 @@ describe('RMLink public-service owner',()=>{
       expect(result.diagnostics?.progress).toEqual(progress);
     }finally{record.mockRestore();await owner.dispose();await rm(directory,{recursive:true,force:true});}
   });
+  it('honors read priorities and cancellation without losing the owner',async()=>{
+    const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
+    await owner.connect({device:'STM32H723VGT6',speedKHz:4000,rmlinkDeviceId:'50787d15a924'});
+    let release!:()=>void;
+    const calls:string[]=[];
+    model.target=async(command:string)=>{
+      calls.push(command);
+      if(calls.length===1)await new Promise<void>(resolve=>{release=resolve;});
+      return command==='read_memory'?{data:'78563412'}:{} as any;
+    };
+    const first=owner.readMemory(0x24000000,4,{priority:'background'});
+    const cancelled=new AbortController();
+    const queued=owner.readMemory(0x24000004,4,{priority:'background',signal:cancelled.signal});
+    const watch=owner.readMemory(0x24000008,4,{priority:'watch'});
+    const halt=owner.halt();cancelled.abort();release();
+    expect((await queued).errorCode).toBe('TargetReadCancelled');
+    await Promise.all([first,watch,halt]);
+    expect(calls).toEqual(['read_memory','halt','read_memory']);
+    expect(owner.usingNative).toBe(true);await owner.dispose();
+  });
 });

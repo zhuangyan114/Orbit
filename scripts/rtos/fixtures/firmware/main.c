@@ -4,6 +4,13 @@
 #include "queue.h"
 #include "semphr.h"
 #include "timers.h"
+#if FIXTURE_BENCHMARK
+#include "SEGGER_RTT.h"
+/* 只在实板验收变体启用，原 11 个阶段 0 镜像行为保持原配置。 */
+volatile uint32_t fixturePhaseCommand;
+volatile uint32_t fixtureOracleRequest;
+__attribute__((noinline)) void FixtureSnapshotCheckpoint(void) { __asm volatile ("nop"); }
+#endif
 _Static_assert(sizeof(void *) == 4 && sizeof(uint32_t) == 4, "Cortex-M 32-bit ABI required");
 /* 直接从 ELF 导出检查，防止只相信构建脚本声称使用了某组宏。 */
 __attribute__((used, section(".fixture_config")))
@@ -101,6 +108,13 @@ static void TimerCallback(TimerHandle_t timer) {
   ++fixtureState.timerCalls;
   (void)xSemaphoreGive(fixtureBinary);
 }
+#if FIXTURE_BENCHMARK
+static void FixtureDeleteSelf(void *argument) {
+  (void)argument;
+  vTaskDelete(NULL);
+  for (;;) __NOP();
+}
+#endif
 
 /* 软件置 pending 的两个真实 IRQ：EXTI1 优先级更高，可抢占 EXTI0。 */
 void EXTI1_IRQHandler(void) {
@@ -125,10 +139,32 @@ void EXTI0_IRQHandler(void) {
 #endif
 }
 static void SaveOracle(uint32_t phase) {
+#if FIXTURE_BENCHMARK
+  /* API 返回到断点之间不能让 SysTick 改变任务列表，否则比较的是两个时刻。 */
+  uint32_t savedMask = __get_PRIMASK();
+  __disable_irq();
+#endif
   fixtureState.oracleCount = uxTaskGetSystemState(
     fixtureTaskOracle, 20, (uint32_t *)&fixtureState.oracleTotal);
+#if FIXTURE_BENCHMARK
+  /* uxTaskGetSystemState 扫到当前任务后仍会调用其他内核函数，
+   * 返回前重新用独立内核 API 取自身水位，避免把采样时差当成解码错误。 */
+  for (uint32_t index = 0; index < fixtureState.oracleCount; ++index) {
+    if (fixtureTaskOracle[index].xHandle == xTaskGetCurrentTaskHandle())
+      fixtureTaskOracle[index].usStackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+  }
+#endif
   fixtureState.phase = phase;
+#if FIXTURE_BENCHMARK
+  FixtureSnapshotCheckpoint();
+  __set_PRIMASK(savedMask);
+#endif
 }
+#if FIXTURE_BENCHMARK
+static void WaitForPhase(uint32_t phase) {
+  while (fixturePhaseCommand < phase) vTaskDelay(1);
+}
+#endif
 #if FIXTURE_MODE
 static void SendDescription(void) {
   SEGGER_SYSVIEW_SendSysDesc("N=Orbit stage0,D=STM32H723VG,O=FreeRTOS");
@@ -159,14 +195,26 @@ static void Coordinator(void *argument) {
 #endif
   vTaskDelay(20);
   SaveOracle(1); /* 初始任务及对象均存在。 */
+#if FIXTURE_BENCHMARK
+  WaitForPhase(2);
+#endif
   configASSERT(xSemaphoreGive(fixtureMutex) == pdTRUE);
   configASSERT(xSemaphoreGiveRecursive(fixtureRecursive) == pdTRUE);
   configASSERT(xSemaphoreGiveRecursive(fixtureRecursive) == pdTRUE);
   vTaskSuspend(fixtureTasks[0]);
   vTaskDelete(fixtureTasks[1]);
   ++fixtureState.deleted;
+#if FIXTURE_BENCHMARK
+  /* 删除别的任务会立即回收；高优先级任务自行退出，才留下真实 termination 节点。 */
+  configASSERT(xTaskCreate(FixtureDeleteSelf, "selfDelete", 128, NULL, 4, NULL) == pdPASS);
+  ++fixtureState.created;
+  ++fixtureState.deleted;
+#endif
   NVIC_SetPendingIRQ(EXTI0_IRQn);
   SaveOracle(2); /* suspended 与等待 idle 回收的 termination 场景。 */
+#if FIXTURE_BENCHMARK
+  WaitForPhase(3);
+#endif
   vTaskDelay(20);
   configASSERT(xTaskCreate(Worker, "recreated", 256, (void *)7, 1, &fixtureTasks[1]) == pdPASS);
   ++fixtureState.created;
@@ -182,6 +230,10 @@ static void Coordinator(void *argument) {
   #endif
 #endif
   for (;;) {
+#if FIXTURE_BENCHMARK
+    if (fixtureOracleRequest) { fixtureOracleRequest = 0; SaveOracle(3); }
+    SEGGER_RTT_WriteString(0, "orbit-rtos-stage1\n");
+#endif
 #if FIXTURE_MODE == 1
     /* Continuous 持续运行，由标准 Down Stop 命令停止，而非定时自行停止。 */
     if (!SEGGER_SYSVIEW_IsStarted() && !fixtureCapture.frozen) FreezeCapture();

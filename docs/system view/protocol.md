@@ -51,6 +51,22 @@ type Field<T> = {
 
 栈扫描按需、分片执行，不将当前 SP 差值当作历史峰值。CPU 使用内核计数差分，说明 ISR 计入当前任务、当前运行段未结算等口径；不用低频采样命中次数替代 CPU%。回绕与启动重置分别处理，不跨身份不确定区间计算差分。
 
+阶段 1 实现补充：运行态列表在两次探针读取之间变化时，整帧仍为 partial；可以返回本次重新读取且通过自身 owner/container 校验的 TCB 字段，任务的 listEvidence 为 validated-tcb。完整链表解析的任务为 traversed。候选地址缓存只帮助定位，不复用旧字段，也不把 partial 升级为一致快照。
+
+任务创建编号、时基、内核总计数和两次采集均可核对时，可对这些独立校验的运行态计数做 best effort 差分。runtime.readWindowMs 给出两帧采集窗口之和；百分比是采样的已结算计数比例，不能当作同一瞬间的精确 CPU 负载。短读、地址/身份不明、预算失败、复位、控制或会话代次变化不建立区间。该行为的实测与限制见 [阶段 1 验收](stage1-validation.md)。
+
+### 2.1 阶段 1 内部接入
+
+Provider 通过精确的 vscode.DebugSession.customRequest('orbitRtosSnapshot', ...) 请求当前 DAP owner；这是扩展内部协议，没有新增 Automation API/MCP 入口或 package 命令。action 支持 refresh（默认）、start、stop、cancel、status、capabilities；Live 默认 500 ms、可选 200～10000 ms。相同会话重叠刷新合并，只有一个在途请求，不排队积累定时 tick。start/stop/cancel、控制及会话代次变化会作废旧请求，stop 也取消在途轮询。
+
+结果 sessionId 为该 DAP adapter 的唯一身份，不根据窗口活动顺序选择；sessionGeneration 区分 adapter 内 launch，bootGeneration 标识显式重启/烧录，operationGeneration 标识控制和刷新取消。字段缺失及错误布局不退回固定偏移，不开启第二个 owner。阶段 5.5 再映射到公开 Automation 会话契约。
+
+轻量刷新不扫描栈；taskAddresses/maxBytesPerTask 显式请求水位。launch 的 rtosSnapshotPort 可提供已核对来源的栈方向、填充值、统计频率与睡眠口径；缺省时相关列不可用。RAM 范围来自已注册目标描述，未注册的目标返回 UnsupportedCapability。
+
+单次内存片上限为 256 bytes / 4 段 / 1024 bytes；RMLink 使用更小的 128 bytes / 1 段，每次无线应答后释放 DAP gate 与 NativeScheduler。每轮还受 128 KiB、1024 批、256 节点和 5 s 总预算约束。queueWaitMs 累计成功取得 DAP gate 的排队时间；ioMs 包含 owner/服务/传输及失败等待，不冒充纯 SWD 总线用时。原生/服务内部排队未单独细分。
+
+5 s 是切片间检查的协作预算；已经发出的 owner 调用沿用其传输超时，不声明能够抢占无线包。当前 bootGeneration 验证覆盖显式 Restart/烧录，不据此声明板端自主复位检测能力。
+
 后续对象还须携带 kind、地址、发现方式（registry/global/list）和字段可用性；候选持有/等待关系附证据及快照一致性，不据单帧运行态结果宣称死锁。
 
 ## 3. Trace 生命周期与缺口

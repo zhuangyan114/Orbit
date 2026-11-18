@@ -388,6 +388,27 @@
                 "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback; an already connected Native owner never hot-switches",
                 "default": "auto"
               },
+              "rtosSnapshotPort": {
+                "type": "object",
+                "description": "FreeRTOS 栈与运行统计条件。填写已核对的 port 来源；缺省时相关列保持不可用。",
+                "required": ["source"],
+                "additionalProperties": false,
+                "properties": {
+                  "source": { "type": "string", "minLength": 1 },
+                  "stackGrowth": { "type": "string", "enum": ["down", "up"] },
+                  "stackFillByte": { "type": "integer", "minimum": 0, "maximum": 255 },
+                  "runtime": {
+                    "type": "object",
+                    "required": ["source", "frequencyHz", "countsDuringSleep"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "source": { "type": "string", "minLength": 1 },
+                      "frequencyHz": { "type": "number", "exclusiveMinimum": 0, "maximum": 10000000000 },
+                      "countsDuringSleep": { "type": "boolean" }
+                    }
+                  }
+                }
+              },
               "rmlinkDeviceId": {
                 "type": "string",
                 "description": "RMLink 的 12 位设备 ID。probe=rmlink 时可省略，由连接服务选择唯一在线且已配对的设备。",

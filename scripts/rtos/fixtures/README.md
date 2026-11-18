@@ -2,6 +2,8 @@
 
 本目录提供可重建的 Cortex-M ELF 和独立 SystemView 字节样本，不实现 Orbit 快照/Trace 引擎。所有脚本均离线运行：没有探针发现、网络访问、烧录、目标控制或目标内存写入。
 
+阶段 1 增加独立的 snapshot-benchmark 构建目标，仍不自动连接或烧录。它复用固定内核，增加 RTT 文本、受控任务阶段、自删除任务及独立内核 API 对照；细节和显式硬件运行方法见 [阶段 1 验收](../../../docs/system%20view/stage1-validation.md)。原有阶段 0 变体仍由原配置生成，63 个 vendor 文件未修改。
+
 ## 构建与检查
 
 在 Orbit 根目录执行，输出默认写到被 Git 忽略的 out/rtos-stage0/fixtures：

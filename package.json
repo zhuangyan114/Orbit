@@ -34,6 +34,7 @@
     "onStartupFinished",
     "onView:ozoneTimeline",
     "onView:ozoneWatch",
+    "onView:ozoneRtos",
     "onDebugResolve:orbit",
     "onDebugResolve:ozone"
   ],
@@ -98,6 +99,11 @@
           "id": "ozone-timeline-panel",
           "title": "TIMELINE",
           "icon": "resources/orbit-view.svg"
+        },
+        {
+          "id": "ozone-rtos-panel",
+          "title": "RTOS",
+          "icon": "resources/orbit-view.svg"
         }
       ]
     },
@@ -114,6 +120,13 @@
           "type": "webview",
           "id": "ozoneTimeline",
           "name": "TIMELINE"
+        }
+      ],
+      "ozone-rtos-panel": [
+        {
+          "type": "webview",
+          "id": "ozoneRtos",
+          "name": "RTOS"
         }
       ]
     },

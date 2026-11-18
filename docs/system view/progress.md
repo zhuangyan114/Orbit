@@ -74,3 +74,14 @@
 - 证据：stage1-validation.md、stage1-performance-gates.json、stage1-evidence.json；本地 out/rtos-stage1 下保留原始命令/响应、DAP trace、失败与各轮数据。测试固件保留在板上，测试会话/owner 已释放。
 - 剩余事项：阶段 2.1 底部任务面板；其后对象、Trace、其他探针实板和长稳均按原计划实施。RMLink 当前 PC 断点继续的既有限制及脚本修正已登记，未写入 bug-fix-log；20 ms 暂停态优化目标未达到，实际无线门槛和统计可信范围已明确。
 - 提交：接入 RTOS 阶段 1.4：完成安全刷新与会话隔离；hash 用 git log 查询本记录所在提交。
+
+## 2.1 / 2026-11-18
+
+- 状态：已完成（L1/L3/L4 与 VSIX 打包验收通过）。
+- 实现：package.json 注册底部容器 ozone-rtos-panel（标题 RTOS）与视图 ozoneRtos（onView:ozoneRtos）；esbuild.config.js 新增 dist/rtos.js 构建入口；src/webview/rtos/rtos-view-state.ts、rtos-provider.ts、app.tsx、main.tsx 与 src/extension.ts 实现任务快照表格、逐行列表证据与 CPU 窗口说明、手动/Live 轮询、按需栈扫描、缺符号/无 DWARF 空态诊断、精确 DebugSession 路由及 workspaceState 视图设置持久化；scripts/rtos/verify-stage2-vscode.js 与 vscode-stage2-driver.js 提供真实 VS Code 自动化验收。
+- 设计变更：面板使用 retainContextWhenHidden=true，并在隐藏或视图销毁时暂停后台 Live 轮询（不终止调试会话），视图重建或重新显示时从宿主状态与 workspaceState 恢复；在 ExtensionMode.Test 下仅向测试驱动暴露 rtosProvider 与 extensionContext。
+- 检查：npm run typecheck、npm run build 通过；聚焦 Vitest 7 文件 56 项通过；scripts/rtos/verify-stage2-vscode.js 在真实 VS Code 中通过打开、隐藏、移动重建（readyCount 1→3）、亮暗主题切换（Default Light Modern / Default Dark Modern）、会话切换（ctrlA→ctrlB）、DwarfUnavailable 空态与设置持久化；vsce 打包的 out/rtos-stage2/orbit-stage2.1.vsix 内已确认包含 extension/dist/rtos.js。
+- 硬件：未执行；真实 VS Code 验收使用隔离测试实例与内联 mock DAP 适配器，不连接或改变物理目标。
+- 证据：src/webview/rtos/*.test.ts、scripts/rtos/verify-stage2-vscode.js、out/rtos-stage2/vscode-ui/report.json、out/rtos-stage2/orbit-stage2.1.vsix。
+- 剩余事项：2.2 增加 Queue、Mutex、Semaphore 与等待关系。
+- 提交：实现 RTOS 阶段 2.1：增加底部任务快照面板；hash 用 git log 查询本记录所在提交。

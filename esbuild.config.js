@@ -59,6 +59,13 @@ const watchConfig = {
 };
 
 /** @type {esbuild.BuildOptions} */
+const rtosConfig = {
+  ...watchConfig,
+  entryPoints: [path.resolve('src/webview/rtos/main.tsx')],
+  outfile: path.resolve('dist/rtos.js'),
+};
+
+/** @type {esbuild.BuildOptions} */
 const symbolPickerConfig = {
   ...watchConfig,
   entryPoints: [path.resolve('src/webview/symbol-picker/main.tsx')],
@@ -86,12 +93,13 @@ async function build() {
       const daCtx = await esbuild.context(debugAdapterConfig);
       const tlCtx = await esbuild.context(timelineConfig);
       const wCtx = await esbuild.context(watchConfig);
+      const rtosCtx = await esbuild.context(rtosConfig);
       const spCtx = await esbuild.context(symbolPickerConfig);
-      await Promise.all([extCtx.watch(), webviewCtx.watch(), daCtx.watch(), tlCtx.watch(), wCtx.watch(), spCtx.watch()]);
-      console.log('[watch] extension + webview + debugadapter + timeline + watch + symbol-picker — waiting for changes...');
+      await Promise.all([extCtx.watch(), webviewCtx.watch(), daCtx.watch(), tlCtx.watch(), wCtx.watch(), rtosCtx.watch(), spCtx.watch()]);
+      console.log('[watch] extension + webview + debugadapter + timeline + watch + rtos + symbol-picker — waiting for changes...');
     } else {
-      await Promise.all([esbuild.build(extConfig), esbuild.build(webviewConfig), esbuild.build(debugAdapterConfig), esbuild.build(timelineConfig), esbuild.build(watchConfig), esbuild.build(symbolPickerConfig)]);
-      console.log('[build] extension + webview + debugadapter + timeline + watch + symbol-picker — done');
+      await Promise.all([esbuild.build(extConfig), esbuild.build(webviewConfig), esbuild.build(debugAdapterConfig), esbuild.build(timelineConfig), esbuild.build(watchConfig), esbuild.build(rtosConfig), esbuild.build(symbolPickerConfig)]);
+      console.log('[build] extension + webview + debugadapter + timeline + watch + rtos + symbol-picker — done');
     }
   } catch (err) {
     console.error(err);

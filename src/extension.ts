@@ -3,6 +3,7 @@ import { OzoneBackend } from './ozone-backend/commander';
 import { WatchProvider } from './debug-providers/watch-provider';
 import { WatchWebviewProvider } from './debug-providers/watch-webview-provider';
 import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
+import { RtosWebviewProvider } from './webview/rtos/rtos-provider';
 import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { SvdBackgroundDownloader } from './debug/svd-background-downloader';
@@ -32,6 +33,7 @@ let watchProvider: WatchProvider;
 let watchWebviewProvider: WatchWebviewProvider;
 let dataSamplingManager: DataSamplingManager;
 let timelineProvider: TimelineWebviewProvider;
+let rtosProvider: RtosWebviewProvider;
 let watchPollTimer: NodeJS.Timeout | null = null;
 let watchPollGeneration = 0;
 let activeWatchSession: vscode.DebugSession | null = null;
@@ -160,6 +162,7 @@ export async function activate(context: vscode.ExtensionContext) {
     };
     const tl = new TimelineWebviewProvider(context, dsm, isUsableWatchSession, symbolPicker);
     timelineProvider = tl;
+    rtosProvider = new RtosWebviewProvider(context);
 
     // Bounded automation event ring and the exact DebugSession registry with
     // the instance-level generation fence (plan Task 3). The ring pulls its
@@ -300,8 +303,12 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(svdDownloads);
 
     context.subscriptions.push(
+      rtosProvider,
       vscode.window.registerWebviewViewProvider('ozoneWatch', wvp),
       vscode.window.registerWebviewViewProvider('ozoneTimeline', timelineProvider, {
+        webviewOptions: { retainContextWhenHidden: true },
+      }),
+      vscode.window.registerWebviewViewProvider('ozoneRtos', rtosProvider, {
         webviewOptions: { retainContextWhenHidden: true },
       }),
       vscode.debug.registerDebugConfigurationProvider(
@@ -502,6 +509,9 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     if (activeWatchSession) startWatchPolling();
+    if (context.extensionMode === vscode.ExtensionMode.Test) {
+      return { rtosProvider, extensionContext: context };
+    }
   } catch (e: any) {
     console.error('[Orbit] activate FAILED:', e.message);
     console.error('[Orbit] stack:', e.stack);
@@ -679,4 +689,5 @@ export async function deactivate() {
   sessionRegistry?.dispose();
   eventHub?.dispose();
   await timelineProvider?.dispose();
+  rtosProvider?.dispose();
 }

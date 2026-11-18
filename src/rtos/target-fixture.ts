@@ -36,4 +36,3 @@ export function syntheticTarget() {
     signal: controller.signal, read: async (address, size) => bytes.subarray(address, address + size) };
   return { layout, bytes, u32, tasks, setList, controller, request };
 }
-

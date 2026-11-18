@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { known, unknown, type TaskSnapshot } from '../../rtos/model';
+import { known, unknown, type SyncObjectSnapshot, type TaskSnapshot } from '../../rtos/model';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   describeConsistency,
   describeDiagnosticIssue,
   filterAndSortTasks,
+  filterSyncObjects,
+  objectKindLabel,
   sanitizeRtosViewSettings,
   stackUsedBytes,
   stackUsedRatio,
@@ -60,23 +62,91 @@ describe('RTOS view state helpers', () => {
     expect(parsed).toEqual({
       version: 1,
       activePage: 'trace',
+      tasksSubTab: 'tasks',
       liveEnabled: true,
       liveIntervalMs: 200,
+      includeObjectsInLive: false,
       sortBy: 'cpu',
       sortDir: 'desc',
       stateFilter: 'blocked',
       searchQuery: 'motor',
+      objectKindFilter: 'all',
+      objectSearchQuery: '',
       selectedTaskAddress: 0x20002000,
+      selectedObjectAddress: null,
       maxStackScanBytes: 16384,
       showDiagnostics: true,
     });
 
+    const withObjectFields = sanitizeRtosViewSettings({
+      tasksSubTab: 'objects',
+      includeObjectsInLive: true,
+      objectKindFilter: 'mutex',
+      objectSearchQuery: 'bus',
+      selectedObjectAddress: 0x20004000,
+    });
+    expect(withObjectFields.tasksSubTab).toBe('objects');
+    expect(withObjectFields.includeObjectsInLive).toBe(true);
+    expect(withObjectFields.objectKindFilter).toBe('mutex');
+    expect(withObjectFields.objectSearchQuery).toBe('bus');
+    expect(withObjectFields.selectedObjectAddress).toBe(0x20004000);
+
     expect(sanitizeRtosViewSettings({
       activePage: 'invalid',
+      tasksSubTab: 'bogus',
       liveIntervalMs: Number.NaN,
       selectedTaskAddress: -5,
+      selectedObjectAddress: 0,
+      objectKindFilter: 'unknown-kind',
       sortBy: 'bogus',
     })).toEqual(DEFAULT_RTOS_VIEW_SETTINGS);
+  });
+
+  it('filters sync objects by kind, issue status, symbol, name, address and holder', () => {
+    const baseObj = (over: Partial<SyncObjectSnapshot> & { address: number }): SyncObjectSnapshot => ({
+      address: over.address,
+      kind: over.kind ?? 'queue',
+      kindSource: 'ucQueueType',
+      name: over.name ?? known('qCmd', 'xQueueRegistry', 'text'),
+      symbolName: over.symbolName,
+      discoverySources: over.discoverySources ?? ['registry'],
+      discoveryNote: 'registry',
+      health: over.health ?? 'valid',
+      healthReason: over.healthReason,
+      queueNumber: known(1, 'Queue_t', 'count'),
+      messagesWaiting: known(1, 'Queue_t', 'count'),
+      length: known(4, 'Queue_t', 'count'),
+      itemSize: known(16, 'Queue_t', 'bytes'),
+      staticallyAllocated: known(false, 'Queue_t', 'boolean'),
+      rxLock: known(-1, 'Queue_t', 'count'),
+      txLock: known(-1, 'Queue_t', 'count'),
+      holder: over.holder,
+      waitingToReceiveCount: known(0, 'Queue_t', 'count'),
+      waitingToSendCount: known(0, 'Queue_t', 'count'),
+      waitListEvidence: over.waitListEvidence ?? 'traversed',
+    });
+    const queue = baseObj({ address: 0x20004100, kind: 'queue', name: known('cmdQueue', 'reg', 'text') });
+    const mutex = baseObj({
+      address: 0x20004200,
+      kind: 'recursive-mutex',
+      name: unknown('unregistered', 'obj', 'text'),
+      symbolName: 'spiLock',
+      holder: {
+        address: 0x20001000,
+        taskName: 'motorTask',
+        recursiveCallCount: known(2, 'Queue_t', 'count'),
+        confidence: 'halted-verified',
+        evidence: 'verified',
+      },
+    });
+    const badSem = baseObj({ address: 0x20004300, kind: 'counting-semaphore', health: 'deleting-or-corrupt', waitListEvidence: 'corrupt' });
+
+    expect(objectKindLabel('recursive-mutex')).toBe('Recursive Mutex');
+    expect(filterSyncObjects([queue, mutex, badSem], 'mutex', '').map(o => o.address)).toEqual([0x20004200]);
+    expect(filterSyncObjects([queue, mutex, badSem], 'semaphore', '').map(o => o.address)).toEqual([0x20004300]);
+    expect(filterSyncObjects([queue, mutex, badSem], 'issues', '').map(o => o.address)).toEqual([0x20004300]);
+    expect(filterSyncObjects([queue, mutex, badSem], 'all', 'motortask').map(o => o.address)).toEqual([0x20004200]);
+    expect(filterSyncObjects([queue, mutex, badSem], 'all', '20004100').map(o => o.address)).toEqual([0x20004100]);
   });
 
   it('filters by state or text and sorts safely when optional fields are unavailable', () => {

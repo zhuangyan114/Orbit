@@ -62,7 +62,26 @@ describe('DAP RTOS snapshot ownership and fences', () => {
   it('does not read while unavailable and validates options before target access', async () => {
     const { session, backend, messages, request } = setup();
     await request(1, { action: 'other' }); expect(backend.execute).not.toHaveBeenCalled();
-    (session as any).phase = 'terminating'; await request(2);
-    expect(messages.find(message => message.request_seq === 2)?.success).toBe(false);
+    await request(2, { action: 'refresh', objectAddresses: ['bad'] }); expect(backend.execute).not.toHaveBeenCalled();
+    expect(messages.find(message => message.request_seq === 2)?.body).toMatchObject({
+      consistency: 'unavailable',
+      errorCode: 'InvalidAddress',
+    });
+    (session as any).phase = 'terminating'; await request(3);
+    expect(messages.find(message => message.request_seq === 3)?.success).toBe(false);
+  });
+  it('includes object summary on request and forwards valid objectAddresses', async () => {
+    const { session, messages, request } = setup();
+    await request(1, { action: 'refresh', includeObjects: true, includeWaitDetails: true, objectAddresses: [0x24005000] });
+    const body = messages.find(message => message.request_seq === 1)?.body;
+    expect(body).toMatchObject({
+      consistency: 'halted-consistent',
+      objects: {
+        registryCount: 0,
+        globalCount: 0,
+        listDiscoveredCount: 0,
+        objects: [],
+      },
+    });
   });
 });

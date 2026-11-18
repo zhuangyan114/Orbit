@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { TaskSnapshot } from '../../rtos/model';
+import { ObjectsView } from './objects-view';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   describeConsistency,
@@ -7,8 +8,10 @@ import {
   filterAndSortTasks,
   formatFieldValue,
   formatHex32,
+  objectKindLabel,
   RtosPanelState,
   RtosSubPage,
+  RtosTasksSubTab,
   RtosTaskSortKey,
   RtosTaskStateFilter,
   RtosViewSettings,
@@ -131,6 +134,8 @@ export function RtosApp() {
 
   const snapshot = panel.snapshot;
   const tasks = snapshot?.tasks ?? [];
+  const objectsSummary = snapshot?.objects;
+  const objectsCount = objectsSummary?.objects.length ?? 0;
   const displayedTasks = useMemo(
     () => (panel.visible ? filterAndSortTasks(tasks, settings) : []),
     [panel.visible, tasks, settings.stateFilter, settings.searchQuery, settings.sortBy, settings.sortDir],
@@ -139,6 +144,20 @@ export function RtosApp() {
   const selectedTask = useMemo(
     () => (settings.selectedTaskAddress !== null ? tasks.find(task => task.tcbAddress === settings.selectedTaskAddress) ?? null : null),
     [tasks, settings.selectedTaskAddress],
+  );
+
+  const selectedTaskWaits = useMemo(
+    () => (selectedTask && objectsSummary
+      ? objectsSummary.waitEdges.filter(edge => edge.taskAddress === selectedTask.tcbAddress)
+      : []),
+    [selectedTask, objectsSummary],
+  );
+
+  const selectedTaskHolds = useMemo(
+    () => (selectedTask && objectsSummary
+      ? objectsSummary.objects.filter(obj => obj.holder?.address === selectedTask.tcbAddress)
+      : []),
+    [selectedTask, objectsSummary],
   );
 
   const consistencyMeta = snapshot ? describeConsistency(snapshot.consistency) : null;
@@ -152,6 +171,7 @@ export function RtosApp() {
 
   const canQueryTarget = panel.session.phase === 'connected' || panel.session.phase === 'starting';
   const canScanStacks = !!panel.capabilities?.capabilities.stackWatermark.available && tasks.length > 0 && !panel.loading.stackScan;
+  const canInspectObjects = canQueryTarget && !panel.loading.capabilities && (panel.capabilities?.capabilities.objects?.available ?? true);
   const caps = panel.capabilities?.capabilities;
 
   return (
@@ -233,6 +253,15 @@ export function RtosApp() {
             <span>Live{panel.liveActive ? ' ●' : ''}</span>
           </label>
 
+          <label className="rtos-live-toggle" title="Live 轮询时同步读取队列、互斥锁与信号量（会增加每轮总线读取量）">
+            <input
+              type="checkbox"
+              checked={settings.includeObjectsInLive}
+              onChange={event => updateSettings({ includeObjectsInLive: event.target.checked })}
+            />
+            <span>Live含对象</span>
+          </label>
+
           <select
             aria-label="Live 刷新周期"
             className="rtos-select"
@@ -275,6 +304,7 @@ export function RtosApp() {
               <CapabilityChip label="栈水位" cap={caps.stackWatermark} />
               <CapabilityChip label="运行计数" cap={caps.runtimeCounters} />
               <CapabilityChip label="CPU%" cap={caps.runtimePercent} />
+              {caps.objects && <CapabilityChip label="队列与锁" cap={caps.objects} />}
             </div>
           )}
           <div className="rtos-timing">
@@ -340,8 +370,43 @@ export function RtosApp() {
             </button>
           </div>
         ) : (
-          <div className="rtos-workspace">
-            <div className="rtos-table-pane">
+          <div className="rtos-subview-shell">
+            <div className="rtos-sub-bar" role="tablist" aria-label="Tasks & Objects 子页签">
+              {([
+                ['tasks', `任务 (${tasks.length})`],
+                ['objects', `队列与锁 (${objectsCount})`],
+              ] as [RtosTasksSubTab, string][]).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={settings.tasksSubTab === id}
+                  className={`rtos-chip${settings.tasksSubTab === id ? ' active' : ''}`}
+                  onClick={() => updateSettings({ tasksSubTab: id })}
+                >
+                  {label}
+                </button>
+              ))}
+              {objectsSummary?.waitCycles.length ? (
+                <span className="rtos-pill rtos-tone-warn" title="检测到候选互斥等待环">
+                  ⚠ 候选等待环 {objectsSummary.waitCycles.length}
+                </span>
+              ) : null}
+            </div>
+
+            {settings.tasksSubTab === 'objects' ? (
+              <ObjectsView
+                summary={objectsSummary}
+                settings={settings}
+                canInspect={canInspectObjects}
+                refreshing={panel.loading.refresh}
+                onUpdateSettings={updateSettings}
+                onInspectObject={address => vscodeApi.postMessage(address ? { command: 'inspectObject', address } : { command: 'inspectObject', all: true })}
+                onSelectTask={taskAddress => updateSettings({ tasksSubTab: 'tasks', selectedTaskAddress: taskAddress })}
+              />
+            ) : (
+              <div className="rtos-workspace">
+                <div className="rtos-table-pane">
               {/* 筛选栏 */}
               <div className="rtos-filter-bar">
                 <input
@@ -545,6 +610,37 @@ export function RtosApp() {
                   {selectedTask.runtime.percent.available && (
                     <DetailItem label="统计口径" value={selectedTask.runtime.percent.source} />
                   )}
+                  {(selectedTaskHolds.length > 0 || selectedTaskWaits.length > 0) && (
+                    <div className="rtos-detail-item">
+                      <span className="rtos-detail-label">对象等待 / 持有</span>
+                      <span className="rtos-detail-value">
+                        {selectedTaskHolds.map(obj => (
+                          <div key={`hold-${obj.address}`} className="rtos-waiter-row">
+                            <span>持有 {objectKindLabel(obj.kind)}:</span>
+                            <button
+                              type="button"
+                              className="rtos-link-btn"
+                              onClick={() => updateSettings({ tasksSubTab: 'objects', selectedObjectAddress: obj.address })}
+                            >
+                              {obj.name.available ? obj.name.value : (obj.symbolName || formatHex32(obj.address))}
+                            </button>
+                          </div>
+                        ))}
+                        {selectedTaskWaits.map((edge, idx) => (
+                          <div key={`wait-${edge.objectAddress}-${idx}`} className="rtos-waiter-row">
+                            <span>等待 ({edge.direction === 'receive' ? '获取' : '发送'}):</span>
+                            <button
+                              type="button"
+                              className="rtos-link-btn"
+                              onClick={() => updateSettings({ tasksSubTab: 'objects', selectedObjectAddress: edge.objectAddress })}
+                            >
+                              {edge.objectName || formatHex32(edge.objectAddress)}
+                            </button>
+                          </div>
+                        ))}
+                      </span>
+                    </div>
+                  )}
                 </div>
                 {caps?.stackWatermark.available && (
                   <button
@@ -557,6 +653,8 @@ export function RtosApp() {
                   </button>
                 )}
               </aside>
+            )}
+              </div>
             )}
           </div>
         )}
@@ -723,4 +821,14 @@ const STYLES = `
 .rtos-empty-error h3 { color:var(--vscode-errorForeground, #f48771); }
 .rtos-diagnostics { border-top:1px solid var(--vscode-panel-border); padding:8px 10px; font-size:11px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); max-height:140px; overflow:auto; flex-shrink:0; }
 .rtos-diag-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:4px 12px; }
+.rtos-subview-shell { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+.rtos-sub-bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:5px 10px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); flex-shrink:0; }
+.rtos-coverage-bar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-descriptionForeground); flex-shrink:0; }
+.rtos-cycle-banner { padding:6px 10px; border-bottom:1px solid var(--vscode-charts-yellow, #cca700); background:color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 12%, transparent); font-size:11px; flex-shrink:0; display:flex; flex-direction:column; gap:4px; }
+.rtos-cycle-item { display:flex; flex-direction:column; gap:2px; }
+.rtos-unresolved-bar { padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; color:var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground)); flex-shrink:0; }
+.rtos-source-chips { display:flex; flex-wrap:wrap; gap:4px; }
+.rtos-link-btn { border:0; padding:0; background:transparent; color:var(--vscode-textLink-foreground, #3794ff); cursor:pointer; font:inherit; text-decoration:underline; }
+.rtos-link-btn:hover { color:var(--vscode-textLink-activeForeground, #4fc1ff); }
+.rtos-waiter-row { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
 `;

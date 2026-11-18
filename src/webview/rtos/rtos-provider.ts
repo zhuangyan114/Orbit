@@ -285,9 +285,11 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     if (!session || !this.isCurrentBinding(generation, session) || !this.isVisible) return;
     if (this.capabilities && !this.capabilities.capabilities.taskSnapshot.available) return;
     try {
+      const includeObjects = this.settings.includeObjectsInLive;
       const response = await session.customRequest('orbitRtosSnapshot', {
         action: 'start',
         intervalMs: this.settings.liveIntervalMs,
+        ...(includeObjects ? { includeObjects: true, includeWaitDetails: this.settings.tasksSubTab === 'objects' } : {}),
       });
       if (!this.isCurrentBinding(generation, session) || !this.settings.liveEnabled || !this.isVisible) {
         void session.customRequest('orbitRtosSnapshot', { action: 'stop' }).then(undefined, () => {});
@@ -329,6 +331,9 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     generation?: number;
     taskAddresses?: number[];
     maxBytesPerTask?: number;
+    includeObjects?: boolean;
+    includeWaitDetails?: boolean;
+    objectAddresses?: number[];
     retryOnCoalescedScan?: boolean;
   } = {}): Promise<void> {
     const generation = options.generation ?? this.sessionGeneration;
@@ -340,15 +345,24 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     }
 
     const isStackScan = Array.isArray(options.taskAddresses) && options.taskAddresses.length > 0;
+    const isObjectDetail = Array.isArray(options.objectAddresses) && options.objectAddresses.length > 0;
+    const includeObjects = options.includeObjects ?? true;
+    const includeWaitDetails = options.includeWaitDetails ?? (this.settings.tasksSubTab === 'objects' || isObjectDetail);
     this.loading.refresh = true;
     if (isStackScan) this.loading.stackScan = true;
     this.postState();
 
     try {
-      const args: Record<string, unknown> = { action: 'refresh' };
+      const args: Record<string, unknown> = {
+        action: 'refresh',
+        ...(includeObjects ? { includeObjects: true, includeWaitDetails } : {}),
+      };
       if (isStackScan) {
         args.taskAddresses = options.taskAddresses;
         args.maxBytesPerTask = options.maxBytesPerTask ?? this.settings.maxStackScanBytes;
+      }
+      if (isObjectDetail) {
+        args.objectAddresses = options.objectAddresses;
       }
       const response = await session.customRequest('orbitRtosSnapshot', args);
       if (!this.isCurrentBinding(generation, session)) return;
@@ -358,18 +372,19 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           return;
         }
         this.applySnapshot(response as RtosSnapshot, generation);
-        // An explicit on-demand stack scan may coalesce onto an already in-flight
-        // lightweight Live refresh. Re-issue once if requested tasks still show 'Not requested'.
-        if (isStackScan && options.retryOnCoalescedScan !== false && Array.isArray(response.tasks)) {
-          const stillUnrequested = (response.tasks as RtosSnapshot['tasks']).some(task =>
+        // An explicit on-demand stack scan or object detail request may coalesce
+        // onto an already in-flight lightweight Live refresh. Re-issue once if needed.
+        const coalescedStack = isStackScan && Array.isArray(response.tasks)
+          && (response.tasks as RtosSnapshot['tasks']).some(task =>
             options.taskAddresses!.includes(task.tcbAddress)
             && !task.stack.watermarkBytes.available
             && task.stack.watermarkBytes.reason === 'Not requested');
-          if (stillUnrequested) {
-            await new Promise(resolve => setTimeout(resolve, 25));
-            if (this.isCurrentBinding(generation, session)) {
-              await this.refreshSnapshot({ ...options, generation, retryOnCoalescedScan: false });
-            }
+        const coalescedObject = isObjectDetail && (!response.objects
+          || response.objects.objects.some((obj: any) => options.objectAddresses!.includes(obj.address) && obj.waitListEvidence === 'summary-only'));
+        if ((coalescedStack || coalescedObject) && options.retryOnCoalescedScan !== false) {
+          await new Promise(resolve => setTimeout(resolve, 25));
+          if (this.isCurrentBinding(generation, session)) {
+            await this.refreshSnapshot({ ...options, generation, retryOnCoalescedScan: false });
           }
         }
       }
@@ -452,8 +467,17 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
             ? msg.taskAddresses.filter((address: unknown): address is number => typeof address === 'number' && Number.isSafeInteger(address) && address > 0)
             : [];
         if (addresses.length > 0) {
-          await this.refreshSnapshot({ taskAddresses: addresses, maxBytesPerTask: this.settings.maxStackScanBytes });
+          await this.refreshSnapshot({ taskAddresses: addresses, maxBytesPerTask: this.settings.maxStackScanBytes, includeObjects: false });
         }
+        break;
+      }
+      case 'inspectObject': {
+        const addresses = msg.all
+          ? undefined
+          : Array.isArray(msg.objectAddresses)
+            ? msg.objectAddresses.filter((address: unknown): address is number => typeof address === 'number' && Number.isSafeInteger(address) && address > 0)
+            : (typeof msg.address === 'number' && Number.isSafeInteger(msg.address) && msg.address > 0 ? [msg.address] : undefined);
+        await this.refreshSnapshot({ includeObjects: true, includeWaitDetails: true, ...(addresses?.length ? { objectAddresses: addresses } : {}) });
         break;
       }
       case 'setLive': {
@@ -470,9 +494,17 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       }
       case 'updateSettings': {
         const previousInterval = this.settings.liveIntervalMs;
+        const previousIncludeObjects = this.settings.includeObjectsInLive;
+        const previousSubTab = this.settings.tasksSubTab;
         await this.updateSettings(msg.settings);
-        if (this.liveActive && this.settings.liveEnabled && this.settings.liveIntervalMs !== previousInterval && this.activeSession && this.isVisible) {
+        if (this.liveActive && this.settings.liveEnabled && this.activeSession && this.isVisible
+          && (this.settings.liveIntervalMs !== previousInterval
+            || this.settings.includeObjectsInLive !== previousIncludeObjects
+            || (this.settings.includeObjectsInLive && this.settings.tasksSubTab !== previousSubTab))) {
           await this.startLiveOnSession(this.sessionGeneration);
+        } else if (this.settings.tasksSubTab === 'objects' && previousSubTab !== 'objects' && this.activeSession && this.isVisible
+          && (!this.snapshot?.objects || this.snapshot.objects.objects.every(o => o.waitListEvidence === 'summary-only'))) {
+          await this.refreshSnapshot({ includeObjects: true, includeWaitDetails: true });
         }
         break;
       }

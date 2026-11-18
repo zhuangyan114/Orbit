@@ -246,6 +246,7 @@ export class DapSession extends EventEmitter {
   private rtosOperationGeneration = 0;
   private rtosPort?: PortContract;
   private rtosSnapshots?: RtosSnapshotService;
+  private rtosRodataCache?: { sha256: string; segments: Array<{ address: number; bytes: Uint8Array }> };
   private targetReadInProgress = false;
   private lowPriorityReadBlockedUntil = 0;
   private pendingForegroundTargetReads = 0;
@@ -1811,17 +1812,29 @@ export class DapSession extends EventEmitter {
       if (!this.targetConnectionEstablished || this.phase !== 'connected' || !this._loadedFirmware) throw new RtosError('SessionChanged', 'No connected session with ELF metadata');
       if (args.taskAddresses !== undefined && (!Array.isArray(args.taskAddresses) || args.taskAddresses.length > 256
         || args.taskAddresses.some((address: unknown) => !Number.isSafeInteger(address) || Number(address) <= 0))) throw new RtosError('InvalidAddress', 'Invalid stack task addresses');
+      if (args.objectAddresses !== undefined && (!Array.isArray(args.objectAddresses) || args.objectAddresses.length > 256
+        || args.objectAddresses.some((address: unknown) => !Number.isSafeInteger(address) || Number(address) <= 0))) throw new RtosError('InvalidAddress', 'Invalid object addresses');
       if (args.maxBytesPerTask !== undefined && (!Number.isSafeInteger(args.maxBytesPerTask) || args.maxBytesPerTask <= 0)) throw new RtosError('BudgetExceeded', 'Invalid stack scan budget');
       if (args.intervalMs !== undefined && (!Number.isFinite(args.intervalMs) || args.intervalMs < 200 || args.intervalMs > 10000)) throw new RtosError('InvalidConfiguration', 'Refresh interval must be 200..10000 ms');
       if (!this.rtosSnapshots) this.rtosSnapshots = this.createRtosSnapshotService();
       if (args.action === 'capabilities') return this.sendResponse(msg, await this.rtosSnapshots.capabilities());
       if (args.action === 'start') {
         this.rtosOperationGeneration++;
-        this.rtosSnapshots.start(snapshot => this.sendEvent('orbitRtosSnapshot', snapshot), args.intervalMs);
+        this.rtosSnapshots.start(
+          snapshot => this.sendEvent('orbitRtosSnapshot', snapshot),
+          args.intervalMs,
+          { includeObjects: Boolean(args.includeObjects), includeWaitDetails: args.includeWaitDetails !== false },
+        );
         return this.sendResponse(msg, { started: true, intervalMs: args.intervalMs ?? 500 });
       }
       refreshEntered = true;
-      const snapshot = await this.rtosSnapshots.refresh({ taskAddresses: args.taskAddresses, maxBytesPerTask: args.maxBytesPerTask });
+      const snapshot = await this.rtosSnapshots.refresh({
+        taskAddresses: args.taskAddresses,
+        maxBytesPerTask: args.maxBytesPerTask,
+        includeObjects: Boolean(args.includeObjects),
+        includeWaitDetails: args.includeWaitDetails !== false,
+        objectAddresses: args.objectAddresses,
+      });
       this.sendResponse(msg, snapshot);
     } catch (error) {
       const errorCode = error instanceof RtosError ? error.errorCode : 'MemoryReadFailed';
@@ -1878,7 +1891,31 @@ export class DapSession extends EventEmitter {
           return { bytes: Uint8Array.from((result.data as MemoryBlock).data), queueWaitMs };
         } finally { this.endTargetRead(); }
       },
+      readRodata: (address, maxBytes) => this.readRtosRodata(address, maxBytes),
     });
+  }
+
+  private readRtosRodata(address: number, maxBytes: number): Uint8Array | undefined {
+    const fw = this._loadedFirmware;
+    if (!fw?.path || !fw.sha256) return undefined;
+    if (!this.rtosRodataCache || this.rtosRodataCache.sha256 !== fw.sha256) {
+      try {
+        const raw = fs.readFileSync(fw.path);
+        const segments = parseElf32LoadSegments(raw)
+          .filter(seg => (seg.flags & 2) === 0 && seg.fileSize > 0)
+          .map(seg => ({ address: seg.address, bytes: seg.bytes }));
+        this.rtosRodataCache = { sha256: fw.sha256, segments };
+      } catch {
+        this.rtosRodataCache = { sha256: fw.sha256, segments: [] };
+      }
+    }
+    for (const seg of this.rtosRodataCache.segments) {
+      if (address >= seg.address && address < seg.address + seg.bytes.length) {
+        const offset = address - seg.address;
+        return seg.bytes.subarray(offset, offset + Math.min(maxBytes, seg.bytes.length - offset));
+      }
+    }
+    return undefined;
   }
 
   private async handleRtosInfo(msg: DebugProtocolMessage) {

@@ -104,6 +104,7 @@ class MockRtosDebugAdapter {
               stackWatermark: ok,
               runtimeCounters: ok,
               runtimePercent: ok,
+              objects: ok,
             },
           });
         }
@@ -111,6 +112,8 @@ class MockRtosDebugAdapter {
           return this.sendResponse(msg, { started: true, intervalMs: msg.arguments?.intervalMs ?? 500 });
         }
         this.snapshotSeq++;
+        const includeObjects = msg.arguments?.includeObjects !== false;
+        const traversedObject = Boolean(msg.arguments?.includeWaitDetails);
         return this.sendResponse(msg, {
           version: 1,
           sessionId: `mock-${this.mode}`,
@@ -158,6 +161,47 @@ class MockRtosDebugAdapter {
           }],
           runtimeTotal: { available: true, value: '2900', source: 'ulTotalRunTime', unit: 'counter-ticks' },
           runtimeTotalBits: { available: true, value: 32, source: 'DWARF', unit: 'bits' },
+          ...(includeObjects ? {
+            objects: {
+              registryCapacity: 12,
+              registryCount: 1,
+              globalCount: 1,
+              listDiscoveredCount: 0,
+              coverageNote: '已检查 xQueueRegistry(12 槽位) 与全局队列句柄',
+              objects: [{
+                address: 0x20005000,
+                kind: 'recursive-mutex',
+                kindSource: 'Queue_t.ucQueueType=4 (queueQUEUE_TYPE_RECURSIVE_MUTEX)',
+                name: { available: true, value: 'busLock', source: 'xQueueRegistry[0].pcQueueName (ELF .rodata)', unit: 'text' },
+                symbolName: 'gBusMutex',
+                discoverySources: ['registry', 'global'],
+                discoveryNote: 'xQueueRegistry[0]; global gBusMutex',
+                health: 'valid',
+                queueNumber: { available: true, value: 1, source: 'Queue_t.uxQueueNumber', unit: 'count' },
+                messagesWaiting: { available: true, value: 0, source: 'Queue_t.uxMessagesWaiting', unit: 'count' },
+                length: { available: true, value: 1, source: 'Queue_t.uxLength', unit: 'count' },
+                itemSize: { available: true, value: 0, source: 'Queue_t.uxItemSize', unit: 'bytes' },
+                staticallyAllocated: { available: true, value: true, source: 'Queue_t.ucStaticallyAllocated', unit: 'boolean' },
+                rxLock: { available: true, value: -1, source: 'Queue_t.cRxLock', unit: 'count' },
+                txLock: { available: true, value: -1, source: 'Queue_t.cTxLock', unit: 'count' },
+                holder: {
+                  address: 0x20001000,
+                  taskName: this.mode === 'freertos-a' ? 'ctrlA' : 'ctrlB',
+                  creationNumber: '1',
+                  recursiveCallCount: { available: true, value: 2, source: 'Queue_t.u.xSemaphore.uxRecursiveCallCount', unit: 'count' },
+                  confidence: 'halted-verified',
+                  evidence: 'xMutexHolder=0x20001000 verified in task snapshot',
+                },
+                waitingToReceiveCount: { available: true, value: 0, source: 'Queue_t.xTasksWaitingToReceive.uxNumberOfItems', unit: 'count' },
+                waitingToSendCount: { available: true, value: 0, source: 'Queue_t.xTasksWaitingToSend.uxNumberOfItems', unit: 'count' },
+                ...(traversedObject ? { waitingToReceive: [], waitingToSend: [] } : {}),
+                waitListEvidence: traversedObject ? 'traversed' : 'summary-only',
+              }],
+              waitEdges: [],
+              waitCycles: [],
+              unresolvedWaits: [],
+            },
+          } : {}),
           issues: [],
           diagnostics: { bytes: 256, batches: 2, rounds: 2, nodes: 1, coveredLists: ['ready[2]'], queueWaitMs: 0, ioMs: 5, parseMs: 1, totalMs: 8 },
         });
@@ -271,16 +315,20 @@ exports.run = async function run() {
       await vscode.commands.executeCommand('ozoneRtos.focus');
       await waitFor(() => provider.readyCount > movedReadyCount && provider.isVisible, 10000, 'RTOS webview recreated in Panel');
 
-      // 7. Persist settings via provider message handler and verify re-instantiated provider restores from real workspaceState.
+      // 7. Persist settings & verify Objects sub-tab + on-demand object inspection in real VS Code host.
       await provider.handleMessage({
         command: 'updateSettings',
-        settings: { sortBy: 'cpu', sortDir: 'desc', stateFilter: 'ready', liveIntervalMs: 200, activePage: 'tasks' },
+        settings: { sortBy: 'cpu', sortDir: 'desc', stateFilter: 'ready', liveIntervalMs: 200, activePage: 'tasks', tasksSubTab: 'objects' },
       });
+      await waitFor(() => provider.currentState.snapshot?.objects?.objects?.[0]?.waitListEvidence === 'traversed', 10000, 'objects wait details auto-loaded on subtab switch');
+      await provider.handleMessage({ command: 'inspectObject', address: 0x20005000 });
       const stored = extensionContext.workspaceState.get('orbitRtosViewSettings');
       assert.equal(stored?.sortBy, 'cpu');
       assert.equal(stored?.sortDir, 'desc');
       assert.equal(stored?.stateFilter, 'ready');
       assert.equal(stored?.liveIntervalMs, 200);
+      assert.equal(stored?.tasksSubTab, 'objects');
+      assert.equal(provider.currentState.snapshot?.objects?.objects?.[0]?.name?.value, 'busLock');
 
       // Terminate remaining mock session cleanly.
       if (sessionFreeRtosB) await vscode.debug.stopDebugging(sessionFreeRtosB);
@@ -295,6 +343,7 @@ exports.run = async function run() {
       recreatedReadyCount: provider.readyCount,
       emptyErrorCode: 'DwarfUnavailable',
       switchedTasks: ['ctrlA', 'ctrlB'],
+      objectsVerified: ['busLock'],
       themesTested: ['Default Light Modern', 'Default Dark Modern'],
       hideShowRecreateVerified: true,
       persistedSettings: provider.currentSettings,

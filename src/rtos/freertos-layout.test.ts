@@ -37,6 +37,71 @@ describe('FreeRTOS layout compiler', () => {
     expect(cache.get(c, 'a')).toBe(a);
     expect(cache.get(c, 'b').layoutId).not.toBe(a.layoutId);
   });
+
+  it('compiles QueueDefinition from registry, globals or concrete struct and degrades queue-only ambiguity without failing task layout', () => {
+    const withQueue = testCatalog();
+    withQueue.types.i8 = { name: 'int8_t', kind: 'base', byteSize: 1 };
+    withQueue.types.u8 = { name: 'uint8_t', kind: 'base', byteSize: 1 };
+    withQueue.types.charPtr = { name: '', kind: 'pointer', byteSize: 4, typeOffset: 'char' };
+    withQueue.types.semStruct = { name: '', kind: 'struct', byteSize: 8, fields: [
+      { name: 'xMutexHolder', byteOffset: 0, typeOffset: 'taskPtr' },
+      { name: 'uxRecursiveCallCount', byteOffset: 4, typeOffset: 'u32' },
+    ] };
+    withQueue.types.queueUnion = { name: '', kind: 'union', byteSize: 8, fields: [
+      { name: 'xSemaphore', byteOffset: 0, typeOffset: 'semStruct' },
+    ] };
+    withQueue.types.queueDef = { name: 'QueueDefinition', kind: 'struct', byteSize: 96, fields: [
+      { name: 'pcHead', byteOffset: 0, typeOffset: 'charPtr' },
+      { name: 'u', byteOffset: 8, typeOffset: 'queueUnion' },
+      { name: 'xTasksWaitingToSend', byteOffset: 16, typeOffset: 'list' },
+      { name: 'xTasksWaitingToReceive', byteOffset: 48, typeOffset: 'list' },
+      { name: 'uxMessagesWaiting', byteOffset: 80, typeOffset: 'u32' },
+      { name: 'uxLength', byteOffset: 84, typeOffset: 'u32' },
+      { name: 'uxItemSize', byteOffset: 88, typeOffset: 'u32' },
+      { name: 'cRxLock', byteOffset: 92, typeOffset: 'i8' },
+      { name: 'cTxLock', byteOffset: 93, typeOffset: 'i8' },
+      { name: 'ucQueueType', byteOffset: 94, typeOffset: 'u8' },
+    ] };
+    withQueue.types.queuePtr = { name: '', kind: 'pointer', byteSize: 4, typeOffset: 'queueDef' };
+    withQueue.types.regEntry = { name: 'xQUEUE_REGISTRY_ITEM', kind: 'struct', byteSize: 8, fields: [
+      { name: 'pcQueueName', byteOffset: 0, typeOffset: 'charPtr' },
+      { name: 'xHandle', byteOffset: 4, typeOffset: 'queuePtr' },
+    ] };
+    withQueue.types.regArr = { name: '', kind: 'array', byteSize: 32, arrayCount: 4, typeOffset: 'regEntry' };
+    withQueue.roots.push(
+      { id: '90', expression: 'xQueueRegistry', address: 0x3000, typeOffset: 'regArr', size: 32, file: 'kernel/queue.c', pointerDepth: 0 },
+      { id: '91', expression: 'appQueue', address: 0x3040, typeOffset: 'queuePtr', size: 4, file: 'app/main.c', pointerDepth: 0 },
+    );
+
+    const layoutWithReg = compileFreeRtosLayout(withQueue, 'q1');
+    expect(layoutWithReg.queueRegistry).toMatchObject({ address: 0x3000, count: 4, entrySize: 8 });
+    expect(layoutWithReg.queue?.fields.xMutexHolder?.offset).toBe(8);
+    expect(layoutWithReg.queue?.fields.uxRecursiveCallCount?.offset).toBe(12);
+    expect(layoutWithReg.queueGlobals).toEqual([{ name: 'appQueue', address: 0x3040, isPointer: true }]);
+
+    // Fallback when configQUEUE_REGISTRY_SIZE == 0 (no xQueueRegistry symbol).
+    const noReg = structuredClone(withQueue);
+    noReg.roots = noReg.roots.filter(r => r.expression !== 'xQueueRegistry');
+    const layoutNoReg = compileFreeRtosLayout(noReg, 'q2');
+    expect(layoutNoReg.queueRegistry).toBeUndefined();
+    expect(layoutNoReg.queue?.fields.uxLength.offset).toBe(84);
+    expect(layoutNoReg.queueGlobals).toEqual([{ name: 'appQueue', address: 0x3040, isPointer: true }]);
+
+    // Multiple conflicting xQueueRegistry symbols must disable queues without breaking tasks.
+    const dupReg = structuredClone(withQueue);
+    dupReg.roots.push({ id: '92', expression: 'xQueueRegistry', address: 0x3100, typeOffset: 'regArr', size: 32, file: 'other.c', pointerDepth: 0 });
+    const degraded = compileFreeRtosLayout(dupReg, 'q3');
+    expect(degraded.tcb.fields.pcTaskName.offset).toBe(72);
+    expect(degraded.queue).toBeUndefined();
+    expect(degraded.queueUnavailableReason).toContain('xQueueRegistry');
+
+    // Conflicting concrete QueueDefinition DIEs must disable queues without breaking tasks.
+    const conflictingDef = structuredClone(noReg);
+    conflictingDef.types.queueDefAlt = { ...conflictingDef.types.queueDef, byteSize: 100 };
+    const degradedDef = compileFreeRtosLayout(conflictingDef, 'q4');
+    expect(degradedDef.queue).toBeUndefined();
+    expect(degradedDef.queueUnavailableReason).toContain('Conflicting QueueDefinition');
+  });
 });
 
 const fixtureRoot = process.env.ORBIT_RTOS_FIXTURES || 'out/rtos-stage0/fixtures/arm';
@@ -53,6 +118,10 @@ describe('fixed stage-0 ELF layouts (requires offline fixture build)', () => {
       expect(!!layout.tcb.fields.ulRunTimeCounter).toBe(variant !== 'native-no-stats');
       expect(!!layout.tcb.fields.pxEndOfStack).toBe(variant !== 'native-no-stack-bound');
       expect(layout.tcb.size).toBe(variant === 'native-no-stats' || variant === 'native-no-stack-bound' ? 96 : 100);
+      expect(layout.queue).toBeDefined();
+      expect(layout.queue?.fields.uxMessagesWaiting.size).toBe(4);
+      expect(layout.queue?.fields.ucQueueType).toBeDefined();
+      expect(layout.queueRegistry?.count).toBe(12);
     }, 30000);
   }
 });

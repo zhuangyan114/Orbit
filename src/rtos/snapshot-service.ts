@@ -1,6 +1,7 @@
 import type { SymbolCatalog } from '../symbols/symbol-catalog';
 import { FreeRtosLayoutCache } from './freertos-layout';
 import { Capability, RtosError, RtosSnapshot, SnapshotIdentity } from './model';
+import { ObjectReadOptions, readObjectSnapshot } from './object-reader';
 import { AddressRange, readTaskSnapshot, SnapshotLimits } from './snapshot-reader';
 import { addStackMetrics, PortContract, StackScanOptions, TaskRuntimeTracker } from './task-metrics';
 
@@ -14,8 +15,12 @@ export interface SnapshotHost {
   slice?: { blockBytes: number; ranges: number };
   read(address: number, size: number, signal: AbortSignal): Promise<{ bytes: Uint8Array; queueWaitMs: number }>;
   readMany?(ranges: AddressRange[], signal: AbortSignal): Promise<{ bytes: Uint8Array[]; queueWaitMs: number }>;
+  readRodata?(address: number, maxBytes: number): Uint8Array | undefined;
 }
-export interface SnapshotOptions extends StackScanOptions { limits?: Partial<SnapshotLimits>; }
+export interface SnapshotOptions extends StackScanOptions, Omit<ObjectReadOptions, 'readRodata'> {
+  limits?: Partial<SnapshotLimits>;
+  includeObjects?: boolean;
+}
 
 /** One in-flight refresh, no queued ticks, and a fence on every asynchronous boundary. */
 export class RtosSnapshotService {
@@ -48,6 +53,7 @@ export class RtosSnapshotService {
       stackWatermark: capability(bounds && this.host.port?.stackFillByte !== undefined, 'Stack bounds or verified fill pattern unavailable'),
       runtimeCounters: capability(!!layout.tcb.fields.ulRunTimeCounter, 'Kernel runtime statistics disabled or missing'),
       runtimePercent: capability(!!layout.runtimeTotal && !!layout.tcb.fields.ulRunTimeCounter && !!this.host.port?.runtime, 'Counter total or verified timebase unavailable'),
+      objects: capability(!!layout.queue && this.host.ram.length > 0, layout.queueUnavailableReason || 'RAM description unavailable'),
     } };
   }
   invalidate(reason: string) {
@@ -79,6 +85,32 @@ export class RtosSnapshotService {
         ...(this.host.readMany ? { readMany: async (ranges: AddressRange[]) => { fence(); const result = await this.host.readMany!(ranges, controller.signal); fence(); queueWaitMs += result.queueWaitMs; return result.bytes; } } : {}) });
       fence();
       await addStackMetrics(result, this.host.port, options); fence();
+      if (options.includeObjects || options.objectAddresses?.length) {
+        try {
+          result.snapshot.objects = await readObjectSnapshot(layout, result, {
+            includeWaitDetails: options.includeWaitDetails,
+            objectAddresses: options.objectAddresses,
+            readRodata: this.host.readRodata,
+          });
+        } catch (error) {
+          if (controller.signal.aborted || (error instanceof RtosError && ['SessionChanged', 'TargetReadCancelled'].includes(error.errorCode))) {
+            throw error;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          result.snapshot.issues.push({
+            errorCode: error instanceof RtosError ? error.errorCode : 'MemoryReadFailed',
+            operation: 'objectSnapshot',
+            message,
+            retryable: false,
+            completion: 'completed',
+          });
+          if (['halted-consistent', 'live-best-effort'].includes(result.snapshot.consistency)) {
+            result.snapshot.consistency = 'partial';
+            result.snapshot.reason = result.snapshot.reason || message;
+          }
+        }
+        fence();
+      }
       result.snapshot.completedAt = Date.now();
       result.snapshot.diagnostics.queueWaitMs = queueWaitMs;
       result.snapshot.diagnostics.ioMs = Math.max(0, result.snapshot.diagnostics.ioMs - queueWaitMs);
@@ -109,14 +141,14 @@ export class RtosSnapshotService {
       || this.last.bootGeneration !== identity.bootGeneration || this.last.elfSha256 !== identity.elfSha256) return;
     return { ...structuredClone(this.last), consistency: 'stale', reason };
   }
-  start(publish: (snapshot: RtosSnapshot) => void, intervalMs = 500) {
+  start(publish: (snapshot: RtosSnapshot) => void, intervalMs = 500, options: Pick<SnapshotOptions, 'includeObjects' | 'includeWaitDetails'> = {}) {
     this.stop();
     this.live = true;
     const interval = Math.max(200, Math.min(10000, Number.isFinite(intervalMs) ? intervalMs : 500)), generation = this.pollingGeneration;
     const tick = async () => {
       const started = Date.now();
       try {
-        const snapshot = await this.refresh();
+        const snapshot = await this.refresh(options);
         if (generation === this.pollingGeneration && !this.disposed) { this.counts.published++; publish(snapshot); }
       } catch { /* Busy/terminated polls do not create work or publish stale data. */ }
       if (generation === this.pollingGeneration && !this.disposed) this.timer = setTimeout(tick, Math.max(0, interval - (Date.now() - started)));

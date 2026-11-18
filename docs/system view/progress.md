@@ -84,4 +84,15 @@
 - 硬件：未执行；真实 VS Code 验收使用隔离测试实例与内联 mock DAP 适配器，不连接或改变物理目标。
 - 证据：src/webview/rtos/*.test.ts、scripts/rtos/verify-stage2-vscode.js、out/rtos-stage2/vscode-ui/report.json、out/rtos-stage2/orbit-stage2.1.vsix。
 - 剩余事项：2.2 增加 Queue、Mutex、Semaphore 与等待关系。
-- 提交：实现 RTOS 阶段 2.1：增加底部任务快照面板；hash 用 git log 查询本记录所在提交。
+- 提交：实现 RTOS 阶段 2.1：增加底部任务快照面板；hash 用 git log 查询本记录所在提交（54d8c3e）。
+
+## 2.2 / 2026-11-18
+
+- 状态：已完成（L1/L3/L4 自动化验收通过；硬件未执行）。
+- 实现：src/rtos/model.ts、src/rtos/freertos-layout.ts、src/rtos/object-reader.ts、src/rtos/snapshot-service.ts 与 src/debug/dap-session.ts 新增 Queue/Mutex/Recursive Mutex/Binary & Counting Semaphore DWARF 布局编译（支持 xQueueRegistry 启用及 configQUEUE_REGISTRY_SIZE=0 退化探测与全局句柄收集）、三来源发现（registry/global/list）与多源去重、ELF .rodata 只读段静态名称零总线解析、仅针对互斥锁提取持有者/递归计数、结构完整性与删除中/异常状态校验、EventGroup 等非队列等待列表归入 unresolvedWaits、暂停态一致/运行态尽力采集下的候选等待环提取（partial 状态抑制误报）及按需 wait-list 遍历；src/webview/rtos/objects-view.tsx、app.tsx、rtos-view-state.ts 与 rtos-provider.ts 新增 Tasks & Objects 子页签、Live 含对象开关、按需对象详情加载、持有者/等待者与任务面板双向跳转。
+- 设计变更：将 ELF 只读段（PT_LOAD flags&2===0，按 sha256 缓存）纳入 C 字符串只读解析并优先于 RAM 回退，避免为 Flash .rodata 中的静态 pcQueueName 发起无效 RAM 读；当 QueueDefinition/xQueueRegistry 仅在对象侧缺失或冲突时降级对象能力而不阻断任务快照。
+- 检查：npm run typecheck 与 npm run build 通过；聚焦 Vitest 8 文件 65 项通过（含 7 个含 DWARF 阶段 0 ELF 变体队列/Registry 布局编译、object-reader.test.ts、rtos-view-state.test.ts、rtos-provider.test.ts 与 dap-session-rtos-snapshot.test.ts）；scripts/rtos/verify-stage2-vscode.js 在真实 VS Code 中通过 Queue/Mutex 能力条、Objects 子页签切换、按需详情加载（busLock）与设置持久化验证。
+- 硬件：未执行；未针对队列/互斥锁/Semaphore 执行物理目标操作。
+- 证据：src/rtos/object-reader.test.ts、src/rtos/freertos-layout.test.ts、out/rtos-stage2/vscode-ui/report.json。
+- 剩余事项：2.3 增加 Software Timers 与 Heap 概览及统一刷新预算；2.4 清理旧 RTOS Views 专属集成。
+- 提交：实现 RTOS 阶段 2.2：增加队列锁与任务等待关系；hash 用 git log 查询本记录所在提交。

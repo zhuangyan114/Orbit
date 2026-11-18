@@ -1,8 +1,10 @@
-import type { Capability, Consistency, Field, RtosSnapshot, TaskSnapshot } from '../../rtos/model';
+import type { Capability, Consistency, Field, QueueObjectKind, RtosSnapshot, SyncObjectSnapshot, TaskSnapshot } from '../../rtos/model';
 
 export const RTOS_VIEW_SETTINGS_KEY = 'orbitRtosViewSettings';
 
 export type RtosSubPage = 'tasks' | 'trace' | 'contexts';
+export type RtosTasksSubTab = 'tasks' | 'objects';
+export type RtosObjectKindFilter = 'all' | 'queue' | 'mutex' | 'semaphore' | 'issues';
 export type RtosTaskSortKey = 'state' | 'priority' | 'name' | 'stack' | 'cpu' | 'address';
 export type RtosSortDirection = 'asc' | 'desc';
 export type RtosTaskStateFilter = 'all' | TaskSnapshot['state'];
@@ -15,6 +17,7 @@ export interface RtosCapabilitiesMap {
   stackWatermark: Capability;
   runtimeCounters: Capability;
   runtimePercent: Capability;
+  objects?: Capability;
 }
 
 export interface RtosCapabilitiesPayload {
@@ -30,13 +33,18 @@ export interface RtosCapabilitiesPayload {
 export interface RtosViewSettings {
   version: 1;
   activePage: RtosSubPage;
+  tasksSubTab: RtosTasksSubTab;
   liveEnabled: boolean;
   liveIntervalMs: number;
+  includeObjectsInLive: boolean;
   sortBy: RtosTaskSortKey;
   sortDir: RtosSortDirection;
   stateFilter: RtosTaskStateFilter;
   searchQuery: string;
+  objectKindFilter: RtosObjectKindFilter;
+  objectSearchQuery: string;
   selectedTaskAddress: number | null;
+  selectedObjectAddress: number | null;
   maxStackScanBytes: number;
   showDiagnostics: boolean;
 }
@@ -44,13 +52,18 @@ export interface RtosViewSettings {
 export const DEFAULT_RTOS_VIEW_SETTINGS: RtosViewSettings = {
   version: 1,
   activePage: 'tasks',
+  tasksSubTab: 'tasks',
   liveEnabled: false,
   liveIntervalMs: 500,
+  includeObjectsInLive: false,
   sortBy: 'state',
   sortDir: 'asc',
   stateFilter: 'all',
   searchQuery: '',
+  objectKindFilter: 'all',
+  objectSearchQuery: '',
   selectedTaskAddress: null,
+  selectedObjectAddress: null,
   maxStackScanBytes: 4096,
   showDiagnostics: false,
 };
@@ -84,6 +97,8 @@ export interface RtosPanelState {
 }
 
 const VALID_PAGES = new Set<RtosSubPage>(['tasks', 'trace', 'contexts']);
+const VALID_SUB_TABS = new Set<RtosTasksSubTab>(['tasks', 'objects']);
+const VALID_OBJ_FILTERS = new Set<RtosObjectKindFilter>(['all', 'queue', 'mutex', 'semaphore', 'issues']);
 const VALID_SORT_KEYS = new Set<RtosTaskSortKey>(['state', 'priority', 'name', 'stack', 'cpu', 'address']);
 const VALID_STATES = new Set<RtosTaskStateFilter>(['all', 'running', 'ready', 'blocked', 'suspended', 'termination', 'unknown']);
 
@@ -102,29 +117,43 @@ export function clampMaxStackScanBytes(value: unknown): number {
 export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings = DEFAULT_RTOS_VIEW_SETTINGS): RtosViewSettings {
   const raw = input && typeof input === 'object' ? input as Record<string, unknown> : {};
   const activePage = VALID_PAGES.has(raw.activePage as RtosSubPage) ? raw.activePage as RtosSubPage : base.activePage;
+  const tasksSubTab = VALID_SUB_TABS.has(raw.tasksSubTab as RtosTasksSubTab) ? raw.tasksSubTab as RtosTasksSubTab : base.tasksSubTab;
   const sortBy = VALID_SORT_KEYS.has(raw.sortBy as RtosTaskSortKey) ? raw.sortBy as RtosTaskSortKey : base.sortBy;
   const sortDir: RtosSortDirection = raw.sortDir === 'desc' ? 'desc' : raw.sortDir === 'asc' ? 'asc' : base.sortDir;
   const stateFilter = VALID_STATES.has(raw.stateFilter as RtosTaskStateFilter) ? raw.stateFilter as RtosTaskStateFilter : base.stateFilter;
+  const objectKindFilter = VALID_OBJ_FILTERS.has(raw.objectKindFilter as RtosObjectKindFilter) ? raw.objectKindFilter as RtosObjectKindFilter : base.objectKindFilter;
   const liveEnabled = typeof raw.liveEnabled === 'boolean' ? raw.liveEnabled : base.liveEnabled;
   const liveIntervalMs = raw.liveIntervalMs !== undefined ? clampLiveIntervalMs(raw.liveIntervalMs) : base.liveIntervalMs;
+  const includeObjectsInLive = typeof raw.includeObjectsInLive === 'boolean' ? raw.includeObjectsInLive : base.includeObjectsInLive;
   const searchQuery = typeof raw.searchQuery === 'string' ? raw.searchQuery.slice(0, 128) : base.searchQuery;
+  const objectSearchQuery = typeof raw.objectSearchQuery === 'string' ? raw.objectSearchQuery.slice(0, 128) : base.objectSearchQuery;
   const selectedTaskAddress = raw.selectedTaskAddress === null
     ? null
     : typeof raw.selectedTaskAddress === 'number' && Number.isSafeInteger(raw.selectedTaskAddress) && raw.selectedTaskAddress > 0
       ? raw.selectedTaskAddress
       : base.selectedTaskAddress;
+  const selectedObjectAddress = raw.selectedObjectAddress === null
+    ? null
+    : typeof raw.selectedObjectAddress === 'number' && Number.isSafeInteger(raw.selectedObjectAddress) && raw.selectedObjectAddress > 0
+      ? raw.selectedObjectAddress
+      : base.selectedObjectAddress;
   const maxStackScanBytes = raw.maxStackScanBytes !== undefined ? clampMaxStackScanBytes(raw.maxStackScanBytes) : base.maxStackScanBytes;
   const showDiagnostics = typeof raw.showDiagnostics === 'boolean' ? raw.showDiagnostics : base.showDiagnostics;
   return {
     version: 1,
     activePage,
+    tasksSubTab,
     liveEnabled,
     liveIntervalMs,
+    includeObjectsInLive,
     sortBy,
     sortDir,
     stateFilter,
     searchQuery,
+    objectKindFilter,
+    objectSearchQuery,
     selectedTaskAddress,
+    selectedObjectAddress,
     maxStackScanBytes,
     showDiagnostics,
   };
@@ -268,4 +297,37 @@ export function describeDiagnosticIssue(error: RtosErrorSummary | null): { title
         hints: [error.message],
       };
   }
+}
+
+export function objectKindLabel(kind: QueueObjectKind): string {
+  switch (kind) {
+    case 'queue': return 'Queue';
+    case 'mutex': return 'Mutex';
+    case 'recursive-mutex': return 'Recursive Mutex';
+    case 'binary-semaphore': return 'Binary Sem';
+    case 'counting-semaphore': return 'Counting Sem';
+    case 'queue-set': return 'Queue Set';
+    default: return 'Unknown';
+  }
+}
+
+export function filterSyncObjects(
+  objects: readonly SyncObjectSnapshot[],
+  kindFilter: RtosObjectKindFilter,
+  query: string,
+): SyncObjectSnapshot[] {
+  const needle = query.trim().toLowerCase();
+  return objects.filter(obj => {
+    if (kindFilter === 'queue' && obj.kind !== 'queue' && obj.kind !== 'queue-set') return false;
+    if (kindFilter === 'mutex' && obj.kind !== 'mutex' && obj.kind !== 'recursive-mutex') return false;
+    if (kindFilter === 'semaphore' && obj.kind !== 'binary-semaphore' && obj.kind !== 'counting-semaphore') return false;
+    if (kindFilter === 'issues' && obj.health === 'valid' && obj.waitListEvidence !== 'corrupt') return false;
+    if (!needle) return true;
+    const name = obj.name.available ? obj.name.value.toLowerCase() : '';
+    const sym = (obj.symbolName || '').toLowerCase();
+    const hex = `0x${obj.address.toString(16)}`;
+    const holder = obj.holder?.taskName?.toLowerCase() || '';
+    const kind = objectKindLabel(obj.kind).toLowerCase();
+    return name.includes(needle) || sym.includes(needle) || hex.includes(needle) || holder.includes(needle) || kind.includes(needle);
+  });
 }

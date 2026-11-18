@@ -341,4 +341,75 @@ describe('RtosWebviewProvider', () => {
     expect(provider.currentState.snapshot?.tasks[0].stack.watermarkBytes).toMatchObject({ available: true, value: 320 });
     provider.dispose();
   });
+
+  it('requests on-demand object wait details via inspectObject and passes includeObjectsInLive to Live start', async () => {
+    const inspected: any[] = [];
+    const session: any = {
+      id: 'obj-test',
+      name: 'Objects',
+      type: 'orbit',
+      configuration: { device: 'STM32H723VGT6' },
+      customRequest: vi.fn(async (_cmd: string, args: any) => {
+        if (args.action === 'capabilities') return makeCapabilities('rtos-obj');
+        if (args.action === 'start') return { started: true, intervalMs: args.intervalMs };
+        if (args.action === 'stop') return { stopped: true };
+        inspected.push(args);
+        const snap = makeSnapshot('rtos-obj', inspected.length);
+        snap.objects = {
+          registryCapacity: 8,
+          registryCount: 1,
+          globalCount: 0,
+          listDiscoveredCount: 0,
+          coverageNote: 'ok',
+          objects: [{
+            address: 0x20005000,
+            kind: 'mutex',
+            kindSource: 'ucQueueType=1',
+            name: { available: true, value: 'busLock', source: 'xQueueRegistry[0]', unit: 'text' },
+            discoverySources: ['registry'],
+            discoveryNote: 'xQueueRegistry[0]',
+            health: 'valid',
+            queueNumber: { available: true, value: 1, source: 'Queue_t', unit: 'count' },
+            messagesWaiting: { available: true, value: 0, source: 'Queue_t', unit: 'count' },
+            length: { available: true, value: 1, source: 'Queue_t', unit: 'count' },
+            itemSize: { available: true, value: 0, source: 'Queue_t', unit: 'bytes' },
+            staticallyAllocated: { available: true, value: false, source: 'Queue_t', unit: 'boolean' },
+            rxLock: { available: true, value: -1, source: 'Queue_t', unit: 'count' },
+            txLock: { available: true, value: -1, source: 'Queue_t', unit: 'count' },
+            waitingToReceiveCount: { available: true, value: 1, source: 'Queue_t', unit: 'count' },
+            waitingToSendCount: { available: true, value: 0, source: 'Queue_t', unit: 'count' },
+            waitListEvidence: args.objectAddresses ? 'traversed' : 'summary-only',
+          }],
+          waitEdges: [],
+          waitCycles: [],
+          unresolvedWaits: [],
+        };
+        return snap;
+      }),
+    };
+    const { provider } = createHarness();
+    const view = createFakeView();
+    provider.resolveWebviewView(view);
+    vscodeMock.emitActive(session);
+    await vi.waitFor(() => expect(provider.currentState.snapshot?.objects?.objects[0].waitListEvidence).toBe('summary-only'));
+
+    await (provider as any).handleMessage({ command: 'inspectObject', address: 0x20005000 });
+    expect(inspected.at(-1)).toMatchObject({
+      action: 'refresh',
+      includeObjects: true,
+      includeWaitDetails: true,
+      objectAddresses: [0x20005000],
+    });
+    expect(provider.currentState.snapshot?.objects?.objects[0].waitListEvidence).toBe('traversed');
+
+    await (provider as any).handleMessage({ command: 'updateSettings', settings: { includeObjectsInLive: true, tasksSubTab: 'objects' } });
+    await (provider as any).handleMessage({ command: 'setLive', enabled: true, intervalMs: 500 });
+    expect(session.customRequest).toHaveBeenCalledWith('orbitRtosSnapshot', expect.objectContaining({
+      action: 'start',
+      intervalMs: 500,
+      includeObjects: true,
+      includeWaitDetails: true,
+    }));
+    provider.dispose();
+  });
 });

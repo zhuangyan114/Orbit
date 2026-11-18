@@ -1,0 +1,51 @@
+/** RTOS snapshot v1. Unknown fields deliberately have no value. */
+export type Field<T> = { source: string; unit: string } &
+  ({ available: true; value: T } | { available: false; reason: string });
+export const known = <T>(value: T, source: string, unit: string): Field<T> => ({ available: true, value, source, unit });
+export const unknown = <T>(reason: string, source: string, unit: string): Field<T> => ({ available: false, reason, source, unit });
+export type Consistency = 'halted-consistent' | 'live-best-effort' | 'partial' | 'stale' | 'unavailable';
+export interface SnapshotIdentity {
+  sessionId: string;
+  sessionGeneration: number;
+  operationGeneration: number;
+  bootGeneration: number;
+  elfSha256: string;
+  layoutId: string;
+}
+export class RtosError extends Error {
+  constructor(public readonly errorCode: string, message: string) { super(message); }
+}
+export interface RtosIssue { errorCode: string; operation: string; message: string; retryable: boolean; completion: 'not-started' | 'completed' | 'unknown'; }
+export interface TaskSnapshot {
+  tcbAddress: number;
+  creationNumber: Field<string>;
+  identityCertain: boolean;
+  name: Field<string>;
+  state: 'running' | 'ready' | 'blocked' | 'suspended' | 'termination' | 'unknown';
+  lists: string[];
+  current: boolean;
+  priority: Field<number>;
+  basePriority: Field<number>;
+  stack: {
+    base: Field<number>; end: Field<number>; growthDirection: Field<'down' | 'up'>;
+    wordBytes: Field<number>; capacityBytes: Field<number>; watermarkBytes: Field<number>;
+    fillByte: Field<number>; scannedBytes: number; scanComplete: boolean; scanMs: number;
+  };
+  runtime: { counter: Field<string>; bits: Field<number>; percent: Field<number>; intervalMs: Field<number>; };
+}
+export interface SnapshotDiagnostics {
+  bytes: number; batches: number; rounds: number; nodes: number; coveredLists: string[];
+  queueWaitMs: number; ioMs: number; parseMs: number; totalMs: number;
+}
+export interface RtosSnapshot extends SnapshotIdentity {
+  version: 1;
+  snapshotSequence: number;
+  startedAt: number; completedAt: number;
+  targetState: 'Running' | 'Halted' | 'Unknown';
+  consistency: Consistency;
+  reason?: string;
+  kernel: { name: 'FreeRTOS'; version: Field<string>; source: string };
+  tasks: TaskSnapshot[];
+  issues: RtosIssue[];
+  diagnostics: SnapshotDiagnostics;
+}

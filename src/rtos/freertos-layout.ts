@@ -64,8 +64,12 @@ export interface FreeRtosHeapLayout {
   source: string;
   ucHeap?: { address: number; size: number };
   blockLinkSize?: number;
+  heapStructSize?: number;
+  blockLinkNext?: Member;
+  blockLinkSizeField?: Member;
   xStartAddress?: number;
   pxEnd?: { address: number; size: number };
+  blockAllocatedBit?: { address: number; size: number };
   freeBytesRemaining?: { address: number; size: number };
   minimumEverFreeBytesRemaining?: { address: number; size: number };
   successfulAllocations?: { address: number; size: number };
@@ -541,19 +545,25 @@ export function compileFreeRtosLayout(catalog: SymbolCatalog, elfSha256: string)
         fail('LayoutIncomplete', 'Invalid BlockLink_t layout in heap_4');
       }
       pointer(member(endPtr.typeOffset!, 'pxNextFreeBlock').typeOffset);
-      integer(member(endPtr.typeOffset!, 'xBlockSize'), 'BlockLink_t.xBlockSize');
+      const blockLinkNext = member(endPtr.typeOffset!, 'pxNextFreeBlock');
+      const blockLinkSizeField = integer(member(endPtr.typeOffset!, 'xBlockSize'), 'BlockLink_t.xBlockSize');
 
       const minEver = singleScalarRoot('xMinimumEverFreeBytesRemaining');
       const allocs = singleScalarRoot('xNumberOfSuccessfulAllocations');
       const frees = singleScalarRoot('xNumberOfSuccessfulFrees');
+      const blockAllocatedBit = singleScalarRoot('xBlockAllocatedBit');
       heap = {
         allocator: 'heap_4',
         supported: true,
         source: `DWARF:${freeInfo.node.file}`,
         ucHeap: { address: ucHeapNode.address!, size: ucHeapSize },
         blockLinkSize: blockLinkType.byteSize,
+        ...(blockLinkType.byteSize === 8 ? { heapStructSize: 8 } : {}),
+        blockLinkNext,
+        blockLinkSizeField,
         xStartAddress: startNode.address!,
         pxEnd: { address: endNode.address!, size: 4 },
+        ...(blockAllocatedBit ? { blockAllocatedBit: { address: blockAllocatedBit.address, size: blockAllocatedBit.size } } : {}),
         freeBytesRemaining: { address: freeInfo.address, size: freeInfo.size },
         ...(minEver ? { minimumEverFreeBytesRemaining: { address: minEver.address, size: minEver.size } } : {}),
         ...(allocs ? { successfulAllocations: { address: allocs.address, size: allocs.size } } : {}),

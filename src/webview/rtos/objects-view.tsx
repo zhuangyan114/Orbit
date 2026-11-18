@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import type { ObjectsDiscoverySummary, SyncObjectSnapshot, WaitEdge } from '../../rtos/model';
+import type { HeapBlockLifecycleStatus, ObjectLifecycleStatus, ObjectsDiscoverySummary, SyncObjectSnapshot, WaitEdge } from '../../rtos/model';
 import {
   filterSyncObjects,
   formatFieldValue,
@@ -27,6 +27,20 @@ const CONFIDENCE_LABELS: Record<string, string> = {
   'halted-verified': '暂停态已校验',
   'live-best-effort': '运行态尽力采集',
   'partial-unverified': '部分/未双端校验',
+};
+
+const LIFECYCLE_LABELS: Record<ObjectLifecycleStatus, string> = {
+  'confirmed-static': '已确认静态分配',
+  'confirmed-freed': '已确认释放',
+  unconfirmed: '身份未确认',
+};
+
+const HEAP_BLOCK_LABELS: Record<HeapBlockLifecycleStatus, string> = {
+  allocated: '块当前已分配',
+  freed: '块已释放',
+  'corrupt-header': '块头异常',
+  static: '静态存储',
+  unverified: '未校验',
 };
 
 export function ObjectsView({
@@ -243,12 +257,26 @@ export function ObjectsView({
                     </td>
                     <td>
                       {obj.health === 'valid' ? (
-                        <span className="rtos-muted" title={obj.healthReason || '结构校验正常'}>
-                          {obj.healthReason ? `提示: ${obj.healthReason}` : '正常'}
-                        </span>
+                        obj.lifecycle === 'confirmed-static' ? (
+                          <span className="rtos-muted" title={obj.healthReason || obj.lifecycleReason || '静态对象校验正常'}>
+                            {obj.healthReason ? `提示: ${obj.healthReason}` : '正常'}
+                          </span>
+                        ) : obj.heapBlock === 'allocated' ? (
+                          <span className="rtos-inline-warn" title={obj.lifecycleReason || obj.heapBlockReason || '堆块当前已分配，但对象身份未确认'}>
+                            未确认（块已分配）{obj.healthReason ? ` · ${obj.healthReason}` : ''}
+                          </span>
+                        ) : (
+                          <span className="rtos-inline-warn" title={obj.lifecycleReason || obj.healthReason || '仅完成结构校验，生命周期未确认'}>
+                            {obj.healthReason ? `生命周期未确认 (${obj.healthReason})` : '生命周期未确认'}
+                          </span>
+                        )
                       ) : (
-                        <span className="rtos-inline-warn" title={obj.healthReason}>
-                          {obj.health === 'deleting-or-corrupt' ? '删除中/异常' : '不完整'}: {obj.healthReason || '结构异常'}
+                        <span className="rtos-inline-warn" title={obj.healthReason || obj.lifecycleReason}>
+                          {obj.lifecycle === 'confirmed-freed'
+                            ? '已释放'
+                            : obj.health === 'deleting-or-corrupt'
+                              ? '删除中/异常'
+                              : '不完整'}: {obj.healthReason || obj.lifecycleReason || '结构异常'}
                         </span>
                       )}
                     </td>
@@ -314,6 +342,22 @@ function ObjectDetailPane({
         <div className="rtos-detail-item">
           <span className="rtos-detail-label">健康状态</span>
           <span className="rtos-detail-value">{obj.health}{obj.healthReason ? ` — ${obj.healthReason}` : ''}</span>
+        </div>
+        {obj.heapBlock && (
+          <div className="rtos-detail-item">
+            <span className="rtos-detail-label">堆块状态</span>
+            <span className="rtos-detail-value">
+              {HEAP_BLOCK_LABELS[obj.heapBlock]} ({obj.heapBlock})
+              {obj.heapBlockReason ? ` — ${obj.heapBlockReason}` : ''}
+            </span>
+          </div>
+        )}
+        <div className="rtos-detail-item">
+          <span className="rtos-detail-label">生命周期验证</span>
+          <span className="rtos-detail-value">
+            {obj.lifecycle ? `${LIFECYCLE_LABELS[obj.lifecycle]} (${obj.lifecycle})` : LIFECYCLE_LABELS.unconfirmed}
+            {obj.lifecycleReason ? ` — ${obj.lifecycleReason}` : ''}
+          </span>
         </div>
         <div className="rtos-detail-item">
           <span className="rtos-detail-label">锁定与分配</span>

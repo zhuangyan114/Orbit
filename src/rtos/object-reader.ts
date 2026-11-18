@@ -1,4 +1,5 @@
 import type { FreeRtosLayout, FreeRtosQueueLayout } from './freertos-layout';
+import { inspectHeapObjectLifecycles } from './heap-lifecycle';
 import {
   Field,
   known,
@@ -37,6 +38,7 @@ interface CandidateObject {
   registrySlot?: number;
   registryMissingName?: boolean;
   symbolName?: string;
+  symbolIsStatic?: boolean;
 }
 
 interface TraversedWaitList {
@@ -347,7 +349,7 @@ export async function readObjectSnapshot(
     });
   }
   for (const g of validGlobals.filter(item => !item.isPointer)) {
-    addCandidate(g.address, 'global', `static global ${g.name}`, { symbolName: g.name });
+    addCandidate(g.address, 'global', `static global ${g.name}`, { symbolName: g.name, symbolIsStatic: true });
   }
 
   // Filter valid RAM addresses vs dangling/corrupt handles.
@@ -453,7 +455,25 @@ export async function readObjectSnapshot(
     }
   }
 
-  // Step 3: Decode every discovered Queue_t, optionally traverse wait lists, and resolve edges.
+  // Step 3: Verify heap lifecycle where supported, decode every Queue_t, optionally traverse wait lists, and resolve edges.
+  const lifecycleInspection = await inspectHeapObjectLifecycles(
+    layout,
+    memory,
+    validAddresses.map(addr => {
+      const bytes = queueBytesMap.get(addr)!;
+      const cand = candidates.get(addr)!;
+      const staticVal = qLayout.fields.ucStaticallyAllocated
+        ? Number(scalar(bytes, qLayout.fields.ucStaticallyAllocated)) !== 0
+        : undefined;
+      return {
+        address: addr,
+        objectSize: qLayout.size,
+        ...(staticVal !== undefined ? { staticallyAllocated: staticVal } : {}),
+        ...(cand.symbolIsStatic ? { symbolIsStatic: true } : {}),
+      };
+    }),
+  );
+
   const tasksByAddr = new Map(snapshot.tasks.map(t => [t.tcbAddress, t]));
   const detailFilter = options.objectAddresses ? new Set(options.objectAddresses) : undefined;
   const shouldTraverseDetails = (addr: number) => detailFilter ? detailFilter.has(addr) : options.includeWaitDetails !== false;
@@ -481,8 +501,13 @@ export async function readObjectSnapshot(
     const recvCount = Number(scalar(recvListBytes, layout.list.count));
 
     const kindInfo = classifyQueueKind(qLayout, bytes);
+    const lifecycle = lifecycleInspection.verdicts.get(addr);
     let health: ObjectHealth = 'valid';
     const healthReasons: string[] = [];
+    if (lifecycle?.status === 'confirmed-freed' || lifecycle?.corruptBlockHeader) {
+      health = 'deleting-or-corrupt';
+      healthReasons.push(lifecycle.reason);
+    }
     if (length === 0 || messagesWaiting > length || rxLock < -1 || txLock < -1) {
       health = 'deleting-or-corrupt';
       healthReasons.push(`Invalid queue counters (uxLength=${length}, uxMessagesWaiting=${messagesWaiting}, rxLock=${rxLock}, txLock=${txLock})`);
@@ -512,7 +537,7 @@ export async function readObjectSnapshot(
 
     // Holder only applies to mutexes / recursive mutexes.
     let holder: SyncObjectHolder | undefined;
-    if (kindInfo.kind === 'mutex' || kindInfo.kind === 'recursive-mutex') {
+    if (health !== 'deleting-or-corrupt' && (kindInfo.kind === 'mutex' || kindInfo.kind === 'recursive-mutex')) {
       if (f.xMutexHolder) {
         const holderAddr = Number(scalar(bytes, f.xMutexHolder));
         const recField = f.uxRecursiveCallCount
@@ -609,6 +634,12 @@ export async function readObjectSnapshot(
       discoveryNote: cand.notes.join('; '),
       health,
       ...(healthReasons.length ? { healthReason: healthReasons.join('; ') } : {}),
+      ...(lifecycle ? {
+        lifecycle: lifecycle.status,
+        lifecycleReason: lifecycle.reason,
+        heapBlock: lifecycle.heapBlock,
+        heapBlockReason: lifecycle.heapBlockReason,
+      } : {}),
       queueNumber: f.uxQueueNumber ? known(Number(scalar(bytes, f.uxQueueNumber)), 'Queue_t.uxQueueNumber', 'count') : unknown('uxQueueNumber not in DWARF', 'Queue_t', 'count'),
       messagesWaiting: known(messagesWaiting, 'Queue_t.uxMessagesWaiting', 'count'),
       length: known(length, 'Queue_t.uxLength', 'count'),
@@ -632,14 +663,22 @@ export async function readObjectSnapshot(
   const globalCount = objects.filter(o => o.discoverySources.includes('global')).length;
   const listDiscoveredCount = objects.filter(o => o.discoverySources.includes('list')).length;
 
+  const lifecycleNote = validAddresses.length === 0
+    ? ''
+    : lifecycleInspection.allocator === 'heap_4'
+      ? (lifecycleInspection.walkComplete
+        ? '；已通过 heap_4 BlockLink_t 与空闲链表核对堆块状态（块已分配不代表队列身份已确认，同址重用对象仍标为未确认）。'
+        : `；heap_4 堆块状态核对未完整完成（${lifecycleInspection.diagnostic || '未确认'}）。`)
+      : `；当前堆 (${lifecycleInspection.allocator}) 仅完成结构校验，对象生命周期与堆块状态未确认。`;
+
   return {
     ...(layout.queueRegistry ? { registryCapacity: layout.queueRegistry.count } : {}),
     registryCount,
     globalCount,
     listDiscoveredCount,
-    coverageNote: layout.queueRegistry
-      ? `已检查 xQueueRegistry(${layout.queueRegistry.count} 槽位)、${layout.queueGlobals.length} 个全局队列句柄及阻塞任务等待链表；未注册且无全局/等待引用的堆队列不会显示。`
-      : `xQueueRegistry 未启用；仅通过 ${layout.queueGlobals.length} 个全局队列句柄与阻塞任务等待链表发现对象，未引用堆对象不会显示。`,
+    coverageNote: (layout.queueRegistry
+      ? `已检查 xQueueRegistry(${layout.queueRegistry.count} 槽位)、${layout.queueGlobals.length} 个全局队列句柄及阻塞任务等待链表；未注册且无全局/等待引用的堆队列不会显示`
+      : `xQueueRegistry 未启用；仅通过 ${layout.queueGlobals.length} 个全局队列句柄与阻塞任务等待链表发现对象，未引用堆对象不会显示`) + (lifecycleNote || '。'),
     objects,
     waitEdges,
     waitCycles,

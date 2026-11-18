@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { known, unknown, type SyncObjectSnapshot, type TaskSnapshot, type TimerSnapshot } from '../../rtos/model';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { known, unknown, type ObjectsDiscoverySummary, type SyncObjectSnapshot, type TaskSnapshot, type TimerSnapshot } from '../../rtos/model';
+import { ObjectsView } from './objects-view';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   describeConsistency,
@@ -296,5 +299,113 @@ describe('RTOS view state helpers', () => {
     expect(appSrc).toContain('.rtos-filter-bar { display:flex; flex-wrap:nowrap;');
     expect(appSrc).toContain('.rtos-coverage-bar { display:flex; flex-wrap:nowrap;');
     expect(appSrc).toContain('.rtos-diagnostics { border-top:1px solid var(--vscode-panel-border); padding:8px 10px; font-size:11px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); height:88px;');
+  });
+
+  it('renders lifecycle status labels accurately in ObjectsView without marking freed or unconfirmed objects as valid', () => {
+    const baseObj = (overrides: Partial<SyncObjectSnapshot> & { address: number }): SyncObjectSnapshot => ({
+      address: overrides.address,
+      kind: overrides.kind ?? 'queue',
+      kindSource: 'Queue_t.ucQueueType',
+      name: overrides.name ?? known('q', 'symbol', 'text'),
+      discoverySources: overrides.discoverySources ?? ['global'],
+      discoveryNote: 'test',
+      health: overrides.health ?? 'valid',
+      ...(overrides.healthReason ? { healthReason: overrides.healthReason } : {}),
+      ...(overrides.lifecycle ? { lifecycle: overrides.lifecycle } : {}),
+      ...(overrides.lifecycleReason ? { lifecycleReason: overrides.lifecycleReason } : {}),
+      ...(overrides.heapBlock ? { heapBlock: overrides.heapBlock } : {}),
+      ...(overrides.heapBlockReason ? { heapBlockReason: overrides.heapBlockReason } : {}),
+      queueNumber: known(1, 'Queue_t', 'count'),
+      messagesWaiting: known(0, 'Queue_t', 'count'),
+      length: known(4, 'Queue_t', 'count'),
+      itemSize: known(4, 'Queue_t', 'bytes'),
+      staticallyAllocated: known(false, 'Queue_t', 'boolean'),
+      rxLock: known(-1, 'Queue_t', 'count'),
+      txLock: known(-1, 'Queue_t', 'count'),
+      waitingToReceiveCount: known(0, 'Queue_t', 'count'),
+      waitingToSendCount: known(0, 'Queue_t', 'count'),
+      waitListEvidence: 'traversed',
+    });
+
+    const summary: ObjectsDiscoverySummary = {
+      registryCount: 1,
+      globalCount: 4,
+      listDiscoveredCount: 1,
+      coverageNote: 'test coverage',
+      objects: [
+        baseObj({
+          address: 0x20001000,
+          name: known('staticObj', 'sym', 'text'),
+          health: 'valid',
+          heapBlock: 'static',
+          heapBlockReason: 'StaticQueue_t',
+          lifecycle: 'confirmed-static',
+          lifecycleReason: 'StaticQueue_t confirmed',
+        }),
+        baseObj({
+          address: 0x20001400,
+          name: known('reusedOrDyn', 'sym', 'text'),
+          health: 'valid',
+          heapBlock: 'allocated',
+          heapBlockReason: 'heap_4 chunk allocated',
+          lifecycle: 'unconfirmed',
+          lifecycleReason: 'same-address reuse cannot be ruled out',
+        }),
+        baseObj({
+          address: 0x20002000,
+          name: known('freedGlobal', 'sym', 'text'),
+          health: 'deleting-or-corrupt',
+          heapBlock: 'freed',
+          heapBlockReason: 'freed in heap_4',
+          lifecycle: 'confirmed-freed',
+          healthReason: 'freed in heap_4',
+          lifecycleReason: 'freed in heap_4',
+        }),
+        baseObj({
+          address: 0x20003000,
+          name: known('heap2Global', 'sym', 'text'),
+          health: 'valid',
+          heapBlock: 'unverified',
+          heapBlockReason: 'heap_2 unverified',
+          lifecycle: 'unconfirmed',
+          lifecycleReason: 'heap_2 unverified',
+        }),
+      ],
+      waitEdges: [],
+      waitCycles: [],
+      unresolvedWaits: [],
+    };
+
+    expect(filterSyncObjects(summary.objects, 'issues', '').map(o => o.address)).toEqual([0x20002000]);
+
+    const htmlWithReusedSelected = renderToStaticMarkup(React.createElement(ObjectsView, {
+      summary,
+      settings: { ...DEFAULT_RTOS_VIEW_SETTINGS, selectedObjectAddress: 0x20001400 },
+      canInspect: true,
+      refreshing: false,
+      onUpdateSettings: () => {},
+      onInspectObject: () => {},
+      onSelectTask: () => {},
+    }));
+    expect(htmlWithReusedSelected).toContain('>正常<');
+    expect(htmlWithReusedSelected).toContain('未确认（块已分配）');
+    expect(htmlWithReusedSelected).toContain('已释放:');
+    expect(htmlWithReusedSelected).toContain('生命周期未确认');
+    expect(htmlWithReusedSelected).toContain('堆块状态');
+    expect(htmlWithReusedSelected).toContain('块当前已分配 (allocated)');
+    expect(htmlWithReusedSelected).toContain('生命周期验证');
+    expect(htmlWithReusedSelected).toContain('same-address reuse cannot be ruled out');
+
+    const htmlOnlyDynamic = renderToStaticMarkup(React.createElement(ObjectsView, {
+      summary: { ...summary, objects: [summary.objects[1]] },
+      settings: DEFAULT_RTOS_VIEW_SETTINGS,
+      canInspect: true,
+      refreshing: false,
+      onUpdateSettings: () => {},
+      onInspectObject: () => {},
+      onSelectTask: () => {},
+    }));
+    expect(htmlOnlyDynamic).not.toContain('>正常<');
+    expect(htmlOnlyDynamic).toContain('未确认（块已分配）');
   });
 });

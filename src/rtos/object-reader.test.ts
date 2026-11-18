@@ -397,3 +397,257 @@ describe('FreeRTOS queue/mutex/semaphore/wait-graph reader', () => {
     service.dispose();
   });
 });
+
+function setupHeap4QueueTarget(opts: { omitAllocBit?: boolean; targetState?: 'Halted' | 'Running' } = {}) {
+  const t = setupQueueTarget({ targetState: opts.targetState });
+  t.catalog.types.blockLink = {
+    name: 'A_BLOCK_LINK',
+    kind: 'struct',
+    byteSize: 8,
+    fields: [
+      { name: 'pxNextFreeBlock', byteOffset: 0, typeOffset: 'blockLinkPtr' },
+      { name: 'xBlockSize', byteOffset: 4, typeOffset: 'u32' },
+    ],
+  };
+  t.catalog.types.blockLinkPtr = { name: '', kind: 'pointer', byteSize: 4, typeOffset: 'blockLink' };
+  t.catalog.types.ucHeapArr = { name: '', kind: 'array', byteSize: 0x2000, arrayCount: 0x2000, typeOffset: 'u8' };
+
+  // Re-place ucHeap over [0x4000, 0x6000) and metadata at 0x3800..0x3820; static queue lives at 0x6400 outside ucHeap.
+  t.catalog.roots = t.catalog.roots.filter(r => r.expression !== 'gStaticSem');
+  t.catalog.roots.push(
+    { id: '92', expression: 'gStaticSem', address: 0x6400, typeOffset: 'staticQueue', size: 100, file: 'app/main.c', pointerDepth: 0 },
+    { id: '93', expression: 'ucHeap', address: 0x4004, typeOffset: 'ucHeapArr', size: 0x2000, file: 'heap_4.c', pointerDepth: 0 }, // Intentionally 4-aligned like Cortex-M BSS
+    { id: '94', expression: 'xStart', address: 0x3800, typeOffset: 'blockLink', size: 8, file: 'heap_4.c', pointerDepth: 0 },
+    { id: '95', expression: 'pxEnd', address: 0x3808, typeOffset: 'blockLinkPtr', size: 4, file: 'heap_4.c', pointerDepth: 0 },
+    { id: '96', expression: 'xFreeBytesRemaining', address: 0x380c, typeOffset: 'u32', size: 4, file: 'heap_4.c', pointerDepth: 0 },
+    ...(opts.omitAllocBit ? [] : [
+      { id: '97', expression: 'xBlockAllocatedBit', address: 0x3810, typeOffset: 'u32', size: 4, file: 'heap_4.c', pointerDepth: 0 },
+    ]),
+    { id: '98', expression: 'gDeletedHandle', address: 0x3104, typeOffset: 'queuePtr', size: 4, file: 'app/main.c', pointerDepth: 0 },
+  );
+
+  const layout = compileFreeRtosLayout(t.catalog, 'heap4-queue-test');
+  const setBlock = (addr: number, nextPtr: number, rawSize: number) => {
+    t.u32(addr, nextPtr);
+    t.u32(addr + 4, rawSize);
+  };
+  const setFreeList = (blocks: { addr: number; size: number }[], pxEndAddr = 0x5ff0) => {
+    t.u32(0x3808, pxEndAddr);
+    t.u32(0x3810, 0x80000000);
+    // pxEnd sentinel
+    setBlock(pxEndAddr, 0, 0);
+    // xStart -> first free or pxEnd
+    setBlock(0x3800, blocks[0]?.addr ?? pxEndAddr, 0);
+    let totalFree = 0;
+    blocks.forEach((b, i) => {
+      setBlock(b.addr, blocks[i + 1]?.addr ?? pxEndAddr, b.size);
+      totalFree += b.size;
+    });
+    t.u32(0x380c, totalFree);
+  };
+
+  return { ...t, layout, setBlock, setFreeList };
+}
+
+describe('heap lifecycle verification for sync objects', () => {
+  it('confirms active dynamic and static queues under heap_4 while catching freed, coalesced, and shrunk dynamic blocks', async () => {
+    const h = setupHeap4QueueTarget();
+    h.rodata.set(0x08001000, Buffer.from('regQueue\0'));
+
+    // ucHeap starts at 0x4004 -> alignedUcStart is 0x4008.
+    // 0x4008..0x4108: Lower adjacent free block [0x4008, 0x4108), size 0x100 (NOT containing 0x4108!).
+    // 0x4108..0x4188: Active registered Queue_t payload at 0x4110 (block header @ 0x4108, size 0x80 | 0x80000000).
+    h.u32(0x3000, 0x08001000);
+    h.u32(0x3004, 0x4110);
+    h.setBlock(0x4108, 0, 0x80000080);
+    h.writeQueue(0x4110, { pcHead: 0x4174, messagesWaiting: 1, length: 4, itemSize: 4, queueType: 0 });
+
+    // 0x4188..0x4208: Normal unregistered global queue payload at 0x4190.
+    h.u32(0x3100, 0x4190);
+    h.setBlock(0x4188, 0, 0x80000080);
+    h.writeQueue(0x4190, { pcHead: 0x41f4, messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+
+    // 0x4208..0x4288: Normal unregistered list-only queue payload at 0x4210 (task 0x2400 waiting).
+    h.setBlock(0x4208, 0, 0x80000080);
+    h.writeQueue(0x4210, { pcHead: 0x4274, waitingRecv: [0x2400], messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+
+    // 0x4308..0x4388: Deleted dynamic queue (dangling gDeletedHandle=0x4310, Queue_t bytes INTACT, vPortFree cleared allocBit and inserted in free list).
+    h.u32(0x3104, 0x4310);
+    h.writeQueue(0x4310, { pcHead: 0x4374, messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+
+    // 0x6400: StaticQueue_t outside ucHeap.
+    h.writeQueue(0x6400, { pcHead: 0x6400, messagesWaiting: 1, length: 1, itemSize: 0, queueType: 3, staticAlloc: 1 });
+
+    // Free blocks: [0x4008, 0x4108) (touches 0x4108, must NOT mark 0x4110 freed) AND [0x4308, 0x5ff0) (covers deleted 0x4310!).
+    h.setFreeList([
+      { addr: 0x4008, size: 0x100 },
+      { addr: 0x4308, size: 0x5ff0 - 0x4308 },
+    ]);
+
+    const tasks = await readTaskSnapshot(h.layout, h.request);
+    const snap = await readObjectSnapshot(h.layout, tasks, { readRodata: h.readRodata });
+
+    expect(snap.objects.find(o => o.address === 0x4110)).toMatchObject({
+      health: 'valid',
+      heapBlock: 'allocated',
+      lifecycle: 'unconfirmed',
+    });
+    expect(snap.objects.find(o => o.address === 0x4190)).toMatchObject({
+      health: 'valid',
+      heapBlock: 'allocated',
+      lifecycle: 'unconfirmed',
+      discoverySources: ['global'],
+    });
+    expect(snap.objects.find(o => o.address === 0x4210)).toMatchObject({
+      health: 'valid',
+      heapBlock: 'allocated',
+      lifecycle: 'unconfirmed',
+      discoverySources: ['list'],
+    });
+    expect(snap.objects.find(o => o.address === 0x6400)).toMatchObject({
+      health: 'valid',
+      heapBlock: 'static',
+      lifecycle: 'confirmed-static',
+    });
+
+    const deleted = snap.objects.find(o => o.address === 0x4310)!;
+    expect(deleted.health).toBe('deleting-or-corrupt');
+    expect(deleted.heapBlock).toBe('freed');
+    expect(deleted.lifecycle).toBe('confirmed-freed');
+    expect(deleted.waitListEvidence).toBe('corrupt');
+    expect(deleted.healthReason).toContain('heap_4');
+
+    // Scenario 2: Coalesced lower free block [0x4288, 0x5ff0) subsumes header @ 0x4308,
+    // even when untouched/stale allocated-looking header bytes sit inside [0x4308..0x4388).
+    h.setBlock(0x4308, 0, 0x80000080);
+    h.setFreeList([
+      { addr: 0x4008, size: 0x100 },
+      { addr: 0x4288, size: 0x5ff0 - 0x4288 },
+    ]);
+
+    const tasksCoalesced = await readTaskSnapshot(h.layout, h.request);
+    const snapCoalesced = await readObjectSnapshot(h.layout, tasksCoalesced, { readRodata: h.readRodata });
+    expect(snapCoalesced.objects.find(o => o.address === 0x4210)).toMatchObject({
+      health: 'valid',
+      heapBlock: 'allocated',
+      lifecycle: 'unconfirmed',
+    });
+    expect(snapCoalesced.objects.find(o => o.address === 0x4310)).toMatchObject({
+      health: 'deleting-or-corrupt',
+      heapBlock: 'freed',
+      lifecycle: 'confirmed-freed',
+    });
+
+    // Scenario 3: Deleted mutex at 0x4310 reallocated as tiny 32-byte block (size=0x20 < 8+100) while stale Mutex bytes survive -> caught as freed & excluded from lock/cycle!
+    h.setBlock(0x4308, 0, 0x80000020);
+    h.writeQueue(0x4310, { pcHead: 0, holder: 0x2000, recCount: 2, waitingRecv: [0x2600], messagesWaiting: 0, length: 1, itemSize: 0, queueType: 4 });
+    h.setFreeList([
+      { addr: 0x4008, size: 0x100 },
+      { addr: 0x4328, size: 0x5ff0 - 0x4328 },
+    ]);
+
+    const tasksShrunk = await readTaskSnapshot(h.layout, h.request);
+    const snapShrunk = await readObjectSnapshot(h.layout, tasksShrunk, { readRodata: h.readRodata });
+    const shrunk = snapShrunk.objects.find(o => o.address === 0x4310)!;
+    expect(shrunk.health).toBe('deleting-or-corrupt');
+    expect(shrunk.heapBlock).toBe('freed');
+    expect(shrunk.lifecycle).toBe('confirmed-freed');
+    expect(shrunk.holder).toBeUndefined();
+    expect(snapShrunk.waitCycles).toEqual([]);
+
+    // Scenario 4: All-zero corrupted BlockLink_t outside free list (e.g. DMA/stack overflow zeroing header) marks deleting-or-corrupt without claiming confirmed-freed.
+    h.setBlock(0x4308, 0, 0);
+    h.setFreeList([
+      { addr: 0x4008, size: 0x100 },
+      { addr: 0x4388, size: 0x5ff0 - 0x4388 },
+    ]);
+    const tasksZeroHdr = await readTaskSnapshot(h.layout, h.request);
+    const snapZeroHdr = await readObjectSnapshot(h.layout, tasksZeroHdr, { readRodata: h.readRodata });
+    const zeroHdr = snapZeroHdr.objects.find(o => o.address === 0x4310)!;
+    expect(zeroHdr.health).toBe('deleting-or-corrupt');
+    expect(zeroHdr.heapBlock).toBe('corrupt-header');
+    expect(zeroHdr.lifecycle).toBe('unconfirmed');
+    expect(zeroHdr.healthReason).toContain('全零');
+
+    // Scenario 5: Same-address reuse after vQueueDelete (pvPortMalloc(sameSize) gets 0x4310 before gDeletedHandle is cleared, leaving intact Queue_t bytes).
+    // Block is genuinely allocated again, but object identity MUST remain unconfirmed (distinguishing heapBlock='allocated' from lifecycle='unconfirmed').
+    h.setBlock(0x4308, 0, 0x80000080);
+    h.writeQueue(0x4310, { pcHead: 0x4374, messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+    h.setFreeList([
+      { addr: 0x4008, size: 0x100 },
+      { addr: 0x4388, size: 0x5ff0 - 0x4388 },
+    ]);
+    const tasksReused = await readTaskSnapshot(h.layout, h.request);
+    const snapReused = await readObjectSnapshot(h.layout, tasksReused, { readRodata: h.readRodata });
+    const reused = snapReused.objects.find(o => o.address === 0x4310)!;
+    expect(reused.health).toBe('valid');
+    expect(reused.heapBlock).toBe('allocated');
+    expect(reused.lifecycle).toBe('unconfirmed');
+    expect(reused.lifecycleReason).toContain('复用');
+    expect(reused.heapBlockReason).toContain('已分配');
+  });
+
+  it('reports lifecycle as unconfirmed when heap_4 evidence is incomplete or under non-heap_4 allocators while preserving global and wait-list discovery', async () => {
+    // 1) heap_4 uninitialized (pxEnd == 0)
+    const uninit = setupHeap4QueueTarget();
+    uninit.u32(0x3100, 0x4190);
+    uninit.writeQueue(0x4190, { pcHead: 0x4500, messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+    uninit.writeQueue(0x6400, { pcHead: 0x6400, messagesWaiting: 1, length: 1, itemSize: 0, queueType: 3, staticAlloc: 1 });
+    uninit.u32(0x3808, 0); // pxEnd == NULL
+    const tUninit = await readTaskSnapshot(uninit.layout, uninit.request);
+    const sUninit = await readObjectSnapshot(uninit.layout, tUninit, { readRodata: uninit.readRodata });
+    expect(sUninit.objects.find(o => o.address === 0x4190)).toMatchObject({
+      health: 'valid',
+      lifecycle: 'unconfirmed',
+    });
+    expect(sUninit.objects.find(o => o.address === 0x6400)?.lifecycle).toBe('confirmed-static');
+
+    // 2) heap_4 free-list sum != xFreeBytesRemaining (transient live mutation) -> non-freed objects degrade to unconfirmed
+    const partialHeap = setupHeap4QueueTarget();
+    partialHeap.u32(0x3100, 0x4190);
+    partialHeap.setBlock(0x4188, 0, 0x80000080);
+    partialHeap.writeQueue(0x4190, { pcHead: 0x41f4, messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+    partialHeap.setFreeList([{ addr: 0x4288, size: 0x5ff0 - 0x4288 }]);
+    partialHeap.u32(0x380c, 128); // mismatch xFreeBytesRemaining
+    const tPartial = await readTaskSnapshot(partialHeap.layout, partialHeap.request);
+    const sPartial = await readObjectSnapshot(partialHeap.layout, tPartial, { readRodata: partialHeap.readRodata });
+    expect(sPartial.objects.find(o => o.address === 0x4190)).toMatchObject({
+      health: 'valid',
+      lifecycle: 'unconfirmed',
+    });
+
+    // 3) heap_2 / heap_5 / heap_1: preserve global & list-only queues with lifecycle = 'unconfirmed'
+    for (const [file, extraRoots] of [
+      ['heap_2.c', [{ id: '99', expression: 'xEnd', address: 0x3808, typeOffset: 'u32', size: 4, file: 'heap_2.c', pointerDepth: 0 }]],
+      ['heap_5.c', [
+        { id: '99', expression: 'pxEnd', address: 0x3808, typeOffset: 'u32', size: 4, file: 'heap_5.c', pointerDepth: 0 },
+        { id: '9a', expression: 'xStart', address: 0x3800, typeOffset: 'u32', size: 4, file: 'heap_5.c', pointerDepth: 0 },
+        { id: '9b', expression: 'xFreeBytesRemaining', address: 0x380c, typeOffset: 'u32', size: 4, file: 'heap_5.c', pointerDepth: 0 },
+      ]],
+    ] as const) {
+      const other = setupQueueTarget();
+      other.catalog.roots.push(...extraRoots.map(r => ({ ...r })));
+      const otherLayout = compileFreeRtosLayout(other.catalog, `alloc-${file}`);
+      other.u32(0x3100, 0x5000);
+      other.writeQueue(0x5000, { pcHead: 0x5800, messagesWaiting: 0, length: 4, itemSize: 4, queueType: 0 });
+      other.writeQueue(0x5200, { pcHead: 0x5900, waitingRecv: [0x2400], messagesWaiting: 0, length: 2, itemSize: 4, queueType: 0 });
+      other.writeQueue(0x5400, { pcHead: 0x5400, messagesWaiting: 1, length: 1, itemSize: 0, queueType: 3, staticAlloc: 1 });
+      const tasksOther = await readTaskSnapshot(otherLayout, other.request);
+      const snapOther = await readObjectSnapshot(otherLayout, tasksOther, { readRodata: other.readRodata });
+      expect(snapOther.objects.find(o => o.address === 0x5000)).toMatchObject({
+        health: 'valid',
+        lifecycle: 'unconfirmed',
+        discoverySources: ['global'],
+      });
+      expect(snapOther.objects.find(o => o.address === 0x5200)).toMatchObject({
+        health: 'valid',
+        lifecycle: 'unconfirmed',
+        discoverySources: ['list'],
+      });
+      expect(snapOther.objects.find(o => o.address === 0x5400)).toMatchObject({
+        health: 'valid',
+        lifecycle: 'confirmed-static',
+      });
+    }
+  });
+});

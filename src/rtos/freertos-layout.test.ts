@@ -158,7 +158,10 @@ describe('fixed stage-0 ELF layouts (requires offline fixture build)', () => {
       expect(layout.timer).toBeDefined();
       expect(layout.timer?.fields.ucStatus).toBeDefined();
       expect(layout.timerGlobals.some(g => g.name === 'fixtureTimer')).toBe(true);
-      expect(layout.heap).toMatchObject({ allocator: 'heap_4', supported: true });
+      expect(layout.heap).toMatchObject({ allocator: 'heap_4', supported: true, heapStructSize: 8, blockLinkSize: 8 });
+      expect(layout.heap?.blockLinkNext).toBeDefined();
+      expect(layout.heap?.blockLinkSizeField).toBeDefined();
+      expect(layout.heap?.blockAllocatedBit?.address).toBeGreaterThan(0);
       expect(layout.heap?.ucHeap?.size).toBe(65536);
     }, 30000);
   }

@@ -46,6 +46,18 @@ export interface SyncObjectHolder {
   evidence: string;
 }
 
+export type HeapBlockLifecycleStatus =
+  | 'allocated'
+  | 'freed'
+  | 'corrupt-header'
+  | 'static'
+  | 'unverified';
+
+export type ObjectLifecycleStatus =
+  | 'confirmed-static'
+  | 'confirmed-freed'
+  | 'unconfirmed';
+
 export interface SyncObjectSnapshot {
   address: number;
   kind: QueueObjectKind;
@@ -57,6 +69,10 @@ export interface SyncObjectSnapshot {
   discoveryNote: string;
   health: ObjectHealth;
   healthReason?: string;
+  lifecycle?: ObjectLifecycleStatus;
+  lifecycleReason?: string;
+  heapBlock?: HeapBlockLifecycleStatus;
+  heapBlockReason?: string;
   queueNumber: Field<number>;
   messagesWaiting: Field<number>;
   length: Field<number>;

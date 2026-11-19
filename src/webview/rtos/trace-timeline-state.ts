@@ -1,9 +1,13 @@
 import type { SegmentReliability, TimeAnchorStatus, TraceGapKind } from '../../trace/systemview-decoder';
 import type { ExecutionContextKind, IntervalCompleteness, LabelSource, ReadyOutcome } from '../../trace/systemview-reconstructor';
+import type { TraceAnalysisQueryResult, TraceContextStatsRow, TraceMarkerStatsRow } from '../../trace/trace-analytics';
 import type { TraceCaptureIntegrity, TraceFreezeEvidence, TraceRecordingMode, TraceRecordingState, TraceTargetState, TraceTransportAdequacy } from '../../trace/trace-recording-coordinator';
 
 export type TraceTimeUnit = 'ns' | 'relative-ns' | 'absolute-ticks' | 'relative-ticks';
 export type TraceRecordingSource = 'live' | 'session' | 'offline';
+export type TraceAnalysisSourceKind = 'viewport' | 'selection' | 'full';
+export type ContextStatsKindFilter = 'all' | 'task' | 'isr' | 'idle' | 'scheduler' | 'timer';
+export type ContextStatsSortKey = 'cpu' | 'name' | 'activations' | 'exclMax' | 'readyMax' | 'readyAvg';
 
 export interface TraceSegmentDto {
   readonly bootGeneration: number;
@@ -1117,4 +1121,228 @@ export function buildSwimlaneLayout(
   });
 
   return rows;
+}
+
+export interface TraceAnalysisResponse {
+  readonly querySeq: number;
+  readonly recordId: string;
+  readonly unit: TraceTimeUnit;
+  readonly scopeKey: string;
+  readonly sourceKind: TraceAnalysisSourceKind;
+  readonly start: string;
+  readonly end: string;
+  readonly analysis?: TraceAnalysisQueryResult;
+  readonly queryDurationMs: number;
+  readonly cancelled?: boolean;
+  readonly error?: string;
+}
+
+export interface ResolvedAnalysisRange {
+  readonly valid: boolean;
+  readonly sourceKind: TraceAnalysisSourceKind;
+  readonly start?: string;
+  readonly end?: string;
+  readonly reason?: string;
+  readonly missingEndpoint?: 'A' | 'B' | 'both';
+  readonly continuity?: TraceCursorSpanEvaluation;
+}
+
+export function resolveContextsAnalysisRange(params: {
+  axisDomain: TraceAxisDomain;
+  viewRange: { start: string; end: string } | null;
+  cursorA: { timeStr: string; unit: TraceTimeUnit; bootGeneration?: number; segmentId?: number } | null;
+  cursorB: { timeStr: string; unit: TraceTimeUnit; bootGeneration?: number; segmentId?: number } | null;
+  cursorAInspect?: TracePointInspectResponse | null;
+  cursorBInspect?: TracePointInspectResponse | null;
+  segments: readonly TraceSegmentDto[];
+  gaps: readonly TraceGapDto[];
+  sourceKind: TraceAnalysisSourceKind;
+}): ResolvedAnalysisRange {
+  const { axisDomain, viewRange, cursorA, cursorB, cursorAInspect, cursorBInspect, segments, gaps, sourceKind } = params;
+  if (!axisDomain.valid) {
+    return {
+      valid: false,
+      sourceKind,
+      reason: axisDomain.reason || '当前录制尚无可用时间范围',
+    };
+  }
+
+  if (sourceKind === 'selection') {
+    if (!cursorA || !cursorB) {
+      const missingEndpoint = !cursorA && !cursorB ? 'both' : !cursorA ? 'A' : 'B';
+      return {
+        valid: false,
+        sourceKind,
+        missingEndpoint,
+        reason: missingEndpoint === 'both'
+          ? '未放置游标 A 与 B（请在 Trace Timeline 点击设置双游标，或切换“Trace 视口 / 全部范围”）'
+          : `选区缺少游标 ${missingEndpoint}（不能默认从 0 起算，请补齐游标 ${missingEndpoint}）`,
+      };
+    }
+    if (cursorA.unit !== axisDomain.unit || cursorB.unit !== axisDomain.unit) {
+      return {
+        valid: false,
+        sourceKind,
+        reason: `游标单位 (${cursorA.unit}/${cursorB.unit}) 与当前时间轴单位 (${axisDomain.unit}) 不一致，请重新放置游标`,
+      };
+    }
+    const tA = BigInt(cursorA.timeStr);
+    const tB = BigInt(cursorB.timeStr);
+    const lo = tA <= tB ? tA : tB;
+    const hi = tA <= tB ? tB : tA;
+    const continuity = evaluateCursorSpanContinuity(
+      { ...cursorA, inspect: cursorAInspect ?? null },
+      { ...cursorB, inspect: cursorBInspect ?? null },
+      segments,
+      gaps,
+      axisDomain.unit,
+    );
+    if (hi <= lo) {
+      return {
+        valid: false,
+        sourceKind,
+        reason: `游标 A 与 B 重合于 ${formatTraceTimestamp(lo.toString(), axisDomain.unit)}（零长度区间）`,
+        continuity,
+      };
+    }
+    return {
+      valid: true,
+      sourceKind,
+      start: lo.toString(),
+      end: hi.toString(),
+      continuity,
+    };
+  }
+
+  const target = sourceKind === 'viewport' && viewRange
+    ? viewRange
+    : { start: axisDomain.minStr, end: axisDomain.displayMaxStr };
+
+  try {
+    const s = BigInt(target.start);
+    const e = BigInt(target.end);
+    if (e <= s) {
+      return { valid: false, sourceKind, reason: '目标区间长度为零或反向' };
+    }
+    return {
+      valid: true,
+      sourceKind,
+      start: s.toString(),
+      end: e.toString(),
+    };
+  } catch {
+    return { valid: false, sourceKind, reason: '非法时间范围边界' };
+  }
+}
+
+export function formatAnalysisDurationStr(valueStr: string | undefined, unit: TraceTimeUnit): string {
+  if (valueStr === undefined) return '—';
+  const trimmed = valueStr.trim();
+  if (/^-?\d+$/.test(trimmed)) {
+    return formatTraceDuration(BigInt(trimmed), unit);
+  }
+  const m = trimmed.match(/^(-?\d+)\.(\d+)$/);
+  if (m) {
+    const wholeBig = BigInt(m[1]);
+    const absWhole = wholeBig < 0n ? -wholeBig : wholeBig;
+    if (absWhole > 9_000_000_000_000n) {
+      return formatTraceDuration(wholeBig, unit);
+    }
+  }
+  const num = Number(trimmed);
+  if (!Number.isFinite(num)) return valueStr;
+  if (unit === 'ns' || unit === 'relative-ns') {
+    if (num >= 1_000_000_000) return `${(num / 1_000_000_000).toFixed(3)} s`;
+    if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(3)} ms`;
+    if (num >= 1_000) return `${(num / 1_000).toFixed(3)} µs`;
+    return `${num.toFixed(2)} ns`;
+  }
+  return `${num.toFixed(2)} ticks`;
+}
+
+export function formatContextLabel(row: Pick<TraceContextStatsRow, 'contextKind' | 'contextKey' | 'label' | 'labelSource' | 'tcbAddress' | 'taskGeneration' | 'irqId' | 'timerId'>): string {
+  if (row.contextKind === 'idle') return row.label || 'IDLE';
+  if (row.contextKind === 'scheduler') return 'Scheduler';
+  if (row.contextKind === 'isr') {
+    const base = row.label && row.labelSource !== 'missing' ? row.label : `ISR #${row.irqId ?? '?'}`;
+    return row.irqId !== undefined && row.label && row.labelSource !== 'missing' ? `${base} (#${row.irqId})` : base;
+  }
+  if (row.contextKind === 'timer') {
+    if (row.label && row.labelSource !== 'missing') return row.label;
+    return row.timerId !== undefined ? `Timer 0x${(row.timerId >>> 0).toString(16).toUpperCase()}` : row.contextKey;
+  }
+  if (row.label && row.labelSource !== 'missing') return row.label;
+  if (row.tcbAddress !== undefined) return `Task 0x${(row.tcbAddress >>> 0).toString(16).toUpperCase()}`;
+  return row.contextKey;
+}
+
+export function filterAndSortContextRows(
+  rows: readonly TraceContextStatsRow[],
+  kindFilter: ContextStatsKindFilter,
+  query: string,
+  sortKey: ContextStatsSortKey,
+  sortDir: 'asc' | 'desc',
+): TraceContextStatsRow[] {
+  const needle = query.trim().toLowerCase();
+  const filtered = rows.filter(r => {
+    if (kindFilter !== 'all' && r.contextKind !== kindFilter) return false;
+    if (!needle) return true;
+    const lbl = formatContextLabel(r).toLowerCase();
+    const key = r.contextKey.toLowerCase();
+    const tcb = r.tcbAddress !== undefined ? `0x${(r.tcbAddress >>> 0).toString(16)}` : '';
+    const irq = r.irqId !== undefined ? `irq${r.irqId} #${r.irqId}` : '';
+    return lbl.includes(needle) || key.includes(needle) || tcb.includes(needle) || irq.includes(needle);
+  });
+
+  const dir = sortDir === 'asc' ? 1 : -1;
+  return [...filtered].sort((a, b) => {
+    let cmp = 0;
+    switch (sortKey) {
+      case 'cpu': {
+        const va = BigInt(a.clippedExclusiveDuration);
+        const vb = BigInt(b.clippedExclusiveDuration);
+        cmp = va < vb ? -1 : va > vb ? 1 : 0;
+        break;
+      }
+      case 'name':
+        cmp = formatContextLabel(a).localeCompare(formatContextLabel(b), undefined, { numeric: true });
+        break;
+      case 'activations':
+        cmp = a.completeActivationCount - b.completeActivationCount;
+        break;
+      case 'exclMax': {
+        const va = a.exclusiveStats ? BigInt(a.exclusiveStats.max) : -1n;
+        const vb = b.exclusiveStats ? BigInt(b.exclusiveStats.max) : -1n;
+        cmp = va < vb ? -1 : va > vb ? 1 : 0;
+        break;
+      }
+      case 'readyMax': {
+        const va = a.readyStats ? BigInt(a.readyStats.max) : -1n;
+        const vb = b.readyStats ? BigInt(b.readyStats.max) : -1n;
+        cmp = va < vb ? -1 : va > vb ? 1 : 0;
+        break;
+      }
+      case 'readyAvg': {
+        const va = a.readyStats ? BigInt(a.readyStats.avgFloor) : -1n;
+        const vb = b.readyStats ? BigInt(b.readyStats.avgFloor) : -1n;
+        cmp = va < vb ? -1 : va > vb ? 1 : 0;
+        break;
+      }
+    }
+    if (cmp !== 0) return cmp * dir;
+    return a.contextKey.localeCompare(b.contextKey);
+  });
+}
+
+export function filterMarkerRows(
+  rows: readonly TraceMarkerStatsRow[],
+  query: string,
+): TraceMarkerStatsRow[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [...rows];
+  return rows.filter(m => {
+    const idStr = String(m.markerId);
+    const name = (m.name || '').toLowerCase();
+    return idStr.includes(needle) || `m#${idStr}`.includes(needle) || name.includes(needle);
+  });
 }

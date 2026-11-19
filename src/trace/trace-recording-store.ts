@@ -57,6 +57,11 @@ import {
 } from './trace-format';
 import { SYSTEMVIEW_PROTOCOL_VERSION } from './systemview-protocol';
 import {
+  computeTraceAnalysis,
+  TraceAnalysisQueryRequest,
+  TraceAnalysisQueryResult,
+} from './trace-analytics';
+import {
   CompactedDirectoryBlock,
   getIntervalBoundsForUnit,
   getMarkerPointTimeForUnit,
@@ -127,7 +132,8 @@ export type TraceStorageErrorCode =
   | 'StorageWriteError'
   | 'StorageReadError'
   | 'QueryCancelled'
-  | 'InvalidCursor';
+  | 'InvalidCursor'
+  | 'UnsupportedCapability';
 
 export interface TraceStorageFailure {
   readonly ok: false;
@@ -2652,6 +2658,64 @@ export class TraceRecordingStore {
   }
 
   /**
+   * 有界可取消的上下文统计、Ready 延迟、Marker 统计与 CPU Load 分箱聚合（阶段 5.1）。
+   */
+  public async queryAnalysis(
+    request: TraceAnalysisQueryRequest,
+    cancel?: TraceQueryCancelToken,
+  ): Promise<TraceStorageResult<TraceAnalysisQueryResult>> {
+    if (this.closed || !this.dataHandle) {
+      return { ok: false, errorCode: 'RecordingClosed', message: '存储已关闭，无法执行统计分析查询' };
+    }
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '统计分析查询已取消' };
+    }
+    if (request.unit === 'byte-offset') {
+      return {
+        ok: false,
+        errorCode: 'InvalidArgument',
+        message: 'Contexts 与 CPU Load 统计不支持 byte-offset 单位，请使用时间/tick 单位',
+      };
+    }
+
+    let qStart: bigint;
+    let qEnd: bigint;
+    try {
+      qStart = parseRangeBoundBigInt(request.start, 'start');
+      qEnd = parseRangeBoundBigInt(request.end, 'end');
+    } catch (err) {
+      return { ok: false, errorCode: 'InvalidArgument', message: err instanceof Error ? err.message : String(err) };
+    }
+
+    try {
+      const res = await computeTraceAnalysis(
+        {
+          index: this.index,
+          loadPage: desc => this.loadPage(desc),
+          getCacheStats: () => this.cache.getStats(),
+          isCancelled: () => isQueryCancelled(cancel),
+          yieldToLoop: () => yieldToEventLoop(),
+          yieldEveryPages: cancel?.yieldEveryPages ?? 2,
+          yieldEveryItems: cancel?.yieldEveryItems ?? 512,
+        },
+        request,
+        qStart,
+        qEnd,
+      );
+      if (!res.ok) {
+        return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '统计分析查询已取消' };
+      }
+      return { ok: true, data: res.data };
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'StorageReadError',
+        message: `统计分析读取数据页失败: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
    * 原始流精确导出：逐字节从 `raw.otbin` `[0, committed.rawBytes)` 读取（与输入完全一致，不使用任何 LOD 抽稀）。
    */
   public async exportRaw(options: {
@@ -3089,6 +3153,24 @@ function computeDescriptorAndLod(
           if (prev) prev.ticks += dur;
           else ctxTicks.set(sl.contextKey, { contextKind: sl.contextKind, label: sl.label, ticks: dur });
         }
+      } else if (ePt) {
+        if (minRel === undefined || ePt.relativeTicksBigInt < minRel) minRel = ePt.relativeTicksBigInt;
+        if (maxRel === undefined || ePt.relativeTicksBigInt > maxRel) maxRel = ePt.relativeTicksBigInt;
+        if (ePt.absoluteTicksBigInt !== undefined) {
+          if (minAbs === undefined || ePt.absoluteTicksBigInt < minAbs) minAbs = ePt.absoluteTicksBigInt;
+          if (maxAbs === undefined || ePt.absoluteTicksBigInt > maxAbs) maxAbs = ePt.absoluteTicksBigInt;
+        } else {
+          allAbs = false;
+        }
+        const f = ePt.sysFreqHz ?? sysFreqHz;
+        if (f !== undefined) sysFreqHz = f;
+        const eNs = getTimePointValueForUnit(ePt, 'ns', f);
+        if (eNs !== undefined) {
+          if (minNs === undefined || eNs < minNs) minNs = eNs;
+          if (maxNs === undefined || eNs > maxNs) maxNs = eNs;
+        }
+        if (ePt.streamByteOffset < minByte) minByte = ePt.streamByteOffset;
+        if (ePt.streamByteOffset > maxByte) maxByte = ePt.streamByteOffset;
       }
     }
   }

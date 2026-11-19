@@ -498,6 +498,40 @@ describe('RtosWebviewProvider', () => {
       await (provider as any).handleMessage({ command: 'traceSaveRecording', recordId: openedId, targetDir: copyDir });
       expect(provider.currentTraceState.lastActionMessage?.tone).toBe('error');
 
+      // Rapid consecutive analysis queries: older query is aborted/dropped, latest succeeds
+      const a1 = (provider as any).handleMessage({
+        command: 'traceQueryAnalysis',
+        querySeq: 1,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        sourceKind: 'viewport',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        maxBins: 40,
+      });
+      const a2 = (provider as any).handleMessage({
+        command: 'traceQueryAnalysis',
+        querySeq: 2,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        sourceKind: 'selection',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        maxBins: 40,
+      });
+      await Promise.all([a1, a2]);
+      const anaMsgs = view.posted.filter((m: any) => m.command === 'traceAnalysisResult');
+      expect(anaMsgs.length).toBeGreaterThanOrEqual(1);
+      expect(anaMsgs[anaMsgs.length - 1].result.querySeq).toBe(2);
+      expect(anaMsgs[anaMsgs.length - 1].result.analysis.precision).toBe('exact');
+      expect(anaMsgs[anaMsgs.length - 1].result.analysis.contexts.length).toBeGreaterThan(0);
+
       // Rapid consecutive viewport queries: older query is aborted/dropped, latest succeeds
       const q1 = (provider as any).handleMessage({
         command: 'traceQueryViewport',

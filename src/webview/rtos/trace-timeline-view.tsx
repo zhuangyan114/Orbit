@@ -5,7 +5,6 @@ import type { RtosSessionSummary, RtosViewSettings } from './rtos-view-state';
 import {
   bigIntToPixelX,
   buildSwimlaneLayout,
-  computeAxisDomain,
   evaluateCursorSpanContinuity,
   formatTraceDuration,
   formatTraceTimestamp,
@@ -17,6 +16,7 @@ import {
   segmentScopeKey,
   type SwimlaneRow,
   type TraceActivationDto,
+  type TraceAxisDomain,
   type TraceCursorPoint,
   type TraceGapAnchor,
   type TraceMarkerDto,
@@ -31,15 +31,32 @@ import {
   zoomBigIntRange,
 } from './trace-timeline-state';
 
+export type SharedTraceCursor = {
+  timeStr: string;
+  unit: TraceTimeUnit;
+  bootGeneration?: number;
+  segmentId?: number;
+};
+
 export interface TraceTimelineViewProps {
   visible: boolean;
   session: RtosSessionSummary;
   settings: RtosViewSettings;
   traceState: TracePanelState;
+  selectedRecord: TraceRecordSummary | null;
+  axisDomain: TraceAxisDomain;
+  selectedScopeKey: string;
+  viewRange: { start: string; end: string } | null;
+  cursorA: SharedTraceCursor | null;
+  cursorB: SharedTraceCursor | null;
   viewportResult: TraceViewportResponse | null;
   hoverInspect: TracePointInspectResponse | null;
   cursorAInspect: TracePointInspectResponse | null;
   cursorBInspect: TracePointInspectResponse | null;
+  onChangeScopeKey: (scopeKey: string) => void;
+  onChangeViewRange: (range: { start: string; end: string } | null) => void;
+  onChangeCursorA: (cursor: SharedTraceCursor | null) => void;
+  onChangeCursorB: (cursor: SharedTraceCursor | null) => void;
   onUpdateSettings: (patch: Partial<RtosViewSettings>) => void;
   onInspectTarget: () => void;
   onStartRecording: (mode: TraceRecordingMode) => void;
@@ -151,16 +168,28 @@ function unitLabel(unit: TraceTimeUnit): string {
   }
 }
 
+let nextTimelineQuerySeq = 1;
+
 export function TraceTimelineView(props: TraceTimelineViewProps) {
   const {
     visible,
     session,
     settings,
     traceState,
+    selectedRecord,
+    axisDomain,
+    selectedScopeKey,
+    viewRange,
+    cursorA,
+    cursorB,
     viewportResult,
     hoverInspect,
     cursorAInspect,
     cursorBInspect,
+    onChangeScopeKey: setSelectedScopeKey,
+    onChangeViewRange: setViewRange,
+    onChangeCursorA: setCursorA,
+    onChangeCursorB: setCursorB,
     onUpdateSettings,
     onInspectTarget,
     onStartRecording,
@@ -177,31 +206,12 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     onPerfReport,
   } = props;
 
-  const selectedRecord: TraceRecordSummary | null = useMemo(() => {
-    if (!traceState.records.length) return null;
-    if (traceState.selectedRecordId) {
-      const hit = traceState.records.find(r => r.recordId === traceState.selectedRecordId);
-      if (hit) return hit;
-    }
-    return traceState.records[traceState.records.length - 1];
-  }, [traceState.records, traceState.selectedRecordId]);
-
-  const [selectedScopeKey, setSelectedScopeKey] = useState<string>('all-anchored');
-  const [viewRange, setViewRange] = useState<{ start: string; end: string } | null>(null);
-  const [cursorA, setCursorA] = useState<{ timeStr: string; unit: TraceTimeUnit; bootGeneration?: number; segmentId?: number } | null>(null);
-  const [cursorB, setCursorB] = useState<{ timeStr: string; unit: TraceTimeUnit; bootGeneration?: number; segmentId?: number } | null>(null);
   const [hoverInfo, setHoverInfo] = useState<{ x: number; y: number; timeStr: string } | null>(null);
   const [canvasSize, setCanvasSize] = useState<{ width: number; height: number }>({ width: 640, height: 260 });
-
-  const axisDomain = useMemo(() => {
-    const segs = selectedRecord?.segments ?? [];
-    return computeAxisDomain(segs, settings.traceTimeUnit, selectedScopeKey);
-  }, [selectedRecord?.segments, settings.traceTimeUnit, selectedScopeKey]);
 
   const activeUnit = axisDomain.unit;
   const activeScopeKey = axisDomain.scopeKey;
   const activeRecordId = selectedRecord?.recordId ?? null;
-  const isSelectedLiveRecording = selectedRecord?.state === 'recording';
 
   const gapAnchors = useMemo<TraceGapAnchor[]>(() => {
     if (!selectedRecord || !axisDomain.valid) return [];
@@ -314,57 +324,14 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     }
   }, [hoverInspect, cursorAInspect, cursorBInspect]);
 
-  // Reset viewport, cursors, hover cleanly when switching recording, scope, or unit
-  const prevRecordIdRef = useRef<string | null>(null);
-  const prevAxisKeyRef = useRef<string>('');
+  const prevAxisClearRef = useRef<string>('');
   useEffect(() => {
     const axisKey = `${activeRecordId ?? ''}::${activeScopeKey}::${activeUnit}`;
-    if (prevRecordIdRef.current !== activeRecordId) {
-      prevRecordIdRef.current = activeRecordId;
-      setSelectedScopeKey('all-anchored');
-      setCursorA(null);
-      setCursorB(null);
+    if (prevAxisClearRef.current !== axisKey) {
+      prevAxisClearRef.current = axisKey;
       setHoverInfo(null);
-      setViewRange(null);
     }
-    if (prevAxisKeyRef.current !== axisKey) {
-      prevAxisKeyRef.current = axisKey;
-      setCursorA(null);
-      setCursorB(null);
-      setHoverInfo(null);
-      if (axisDomain.valid) {
-        setViewRange({ start: axisDomain.minStr, end: axisDomain.displayMaxStr });
-      } else {
-        setViewRange(null);
-      }
-    }
-  }, [activeRecordId, activeScopeKey, activeUnit, axisDomain.valid, axisDomain.minStr, axisDomain.displayMaxStr]);
-
-  // Sync Auto-Follow or initial bounds when live data grows
-  useEffect(() => {
-    if (!axisDomain.valid) return;
-    const minB = BigInt(axisDomain.minStr);
-    const maxB = BigInt(axisDomain.displayMaxStr);
-    setViewRange(prev => {
-      if (!prev) {
-        return { start: minB.toString(), end: maxB.toString() };
-      }
-      const prevStart = BigInt(prev.start);
-      const prevEnd = BigInt(prev.end);
-      const span = prevEnd > prevStart ? prevEnd - prevStart : maxB - minB;
-      if (settings.traceAutoFollow && isSelectedLiveRecording) {
-        const nextEnd = maxB;
-        const nextStart = nextEnd - span > minB ? nextEnd - span : minB;
-        if (nextStart === prevStart && nextEnd === prevEnd) return prev;
-        return { start: nextStart.toString(), end: nextEnd.toString() };
-      }
-      // Clamp within current axis bounds if needed
-      if (prevStart < minB && prevEnd > maxB) {
-        return { start: minB.toString(), end: maxB.toString() };
-      }
-      return prev;
-    });
-  }, [axisDomain.valid, axisDomain.minStr, axisDomain.displayMaxStr, settings.traceAutoFollow, isSelectedLiveRecording]);
+  }, [activeRecordId, activeScopeKey, activeUnit]);
 
   // Trigger coalesced Worker viewport query whenever visible & record/viewRange/commitSeq updates
   const committedBytes = selectedRecord?.counters.committedRawBytes ?? 0;
@@ -376,7 +343,7 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
   ) => {
     if (!visible || !axisDomain.valid) return;
     const run = () => {
-      const seq = ++querySeqRef.current;
+      const seq = nextTimelineQuerySeq++;
       lastDispatchedQuerySeqRef.current = seq;
       perfRef.current.viewportQueriesSent++;
       const maxBuckets = Math.max(64, Math.min(512, Math.floor(canvasSize.width / 2) || 256));

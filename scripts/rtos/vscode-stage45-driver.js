@@ -416,6 +416,7 @@ exports.run = async function run() {
       await waitFor(() => !provider.isVisible, 10000, 'RTOS view hidden');
       assert.equal(coordinator.getStatus(activeRec.recordId)?.state, 'recording');
 
+      const perfSeqBeforeExplorer = provider.tracePerfSeq;
       await vscode.commands.executeCommand('vscode.moveViews', { viewIds: ['ozoneRtos'], destinationId: 'workbench.view.explorer' });
       await vscode.commands.executeCommand('ozoneRtos.focus');
       await waitFor(() => provider.readyCount > prevReady && provider.isVisible, 10000, 'RTOS view recreated in Explorer');
@@ -423,19 +424,55 @@ exports.run = async function run() {
       assert.equal(coordinator.getStatus(activeRec.recordId)?.state, 'recording');
 
       // Wait for real Chromium Webview render/data message while hosted in Explorer before restoring.
-      const perfSeqBeforeRestore = provider.tracePerfSeq;
-      await waitFor(() => provider.tracePerfSeq > perfSeqBeforeRestore || Boolean(provider.currentTracePerf?.frameCount >= 1), 10000, 'Explorer hosted Trace Webview render proof');
+      await waitFor(
+        () => provider.tracePerfSeq > perfSeqBeforeExplorer
+          && Number(provider.currentTracePerf?.frameCount || 0) >= 1
+          && Number(provider.currentTracePerf?.viewportRepliesApplied || 0) >= 1,
+        10000,
+        () => `Explorer hosted Trace Webview render proof (visible=${provider.isVisible}, ready=${provider.readyCount}, perfSeq=${provider.tracePerfSeq}/${perfSeqBeforeExplorer}, perf=${JSON.stringify(provider.currentTracePerf)})`,
+      );
 
-      // Use VS Code's built-in view-location reset command (restores empty hideIfEmpty container + expanded visible view + openView)
+      // Use VS Code's built-in view-location reset command, then activate the restored Panel container
+      // so Watch Panel (focused prior to moving to Explorer) does not reclaim visibility asynchronously.
       const registeredCommands = await vscode.commands.getCommands(true);
       assert.ok(registeredCommands.includes('ozoneRtos.resetViewLocation'), 'Built-in ozoneRtos.resetViewLocation command must exist');
       const prevPerfSeqRestore = provider.tracePerfSeq;
       await vscode.commands.executeCommand('ozoneRtos.resetViewLocation');
-      await waitFor(() => provider.isVisible, 10000, () => `RTOS view restored to panel (visible=${provider.isVisible}, ready=${provider.readyCount}, perfSeq=${provider.tracePerfSeq})`);
+      let lastPanelFocusAt = 0;
+      const ensureRestoredPanelFocused = async () => {
+        if ((!provider.isVisible || provider.readyCount === explorerReadyCount) && Date.now() - lastPanelFocusAt >= 250) {
+          lastPanelFocusAt = Date.now();
+          await vscode.commands.executeCommand('workbench.view.extension.ozone-rtos-panel');
+          await vscode.commands.executeCommand('ozoneRtos.focus');
+        }
+      };
+      await waitFor(async () => {
+        if (provider.readyCount > explorerReadyCount && provider.isVisible) {
+          return true;
+        }
+        await ensureRestoredPanelFocused();
+        return false;
+      }, 10000, () => `RTOS view restored to panel (visible=${provider.isVisible}, ready=${provider.readyCount}, perfSeq=${provider.tracePerfSeq})`);
 
       // Verify restored view really lives back in Panel (switching Panel to Watch hides it, switching back shows it)
       // and proves genuine restored Webview rendering + active recording continuity without forcing fake ready counts.
-      await waitFor(() => provider.tracePerfSeq > prevPerfSeqRestore && Number(provider.currentTracePerf?.frameCount || 0) >= 1, 10000, () => `Restored RTOS Webview render/message proof (visible=${provider.isVisible}, ready=${provider.readyCount}, perfSeq=${provider.tracePerfSeq}/${prevPerfSeqRestore})`);
+      await waitFor(
+        async () => {
+          if (
+            provider.readyCount > explorerReadyCount
+            && provider.isVisible
+            && provider.tracePerfSeq > prevPerfSeqRestore
+            && Number(provider.currentTracePerf?.frameCount || 0) >= 1
+            && Number(provider.currentTracePerf?.viewportRepliesApplied || 0) >= 1
+          ) {
+            return true;
+          }
+          await ensureRestoredPanelFocused();
+          return false;
+        },
+        10000,
+        () => `Restored RTOS Webview render/message proof (visible=${provider.isVisible}, ready=${provider.readyCount}, perfSeq=${provider.tracePerfSeq}/${prevPerfSeqRestore}, perf=${JSON.stringify(provider.currentTracePerf)})`,
+      );
       assert.equal(coordinator.getStatus(activeRec.recordId)?.state, 'recording');
 
       await vscode.commands.executeCommand('workbench.view.extension.ozone-watch-panel');

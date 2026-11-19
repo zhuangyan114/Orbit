@@ -15,6 +15,10 @@ import type {
   TraceRecordingManifest,
 } from './trace-format';
 import type {
+  TraceAnalysisQueryRequest,
+  TraceAnalysisQueryResult,
+} from './trace-analytics';
+import type {
   CreateTraceRecordingOptions,
   IngestBatchSummary,
   TraceLodQueryRequest,
@@ -24,6 +28,8 @@ import type {
   TraceStorageLimits,
   TraceStorageStats,
 } from './trace-recording-store';
+
+export type { TraceAnalysisQueryRequest, TraceAnalysisQueryResult };
 
 export interface TraceWorkerLimits {
   readonly maxSingleBatchBytes: number;
@@ -158,6 +164,17 @@ export type TraceWorkerRequest =
       readonly request: TraceLodQueryRequest;
       readonly cancelSlot?: number;
       readonly cancelToken?: number;
+    }
+  | {
+      readonly reqId: number;
+      readonly type: 'queryAnalysis';
+      readonly recordId: string;
+      readonly queryId: string;
+      readonly request: TraceAnalysisQueryRequest;
+      readonly cancelSlot?: number;
+      readonly cancelToken?: number;
+      readonly yieldEveryPages?: number;
+      readonly yieldEveryItems?: number;
     }
   | {
       readonly reqId: number;

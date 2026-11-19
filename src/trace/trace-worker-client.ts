@@ -18,6 +18,10 @@ import type {
   TraceRecordingManifest,
 } from './trace-format';
 import type {
+  TraceAnalysisQueryRequest,
+  TraceAnalysisQueryResult,
+} from './trace-analytics';
+import type {
   IngestBatchSummary,
   TraceLodQueryRequest,
   TraceLodQueryResult,
@@ -871,6 +875,54 @@ export class TraceWorkerClient {
         request,
         cancelSlot: slotGuard.slot,
         cancelToken: slotGuard.token,
+      });
+      return this.toResult(res);
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort);
+      slotGuard.release();
+      this.releaseQuerySlot();
+    }
+  }
+
+  public async queryAnalysis(
+    recordId: string,
+    request: TraceAnalysisQueryRequest,
+    options: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    } = {},
+  ): Promise<TraceStorageResult<TraceAnalysisQueryResult>> {
+    if (options.signal?.aborted) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '统计分析查询在发送前已取消' };
+    }
+    if (!this.tryAcquireQuerySlot()) {
+      return {
+        ok: false,
+        errorCode: 'QueryQueueFull' as any,
+        message: `宿主机并发查询数已达上限 ${this.limits.maxPendingQueries}`,
+      };
+    }
+    const queryId = options.queryId ?? `ana-${this.nextSeqId++}`;
+    const slotGuard = this.acquireCancelSlot();
+    const onAbort = () => {
+      slotGuard.cancel();
+      void this.cancelQuery(queryId).catch(() => {});
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      const res = await this.sendRaw({
+        reqId: this.nextReqId++,
+        type: 'queryAnalysis',
+        recordId,
+        queryId,
+        request,
+        cancelSlot: slotGuard.slot,
+        cancelToken: slotGuard.token,
+        yieldEveryPages: options.yieldEveryPages,
+        yieldEveryItems: options.yieldEveryItems,
       });
       return this.toResult(res);
     } finally {

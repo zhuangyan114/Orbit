@@ -1,9 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TaskSnapshot } from '../../rtos/model';
+import { ContextsView } from './contexts-view';
 import { ObjectsView } from './objects-view';
 import { TimersHeapView } from './timers-heap-view';
-import { TraceTimelineView } from './trace-timeline-view';
-import type { TracePointInspectResponse, TraceRecordSummary, TraceViewportResponse } from './trace-timeline-state';
+import { TraceTimelineView, type SharedTraceCursor } from './trace-timeline-view';
+import {
+  computeAxisDomain,
+  type TraceAnalysisResponse,
+  type TraceAnalysisSourceKind,
+  type TracePointInspectResponse,
+  type TraceRecordSummary,
+  type TraceTimeUnit,
+  type TraceViewportResponse,
+} from './trace-timeline-state';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   INITIAL_TRACE_PANEL_STATE,
@@ -94,11 +103,19 @@ export function RtosApp() {
   const [panel, setPanel] = useState<RtosPanelState>(INITIAL_STATE);
   const [themeKind, setThemeKind] = useState<'dark' | 'light' | 'hc'>(() => detectThemeKind());
   const [traceViewport, setTraceViewport] = useState<TraceViewportResponse | null>(null);
+  const [traceAnalysis, setTraceAnalysis] = useState<TraceAnalysisResponse | null>(null);
   const [hoverInspect, setHoverInspect] = useState<TracePointInspectResponse | null>(null);
   const [cursorAInspect, setCursorAInspect] = useState<TracePointInspectResponse | null>(null);
   const [cursorBInspect, setCursorBInspect] = useState<TracePointInspectResponse | null>(null);
+  const [traceScopeKey, setTraceScopeKey] = useState<string>('all-anchored');
+  const [traceViewRange, setTraceViewRange] = useState<{ start: string; end: string } | null>(null);
+  const [cursorA, setCursorA] = useState<SharedTraceCursor | null>(null);
+  const [cursorB, setCursorB] = useState<SharedTraceCursor | null>(null);
+  const [contextsRangeSource, setContextsRangeSource] = useState<TraceAnalysisSourceKind>('viewport');
   const hostVersionRef = useRef(-1);
   const selectedTraceIdRef = useRef<string | null>(null);
+  const prevTraceRecordRef = useRef<string | null>(null);
+  const prevTraceAxisKeyRef = useRef<string>('');
 
   useEffect(() => {
     const refreshTheme = () => setThemeKind(detectThemeKind());
@@ -117,6 +134,7 @@ export function RtosApp() {
         if (nextRecId !== selectedTraceIdRef.current) {
           selectedTraceIdRef.current = nextRecId;
           setTraceViewport(null);
+          setTraceAnalysis(null);
           setHoverInspect(null);
           setCursorAInspect(null);
           setCursorBInspect(null);
@@ -138,6 +156,11 @@ export function RtosApp() {
         const res = msg.result as TraceViewportResponse;
         if (res.recordId === selectedTraceIdRef.current) {
           setTraceViewport(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
+        }
+      } else if (msg.command === 'traceAnalysisResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TraceAnalysisResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          setTraceAnalysis(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
         }
       } else if (msg.command === 'tracePointInspectResult' && msg.result && typeof msg.result === 'object') {
         const res = msg.result as TracePointInspectResponse;
@@ -195,6 +218,99 @@ export function RtosApp() {
   const handlePerfReport = useCallback((perf: Record<string, unknown>) => {
     vscodeApi.postMessage({ command: 'tracePerfReport', perf });
   }, []);
+
+  const handleQueryAnalysis = useCallback((req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    scopeKey: string;
+    sourceKind: TraceAnalysisSourceKind;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    maxBins: number;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceQueryAnalysis', ...req });
+  }, []);
+
+  const handleContextsPerfReport = useCallback((perf: Record<string, unknown>) => {
+    vscodeApi.postMessage({ command: 'contextsPerfReport', perf });
+  }, []);
+
+  const traceState = panel.trace ?? INITIAL_TRACE_PANEL_STATE;
+  const selectedTraceRecord: TraceRecordSummary | null = useMemo(() => {
+    if (!traceState.records.length) return null;
+    if (traceState.selectedRecordId) {
+      const hit = traceState.records.find(r => r.recordId === traceState.selectedRecordId);
+      if (hit) return hit;
+    }
+    return traceState.records[traceState.records.length - 1];
+  }, [traceState.records, traceState.selectedRecordId]);
+
+  const traceAxisDomain = useMemo(() => {
+    const segs = selectedTraceRecord?.segments ?? [];
+    return computeAxisDomain(segs, settings.traceTimeUnit, traceScopeKey);
+  }, [selectedTraceRecord?.segments, settings.traceTimeUnit, traceScopeKey]);
+
+  const activeTraceRecordId = selectedTraceRecord?.recordId ?? null;
+  const isSelectedTraceLive = selectedTraceRecord?.state === 'recording';
+
+  useEffect(() => {
+    const axisKey = `${activeTraceRecordId ?? ''}::${traceAxisDomain.scopeKey}::${traceAxisDomain.unit}`;
+    if (prevTraceRecordRef.current !== activeTraceRecordId) {
+      prevTraceRecordRef.current = activeTraceRecordId;
+      setTraceScopeKey('all-anchored');
+      setCursorA(null);
+      setCursorB(null);
+      setTraceViewRange(null);
+      setTraceAnalysis(null);
+    }
+    if (prevTraceAxisKeyRef.current !== axisKey) {
+      prevTraceAxisKeyRef.current = axisKey;
+      setCursorA(null);
+      setCursorB(null);
+      setTraceAnalysis(null);
+      if (traceAxisDomain.valid) {
+        setTraceViewRange({ start: traceAxisDomain.minStr, end: traceAxisDomain.displayMaxStr });
+      } else {
+        setTraceViewRange(null);
+      }
+    }
+  }, [activeTraceRecordId, traceAxisDomain.scopeKey, traceAxisDomain.unit, traceAxisDomain.valid, traceAxisDomain.minStr, traceAxisDomain.displayMaxStr]);
+
+  useEffect(() => {
+    if (!traceAxisDomain.valid) return;
+    const minB = BigInt(traceAxisDomain.minStr);
+    const maxB = BigInt(traceAxisDomain.displayMaxStr);
+    setTraceViewRange(prev => {
+      if (!prev) {
+        return { start: minB.toString(), end: maxB.toString() };
+      }
+      const prevStart = BigInt(prev.start);
+      const prevEnd = BigInt(prev.end);
+      const span = prevEnd > prevStart ? prevEnd - prevStart : maxB - minB;
+      if (settings.traceAutoFollow && isSelectedTraceLive) {
+        const nextEnd = maxB;
+        const nextStart = nextEnd - span > minB ? nextEnd - span : minB;
+        if (nextStart === prevStart && nextEnd === prevEnd) return prev;
+        return { start: nextStart.toString(), end: nextEnd.toString() };
+      }
+      if (prevStart < minB && prevEnd > maxB) {
+        return { start: minB.toString(), end: maxB.toString() };
+      }
+      return prev;
+    });
+  }, [traceAxisDomain.valid, traceAxisDomain.minStr, traceAxisDomain.displayMaxStr, settings.traceAutoFollow, isSelectedTraceLive]);
+
+  const handleJumpToTimelineRange = useCallback((start: string, end: string) => {
+    if (traceAxisDomain.valid && BigInt(end) < BigInt(traceAxisDomain.displayMaxStr) && settings.traceAutoFollow) {
+      updateSettings({ traceAutoFollow: false, activePage: 'trace' });
+    } else {
+      updateSettings({ activePage: 'trace' });
+    }
+    setTraceViewRange({ start, end });
+  }, [traceAxisDomain.valid, traceAxisDomain.displayMaxStr, settings.traceAutoFollow, updateSettings]);
 
   const toggleLive = (enabled: boolean) => {
     setPanel(prev => ({ ...prev, settings: { ...prev.settings, liveEnabled: enabled } }));
@@ -417,11 +533,21 @@ export function RtosApp() {
             visible={panel.visible}
             session={panel.session}
             settings={settings}
-            traceState={panel.trace ?? INITIAL_TRACE_PANEL_STATE}
+            traceState={traceState}
+            selectedRecord={selectedTraceRecord}
+            axisDomain={traceAxisDomain}
+            selectedScopeKey={traceScopeKey}
+            viewRange={traceViewRange}
+            cursorA={cursorA}
+            cursorB={cursorB}
             viewportResult={traceViewport}
             hoverInspect={hoverInspect}
             cursorAInspect={cursorAInspect}
             cursorBInspect={cursorBInspect}
+            onChangeScopeKey={setTraceScopeKey}
+            onChangeViewRange={setTraceViewRange}
+            onChangeCursorA={setCursorA}
+            onChangeCursorB={setCursorB}
             onUpdateSettings={updateSettings}
             onInspectTarget={() => vscodeApi.postMessage({ command: 'traceInspectTarget' })}
             onStartRecording={mode => vscodeApi.postMessage({ command: 'traceStart', mode })}
@@ -438,14 +564,28 @@ export function RtosApp() {
             onPerfReport={handlePerfReport}
           />
         ) : settings.activePage === 'contexts' ? (
-          <PreviewPlaceholder
-            title="Contexts & Events（阶段 5 接入）"
-            summary="上下文运行统计、CPU Load 分箱、虚拟化事件表与 Trace Terminal 将在阶段 5 实现。"
-            missing={[
-              'Contexts 执行耗时 Min/Avg/Max 与 Ready 延迟统计（阶段 5.1）',
-              '虚拟化 Events 与 FreeRTOS API 参数解码（阶段 5.2）',
-              'Orbit 原始录制归档与 CSV 导出（阶段 5.3）',
-            ]}
+          <ContextsView
+            visible={panel.visible}
+            settings={settings}
+            traceState={traceState}
+            selectedRecord={selectedTraceRecord}
+            axisDomain={traceAxisDomain}
+            selectedScopeKey={traceScopeKey}
+            viewRange={traceViewRange}
+            cursorA={cursorA}
+            cursorB={cursorB}
+            cursorAInspect={cursorAInspect}
+            cursorBInspect={cursorBInspect}
+            analysisResult={traceAnalysis}
+            rangeSource={contextsRangeSource}
+            onChangeRangeSource={setContextsRangeSource}
+            onChangeScopeKey={setTraceScopeKey}
+            onUpdateSettings={updateSettings}
+            onSelectRecord={recordId => vscodeApi.postMessage({ command: 'traceSelectRecord', recordId })}
+            onOpenRecording={recordingDir => vscodeApi.postMessage({ command: 'traceOpenRecording', ...(recordingDir ? { recordingDir } : {}) })}
+            onQueryAnalysis={handleQueryAnalysis}
+            onJumpToTimelineRange={handleJumpToTimelineRange}
+            onPerfReport={handleContextsPerfReport}
           />
         ) : panel.session.phase === 'none' ? (
           <div className="rtos-empty" role="status">
@@ -842,18 +982,6 @@ function DetailItem({ label, value }: { label: string; value: string }) {
   );
 }
 
-function PreviewPlaceholder({ title, summary, missing }: { title: string; summary: string; missing: string[] }) {
-  return (
-    <div className="rtos-empty" role="status">
-      <h3>{title}</h3>
-      <p>{summary}</p>
-      <ul>
-        {missing.map((item, idx) => <li key={idx}>{item}</li>)}
-      </ul>
-    </div>
-  );
-}
-
 const STYLES = `
 .rtos-root { display:flex; flex-direction:column; height:100%; min-height:0; background:var(--vscode-panel-background, var(--vscode-editor-background)); color:var(--vscode-foreground); }
 .rtos-root button, .rtos-root input, .rtos-root select { font-family:inherit; font-size:12px; }
@@ -987,4 +1115,23 @@ const STYLES = `
 .trace-tag-b { background:var(--vscode-charts-blue, #79C0FF); }
 .trace-tag-dt { background:var(--vscode-charts-green, #4EC9B0); }
 .trace-hover-detail { color:var(--vscode-foreground); line-height:1.35; }
+.contexts-warn-bar { display:flex; flex-direction:column; gap:2px; padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); background:color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 8%, transparent); font-size:11px; flex-shrink:0; max-height:76px; overflow:auto; }
+.contexts-cpuload-card { display:flex; flex-direction:column; gap:4px; padding:6px 10px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; }
+.contexts-cpuload-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; font-size:11px; }
+.contexts-legend { display:inline-flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.contexts-dot-lbl { display:inline-flex; align-items:center; gap:4px; color:var(--vscode-descriptionForeground); }
+.contexts-swatch { display:inline-block; width:9px; height:9px; border-radius:2px; }
+.contexts-swatch.sw-task { background:#3794FF; }
+.contexts-swatch.sw-isr { background:#F48771; }
+.contexts-swatch.sw-sched { background:#C586C0; }
+.contexts-swatch.sw-idle { background:rgba(148,163,184,0.45); }
+.contexts-swatch.sw-unknown { background:rgba(204,167,0,0.45); }
+.contexts-bin-hover { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:65%; }
+.contexts-canvas-wrap { width:100%; height:112px; overflow:hidden; }
+.contexts-cpuload-canvas { display:block; cursor:pointer; }
+.contexts-kind-isr { border-color:var(--vscode-charts-red, #f48771); color:var(--vscode-charts-red, #f48771); }
+.contexts-kind-task { border-color:var(--vscode-charts-blue, #3794ff); }
+.contexts-kind-idle { opacity:.75; }
+.contexts-kind-scheduler { border-color:var(--vscode-charts-purple, #c586c0); }
+.contexts-kind-timer { border-color:var(--vscode-charts-green, #4ec9b0); }
 `;

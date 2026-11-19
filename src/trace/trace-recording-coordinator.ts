@@ -16,6 +16,8 @@ import type {
   RecordingInspectionResult,
   SegmentIndexMetadata,
   StoredGapEntry,
+  TraceAnalysisQueryRequest,
+  TraceAnalysisQueryResult,
   TraceLodQueryRequest,
   TraceLodQueryResult,
   TraceRangeQueryRequest,
@@ -138,6 +140,16 @@ export interface TraceWorkerClientLike {
       queryId?: string;
     },
   ): Promise<TraceStorageResult<TraceLodQueryResult>>;
+  queryAnalysis?(
+    recordId: string,
+    request: TraceAnalysisQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceAnalysisQueryResult>>;
   getSegments(recordId: string): Promise<TraceStorageResult<readonly SegmentIndexMetadata[]>>;
   getGaps(recordId: string): Promise<TraceStorageResult<readonly StoredGapEntry[]>>;
   exportRawToFile(
@@ -1008,6 +1020,23 @@ export class TraceRecordingCoordinator {
     },
   ): Promise<TraceStorageResult<TraceLodQueryResult>> {
     return this.ensureWorker().queryLod(recordId, request, options);
+  }
+
+  public async queryAnalysis(
+    recordId: string,
+    request: TraceAnalysisQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceAnalysisQueryResult>> {
+    const worker = this.ensureWorker();
+    if (!worker.queryAnalysis) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持统计分析聚合' };
+    }
+    return worker.queryAnalysis(recordId, request, options);
   }
 
   public async flushRecording(

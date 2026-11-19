@@ -42,6 +42,8 @@ import {
   projectTargetProbeState,
 } from './trace-dto';
 import type {
+  TraceAnalysisResponse,
+  TraceAnalysisSourceKind,
   TracePanelState,
   TracePointInspectResponse,
   TraceRecordSummary,
@@ -90,10 +92,17 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   private traceLiveInFlight = false;
   private inFlightViewportAbort: AbortController | null = null;
   private latestViewportQuerySeq = 0;
+  private viewportRequestEpoch = 0;
+  private inFlightAnalysisAbort: AbortController | null = null;
+  private latestAnalysisQuerySeq = 0;
+  private analysisRequestEpoch = 0;
   private readonly inFlightInspectAborts = new Map<'hover' | 'cursorA' | 'cursorB', AbortController>();
   private readonly latestInspectSeq = new Map<'hover' | 'cursorA' | 'cursorB', number>();
+  private readonly inspectRequestEpoch = new Map<'hover' | 'cursorA' | 'cursorB', number>();
   private lastWebviewTracePerf: Record<string, unknown> | null = null;
   private _tracePerfSeq = 0;
+  private lastWebviewContextsPerf: Record<string, unknown> | null = null;
+  private _contextsPerfSeq = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -181,6 +190,14 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
 
   get tracePerfSeq(): number {
     return this._tracePerfSeq;
+  }
+
+  get currentContextsPerf(): Record<string, unknown> | null {
+    return this.lastWebviewContextsPerf;
+  }
+
+  get contextsPerfSeq(): number {
+    return this._contextsPerfSeq;
   }
 
   get currentState(): RtosPanelState {
@@ -565,6 +582,9 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     switch (msg.command) {
       case 'ready':
         this._readyCount++;
+        this.latestViewportQuerySeq = 0;
+        this.latestAnalysisQuerySeq = 0;
+        this.latestInspectSeq.clear();
         this.postState();
         if (this.activeSession && this.isVisible) {
           if (!this.capabilities) await this.syncSessionConnection(this.sessionGeneration);
@@ -654,7 +674,7 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           && (!this.snapshot?.timers || !this.snapshot?.heap)) {
           await this.refreshSnapshot({ includeObjects: false, includeTimers: true, includeHeap: true });
         }
-        if (this.settings.activePage === 'trace' && previousPage !== 'trace') {
+        if ((this.settings.activePage === 'trace' || this.settings.activePage === 'contexts') && previousPage !== this.settings.activePage) {
           if (this.activeSession && this.isVisible && this.traceCoordinator && !this.traceTargetProbe && !this.traceProbing) {
             void this.probeTraceTarget(this.sessionGeneration);
           }
@@ -701,6 +721,9 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       case 'traceQueryViewport':
         await this.handleTraceQueryViewport(msg);
         break;
+      case 'traceQueryAnalysis':
+        await this.handleTraceQueryAnalysis(msg);
+        break;
       case 'traceInspectPoint':
         await this.handleTraceInspectPoint(msg);
         break;
@@ -708,6 +731,12 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
         if (msg.perf && typeof msg.perf === 'object') {
           this.lastWebviewTracePerf = msg.perf as Record<string, unknown>;
           this._tracePerfSeq++;
+        }
+        break;
+      case 'contextsPerfReport':
+        if (msg.perf && typeof msg.perf === 'object') {
+          this.lastWebviewContextsPerf = msg.perf as Record<string, unknown>;
+          this._contextsPerfSeq++;
         }
         break;
     }
@@ -787,6 +816,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   private cancelAllTraceQueries(): void {
     this.inFlightViewportAbort?.abort();
     this.inFlightViewportAbort = null;
+    this.inFlightAnalysisAbort?.abort();
+    this.inFlightAnalysisAbort = null;
     for (const ctrl of this.inFlightInspectAborts.values()) {
       ctrl.abort();
     }
@@ -824,7 +855,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
 
   private syncTraceLiveTimer(): void {
     const hasRecordingActive = Array.from(this.traceRecords.values()).some(r => r.state === 'recording');
-    if (this.disposed || !this.isVisible || this.settings.activePage !== 'trace' || !hasRecordingActive || !this.traceCoordinator) {
+    const onTracePage = this.settings.activePage === 'trace' || this.settings.activePage === 'contexts';
+    if (this.disposed || !this.isVisible || !onTracePage || !hasRecordingActive || !this.traceCoordinator) {
       this.stopTraceLiveTimer();
       return;
     }
@@ -842,7 +874,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   }
 
   private async tickTraceLiveRefresh(): Promise<void> {
-    if (this.disposed || !this.isVisible || this.settings.activePage !== 'trace' || !this.traceCoordinator) {
+    const onTracePage = this.settings.activePage === 'trace' || this.settings.activePage === 'contexts';
+    if (this.disposed || !this.isVisible || !onTracePage || !this.traceCoordinator) {
       this.stopTraceLiveTimer();
       return;
     }
@@ -1211,8 +1244,9 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
 
     if (!recordId || !this.traceRecords.has(recordId)) return;
     if (Number.isFinite(querySeq)) {
-      this.latestViewportQuerySeq = Math.max(this.latestViewportQuerySeq, querySeq);
+      this.latestViewportQuerySeq = querySeq;
     }
+    const myEpoch = ++this.viewportRequestEpoch;
 
     this.inFlightViewportAbort?.abort();
     const controller = new AbortController();
@@ -1290,7 +1324,7 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) {
         return;
       }
-      if (Number.isFinite(querySeq) && querySeq < this.latestViewportQuerySeq) {
+      if (myEpoch !== this.viewportRequestEpoch) {
         return;
       }
 
@@ -1367,6 +1401,103 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     }
   }
 
+  private async handleTraceQueryAnalysis(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const querySeq = Number(msg.querySeq);
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const unit: TraceTimeUnit = msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const scopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey : 'all-anchored';
+    const sourceKind: TraceAnalysisSourceKind = msg.sourceKind === 'selection' || msg.sourceKind === 'full' ? msg.sourceKind : 'viewport';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    const start = String(msg.start ?? '0');
+    const end = String(msg.end ?? '0');
+    const maxBins = Math.max(1, Math.min(512, Number(msg.maxBins) || 120));
+
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    if (Number.isFinite(querySeq)) {
+      this.latestAnalysisQuerySeq = querySeq;
+    }
+    const myEpoch = ++this.analysisRequestEpoch;
+
+    this.inFlightAnalysisAbort?.abort();
+    const controller = new AbortController();
+    this.inFlightAnalysisAbort = controller;
+    const t0 = performance.now();
+
+    try {
+      const anaRes = await this.traceCoordinator.queryAnalysis(
+        recordId,
+        {
+          start,
+          end,
+          unit,
+          maxBins,
+          maxContexts: 256,
+          maxMarkers: 256,
+          ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+          ...(segmentId !== undefined ? { segmentId } : {}),
+        },
+        { signal: controller.signal },
+      );
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) {
+        return;
+      }
+      if (myEpoch !== this.analysisRequestEpoch) {
+        return;
+      }
+
+      if (!anaRes.ok) {
+        if (anaRes.cancelled) return;
+        const result: TraceAnalysisResponse = {
+          querySeq,
+          recordId,
+          unit,
+          scopeKey,
+          sourceKind,
+          start,
+          end,
+          queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+          error: `${anaRes.errorCode}: ${anaRes.message}`,
+        };
+        this.postMessage({ command: 'traceAnalysisResult', result });
+        return;
+      }
+
+      const result: TraceAnalysisResponse = {
+        querySeq,
+        recordId,
+        unit,
+        scopeKey,
+        sourceKind,
+        start: anaRes.data.start,
+        end: anaRes.data.end,
+        analysis: anaRes.data,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      };
+      this.postMessage({ command: 'traceAnalysisResult', result });
+    } catch (err) {
+      if (controller.signal.aborted || this.disposed) return;
+      const result: TraceAnalysisResponse = {
+        querySeq,
+        recordId,
+        unit,
+        scopeKey,
+        sourceKind,
+        start,
+        end,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      this.postMessage({ command: 'traceAnalysisResult', result });
+    } finally {
+      if (this.inFlightAnalysisAbort === controller) {
+        this.inFlightAnalysisAbort = null;
+      }
+    }
+  }
+
   private async handleTraceInspectPoint(msg: any): Promise<void> {
     if (!this.traceCoordinator || this.disposed) return;
     const targetKind: 'hover' | 'cursorA' | 'cursorB' = msg.targetKind === 'cursorA' || msg.targetKind === 'cursorB' ? msg.targetKind : 'hover';
@@ -1388,9 +1519,10 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     if (!recordId || !this.traceRecords.has(recordId)) return;
 
     if (Number.isFinite(querySeq)) {
-      const prevSeq = this.latestInspectSeq.get(targetKind) ?? 0;
-      this.latestInspectSeq.set(targetKind, Math.max(prevSeq, querySeq));
+      this.latestInspectSeq.set(targetKind, querySeq);
     }
+    const myEpoch = (this.inspectRequestEpoch.get(targetKind) ?? 0) + 1;
+    this.inspectRequestEpoch.set(targetKind, myEpoch);
     this.inFlightInspectAborts.get(targetKind)?.abort();
     const controller = new AbortController();
     this.inFlightInspectAborts.set(targetKind, controller);
@@ -1418,7 +1550,7 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       ]);
 
       if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) return;
-      if (Number.isFinite(querySeq) && querySeq < (this.latestInspectSeq.get(targetKind) ?? 0)) return;
+      if (myEpoch !== (this.inspectRequestEpoch.get(targetKind) ?? 0)) return;
 
       const segList = segsRes.ok ? segsRes.data : (this.traceSegmentsByRecord.get(recordId) ?? []);
       if (segsRes.ok) this.traceSegmentsByRecord.set(recordId, segsRes.data);

@@ -611,6 +611,35 @@ export class TraceWorkerRuntime {
           return;
         }
 
+        case 'queryAnalysis': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const guard = this.buildCancelToken(
+            msg.queryId,
+            msg.recordId,
+            msg.cancelSlot,
+            msg.cancelToken,
+            msg.yieldEveryPages,
+            msg.yieldEveryItems,
+          );
+          if (!guard.ok) {
+            this.replyErr(msg.reqId, 'QueryQueueFull', `并发查询数已达上限 ${this.limits.maxPendingQueries}`, {
+              backpressure: true,
+            });
+            return;
+          }
+          try {
+            const res = await slot.store.queryAnalysis(msg.request, guard.token);
+            this.replyFromStoreResult(msg.reqId, res);
+          } finally {
+            guard.cleanup();
+          }
+          return;
+        }
+
         case 'cancelQuery': {
           const q = this.activeQueries.get(msg.queryId);
           if (q) {

@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "stage": "4.5",
+  "frozenDate": "2026-11-19",
+  "baseCommit": "664cbab20e76bb3507d895f081943df943763b00",
+  "environment": {
+    "os": "win32 x64",
+    "cpu": "AMD Ryzen 7 7745HX with Radeon Graphics (16 logical CPUs)",
+    "node": "v24.15.0",
+    "vscodeTestExecutable": ".vscode-test/vscode-win32-x64-archive-1.134.0/Code.exe"
+  },
+  "scope": {
+    "frozenNow": [
+      "Offline / synthetic 1,002,005-packet (2,505,036 B, 668,000 slices) Worker ingest + finish throughput",
+      "1M-event LOD / exact-point / zoomed viewport query latencies and rapid cancellation",
+      "Real VS Code Extension Host + Chromium Webview Canvas drawing duration, long-task budget, stale-reply isolation",
+      "Bounded Worker cache, page-descriptor memory, write-queue, and host in-flight queue/input limits"
+    ],
+    "hardwarePendingForStage6_2": [
+      "30-minute continuous real-target sustained endurance burn-in (storage growth, stop drain, multi-transport contention)",
+      "Real-target throughput and control contention comparison across RMLink, J-Link native, CMSIS-DAP WinUSB and HID"
+    ]
+  },
+  "designTargetsVsMeasured": {
+    "canvasTarget": "60 Hz responsive rendering (< 16.6 ms per frame target, no > 50 ms main-thread long tasks during viewport queries)",
+    "measuredChromium1MVp": {
+      "frameCount": 20,
+      "lastDrawMs": 2.3,
+      "maxDrawMs": 2.7,
+      "over16msFrames": 0,
+      "over50msDrawFrames": 0,
+      "longTasksOver50ms": 0,
+      "maxLongTaskMs": 0,
+      "viewportQueryMs": 17.33,
+      "pointInspectMs": 7.53,
+      "rapid10SwitchesTotalMs": 23
+    },
+    "measuredNode1MWorker": {
+      "packetCount": 1002005,
+      "rawBytes": 2505036,
+      "ingestMs": 11002.71,
+      "finishMs": 42.02,
+      "packetsPerSec": 91069,
+      "bytesPerSec": 227675,
+      "lodP50Ms": 1.76,
+      "lodP95Ms": 4.46,
+      "lodMaxMs": 5.21,
+      "exactPointP50Ms": 4.25,
+      "exactPointP95Ms": 10.11,
+      "exactPointMaxMs": 10.23,
+      "zoomedViewportP50Ms": 5.02,
+      "zoomedViewportP95Ms": 12.24,
+      "zoomedViewportMaxMs": 14.15,
+      "rapidCancel12TotalMs": 4.54,
+      "cancelledCount": 11,
+      "workerPeakRssBytes": 320221184,
+      "workerPeakHeapUsedBytes": 106739968,
+      "workerInMemoryPageDescriptors": 847,
+      "workerCachedPagesPeak": 30,
+      "workerCachedBytesPeak": 8365182,
+      "hostPeakRetainedInputBytes": 32768
+    }
+  },
+  "frozenGates": {
+    "minWorkerSustainedDecodePacketsPerSec": 40000,
+    "minWorkerSustainedRawBytesPerSec": 100000,
+    "max1MFinishMs": 500,
+    "max1MLodQueryP95Ms": 30,
+    "max1MExactPointQueryP95Ms": 50,
+    "max1MZoomedViewportQueryP95Ms": 60,
+    "max1MRapid12CancelDrainMs": 100,
+    "maxCanvasDrawFrameP95Ms": 16.6,
+    "maxCanvasDrawFrameMaxMs": 50,
+    "maxWebviewLongTasksOver50msDuring1MBrowse": 0,
+    "maxWorkerCachedPages": 64,
+    "maxWorkerCachedBytes": 8388608,
+    "maxWorkerInMemoryPageDescriptors": 16384,
+    "maxWorkerWriteQueueBytes": 16777216,
+    "maxQueryResultItems": 4096,
+    "maxQueryResultBytes": 2097152,
+    "maxWorkerPeakHeapUsedBytesFor1M": 268435456,
+    "maxHostRetainedInputBytes": 8388608,
+    "maxHostInFlightQueries": 32
+  },
+  "measurementScripts": [
+    "node scripts/rtos/benchmark-trace-45.cjs",
+    "node scripts/rtos/verify-stage45-vscode.js"
+  ]
+}

@@ -1,9 +1,12 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TaskSnapshot } from '../../rtos/model';
 import { ObjectsView } from './objects-view';
 import { TimersHeapView } from './timers-heap-view';
+import { TraceTimelineView } from './trace-timeline-view';
+import type { TracePointInspectResponse, TraceRecordSummary, TraceViewportResponse } from './trace-timeline-state';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
+  INITIAL_TRACE_PANEL_STATE,
   describeConsistency,
   describeDiagnosticIssue,
   filterAndSortTasks,
@@ -44,6 +47,7 @@ const INITIAL_STATE: RtosPanelState = {
   loading: { refresh: false, stackScan: false, capabilities: false },
   liveActive: false,
   lastError: null,
+  trace: INITIAL_TRACE_PANEL_STATE,
 };
 
 const STATE_LABELS: Record<TaskSnapshot['state'], string> = {
@@ -89,7 +93,12 @@ function formatTime(timestamp: number): string {
 export function RtosApp() {
   const [panel, setPanel] = useState<RtosPanelState>(INITIAL_STATE);
   const [themeKind, setThemeKind] = useState<'dark' | 'light' | 'hc'>(() => detectThemeKind());
+  const [traceViewport, setTraceViewport] = useState<TraceViewportResponse | null>(null);
+  const [hoverInspect, setHoverInspect] = useState<TracePointInspectResponse | null>(null);
+  const [cursorAInspect, setCursorAInspect] = useState<TracePointInspectResponse | null>(null);
+  const [cursorBInspect, setCursorBInspect] = useState<TracePointInspectResponse | null>(null);
   const hostVersionRef = useRef(-1);
+  const selectedTraceIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const refreshTheme = () => setThemeKind(detectThemeKind());
@@ -104,9 +113,39 @@ export function RtosApp() {
         const next = msg.state as RtosPanelState;
         if (next.hostVersion < hostVersionRef.current) return;
         hostVersionRef.current = next.hostVersion;
+        const nextRecId = next.trace?.selectedRecordId ?? null;
+        if (nextRecId !== selectedTraceIdRef.current) {
+          selectedTraceIdRef.current = nextRecId;
+          setTraceViewport(null);
+          setHoverInspect(null);
+          setCursorAInspect(null);
+          setCursorBInspect(null);
+        }
         setPanel(next);
       } else if (msg.command === 'visibility') {
         setPanel(prev => ({ ...prev, visible: Boolean(msg.visible) }));
+      } else if (msg.command === 'traceRecordMeta' && msg.record && typeof msg.record === 'object') {
+        const rec = msg.record as TraceRecordSummary;
+        setPanel(prev => {
+          const curTrace = prev.trace ?? INITIAL_TRACE_PANEL_STATE;
+          const exists = curTrace.records.some(r => r.recordId === rec.recordId);
+          const records = exists
+            ? curTrace.records.map(r => (r.recordId === rec.recordId ? rec : r))
+            : [...curTrace.records, rec];
+          return { ...prev, trace: { ...curTrace, records } };
+        });
+      } else if (msg.command === 'traceViewportResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TraceViewportResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          setTraceViewport(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
+        }
+      } else if (msg.command === 'tracePointInspectResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TracePointInspectResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          if (res.targetKind === 'hover') setHoverInspect(res);
+          else if (res.targetKind === 'cursorA') setCursorAInspect(res);
+          else if (res.targetKind === 'cursorB') setCursorBInspect(res);
+        }
       }
     };
     window.addEventListener('message', onMessage);
@@ -119,10 +158,43 @@ export function RtosApp() {
   }, []);
 
   const settings = panel.settings;
-  const updateSettings = (patch: Partial<RtosViewSettings>) => {
+  const updateSettings = useCallback((patch: Partial<RtosViewSettings>) => {
     setPanel(prev => ({ ...prev, settings: { ...prev.settings, ...patch } }));
     vscodeApi.postMessage({ command: 'updateSettings', settings: patch });
-  };
+  }, []);
+
+  const handleQueryViewport = useCallback((req: {
+    querySeq: number;
+    recordId: string;
+    unit: 'ns' | 'relative-ns' | 'absolute-ticks' | 'relative-ticks';
+    scopeKey: string;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    maxBuckets: number;
+    detailLimit: number;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceQueryViewport', ...req });
+  }, []);
+
+  const handleInspectPoint = useCallback((req: {
+    querySeq: number;
+    targetKind: 'hover' | 'cursorA' | 'cursorB';
+    recordId: string;
+    unit: 'ns' | 'relative-ns' | 'absolute-ticks' | 'relative-ticks';
+    queryTime: string;
+    queryStart: string;
+    queryEnd: string;
+    bootGeneration?: number;
+    segmentId?: number;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceInspectPoint', ...req });
+  }, []);
+
+  const handlePerfReport = useCallback((perf: Record<string, unknown>) => {
+    vscodeApi.postMessage({ command: 'tracePerfReport', perf });
+  }, []);
 
   const toggleLive = (enabled: boolean) => {
     setPanel(prev => ({ ...prev, settings: { ...prev.settings, liveEnabled: enabled } }));
@@ -341,14 +413,29 @@ export function RtosApp() {
         {!panel.visible ? (
           <div className="rtos-empty" role="status">RTOS 视图已隐藏，暂停刷新与渲染。</div>
         ) : settings.activePage === 'trace' ? (
-          <PreviewPlaceholder
-            title="Trace Timeline（阶段 4 接入）"
-            summary="当前阶段 2 提供 FreeRTOS 内存快照预览；SystemView 二进制 RTT 流传输、任务/ISR 泳道与 A/B 游标将在阶段 3～4 实现。"
-            missing={[
-              'SystemView RTT 通道枚举与下行控制（阶段 3）',
-              '事件流式解码、上下文区间重建与录制存储（阶段 4）',
-              'Continuous / Single-Shot / Post-Mortem 模式采集（阶段 4）',
-            ]}
+          <TraceTimelineView
+            visible={panel.visible}
+            session={panel.session}
+            settings={settings}
+            traceState={panel.trace ?? INITIAL_TRACE_PANEL_STATE}
+            viewportResult={traceViewport}
+            hoverInspect={hoverInspect}
+            cursorAInspect={cursorAInspect}
+            cursorBInspect={cursorBInspect}
+            onUpdateSettings={updateSettings}
+            onInspectTarget={() => vscodeApi.postMessage({ command: 'traceInspectTarget' })}
+            onStartRecording={mode => vscodeApi.postMessage({ command: 'traceStart', mode })}
+            onStopRecording={recordId => vscodeApi.postMessage({ command: 'traceStop', recordId })}
+            onPauseRecording={recordId => vscodeApi.postMessage({ command: 'tracePause', recordId })}
+            onResumeRecording={recordId => vscodeApi.postMessage({ command: 'traceResume', recordId })}
+            onCancelRecording={recordId => vscodeApi.postMessage({ command: 'traceCancel', recordId })}
+            onSelectRecord={recordId => vscodeApi.postMessage({ command: 'traceSelectRecord', recordId })}
+            onOpenRecording={recordingDir => vscodeApi.postMessage({ command: 'traceOpenRecording', ...(recordingDir ? { recordingDir } : {}) })}
+            onSaveRecording={(recordId, targetDir) => vscodeApi.postMessage({ command: 'traceSaveRecording', recordId, ...(targetDir ? { targetDir } : {}) })}
+            onCloseRecording={recordId => vscodeApi.postMessage({ command: 'traceCloseRecording', recordId })}
+            onQueryViewport={handleQueryViewport}
+            onInspectPoint={handleInspectPoint}
+            onPerfReport={handlePerfReport}
           />
         ) : settings.activePage === 'contexts' ? (
           <PreviewPlaceholder
@@ -875,4 +962,29 @@ const STYLES = `
 .rtos-heap-stat { display:flex; flex-direction:column; gap:1px; }
 .rtos-heap-bar-wrap { display:flex; align-items:center; gap:8px; }
 .rtos-heap-bar { width:100%; max-width:360px; height:7px; }
+.trace-shell { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+.trace-controls-bar { justify-content:space-between; }
+.trace-nav-bar { gap:6px; }
+.trace-btn-group { display:flex; align-items:center; gap:5px; flex-shrink:0; }
+.trace-record-select { max-width:260px; }
+.trace-status-banner { display:flex; flex-wrap:nowrap; align-items:center; gap:8px; padding:4px 10px; min-height:24px; border-bottom:1px solid var(--vscode-panel-border); font-size:11px; overflow-x:auto; scrollbar-width:none; flex-shrink:0; white-space:nowrap; }
+.trace-stat-text { color:var(--vscode-descriptionForeground); flex-shrink:0; }
+.trace-action-msg { padding:1px 6px; border-radius:3px; border:1px solid var(--vscode-panel-border); flex-shrink:0; }
+.trace-viewport-body { flex:1; min-height:0; display:flex; align-items:flex-start; overflow-y:auto; overflow-x:hidden; position:relative; }
+.trace-lane-headers { flex-shrink:0; border-right:1px solid var(--vscode-panel-border); background:var(--vscode-sideBar-background, var(--vscode-panel-background)); user-select:none; }
+.trace-ruler-corner { display:flex; align-items:center; padding:0 8px; font-size:10px; color:var(--vscode-descriptionForeground); border-bottom:1px solid var(--vscode-panel-border); font-family:var(--vscode-editor-font-family, monospace); }
+.trace-lane-header { display:flex; flex-direction:column; justify-content:center; padding:0 8px; border-bottom:1px solid var(--vscode-panel-border); overflow:hidden; }
+.trace-lane-title { font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.trace-lane-sub { font-size:10px; color:var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.trace-canvas-wrap { flex:1; min-width:0; min-height:100%; position:relative; }
+.trace-canvas { display:block; cursor:crosshair; touch-action:none; }
+.trace-dense-hud { position:sticky; top:28px; float:right; margin:4px 8px 0 0; padding:2px 8px; border-radius:3px; font-size:10px; background:var(--vscode-editorHoverWidget-background, #252526); color:var(--vscode-editorHoverWidget-foreground, #cccccc); border:1px solid var(--vscode-panel-border); pointer-events:none; }
+.trace-inspector-bar { border-top:1px solid var(--vscode-panel-border); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); padding:5px 10px; height:84px; min-height:84px; max-height:84px; overflow:auto; flex-shrink:0; display:flex; flex-direction:column; gap:3px; font-size:11px; }
+.trace-cursor-summary { display:flex; flex-wrap:wrap; gap:4px 14px; align-items:center; }
+.trace-cursor-row { display:flex; align-items:center; gap:5px; }
+.trace-tag { display:inline-block; min-width:16px; text-align:center; border-radius:3px; font-size:10px; font-weight:700; padding:0 4px; color:#000; }
+.trace-tag-a { background:var(--vscode-charts-yellow, #FFD166); }
+.trace-tag-b { background:var(--vscode-charts-blue, #79C0FF); }
+.trace-tag-dt { background:var(--vscode-charts-green, #4EC9B0); }
+.trace-hover-detail { color:var(--vscode-foreground); line-height:1.35; }
 `;

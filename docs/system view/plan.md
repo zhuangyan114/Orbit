@@ -1,7 +1,7 @@
 # Orbit RTOS / SystemView 开发总计划
 
 - 编写日期：2026-11-18（Asia/Shanghai）。
-- 状态：阶段 0～2 已完成。阶段 3 的 RMLink 实板回环通过，J-Link 与 USB CMSIS-DAP 待验，Trace 三种录制模式已通过 RMLink 实板验收，下一部分是 4.5。各项状态见第 12 节。
+- 状态：阶段 0～2 已完成。阶段 3 的 RMLink 实板回环通过，J-Link 与 USB CMSIS-DAP 待验，Trace 三种录制模式和 Trace Timeline 已通过 RMLink 实板验收，下一部分是 5.1。各项状态见第 12 节。
 - 适用项目：Orbit for VS Code，Windows。
 - 首版范围：仅支持和验证 FreeRTOS；其他 RTOS 全部放到首版之后。
 - 执行规则：按小部分实施，每部分完成相应检查后独立提交 Git，提交信息使用中文。
@@ -503,14 +503,14 @@ git diff --check
 | 1：快照引擎 | 已完成 | 1.1～1.4：布局、任务、栈/计数器、DAP 安全刷新；H723/RMLink 实板及冻结门槛通过，见 stage1-validation.md。 |
 | 2：面板与对象 | 已完成 | 2.1～2.4：内建 RTOS 面板、Queue/Mutex/Sem/WaitGraph、Timers/Heap 与旧 RTOS Views 专属清理已通过自动化与真实 VS Code 出口检查。 |
 | 3：RTT 传输 | 进行中 | 3.1～3.3 已通过独立 mock 验收；3.4 通过全量自动化和 RMLink 二号机 H723 回环验收。J-Link native、CMSIS-DAP WinUSB/HID 对应实板门槛待补验。4.1 可用现有独立样本开展离线解码。 |
-| 4：Trace 引擎 | 进行中 | 4.1 流式解码、4.2 区间重建与 4.3 存储、索引和范围查询已通过独立样本与百万级事件验收。4.4 的三种录制模式已在 STM32H723 和 RMLink 二号机通过实板验收，包含 Continuous 停止排空与超时恢复。下一部分是 4.5 的 Trace Timeline。 |
+| 4：Trace 引擎 | 已完成 | 4.1～4.3 通过独立样本与百万事件验收。4.4 在 STM32H723 与 RMLink 二号机验收三种录制模式，4.5 通过真实 VS Code 的实时录制、离线回放、缩放与精确游标复验，并冻结可复跑的 Trace 性能门槛。30 分钟长稳与跨探针矩阵列入 6.2。 |
 | 5：分析与联动 | 未开始 | 5.1～5.5 待执行。 |
 | 6：首版验收 | 未开始 | 6.1～6.4 待执行。 |
 | 7：后续扩展 | 未排期 | 不计入首版范围。 |
 
 ### 12.2 记录要求
 
-当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[冻结性能门槛](stage1-performance-gates.json)。
+当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[阶段 1 冻结性能门槛](stage1-performance-gates.json)、[阶段 4.5 Trace 验收与基准](stage4-trace-validation.md)、[阶段 4.5 Trace 冻结门槛](stage4-trace-performance-gates.json)。
 
 后续详细设计、证据索引、基准与交接文件统一放在 `docs/system view/` 下，在本节补相对链接。开始阶段 0 时建立 `progress.md`、`compatibility.md`、`protocol.md` 和 `validation.md`，记录已确定内容；不要预填虚假的测试结果。
 

@@ -245,3 +245,30 @@
 - 证据：`src/trace/systemview-target-metadata.ts`、`src/trace/trace-recording-coordinator.ts`、`src/rtos/rtt-coordinator.ts`、`src/debug/dap-session.ts`、`src/trace/trace-format.ts`、`src/trace/trace-recording-store.ts`、`src/trace/trace-worker*.ts`、`src/extension.ts`、`out/rtos-stage4/acceptance-4.4/{README.md,offline-acceptance.json,vscode-host-report.json,independent-*.json,codex-*}`。
 - 剩余事项：4.5 接入 Trace Timeline。J-Link native 和 CMSIS-DAP WinUSB/HID 实板矩阵仍待补验。
 - 提交：`实现 RTOS 阶段 4.4：接入实时与缓冲录制模式`。
+
+## 4.5 / 2026-11-19
+
+- 状态：已完成。独立自动化、两个真实 VS Code 宿主的集成和操作复验、H723 实板实时录制及归档重开均通过。
+- 实现：
+  - 新增 `src/webview/rtos/trace-timeline-state.ts`（与 `trace-timeline-state.test.ts`）和 `src/webview/rtos/trace-dto.ts`：保持 JSON-safe 字符串承载全部无损 `bigint` 相对/绝对 tick 与纳秒域，提供精确缩放/平移计算、时间域校验与非锚定/跨复位段隔离、缺口位置解析，以及 A/B 游标跨缺口/不确定段/不同时间域 `Δt` 连续性护栏。
+  - 扩展 `src/trace/trace-recording-coordinator.ts`：新增 `onDidChangeStatus` 状态事件节流分发、串行入 `ingestChain` 的 `flushRecording(recordId)` 热提交支持，以及 `queryRange`/`queryLod` 的 `AbortSignal`/让步透传。
+  - 扩展 `src/webview/rtos/rtos-view-state.ts`、`src/webview/rtos/rtos-provider.ts` 与 `src/extension.ts`：注入 `TraceRecordingCoordinator`；支持在无调试会话状态下独立保存（`orbit-trace-v1` 全套文件复制+可读校验）、打开、选择和关闭离线归档；支持实时热录制期间 350 ms 单飞 `flushRecording` 刷新已提交范围，视图隐藏/切换页面仅暂停轮询定时器与在途查询而不中止后台录制，销毁/切换记录/重启会话严格隔离过期异步回包；视口查询与 Hover/Cursor A/B 精确点查询各自携带递增序号与 `AbortController` 取消过期请求；保留现有 Watch、变量 Timeline、RTT Log、SVD/Mem/DAP 与阶段 2 Tasks/Objects/Timers/Heap 页面兼容。
+  - 新增 `src/webview/rtos/trace-timeline-view.tsx` 并接入 `src/webview/rtos/app.tsx`：沿用现有 VS Code 主题令牌（`readTimelineTheme()` + `--vscode-*`）在单一 DPR 感知 `<canvas>` 上实现 Overview LOD 轨、ISR（含嵌套抢占含/独占与虚线轮廓）泳道、Task 运行条与 Ready 等待子轨、Markers 区间与点标记、缺口竖带与不确定段阴影、滚轮/按钮缩放、拖拽平移、Auto-Follow 随动与手动平移/缩离自动退出、Hover 与 A/B 游标精确查询，以及三种模式确认/错误/完成/冻结诊断条与 Chromium `rAF`/LongTask 采样。未提前扩张 5.x Contexts/CPU Load/Events/Terminal/CSV/SVDat/公开 API/MCP 或跨面板联动。
+  - 冻结阶段 4 §10 Trace 性能门槛并落盘受控脚本与基准文档：`scripts/rtos/benchmark-trace-45.cjs`、`scripts/rtos/verify-stage45-vscode.js`、`scripts/rtos/vscode-stage45-driver.js`、`src/webview/rtos/trace-timeline-integration.test.ts`、`docs/system view/stage4-trace-performance-gates.json`、`docs/system view/stage4-trace-validation.md`。
+- 设计变更：
+  - 将所有跨 Webview `postMessage` 的 `bigint` 时间与持续时间转为十进制字符串 DTO，由视图侧还原为 `bigint` 运算，避免 JSON 序列化异常并保留 64-bit 时基精度；
+  - 将热录制定时刷新严格限制在 Webview 可见、处于 Trace 子页且处于 `recording` 时以单飞 350 ms 节拍执行 `flushRecording`，绝不在 Webview 内另起目标通信链路，也不为不支持模式或未完成排空发自动 halt/reset。
+- 检查：
+  - 聚焦 Vitest（8 文件 79 项：`rtos-view-state.test.ts` 8、`rtos-provider.test.ts` 7、`trace-timeline-state.test.ts` 4、`trace-timeline-integration.test.ts` 4、`dap-session-realtime-variables.test.ts` 41、`dap-session-scopes.test.ts` 1、`native-scheduler.test.ts` 8、`watch-expression-validation.test.ts` 6）：全部通过（含阶段 0 固定样本、1,002,005 事件快速取消与无 halt/reset 热刷新）；
+  - `npm run typecheck` 通过（0 errors）；`npm run build` 通过；
+  - 全量 `npm test -- --minWorkers=1 --maxWorkers=2`：**121 文件、1512 项通过、1 项已有跳过（1513 总计）**；
+  - §10 Node Worker 1M 基准（`node scripts/rtos/benchmark-trace-45.cjs`）：1,002,005 包（2,505,036 B / 668,000 slices）写入 `11002.71 ms`（`91,069 pkts/s`、`227,675 B/s`）、`finishMs = 42.02 ms`；LOD `p50=1.76 / p95=4.46 ms`、精确点 `p50=4.25 / p95=10.11 ms`、放大视口 `p50=5.02 / p95=12.24 ms`、12 次连续快速取消 `4.54 ms`（取消 11 次）；Worker 峰值堆 `106,739,968 B`、峰值 RSS `320,221,184 B`、LRU 缓存峰值 `30/64` 页（`8,365,182 B`）、页描述符 `847/16,384`；
+  - 真实 VS Code 集成 UI 验收（`node scripts/rtos/verify-stage45-vscode.js`；返工 R2 在两个全新隔离 `--output` 目录 `r2-verify-1` 与 `r2-verify-2` 均复验通过）：确认原测试使用 `vscode.moveViews` 将 `ozoneRtos` 移回变空后隐藏的 `hideIfEmpty` Panel 容器 `workbench.view.extension.ozone-rtos-panel` 时，VS Code `moveViewsToContainer(..., 0)` 不会像内建 `ozoneRtos.resetViewLocation` 那样同步修复空容器位置、展开视图并 `openView`；测试驱动改走正当 `ozoneRtos.resetViewLocation` 入口并校验 `provider.isVisible === true`、Panel 切至 Watch 再切回确实隐藏/重显、恢复后的真实 Chromium Webview 渲染上报（`tracePerfSeq=4`）以及录制全程保持 `recording`。两轮全新隔离结果：`r2-verify-1` 1M 打开 `1483 ms`、10 次切换 `21 ms`、`lastDrawMs=1.5 / maxDrawMs=4.5 ms / over16msFrames=0 / longTasksOver50ms=0`；`r2-verify-2` 1M 打开 `1515 ms`、10 次切换 `21 ms`、`lastDrawMs=1.4 / maxDrawMs=3.6 ms / over16msFrames=0 / longTasksOver50ms=0`；阶段 0/5 份 H723 只读归档、Light/Dark 主题切换及 Post-Mortem 模式冲突均通过。
+  - 阶段 2 面板 VS Code UI 回归（`node scripts/rtos/verify-stage2-vscode.js --output=out/rtos-stage4/acceptance-4.5/stage2-regression-vscode`）：通过。
+- 硬件和实际操作：在原 `h7vgt6_test` 扩展开发宿主（VS Code 1.146.0）与 RMLink 二号机操作 Trace Timeline。100 Hz FreeRTOS 测试固件通过 UI 开始、跟随和停止，完成 58,803 B、9,797 包、3,387 个执行切片，目标和宿主丢包计数为 0。调试会话释放后，用原生保存和打开对话框保存副本并重开，独立核对 raw SHA-256 一致。
+  - 真机回卷归档显示前缀覆盖、616 个 Marker 点，实际悬停查询得到 `EX_MARK markerId=5425 @off=827`，A/B 原始差值为 955,859 ns。打开 1,002,005 包归档，放大、平移并检视数据；原记录的游标状态没有进入新记录。
+  - 独立用全新 VS Code 1.134.0 profile 复跑修订后的 UI 驱动，视图恢复到 Panel 后真实重绘、再次隐藏并重显，录制继续运行。百万事件测得 10 次视口切换 23 ms，采样 20 帧中最长绘制 3.7 ms，超过 50 ms 的长任务为 0。
+  - 独立 Worker 性能复测为 92,244 包/s、230,613 B/s，精确点 p95 为 12.64 ms，连续 12 个查询取消了前 11 个并返回最后一个结果。实测对应已冻结门槛。
+- 证据：`src/webview/rtos/{trace-timeline-state.ts,trace-dto.ts,trace-timeline-view.tsx,rtos-view-state.ts,rtos-provider.ts,app.tsx,trace-timeline-state.test.ts,trace-timeline-integration.test.ts,rtos-provider.test.ts,rtos-view-state.test.ts}`、`src/trace/trace-recording-coordinator.ts`、`src/extension.ts`、`scripts/rtos/{benchmark-trace-45.cjs,verify-stage45-vscode.js,vscode-stage45-driver.js}`、`docs/system view/{stage4-trace-validation.md,stage4-trace-performance-gates.json}`、`out/rtos-stage4/acceptance-4.5/{benchmark-worker.json,vscode-ui-report.json,r2-verify-1/{vscode-ui-report.json,verification.log},r2-verify-2/{vscode-ui-report.json,verification.log},stage2-regression-vscode/report.json,codex-benchmark-worker.json,codex-r2-vscode-091253/vscode-ui-report.json,codex-stage45-live-stop.json,codex-stage45-saved-copy.json}`。
+- 剩余事项：5.1 增加上下文统计与 CPU 负载。30 分钟连续长稳与完整探针矩阵归阶段 6.2。
+- 提交：`实现 RTOS 阶段 4.5：增加任务与中断泳道视图`。

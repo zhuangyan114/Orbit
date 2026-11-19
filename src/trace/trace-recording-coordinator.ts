@@ -123,8 +123,21 @@ export interface TraceWorkerClientLike {
   queryRange<T = unknown>(
     recordId: string,
     request: TraceRangeQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
   ): Promise<TraceStorageResult<TraceRangeQueryResult<T>>>;
-  queryLod(recordId: string, request: TraceLodQueryRequest): Promise<TraceStorageResult<TraceLodQueryResult>>;
+  queryLod(
+    recordId: string,
+    request: TraceLodQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceLodQueryResult>>;
   getSegments(recordId: string): Promise<TraceStorageResult<readonly SegmentIndexMetadata[]>>;
   getGaps(recordId: string): Promise<TraceStorageResult<readonly StoredGapEntry[]>>;
   exportRawToFile(
@@ -496,6 +509,8 @@ export class TraceRecordingCoordinator {
   private readonly nowMs: () => number;
   private readonly sleepMs: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly onStatusChange?: (status: TraceRecordingStatus) => void;
+  private readonly statusListeners = new Set<(status: TraceRecordingStatus) => void>();
+  private lastProgressEmitMs = 0;
 
   private worker: TraceWorkerClientLike | null = null;
   private boundSession: TraceSessionHandle | undefined;
@@ -528,6 +543,15 @@ export class TraceRecordingCoordinator {
 
   public get activeSession(): TraceSessionHandle | undefined {
     return this.boundSession;
+  }
+
+  public onDidChangeStatus(listener: (status: TraceRecordingStatus) => void): { dispose(): void } {
+    this.statusListeners.add(listener);
+    return {
+      dispose: () => {
+        this.statusListeners.delete(listener);
+      },
+    };
   }
 
   public bindSession(session: TraceSessionHandle | undefined): void {
@@ -965,12 +989,63 @@ export class TraceRecordingCoordinator {
   public async queryRange<T = unknown>(
     recordId: string,
     request: TraceRangeQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
   ): Promise<TraceStorageResult<TraceRangeQueryResult<T>>> {
-    return this.ensureWorker().queryRange<T>(recordId, request);
+    return this.ensureWorker().queryRange<T>(recordId, request, options);
   }
 
-  public async queryLod(recordId: string, request: TraceLodQueryRequest): Promise<TraceStorageResult<TraceLodQueryResult>> {
-    return this.ensureWorker().queryLod(recordId, request);
+  public async queryLod(
+    recordId: string,
+    request: TraceLodQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceLodQueryResult>> {
+    return this.ensureWorker().queryLod(recordId, request, options);
+  }
+
+  public async flushRecording(
+    recordId: string,
+  ): Promise<TraceStorageResult<{ commitSeq: number; committedRawBytes: number }>> {
+    const rec = this.activeRecording;
+    if (!rec || rec.recordId !== recordId || !rec.workerCreated || rec.workerFinished || rec.finalized) {
+      return { ok: false, errorCode: 'RecordingClosed', message: `Recording ${recordId} is not writable` };
+    }
+    const runGen = rec.runGeneration;
+    let result: TraceStorageResult<{ commitSeq: number; committedRawBytes: number }> = {
+      ok: false,
+      errorCode: 'RecordingClosed',
+      message: `Recording ${recordId} closed before flush`,
+    };
+    rec.ingestChain = rec.ingestChain.then(async () => {
+      if (rec.runGeneration !== runGen || !rec.workerCreated || rec.workerFinished || rec.finalized) {
+        return;
+      }
+      const worker = this.ensureWorker();
+      result = await worker.flushRecording(rec.recordId);
+      if (result.ok) {
+        rec.committedRawBytes = result.data.committedRawBytes;
+        const statsRes = await worker.getStats(rec.recordId).catch(() => undefined);
+        if (statsRes?.ok) {
+          const s = statsRes.data.records[rec.recordId];
+          if (s) {
+            rec.packetsDecoded = s.committed.packetCount;
+            rec.sliceCount = s.committed.sliceCount;
+            rec.gapCount = s.committed.gapCount;
+            rec.segmentCount = s.committed.segmentCount;
+          }
+        }
+        this.emitStatus(rec);
+      }
+    });
+    await rec.ingestChain;
+    return result;
   }
 
   public async getSegments(recordId: string): Promise<TraceStorageResult<readonly SegmentIndexMetadata[]>> {
@@ -2300,6 +2375,7 @@ export class TraceRecordingCoordinator {
         rec.packetsDecoded += ingestRes.data.packetsDecoded;
         rec.sliceCount += ingestRes.data.slicesEmitted;
         rec.gapCount += ingestRes.data.gapsRecorded;
+        this.emitStatusThrottled(rec);
         if (rec.hostBackpressured && rec.pendingHostQueueBytes <= 128 * 1024) {
           await this.applyHostBackpressure(rec, false);
         }
@@ -3348,11 +3424,30 @@ export class TraceRecordingCoordinator {
         completion: 'not-started',
       },
     };
-    this.onStatusChange?.(status);
+    this.publishStatus(status);
     return status;
   }
 
+  private emitStatusThrottled(rec: ActiveRecordingContext): void {
+    const now = this.nowMs();
+    if (now - this.lastProgressEmitMs < 150) return;
+    this.lastProgressEmitMs = now;
+    this.emitStatus(rec);
+  }
+
   private emitStatus(rec: ActiveRecordingContext): void {
-    this.onStatusChange?.(this.snapshotStatus(rec));
+    this.lastProgressEmitMs = this.nowMs();
+    this.publishStatus(this.snapshotStatus(rec));
+  }
+
+  private publishStatus(status: TraceRecordingStatus): void {
+    this.onStatusChange?.(status);
+    for (const listener of this.statusListeners) {
+      try {
+        listener(status);
+      } catch {
+        // Ignore listener errors to avoid disrupting coordinator state transitions.
+      }
+    }
   }
 }

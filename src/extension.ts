@@ -163,13 +163,13 @@ export async function activate(context: vscode.ExtensionContext) {
     };
     const tl = new TimelineWebviewProvider(context, dsm, isUsableWatchSession, symbolPicker);
     timelineProvider = tl;
-    rtosProvider = new RtosWebviewProvider(context);
     traceCoordinator = new TraceRecordingCoordinator({
       storageRoot: path.join(context.globalStorageUri.fsPath, 'trace-recordings'),
     });
     if (initialSession && isOrbitDebugSessionType(initialSession.type)) {
       traceCoordinator.bindSession(initialSession);
     }
+    rtosProvider = new RtosWebviewProvider(context, traceCoordinator);
 
     // Bounded automation event ring and the exact DebugSession registry with
     // the instance-level generation fence (plan Task 3). The ring pulls its

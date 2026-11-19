@@ -1,11 +1,24 @@
 import * as vscode from 'vscode';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import { randomBytes } from 'crypto';
 import type { RtosSnapshot } from '../../rtos/model';
 import { AUTOMATION_CONTROL_EVENT, AUTOMATION_LIFECYCLE_EVENT } from '../../debug/dap-automation-protocol';
+import { ORBIT_TRACE_FILES, type SegmentIndexMetadata } from '../../trace/trace-format';
+import type { DecodedSystemViewPacket } from '../../trace/systemview-decoder';
+import type {
+  ContextActivationInterval,
+  ExecutionSliceInterval,
+  MarkerInterval,
+  MarkerPointEvent,
+  ReadyWaitInterval,
+} from '../../trace/systemview-reconstructor';
+import type { TraceRecordingCoordinator, TraceRecordingMode, TraceRecordingStatus } from '../../trace/trace-recording-coordinator';
 import { isOrbitDebugSessionType } from '../../utils/debug-session-type';
 import { log } from '../../utils/logger';
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
+  INITIAL_TRACE_PANEL_STATE,
   RTOS_VIEW_SETTINGS_KEY,
   RtosCapabilitiesPayload,
   RtosErrorSummary,
@@ -14,6 +27,28 @@ import {
   RtosViewSettings,
   sanitizeRtosViewSettings,
 } from './rtos-view-state';
+import {
+  projectActivationDto,
+  projectGapDto,
+  projectLodBucketDto,
+  projectMarkerDto,
+  projectMarkerPointDto,
+  projectPacketDto,
+  projectRecordFromOpened,
+  projectRecordFromStatus,
+  projectReadyWaitDto,
+  projectSegmentDto,
+  projectSliceDto,
+  projectTargetProbeState,
+} from './trace-dto';
+import type {
+  TracePanelState,
+  TracePointInspectResponse,
+  TraceRecordSummary,
+  TraceTargetProbeState,
+  TraceTimeUnit,
+  TraceViewportResponse,
+} from './trace-timeline-state';
 
 export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | null = null;
@@ -42,8 +77,45 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   private lastSnapshotSequence = 0;
   private _readyCount = 0;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  // Stage 4.5 Trace Timeline coordinator & query cancellation state
+  private traceRecords = new Map<string, TraceRecordSummary>();
+  private traceSegmentsByRecord = new Map<string, readonly SegmentIndexMetadata[]>();
+  private selectedTraceRecordId: string | null = null;
+  private traceTargetProbe: TraceTargetProbeState | null = null;
+  private traceProbing = false;
+  private traceActionMessage: TracePanelState['lastActionMessage'] = null;
+  private traceProbeGen = 0;
+  private traceOfflineSeq = 0;
+  private traceLiveTimer: NodeJS.Timeout | null = null;
+  private traceLiveInFlight = false;
+  private inFlightViewportAbort: AbortController | null = null;
+  private latestViewportQuerySeq = 0;
+  private readonly inFlightInspectAborts = new Map<'hover' | 'cursorA' | 'cursorB', AbortController>();
+  private readonly latestInspectSeq = new Map<'hover' | 'cursorA' | 'cursorB', number>();
+  private lastWebviewTracePerf: Record<string, unknown> | null = null;
+  private _tracePerfSeq = 0;
+
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly traceCoordinator?: TraceRecordingCoordinator,
+  ) {
     this.settings = sanitizeRtosViewSettings(context.workspaceState.get(RTOS_VIEW_SETTINGS_KEY));
+    if (this.traceCoordinator) {
+      const sub = this.traceCoordinator.onDidChangeStatus(status => {
+        this.handleTraceStatusChange(status);
+      });
+      this.disposables.push(sub);
+      for (const existing of this.traceCoordinator.listRecordings()) {
+        this.traceRecords.set(
+          existing.recordId,
+          projectRecordFromStatus(existing, existing.state === 'recording' || existing.state === 'preparing' || existing.state === 'paused' || existing.state === 'stopping' ? 'live' : 'session', [], []),
+        );
+      }
+      if (this.traceRecords.size > 0) {
+        const lastKey = Array.from(this.traceRecords.keys()).pop() ?? null;
+        this.selectedTraceRecordId = lastKey;
+      }
+    }
     this.disposables.push(
       vscode.debug.onDidStartDebugSession(session => {
         if (isOrbitDebugSessionType(session.type) && (!this.activeSession || vscode.debug.activeDebugSession === session)) {
@@ -90,6 +162,27 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     return structuredClone(this.settings);
   }
 
+  get currentTraceState(): TracePanelState {
+    if (!this.traceCoordinator && this.traceRecords.size === 0 && !this.traceTargetProbe && !this.traceActionMessage) {
+      return INITIAL_TRACE_PANEL_STATE;
+    }
+    return {
+      targetProbe: this.traceTargetProbe,
+      probing: this.traceProbing,
+      selectedRecordId: this.selectedTraceRecordId,
+      records: Array.from(this.traceRecords.values()),
+      lastActionMessage: this.traceActionMessage,
+    };
+  }
+
+  get currentTracePerf(): Record<string, unknown> | null {
+    return this.lastWebviewTracePerf;
+  }
+
+  get tracePerfSeq(): number {
+    return this._tracePerfSeq;
+  }
+
   get currentState(): RtosPanelState {
     return {
       hostVersion: this.hostVersion,
@@ -109,6 +202,7 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       loading: { ...this.loading },
       liveActive: this.liveActive,
       lastError: this.lastError,
+      trace: this.currentTraceState,
     };
   }
 
@@ -128,6 +222,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           this.view = null;
           this.disposeViewListeners();
           void this.stopLivePolling();
+          this.stopTraceLiveTimer();
+          this.cancelAllTraceQueries();
         }
       }),
     );
@@ -143,6 +239,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     if (!this.view) return;
     if (!this.view.visible) {
       void this.stopLivePolling();
+      this.stopTraceLiveTimer();
+      this.cancelAllTraceQueries();
       this.postMessage({ command: 'visibility', visible: false });
       return;
     }
@@ -153,7 +251,11 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       } else if (this.settings.liveEnabled && !this.liveActive && this.capabilities.capabilities.taskSnapshot.available) {
         void this.startLiveOnSession(this.sessionGeneration);
       }
+      if (this.settings.activePage === 'trace' && this.traceCoordinator && !this.traceTargetProbe && !this.traceProbing) {
+        void this.probeTraceTarget(this.sessionGeneration);
+      }
     }
+    this.syncTraceLiveTimer();
   }
 
   private bindSession(session: vscode.DebugSession | undefined): void {
@@ -161,7 +263,12 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     if (valid === this.activeSession && (valid || this.sessionPhase === 'none')) return;
 
     void this.stopLivePolling();
+    this.stopTraceLiveTimer();
+    this.cancelAllTraceQueries();
     this.sessionGeneration++;
+    this.traceProbeGen++;
+    this.traceTargetProbe = null;
+    this.traceProbing = false;
     this.activeSession = valid;
     this.sessionPhase = valid ? 'starting' : 'none';
     this.targetState = 'Unknown';
@@ -179,6 +286,9 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     this.postState();
     if (valid && this.isVisible) {
       void this.syncSessionConnection(this.sessionGeneration);
+      if (this.settings.activePage === 'trace' && this.traceCoordinator) {
+        void this.probeTraceTarget(this.sessionGeneration);
+      }
     }
   }
 
@@ -459,7 +569,11 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
         if (this.activeSession && this.isVisible) {
           if (!this.capabilities) await this.syncSessionConnection(this.sessionGeneration);
           else if (this.settings.liveEnabled && !this.liveActive) await this.startLiveOnSession(this.sessionGeneration);
+          if (this.settings.activePage === 'trace' && this.traceCoordinator && !this.traceTargetProbe && !this.traceProbing) {
+            void this.probeTraceTarget(this.sessionGeneration);
+          }
         }
+        this.syncTraceLiveTimer();
         break;
       case 'refresh':
         this.capabilitiesError = null;
@@ -525,6 +639,7 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
         const previousIncludeObjects = this.settings.includeObjectsInLive;
         const previousSubTab = this.settings.tasksSubTab;
         const previousBudget = this.settings.detailBudgetBytes;
+        const previousPage = this.settings.activePage;
         await this.updateSettings(msg.settings);
         if (this.liveActive && this.settings.liveEnabled && this.activeSession && this.isVisible
           && (this.settings.liveIntervalMs !== previousInterval
@@ -539,8 +654,62 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           && (!this.snapshot?.timers || !this.snapshot?.heap)) {
           await this.refreshSnapshot({ includeObjects: false, includeTimers: true, includeHeap: true });
         }
+        if (this.settings.activePage === 'trace' && previousPage !== 'trace') {
+          if (this.activeSession && this.isVisible && this.traceCoordinator && !this.traceTargetProbe && !this.traceProbing) {
+            void this.probeTraceTarget(this.sessionGeneration);
+          }
+          if (this.selectedTraceRecordId) {
+            void this.refreshTraceRecordMeta(this.selectedTraceRecordId);
+          }
+        }
+        this.syncTraceLiveTimer();
         break;
       }
+      case 'traceInspectTarget':
+        await this.probeTraceTarget(this.sessionGeneration);
+        break;
+      case 'traceStart':
+        await this.handleTraceStart(msg.mode);
+        break;
+      case 'traceStop':
+        await this.handleTraceStop(typeof msg.recordId === 'string' ? msg.recordId : undefined);
+        break;
+      case 'tracePause':
+        await this.handleTracePauseResume(true, typeof msg.recordId === 'string' ? msg.recordId : undefined);
+        break;
+      case 'traceResume':
+        await this.handleTracePauseResume(false, typeof msg.recordId === 'string' ? msg.recordId : undefined);
+        break;
+      case 'traceCancel':
+        await this.handleTraceCancel(typeof msg.recordId === 'string' ? msg.recordId : undefined);
+        break;
+      case 'traceSelectRecord':
+        await this.handleTraceSelectRecord(typeof msg.recordId === 'string' ? msg.recordId : '');
+        break;
+      case 'traceOpenRecording':
+        await this.handleTraceOpenRecording(typeof msg.recordingDir === 'string' ? msg.recordingDir : undefined);
+        break;
+      case 'traceSaveRecording':
+        await this.handleTraceSaveRecording(
+          typeof msg.recordId === 'string' ? msg.recordId : (this.selectedTraceRecordId || ''),
+          typeof msg.targetDir === 'string' ? msg.targetDir : undefined,
+        );
+        break;
+      case 'traceCloseRecording':
+        await this.handleTraceCloseRecording(typeof msg.recordId === 'string' ? msg.recordId : '');
+        break;
+      case 'traceQueryViewport':
+        await this.handleTraceQueryViewport(msg);
+        break;
+      case 'traceInspectPoint':
+        await this.handleTraceInspectPoint(msg);
+        break;
+      case 'tracePerfReport':
+        if (msg.perf && typeof msg.perf === 'object') {
+          this.lastWebviewTracePerf = msg.perf as Record<string, unknown>;
+          this._tracePerfSeq++;
+        }
+        break;
     }
   }
 
@@ -602,11 +771,736 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     if (this.disposed) return;
     this.disposed = true;
     this.sessionGeneration++;
+    this.traceProbeGen++;
     void this.stopLivePolling();
+    this.stopTraceLiveTimer();
+    this.cancelAllTraceQueries();
     this.disposeViewListeners();
     this.view = null;
     while (this.disposables.length > 0) {
       this.disposables.pop()?.dispose();
     }
+  }
+
+  // --- Stage 4.5 Trace Timeline coordinator & query methods ----------------
+
+  private cancelAllTraceQueries(): void {
+    this.inFlightViewportAbort?.abort();
+    this.inFlightViewportAbort = null;
+    for (const ctrl of this.inFlightInspectAborts.values()) {
+      ctrl.abort();
+    }
+    this.inFlightInspectAborts.clear();
+  }
+
+  private handleTraceStatusChange(status: TraceRecordingStatus): void {
+    if (this.disposed) return;
+    const isActive = status.state === 'preparing' || status.state === 'recording' || status.state === 'paused' || status.state === 'stopping';
+    const existing = this.traceRecords.get(status.recordId);
+    const segs = this.traceSegmentsByRecord.get(status.recordId) ?? [];
+    const gaps = existing?.gaps ?? [];
+    const summary = projectRecordFromStatus(status, isActive ? 'live' : 'session', segs, []);
+    const merged: TraceRecordSummary = existing && segs.length === 0 && existing.segments.length > 0
+      ? { ...summary, segments: existing.segments, gaps }
+      : { ...summary, gaps };
+
+    this.traceRecords.set(status.recordId, merged);
+    if (status.state === 'preparing' || status.state === 'recording') {
+      this.selectedTraceRecordId = status.recordId;
+    } else if (!this.selectedTraceRecordId) {
+      this.selectedTraceRecordId = status.recordId;
+    }
+
+    if (status.state === 'stopped' || status.state === 'incomplete' || status.state === 'error') {
+      this.stopTraceLiveTimer();
+      if (status.counters.committedRawBytes > 0) {
+        void this.refreshTraceRecordMeta(status.recordId);
+      }
+    } else if (status.state === 'recording') {
+      this.syncTraceLiveTimer();
+    }
+    this.postState();
+  }
+
+  private syncTraceLiveTimer(): void {
+    const hasRecordingActive = Array.from(this.traceRecords.values()).some(r => r.state === 'recording');
+    if (this.disposed || !this.isVisible || this.settings.activePage !== 'trace' || !hasRecordingActive || !this.traceCoordinator) {
+      this.stopTraceLiveTimer();
+      return;
+    }
+    if (this.traceLiveTimer) return;
+    this.traceLiveTimer = setInterval(() => {
+      void this.tickTraceLiveRefresh();
+    }, 350);
+  }
+
+  private stopTraceLiveTimer(): void {
+    if (this.traceLiveTimer) {
+      clearInterval(this.traceLiveTimer);
+      this.traceLiveTimer = null;
+    }
+  }
+
+  private async tickTraceLiveRefresh(): Promise<void> {
+    if (this.disposed || !this.isVisible || this.settings.activePage !== 'trace' || !this.traceCoordinator) {
+      this.stopTraceLiveTimer();
+      return;
+    }
+    if (this.traceLiveInFlight) return;
+    const activeLive = Array.from(this.traceRecords.values()).find(r => r.state === 'recording');
+    if (!activeLive) {
+      this.stopTraceLiveTimer();
+      return;
+    }
+    this.traceLiveInFlight = true;
+    try {
+      const status = this.traceCoordinator.getStatus(activeLive.recordId);
+      if (!status || status.state !== 'recording') {
+        if (status) this.handleTraceStatusChange(status);
+        this.stopTraceLiveTimer();
+        return;
+      }
+      if (status.counters.bytesReceived > status.counters.committedRawBytes) {
+        await this.traceCoordinator.flushRecording(status.recordId).catch(() => {});
+      }
+      await this.refreshTraceRecordMeta(status.recordId);
+    } finally {
+      this.traceLiveInFlight = false;
+    }
+  }
+
+  private async refreshTraceRecordMeta(recordId: string): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const existing = this.traceRecords.get(recordId);
+    if (!existing) return;
+    try {
+      const [segsRes, gapsRes] = await Promise.all([
+        this.traceCoordinator.getSegments(recordId),
+        this.traceCoordinator.getGaps(recordId),
+      ]);
+      if (this.disposed) return;
+      const latestStatus = this.traceCoordinator.getStatus(recordId);
+      const current = this.traceRecords.get(recordId) ?? existing;
+      const rawSegs = segsRes.ok ? segsRes.data : (this.traceSegmentsByRecord.get(recordId) ?? []);
+      if (segsRes.ok) {
+        this.traceSegmentsByRecord.set(recordId, segsRes.data);
+      }
+      const nextSegDtos = segsRes.ok ? segsRes.data.map(projectSegmentDto) : current.segments;
+      const nextGapDtos = gapsRes.ok ? gapsRes.data.map(projectGapDto) : current.gaps;
+
+      let updated: TraceRecordSummary;
+      if (latestStatus && current.source !== 'offline') {
+        const isActive = latestStatus.state === 'preparing' || latestStatus.state === 'recording'
+          || latestStatus.state === 'paused' || latestStatus.state === 'stopping';
+        updated = projectRecordFromStatus(
+          latestStatus,
+          isActive ? 'live' : 'session',
+          rawSegs,
+          gapsRes.ok ? gapsRes.data : [],
+        );
+        if (!gapsRes.ok) updated = { ...updated, gaps: nextGapDtos };
+      } else {
+        updated = {
+          ...current,
+          segments: nextSegDtos,
+          gaps: nextGapDtos,
+        };
+      }
+      this.traceRecords.set(recordId, updated);
+      this.postMessage({ command: 'traceRecordMeta', record: updated });
+    } catch {
+      // Ignore metadata refresh failures while closing/terminating.
+    }
+  }
+
+  private async probeTraceTarget(generation: number): Promise<void> {
+    const session = this.activeSession;
+    if (!this.traceCoordinator || !session || !this.isCurrentBinding(generation, session)) {
+      this.traceTargetProbe = null;
+      this.traceProbing = false;
+      this.postState();
+      return;
+    }
+    const probeGen = ++this.traceProbeGen;
+    this.traceProbing = true;
+    this.postState();
+    try {
+      const res = await this.traceCoordinator.inspectTarget({ includeEnumerate: true, timeoutMs: 2500 });
+      if (this.disposed || probeGen !== this.traceProbeGen || !this.isCurrentBinding(generation, session)) return;
+      this.traceTargetProbe = projectTargetProbeState(res);
+    } catch (err) {
+      if (this.disposed || probeGen !== this.traceProbeGen || !this.isCurrentBinding(generation, session)) return;
+      this.traceTargetProbe = {
+        ok: false,
+        errorCode: 'InspectFailed',
+        message: err instanceof Error ? err.message : String(err),
+        inspectedAtMs: Date.now(),
+      };
+    } finally {
+      if (!this.disposed && probeGen === this.traceProbeGen) {
+        this.traceProbing = false;
+        this.postState();
+      }
+    }
+  }
+
+  private async handleTraceStart(modeRaw: unknown): Promise<void> {
+    if (!this.traceCoordinator) {
+      this.setTraceActionMessage('error', 'Trace 协调器未初始化');
+      return;
+    }
+    const mode: TraceRecordingMode = modeRaw === 'single-shot' || modeRaw === 'post-mortem' ? modeRaw : 'continuous';
+    await this.updateSettings({ traceMode: mode });
+    this.traceActionMessage = null;
+    try {
+      const status = await this.traceCoordinator.startRecording({ mode });
+      this.handleTraceStatusChange(status);
+      if (status.state === 'error' || status.state === 'incomplete') {
+        this.setTraceActionMessage('error', `${status.error?.errorCode ?? status.state}: ${status.error?.message ?? status.stateReason}`);
+      } else {
+        this.setTraceActionMessage('ok', status.stateReason);
+      }
+      if (status.counters.committedRawBytes > 0) {
+        await this.refreshTraceRecordMeta(status.recordId);
+      }
+    } catch (err) {
+      this.setTraceActionMessage('error', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async handleTraceStop(recordId?: string): Promise<void> {
+    if (!this.traceCoordinator) return;
+    try {
+      const status = await this.traceCoordinator.stopRecording(recordId);
+      if (status) {
+        this.handleTraceStatusChange(status);
+        const tone = status.state === 'stopped' ? 'ok' : status.state === 'incomplete' ? 'warn' : 'error';
+        this.setTraceActionMessage(tone, status.error ? `${status.error.errorCode}: ${status.error.message}` : status.stateReason);
+      }
+    } catch (err) {
+      this.setTraceActionMessage('error', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async handleTracePauseResume(pause: boolean, recordId?: string): Promise<void> {
+    if (!this.traceCoordinator) return;
+    try {
+      const status = pause
+        ? await this.traceCoordinator.pauseReceiving(recordId)
+        : await this.traceCoordinator.resumeReceiving(recordId);
+      if (status) {
+        this.handleTraceStatusChange(status);
+        this.setTraceActionMessage('info', status.stateReason);
+      }
+    } catch (err) {
+      this.setTraceActionMessage('error', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async handleTraceCancel(recordId?: string): Promise<void> {
+    if (!this.traceCoordinator) return;
+    try {
+      const status = await this.traceCoordinator.cancelRecording(recordId);
+      if (status) {
+        this.handleTraceStatusChange(status);
+        this.setTraceActionMessage('warn', status.stateReason);
+      }
+    } catch (err) {
+      this.setTraceActionMessage('error', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async handleTraceSelectRecord(recordId: string): Promise<void> {
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    if (this.selectedTraceRecordId !== recordId) {
+      this.cancelAllTraceQueries();
+      this.selectedTraceRecordId = recordId;
+      this.postState();
+    }
+    await this.refreshTraceRecordMeta(recordId);
+  }
+
+  private async handleTraceOpenRecording(explicitDir?: string): Promise<void> {
+    if (!this.traceCoordinator) {
+      this.setTraceActionMessage('error', 'Trace 协调器未初始化');
+      return;
+    }
+    let dir = explicitDir?.trim();
+    if (!dir) {
+      const picked = await vscode.window?.showOpenDialog?.({
+        canSelectFiles: true,
+        canSelectFolders: true,
+        canSelectMany: false,
+        filters: { 'Orbit Trace Manifest': ['json'] },
+        openLabel: '打开 Orbit Trace 录制目录或 manifest.json',
+      });
+      if (!picked || picked.length === 0) return;
+      const fsPath = picked[0].fsPath;
+      try {
+        const st = await fs.stat(fsPath);
+        dir = st.isDirectory() ? fsPath : path.dirname(fsPath);
+      } catch {
+        dir = fsPath;
+      }
+    }
+    const resolvedDir = path.resolve(dir);
+
+    // If this exact offline directory is already open, reuse/focus it cleanly.
+    for (const [id, rec] of this.traceRecords.entries()) {
+      if (rec.source === 'offline' && rec.recordingDir && path.resolve(rec.recordingDir) === resolvedDir) {
+        await this.handleTraceSelectRecord(id);
+        this.setTraceActionMessage('info', `已切换到已打开的离线录制: ${resolvedDir}`);
+        return;
+      }
+    }
+
+    const baseName = path.basename(resolvedDir).replace(/[^A-Za-z0-9._-]/g, '_') || 'recording';
+    const viewRecordId = `offline-${++this.traceOfflineSeq}-${baseName}`;
+    const openRes = await this.traceCoordinator.openRecording(resolvedDir, viewRecordId, true);
+    if (!openRes.ok) {
+      this.setTraceActionMessage('error', `打开离线录制失败 (${openRes.errorCode}): ${openRes.message}`);
+      this.postMessage({ command: 'traceActionResult', ok: false, action: 'open', errorCode: openRes.errorCode, message: openRes.message });
+      return;
+    }
+    const [segsRes, gapsRes] = await Promise.all([
+      this.traceCoordinator.getSegments(viewRecordId),
+      this.traceCoordinator.getGaps(viewRecordId),
+    ]);
+    if (this.disposed) return;
+    const rawSegs = segsRes.ok ? segsRes.data : [];
+    const rawGaps = gapsRes.ok ? gapsRes.data : [];
+    this.traceSegmentsByRecord.set(viewRecordId, rawSegs);
+
+    const summary = projectRecordFromOpened(openRes.data, resolvedDir, rawSegs, rawGaps);
+    this.traceRecords.set(viewRecordId, summary);
+    this.cancelAllTraceQueries();
+    this.selectedTraceRecordId = viewRecordId;
+    const tone = summary.inspectionStatus === 'completed' ? 'ok' : summary.inspectionStatus === 'corrupted' ? 'error' : 'warn';
+    this.setTraceActionMessage(tone, `已打开离线录制 (${summary.inspectionStatus}): ${resolvedDir}`);
+    this.postMessage({ command: 'traceRecordMeta', record: summary });
+    this.postMessage({
+      command: 'traceActionResult',
+      ok: true,
+      action: 'open',
+      recordId: viewRecordId,
+      recordingDir: resolvedDir,
+      inspectionStatus: summary.inspectionStatus,
+    });
+  }
+
+  private async handleTraceSaveRecording(recordId: string, explicitTargetDir?: string): Promise<void> {
+    if (!this.traceCoordinator) return;
+    const rec = this.traceRecords.get(recordId);
+    if (!rec || !rec.recordingDir) {
+      this.setTraceActionMessage('error', '当前选中的录制没有可保存的归档目录');
+      return;
+    }
+    if (rec.state === 'recording' || rec.state === 'preparing' || rec.state === 'stopping' || rec.state === 'paused') {
+      this.setTraceActionMessage('warn', '请先停止当前录制，待归档封存完成后再保存副本');
+      return;
+    }
+    let targetDir = explicitTargetDir?.trim();
+    if (!targetDir) {
+      const defaultUri = vscode.Uri.file(path.join(path.dirname(rec.recordingDir), `${rec.recordId}-saved`));
+      const picked = await vscode.window?.showSaveDialog?.({
+        defaultUri,
+        saveLabel: '保存 Orbit Trace 归档目录',
+        title: '选择保存 Orbit Trace 录制的目标目录',
+      });
+      if (!picked) return;
+      targetDir = picked.fsPath;
+    }
+    const srcDir = path.resolve(rec.recordingDir);
+    const dstDir = path.resolve(targetDir);
+    if (srcDir.toLowerCase() === dstDir.toLowerCase()) {
+      this.setTraceActionMessage('warn', '目标目录与源录制目录相同，无需复制');
+      return;
+    }
+
+    try {
+      try {
+        const entries = await fs.readdir(dstDir);
+        if (entries.length > 0) {
+          this.setTraceActionMessage('error', `目标目录非空，拒绝覆盖既有文件: ${dstDir}`);
+          this.postMessage({ command: 'traceActionResult', ok: false, action: 'save', errorCode: 'RecordingDirectoryNotEmpty', message: `目标目录非空: ${dstDir}` });
+          return;
+        }
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') throw err;
+        await fs.mkdir(dstDir, { recursive: true });
+      }
+
+      const candidateFiles = [
+        ORBIT_TRACE_FILES.manifest,
+        ORBIT_TRACE_FILES.raw,
+        ORBIT_TRACE_FILES.data,
+        ORBIT_TRACE_FILES.journal,
+        ORBIT_TRACE_FILES.index,
+        'index-spill.otidx',
+      ];
+      for (const name of candidateFiles) {
+        const srcFile = path.join(srcDir, name);
+        try {
+          await fs.access(srcFile);
+          await fs.copyFile(srcFile, path.join(dstDir, name));
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') throw err;
+        }
+      }
+
+      const inspectRes = await this.traceCoordinator.inspectRecordingDirectory(dstDir, true);
+      if (!inspectRes.ok) {
+        this.setTraceActionMessage('error', `保存后校验失败 (${inspectRes.errorCode}): ${inspectRes.message}`);
+        this.postMessage({ command: 'traceActionResult', ok: false, action: 'save', errorCode: inspectRes.errorCode, message: inspectRes.message });
+        return;
+      }
+      const st = inspectRes.data.status;
+      this.setTraceActionMessage(
+        st === 'completed' ? 'ok' : 'warn',
+        `已保存录制归档到 ${dstDir}（校验=${st}, ${inspectRes.data.recoverableRawBytes} B）`,
+      );
+      this.postMessage({
+        command: 'traceActionResult',
+        ok: true,
+        action: 'save',
+        recordId,
+        targetDir: dstDir,
+        inspectionStatus: st,
+        recoverableRawBytes: inspectRes.data.recoverableRawBytes,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.setTraceActionMessage('error', `保存录制失败: ${message}`);
+      this.postMessage({ command: 'traceActionResult', ok: false, action: 'save', errorCode: 'SaveFailed', message });
+    }
+  }
+
+  private async handleTraceCloseRecording(recordId: string): Promise<void> {
+    if (!this.traceCoordinator || !recordId) return;
+    const rec = this.traceRecords.get(recordId);
+    if (!rec) return;
+    if (rec.state === 'recording' || rec.state === 'preparing' || rec.state === 'paused' || rec.state === 'stopping') {
+      this.setTraceActionMessage('warn', '活动录制请使用“停止录制”');
+      return;
+    }
+    if (this.selectedTraceRecordId === recordId) {
+      this.cancelAllTraceQueries();
+    }
+    await this.traceCoordinator.closeRecording(recordId).catch(() => {});
+    this.traceRecords.delete(recordId);
+    this.traceSegmentsByRecord.delete(recordId);
+    if (this.selectedTraceRecordId === recordId) {
+      const next = Array.from(this.traceRecords.keys()).pop() ?? null;
+      this.selectedTraceRecordId = next;
+    }
+    this.postState();
+  }
+
+  private async handleTraceQueryViewport(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const querySeq = Number(msg.querySeq);
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const unit: TraceTimeUnit = msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const scopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey : 'all-anchored';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    const start = String(msg.start ?? '0');
+    const end = String(msg.end ?? '0');
+    const maxBuckets = Math.max(32, Math.min(1024, Number(msg.maxBuckets) || 256));
+    const detailLimit = Math.max(100, Math.min(2000, Number(msg.detailLimit) || 1200));
+
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    if (Number.isFinite(querySeq)) {
+      this.latestViewportQuerySeq = Math.max(this.latestViewportQuerySeq, querySeq);
+    }
+
+    this.inFlightViewportAbort?.abort();
+    const controller = new AbortController();
+    this.inFlightViewportAbort = controller;
+    const t0 = performance.now();
+
+    try {
+      const lodRes = await this.traceCoordinator.queryLod(
+        recordId,
+        {
+          start,
+          end,
+          unit,
+          maxBuckets,
+          ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+          ...(segmentId !== undefined ? { segmentId } : {}),
+        },
+        { signal: controller.signal },
+      );
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) {
+        return;
+      }
+      if (!lodRes.ok) {
+        if (lodRes.cancelled) return;
+        const result: TraceViewportResponse = {
+          querySeq,
+          recordId,
+          unit,
+          scopeKey,
+          bootGeneration,
+          segmentId,
+          start,
+          end,
+          lodBuckets: [],
+          usedFineItems: false,
+          slices: [],
+          activations: [],
+          readyWaits: [],
+          markers: [],
+          markerPoints: [],
+          truncated: false,
+          skippedUnanchoredSegments: [],
+          skippedNoFrequencySegments: [],
+          queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+          error: `${lodRes.errorCode}: ${lodRes.message}`,
+        };
+        this.postMessage({ command: 'traceViewportResult', result });
+        return;
+      }
+
+      const lodBuckets = lodRes.data.buckets.map(projectLodBucketDto);
+      const totalEstimatedIntervals = lodBuckets.reduce((acc, b) => acc + b.intervalCount, 0);
+      const isVeryDense = !lodRes.data.usedFineItems && totalEstimatedIntervals > detailLimit * 4;
+      const effectiveLimit = isVeryDense ? Math.min(400, detailLimit) : detailLimit;
+
+      const commonRange = {
+        start,
+        end,
+        unit,
+        ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+        ...(segmentId !== undefined ? { segmentId } : {}),
+        limit: effectiveLimit,
+      } as const;
+
+      const [slicesRes, actsRes, readyRes, markersRes, markerPtsRes, segsRes] = await Promise.all([
+        this.traceCoordinator.queryRange<ExecutionSliceInterval>(recordId, { ...commonRange, target: 'slices' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<ContextActivationInterval>(recordId, { ...commonRange, target: 'activations' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<ReadyWaitInterval>(recordId, { ...commonRange, target: 'readyWaits' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<MarkerInterval>(recordId, { ...commonRange, target: 'markers' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<MarkerPointEvent>(recordId, { ...commonRange, target: 'markerPoints' }, { signal: controller.signal }),
+        this.traceCoordinator.getSegments(recordId),
+      ]);
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) {
+        return;
+      }
+      if (Number.isFinite(querySeq) && querySeq < this.latestViewportQuerySeq) {
+        return;
+      }
+
+      const segList = segsRes.ok ? segsRes.data : (this.traceSegmentsByRecord.get(recordId) ?? []);
+      if (segsRes.ok) this.traceSegmentsByRecord.set(recordId, segsRes.data);
+      const segMap = new Map<string, SegmentIndexMetadata>();
+      for (const s of segList) segMap.set(`${s.bootGeneration}:${s.segmentId}`, s);
+
+      const slices = slicesRes.ok ? slicesRes.data.items.map(s => projectSliceDto(s, segMap)) : [];
+      const activations = actsRes.ok ? actsRes.data.items.map(a => projectActivationDto(a, segMap)) : [];
+      const readyWaits = readyRes.ok ? readyRes.data.items.map(r => projectReadyWaitDto(r, segMap)) : [];
+      const markers = markersRes.ok ? markersRes.data.items.map(m => projectMarkerDto(m, segMap)) : [];
+      const markerPoints = markerPtsRes.ok ? markerPtsRes.data.items.map(mp => projectMarkerPointDto(mp, segMap)) : [];
+      const truncated = Boolean(
+        (slicesRes.ok && slicesRes.data.hasMore)
+        || (actsRes.ok && actsRes.data.hasMore)
+        || (readyRes.ok && readyRes.data.hasMore)
+        || (markersRes.ok && markersRes.data.hasMore)
+        || (markerPtsRes.ok && markerPtsRes.data.hasMore)
+        || isVeryDense,
+      );
+
+      const result: TraceViewportResponse = {
+        querySeq,
+        recordId,
+        unit,
+        scopeKey,
+        bootGeneration,
+        segmentId,
+        start: lodRes.data.start,
+        end: lodRes.data.end,
+        lodBuckets,
+        usedFineItems: lodRes.data.usedFineItems,
+        slices,
+        activations,
+        readyWaits,
+        markers,
+        markerPoints,
+        truncated,
+        skippedUnanchoredSegments: lodRes.data.skippedUnanchoredSegments,
+        skippedNoFrequencySegments: lodRes.data.skippedNoFrequencySegments,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      };
+      this.postMessage({ command: 'traceViewportResult', result });
+    } catch (err) {
+      if (controller.signal.aborted || this.disposed) return;
+      const result: TraceViewportResponse = {
+        querySeq,
+        recordId,
+        unit,
+        scopeKey,
+        bootGeneration,
+        segmentId,
+        start,
+        end,
+        lodBuckets: [],
+        usedFineItems: false,
+        slices: [],
+        activations: [],
+        readyWaits: [],
+        markers: [],
+        markerPoints: [],
+        truncated: false,
+        skippedUnanchoredSegments: [],
+        skippedNoFrequencySegments: [],
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      this.postMessage({ command: 'traceViewportResult', result });
+    } finally {
+      if (this.inFlightViewportAbort === controller) {
+        this.inFlightViewportAbort = null;
+      }
+    }
+  }
+
+  private async handleTraceInspectPoint(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const targetKind: 'hover' | 'cursorA' | 'cursorB' = msg.targetKind === 'cursorA' || msg.targetKind === 'cursorB' ? msg.targetKind : 'hover';
+    const querySeq = Number(msg.querySeq);
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const unit: TraceTimeUnit = msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const queryTime = String(msg.queryTime ?? '0');
+    const queryStart = String(msg.queryStart ?? queryTime);
+    let queryEnd = String(msg.queryEnd ?? queryStart);
+    try {
+      if (BigInt(queryEnd) <= BigInt(queryStart)) {
+        queryEnd = (BigInt(queryStart) + 1n).toString();
+      }
+    } catch {
+      return;
+    }
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+
+    if (Number.isFinite(querySeq)) {
+      const prevSeq = this.latestInspectSeq.get(targetKind) ?? 0;
+      this.latestInspectSeq.set(targetKind, Math.max(prevSeq, querySeq));
+    }
+    this.inFlightInspectAborts.get(targetKind)?.abort();
+    const controller = new AbortController();
+    this.inFlightInspectAborts.set(targetKind, controller);
+    const t0 = performance.now();
+
+    try {
+      const rangeBase = {
+        start: queryStart,
+        end: queryEnd,
+        unit,
+        ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+        ...(segmentId !== undefined ? { segmentId } : {}),
+        limit: 64,
+      } as const;
+
+      const [slicesRes, actsRes, readyRes, markersRes, markerPtsRes, packetsRes, segsRes, gapsRes] = await Promise.all([
+        this.traceCoordinator.queryRange<ExecutionSliceInterval>(recordId, { ...rangeBase, target: 'slices' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<ContextActivationInterval>(recordId, { ...rangeBase, target: 'activations' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<ReadyWaitInterval>(recordId, { ...rangeBase, target: 'readyWaits' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<MarkerInterval>(recordId, { ...rangeBase, target: 'markers' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<MarkerPointEvent>(recordId, { ...rangeBase, target: 'markerPoints' }, { signal: controller.signal }),
+        this.traceCoordinator.queryRange<DecodedSystemViewPacket>(recordId, { ...rangeBase, target: 'packets' }, { signal: controller.signal }),
+        this.traceCoordinator.getSegments(recordId),
+        this.traceCoordinator.getGaps(recordId),
+      ]);
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) return;
+      if (Number.isFinite(querySeq) && querySeq < (this.latestInspectSeq.get(targetKind) ?? 0)) return;
+
+      const segList = segsRes.ok ? segsRes.data : (this.traceSegmentsByRecord.get(recordId) ?? []);
+      if (segsRes.ok) this.traceSegmentsByRecord.set(recordId, segsRes.data);
+      const segMap = new Map<string, SegmentIndexMetadata>();
+      for (const s of segList) segMap.set(`${s.bootGeneration}:${s.segmentId}`, s);
+
+      const slices = slicesRes.ok ? slicesRes.data.items.map(s => projectSliceDto(s, segMap)) : [];
+      const activations = actsRes.ok ? actsRes.data.items.map(a => projectActivationDto(a, segMap)) : [];
+      const readyWaits = readyRes.ok ? readyRes.data.items.map(r => projectReadyWaitDto(r, segMap)) : [];
+      const markers = markersRes.ok ? markersRes.data.items.map(m => projectMarkerDto(m, segMap)) : [];
+      const markerPoints = markerPtsRes.ok ? markerPtsRes.data.items.map(mp => projectMarkerPointDto(mp, segMap)) : [];
+      const resolvedBoot = slices[0]?.bootGeneration ?? activations[0]?.bootGeneration ?? readyWaits[0]?.bootGeneration ?? markers[0]?.bootGeneration ?? bootGeneration;
+      const resolvedSeg = slices[0]?.segmentId ?? activations[0]?.segmentId ?? readyWaits[0]?.segmentId ?? markers[0]?.segmentId ?? (packetsRes.ok ? packetsRes.data.items[0]?.segmentId : undefined) ?? segmentId;
+      const matchedSeg = resolvedSeg !== undefined
+        ? (resolvedBoot !== undefined
+          ? segMap.get(`${resolvedBoot}:${resolvedSeg}`)
+          : segList.find(s => s.segmentId === resolvedSeg))
+        : undefined;
+      const packets = packetsRes.ok
+        ? packetsRes.data.items.map(p => projectPacketDto(p, segMap, resolvedBoot ?? matchedSeg?.bootGeneration))
+        : [];
+      const gaps = gapsRes.ok
+        ? gapsRes.data
+            .filter(g => (resolvedSeg === undefined || g.segmentIdBefore === resolvedSeg || g.segmentIdBefore === resolvedSeg - 1 || g.segmentIdBefore === undefined))
+            .map(projectGapDto)
+        : [];
+
+      const result: TracePointInspectResponse = {
+        querySeq,
+        targetKind,
+        recordId,
+        unit,
+        queryTime,
+        queryStart,
+        queryEnd,
+        bootGeneration: resolvedBoot ?? matchedSeg?.bootGeneration,
+        segmentId: resolvedSeg,
+        segmentReliability: matchedSeg?.reliability,
+        timeAnchorStatus: matchedSeg?.timeAnchorStatus,
+        sysFreqHz: matchedSeg?.sysFreqHz,
+        slices,
+        activations,
+        readyWaits,
+        markers,
+        markerPoints,
+        packets,
+        gaps,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      };
+      this.postMessage({ command: 'tracePointInspectResult', result });
+    } catch (err) {
+      if (controller.signal.aborted || this.disposed) return;
+      this.postMessage({
+        command: 'tracePointInspectResult',
+        result: {
+          querySeq,
+          targetKind,
+          recordId,
+          unit,
+          queryTime,
+          queryStart,
+          queryEnd,
+          slices: [],
+          activations: [],
+          readyWaits: [],
+          markers: [],
+          markerPoints: [],
+          packets: [],
+          gaps: [],
+          queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+          error: err instanceof Error ? err.message : String(err),
+        } satisfies TracePointInspectResponse,
+      });
+    } finally {
+      if (this.inFlightInspectAborts.get(targetKind) === controller) {
+        this.inFlightInspectAborts.delete(targetKind);
+      }
+    }
+  }
+
+  private setTraceActionMessage(tone: 'info' | 'ok' | 'warn' | 'error', text: string): void {
+    this.traceActionMessage = { tone, text };
+    this.postState();
   }
 }

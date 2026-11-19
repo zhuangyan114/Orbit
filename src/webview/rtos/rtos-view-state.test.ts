@@ -87,7 +87,19 @@ describe('RTOS view state helpers', () => {
       maxStackScanBytes: 16384,
       detailBudgetBytes: 65536,
       showDiagnostics: true,
+      traceMode: 'continuous',
+      traceAutoFollow: true,
+      traceTimeUnit: 'ns',
     });
+
+    const withTraceFields = sanitizeRtosViewSettings({
+      traceMode: 'post-mortem',
+      traceAutoFollow: false,
+      traceTimeUnit: 'relative-ticks',
+    });
+    expect(withTraceFields.traceMode).toBe('post-mortem');
+    expect(withTraceFields.traceAutoFollow).toBe(false);
+    expect(withTraceFields.traceTimeUnit).toBe('relative-ticks');
 
     const withObjectFields = sanitizeRtosViewSettings({
       tasksSubTab: 'timers',

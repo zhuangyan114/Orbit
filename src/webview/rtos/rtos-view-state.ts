@@ -9,6 +9,8 @@ import type {
   TimerListState,
   TimerSnapshot,
 } from '../../rtos/model';
+import type { TraceRecordingMode } from '../../trace/trace-recording-coordinator';
+import type { TracePanelState, TraceTimeUnit } from './trace-timeline-state';
 
 export const RTOS_VIEW_SETTINGS_KEY = 'orbitRtosViewSettings';
 
@@ -63,6 +65,9 @@ export interface RtosViewSettings {
   maxStackScanBytes: number;
   detailBudgetBytes: number;
   showDiagnostics: boolean;
+  traceMode: TraceRecordingMode;
+  traceAutoFollow: boolean;
+  traceTimeUnit: TraceTimeUnit;
 }
 
 export const DEFAULT_RTOS_VIEW_SETTINGS: RtosViewSettings = {
@@ -85,6 +90,17 @@ export const DEFAULT_RTOS_VIEW_SETTINGS: RtosViewSettings = {
   maxStackScanBytes: 4096,
   detailBudgetBytes: 65536,
   showDiagnostics: false,
+  traceMode: 'continuous',
+  traceAutoFollow: true,
+  traceTimeUnit: 'ns',
+};
+
+export const INITIAL_TRACE_PANEL_STATE: TracePanelState = {
+  targetProbe: null,
+  probing: false,
+  selectedRecordId: null,
+  records: [],
+  lastActionMessage: null,
 };
 
 export interface RtosSessionSummary {
@@ -113,6 +129,7 @@ export interface RtosPanelState {
   loading: { refresh: boolean; stackScan: boolean; capabilities: boolean };
   liveActive: boolean;
   lastError: RtosErrorSummary | null;
+  trace?: TracePanelState;
 }
 
 const VALID_PAGES = new Set<RtosSubPage>(['tasks', 'trace', 'contexts']);
@@ -121,6 +138,8 @@ const VALID_OBJ_FILTERS = new Set<RtosObjectKindFilter>(['all', 'queue', 'mutex'
 const VALID_TIMER_FILTERS = new Set<RtosTimerFilter>(['all', 'active', 'stopped']);
 const VALID_SORT_KEYS = new Set<RtosTaskSortKey>(['state', 'priority', 'name', 'stack', 'cpu', 'address']);
 const VALID_STATES = new Set<RtosTaskStateFilter>(['all', 'running', 'ready', 'blocked', 'suspended', 'termination', 'unknown']);
+const VALID_TRACE_MODES = new Set<TraceRecordingMode>(['continuous', 'single-shot', 'post-mortem']);
+const VALID_TRACE_UNITS = new Set<TraceTimeUnit>(['ns', 'relative-ns', 'absolute-ticks', 'relative-ticks']);
 
 export function clampLiveIntervalMs(value: unknown): number {
   const num = typeof value === 'number' ? value : Number(value);
@@ -168,6 +187,9 @@ export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings 
   const maxStackScanBytes = raw.maxStackScanBytes !== undefined ? clampMaxStackScanBytes(raw.maxStackScanBytes) : base.maxStackScanBytes;
   const detailBudgetBytes = raw.detailBudgetBytes !== undefined ? clampDetailBudgetBytes(raw.detailBudgetBytes) : base.detailBudgetBytes;
   const showDiagnostics = typeof raw.showDiagnostics === 'boolean' ? raw.showDiagnostics : base.showDiagnostics;
+  const traceMode = VALID_TRACE_MODES.has(raw.traceMode as TraceRecordingMode) ? raw.traceMode as TraceRecordingMode : base.traceMode;
+  const traceAutoFollow = typeof raw.traceAutoFollow === 'boolean' ? raw.traceAutoFollow : base.traceAutoFollow;
+  const traceTimeUnit = VALID_TRACE_UNITS.has(raw.traceTimeUnit as TraceTimeUnit) ? raw.traceTimeUnit as TraceTimeUnit : base.traceTimeUnit;
   return {
     version: 1,
     activePage,
@@ -188,6 +210,9 @@ export function sanitizeRtosViewSettings(input: unknown, base: RtosViewSettings 
     maxStackScanBytes,
     detailBudgetBytes,
     showDiagnostics,
+    traceMode,
+    traceAutoFollow,
+    traceTimeUnit,
   };
 }
 

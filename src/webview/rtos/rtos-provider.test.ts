@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { RtosSnapshot } from '../../rtos/model';
+import { TraceRecordingCoordinator } from '../../trace/trace-recording-coordinator';
+import { TraceWorkerClient } from '../../trace/trace-worker-client';
 
 const vscodeMock = vi.hoisted(() => {
   const listeners = {
@@ -29,7 +34,10 @@ const vscodeMock = vi.hoisted(() => {
 });
 
 vi.mock('vscode', () => ({
-  Uri: { joinPath: (...parts: any[]) => parts.join('/') },
+  Uri: {
+    joinPath: (...parts: any[]) => parts.join('/'),
+    file: (fsPath: string) => ({ fsPath }),
+  },
   debug: {
     get activeDebugSession() { return vscodeMock.activeDebugSession; },
     onDidStartDebugSession: (cb: any) => { vscodeMock.listeners.start.add(cb); return { dispose: () => vscodeMock.listeners.start.delete(cb) }; },
@@ -423,5 +431,143 @@ describe('RtosWebviewProvider', () => {
       detailBudgetBytes: 65536,
     });
     provider.dispose();
+  });
+
+  it('keeps active Trace recording running on view hide/dispose, isolates session switches, cancels superseded viewport queries, and supports offline save/reopen without a debug session', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orbit-rtos-prov-trace-'));
+    const workers: TraceWorkerClient[] = [];
+    const coordinator = new TraceRecordingCoordinator({
+      storageRoot: path.join(tmpRoot, 'recordings'),
+      workerFactory: () => {
+        const w = new TraceWorkerClient();
+        workers.push(w);
+        return w;
+      },
+    });
+
+    try {
+      const sampleBytes = await fs.readFile('scripts/rtos/fixtures/samples/continuous.bin');
+      const saved = new Map<string, unknown>();
+      const context = {
+        extensionUri: 'file:///ext',
+        workspaceState: {
+          get: vi.fn((key: string, fallback?: unknown) => (saved.has(key) ? saved.get(key) : fallback)),
+          update: vi.fn((key: string, value: unknown) => {
+            saved.set(key, structuredClone(value));
+            return Promise.resolve();
+          }),
+        },
+      } as any;
+
+      const provider = new RtosWebviewProvider(context, coordinator);
+      const view = createFakeView();
+      provider.resolveWebviewView(view);
+
+      // 1. Offline open works with NO active debug session (session.phase === 'none')
+      const seedDir = path.join(tmpRoot, 'seed-rec');
+      const seedWorker = workers[0] ?? new TraceWorkerClient();
+      if (!workers.includes(seedWorker)) workers.push(seedWorker);
+      const createSeed = await seedWorker.createRecording({
+        recordingDir: seedDir,
+        recordId: 'seed-1',
+        identity: { sessionId: 's-seed', sessionGeneration: 1, bootGeneration: 1, recordId: 'seed-1' },
+        commitOnEachIngest: true,
+      });
+      expect(createSeed.ok).toBe(true);
+      await seedWorker.ingestChunk({
+        recordId: 'seed-1',
+        sessionId: 's-seed',
+        sessionGeneration: 1,
+        batchSequence: 1,
+        chunk: sampleBytes,
+        flush: true,
+      });
+      await seedWorker.finishRecording('seed-1', 'seed-done');
+      await seedWorker.closeRecording('seed-1');
+
+      await (provider as any).handleMessage({ command: 'traceOpenRecording', recordingDir: seedDir });
+      const openedId = provider.currentTraceState.selectedRecordId;
+      expect(openedId).toBeTruthy();
+      expect(provider.currentTraceState.records[0].source).toBe('offline');
+      expect(provider.currentTraceState.records[0].segments.length).toBeGreaterThan(0);
+
+      // Save copy to fresh directory and verify refusal on non-empty directory
+      const copyDir = path.join(tmpRoot, 'saved-copy');
+      await (provider as any).handleMessage({ command: 'traceSaveRecording', recordId: openedId, targetDir: copyDir });
+      expect(provider.currentTraceState.lastActionMessage?.tone).toBe('ok');
+      await (provider as any).handleMessage({ command: 'traceSaveRecording', recordId: openedId, targetDir: copyDir });
+      expect(provider.currentTraceState.lastActionMessage?.tone).toBe('error');
+
+      // Rapid consecutive viewport queries: older query is aborted/dropped, latest succeeds
+      const q1 = (provider as any).handleMessage({
+        command: 'traceQueryViewport',
+        querySeq: 1,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        maxBuckets: 64,
+      });
+      const q2 = (provider as any).handleMessage({
+        command: 'traceQueryViewport',
+        querySeq: 2,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        maxBuckets: 64,
+      });
+      await Promise.all([q1, q2]);
+      const vpMsgs = view.posted.filter((m: any) => m.command === 'traceViewportResult');
+      expect(vpMsgs.length).toBeGreaterThanOrEqual(1);
+      expect(vpMsgs[vpMsgs.length - 1].result.querySeq).toBe(2);
+      expect(vpMsgs[vpMsgs.length - 1].result.slices.length).toBeGreaterThan(0);
+
+      // 2. Hiding / disposing view MUST NOT stop an active recording in TraceRecordingCoordinator
+      const stopSpy = vi.spyOn(coordinator, 'stopRecording');
+      const fakeSession: any = {
+        id: 'sess-live',
+        name: 'Live',
+        type: 'orbit',
+        configuration: { device: 'STM32H723VGT6' },
+        customRequest: vi.fn(async (cmd: string, args: any) => {
+          if (cmd === 'orbitRtosSnapshot' && args.action === 'capabilities') {
+            return makeCapabilities('sess-live');
+          }
+          if (cmd === 'orbitRtosSnapshot' && args.action === 'refresh') {
+            return makeSnapshot('sess-live', 1);
+          }
+          return { stopped: true };
+        }),
+      };
+      vscodeMock.emitActive(fakeSession);
+      await (provider as any).handleMessage({ command: 'traceInspectTarget' });
+      expect(provider.currentTraceState.targetProbe?.ok).toBe(false);
+
+      // View hide & dispose only stop UI timers/queries, never stopRecording
+      view.setVisible(false);
+      view.triggerDispose();
+      expect(stopSpy).not.toHaveBeenCalled();
+
+      // Switch session clears stale target probe while keeping offline records inspectable
+      vscodeMock.emitTerminate(fakeSession);
+      expect(provider.currentTraceState.targetProbe).toBeNull();
+      expect(provider.currentTraceState.records.some(r => r.recordId === openedId)).toBe(true);
+
+      await (provider as any).handleMessage({ command: 'traceCloseRecording', recordId: openedId });
+      expect(provider.currentTraceState.records.some(r => r.recordId === openedId)).toBe(false);
+
+      provider.dispose();
+    } finally {
+      await coordinator.dispose();
+      await Promise.all(workers.map(w => w.shutdown('test-end').catch(() => {})));
+      await fs.rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

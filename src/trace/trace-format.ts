@@ -152,6 +152,7 @@ export interface TraceRecordingManifest {
   readonly state: RecordingLifecycleState;
   readonly closeReason?: string;
   readonly failureCode?: string;
+  readonly failureDiagnostics?: Record<string, unknown>;
   readonly decoderOptions?: SystemViewDecoderOptions;
   readonly committed: TraceRecordingCommittedCounts;
   readonly rawSha256?: string;
@@ -254,6 +255,11 @@ export interface JournalCommitMetadata {
   readonly failureSummary?: {
     readonly errorCode: string;
     readonly message: string;
+    readonly terminalState?: 'interrupted' | 'failed';
+    readonly rawSha256?: string;
+    readonly totalRawBytes?: number;
+    readonly committed?: TraceRecordingCommittedCounts;
+    readonly diagnostics?: Record<string, unknown>;
   };
   readonly resetSummary?: {
     readonly previousBootGeneration: number;
@@ -1756,6 +1762,8 @@ export async function inspectRecordingDirectory(
   let lastValidCommitSeq = 0;
   let cleanCloseFound = false;
   let failureFound = false;
+  let failureTerminalState: 'interrupted' | 'failed' | undefined;
+  let failureExpectedSha: string | undefined;
   let hasCommittedCorruption = false;
   let hasTruncatedJournalTail = false;
 
@@ -1980,13 +1988,20 @@ export async function inspectRecordingDirectory(
         }
         if (frameKind === JOURNAL_FRAME_KIND.FAILURE_MARK) {
           failureFound = true;
+          const fs = meta.failureSummary;
+          if (fs?.terminalState === 'interrupted' || fs?.terminalState === 'failed') {
+            failureTerminalState = fs.terminalState;
+          }
+          if (fs?.rawSha256 && typeof fs.totalRawBytes === 'number') {
+            failureExpectedSha = fs.rawSha256;
+          }
           diagnostics.push({
             code: 'failure-recorded',
             file: ORBIT_TRACE_FILES.journal,
             offset: jPos - frameLength,
             commitSeq,
-            message: meta.failureSummary
-              ? `录制记录了存储失败: ${meta.failureSummary.errorCode} (${meta.failureSummary.message})`
+            message: fs
+              ? `录制记录了中断/失败封存 (${fs.terminalState ?? 'failed'}): ${fs.errorCode} (${fs.message})`
               : '录制记录了存储失败标记',
           });
         }
@@ -2014,8 +2029,8 @@ export async function inspectRecordingDirectory(
 
     let rawSha256Verified = false;
     const cleanFrame = cleanCloseFound ? frames[frames.length - 1] : undefined;
-    const expectedSha = cleanFrame?.meta.closeSummary?.rawSha256 ?? manifest?.rawSha256;
-    if (cleanCloseFound && expectedSha && (options.verifyRawSha256 ?? true)) {
+    const expectedSha = cleanFrame?.meta.closeSummary?.rawSha256 ?? failureExpectedSha ?? manifest?.rawSha256;
+    if ((cleanCloseFound || (failureFound && expectedSha !== undefined)) && expectedSha && (options.verifyRawSha256 ?? true)) {
       if (recoverableRawBytes === 0) {
         const emptySha = createHash('sha256').digest('hex');
         if (emptySha === expectedSha) {
@@ -2051,6 +2066,13 @@ export async function inspectRecordingDirectory(
         file: ORBIT_TRACE_FILES.journal,
         message: 'manifest.json 标记 completed，但 journal.otj 缺少 CLEAN_CLOSE 帧',
       });
+    } else if (manifest && (manifest.state === 'interrupted' || manifest.state === 'failed') && cleanCloseFound) {
+      hasCommittedCorruption = true;
+      diagnostics.push({
+        code: 'unclean-close',
+        file: ORBIT_TRACE_FILES.journal,
+        message: `manifest.json 标记 ${manifest.state}，但 journal.otj 存在矛盾的 CLEAN_CLOSE 帧`,
+      });
     } else if (manifest?.state === 'completed' && manifest.committed.rawBytes !== recoverableRawBytes) {
       hasCommittedCorruption = true;
       diagnostics.push({
@@ -2071,6 +2093,8 @@ export async function inspectRecordingDirectory(
       status = 'corrupted';
     } else if (cleanCloseFound && manifest?.state === 'completed') {
       status = 'completed';
+    } else if (manifest?.state === 'interrupted' || failureTerminalState === 'interrupted') {
+      status = 'interrupted';
     } else if (failureFound || manifest?.state === 'failed') {
       status = 'failed';
     } else {

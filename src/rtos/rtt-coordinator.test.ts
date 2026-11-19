@@ -456,4 +456,123 @@ describe('RttConsumptionCoordinator', () => {
 
     coordinator.dispose();
   });
+
+  it('flushes queued FIFO in-flight callback batches in strict batchSequence order on resume/drain without double-delivering to shared consumers or silently losing undelivered bytes', async () => {
+    const host = new SimulatedPhysicalRttHost();
+    const coordinator = new RttConsumptionCoordinator(host);
+
+    const primaryBatches: RttChannelBatch[] = [];
+    const primaryDrops: RttConsumerDropEvent[] = [];
+    const sharedBatches: RttChannelBatch[] = [];
+    let rejectNextCallback = false;
+
+    const subPrimary = await coordinator.subscribe({
+      consumerId: 'cb-primary',
+      channelIndex: 1,
+      deliveryKind: 'binary',
+      deliveryMode: 'callback',
+      pollIntervalMs: 10,
+      maxBatchBytes: 64,
+      maxQueueBytes: 256,
+      maxQueueBatches: 8,
+      backpressurePolicy: 'pause-reader',
+      onBatch: b => {
+        primaryBatches.push(b);
+        if (rejectNextCallback) {
+          rejectNextCallback = false;
+          return false;
+        }
+        return true;
+      },
+      onDrop: ev => primaryDrops.push(ev),
+    });
+    expect(subPrimary.ok).toBe(true);
+
+    const subShared = await coordinator.subscribe({
+      consumerId: 'cb-shared',
+      channelIndex: 1,
+      deliveryKind: 'binary',
+      deliveryMode: 'callback',
+      pollIntervalMs: 10,
+      maxBatchBytes: 64,
+      conflictPolicy: 'best-effort',
+      onBatch: b => { sharedBatches.push(b); },
+    });
+    expect(subShared.ok).toBe(true);
+
+    // 1) Initial live batch (16 B) delivered to both once
+    const part1 = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
+    host.pushTargetBytes(1, part1);
+    await vi.advanceTimersByTimeAsync(12);
+    expect(primaryBatches).toHaveLength(1);
+    expect(sharedBatches).toHaveLength(1);
+
+    // 2) Suspend an in-flight target read (35 B), pause cb-primary mid-read, then complete the read
+    const part2 = Uint8Array.from({ length: 35 }, (_, i) => 0x20 + i);
+    host.holdNextRead = true;
+    host.pushTargetBytes(1, part2);
+    await vi.advanceTimersByTimeAsync(12);
+    expect(coordinator.setConsumerPaused('cb-primary', 1, true)).toBe(true);
+
+    // Complete held read: target RdOff committed; shared receives seq=2 immediately, paused cb-primary buffers seq=2 (35 B)
+    host.pendingReadResolver?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sharedBatches).toHaveLength(2);
+    expect(primaryBatches).toHaveLength(1);
+    const queuedStatus = coordinator.getChannelStatus(1)!.consumers.find(c => c.consumerId === 'cb-primary')!;
+    expect(queuedStatus.queuedBatches).toBe(1);
+    expect(queuedStatus.queuedBytes).toBe(35);
+
+    // 3) Push later target bytes (20 B), then resume cb-primary & run drainConsumer -> older seq=2 MUST flush BEFORE newer seq=3!
+    const part3 = Uint8Array.from({ length: 20 }, (_, i) => 0x60 + i);
+    host.pushTargetBytes(1, part3);
+    expect(coordinator.setConsumerPaused('cb-primary', 1, false)).toBe(true);
+    // Older in-flight batch (35 B, seq=2) was delivered synchronously on resume before seq=3 is even read!
+    expect(primaryBatches.map(b => b.batchSequence)).toEqual([1, 2]);
+    expect(primaryBatches[1].bytes.length).toBe(35);
+
+    const drainRes = await coordinator.drainConsumer('cb-primary', 1, { timeoutMs: 200 });
+    expect(drainRes.ok).toBe(true);
+    expect(drainRes.drained).toBe(true);
+    expect(primaryBatches.map(b => b.batchSequence)).toEqual([1, 2, 3]);
+    expect(sharedBatches.map(b => b.batchSequence)).toEqual([1, 2, 3]);
+    expect(Buffer.concat(primaryBatches.map(b => Buffer.from(b.bytes)))).toEqual(
+      Buffer.concat([Buffer.from(part1), Buffer.from(part2), Buffer.from(part3)]),
+    );
+    expect(Buffer.concat(sharedBatches.map(b => Buffer.from(b.bytes)))).toEqual(
+      Buffer.concat([Buffer.from(part1), Buffer.from(part2), Buffer.from(part3)]),
+    );
+
+    // 4) Host backpressure via callback returning false queues subsequent held/paused batch and resumes cleanly in FIFO order
+    rejectNextCallback = true;
+    const part4 = Uint8Array.from([0xa1, 0xa2, 0xa3, 0xa4]);
+    host.pushTargetBytes(1, part4);
+    await vi.advanceTimersByTimeAsync(12);
+    expect(primaryBatches).toHaveLength(4);
+    expect(coordinator.getChannelStatus(1)!.consumers.find(c => c.consumerId === 'cb-primary')!.backpressured).toBe(true);
+
+    // Pause while another read lands in queue under backpressure, then unsubscribe while unable to receive -> explicit host-drop!
+    const part5 = Uint8Array.from([0xb1, 0xb2, 0xb3]);
+    host.holdNextRead = true;
+    host.pushTargetBytes(1, part5);
+    // Force one manual held batch via temporary unpause+pause during read
+    expect(coordinator.setConsumerPaused('cb-primary', 1, false)).toBe(true);
+    await vi.advanceTimersByTimeAsync(12);
+    expect(coordinator.setConsumerPaused('cb-primary', 1, true)).toBe(true);
+    host.pendingReadResolver?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(coordinator.getChannelStatus(1)!.consumers.find(c => c.consumerId === 'cb-primary')!.queuedBytes).toBe(3);
+
+    const unsubRes = await coordinator.unsubscribe('cb-primary', 1);
+    expect(unsubRes.ok).toBe(true);
+    expect(unsubRes.remainingRefCount).toBe(1);
+    expect(primaryDrops.some(d => d.reason === 'host-drop' && d.droppedBytes === 3)).toBe(true);
+    // Shared consumer still received part4 & part5 cleanly once each
+    expect(sharedBatches.map(b => b.batchSequence)).toEqual([1, 2, 3, 4, 5]);
+
+    await coordinator.unsubscribe('cb-shared', 1);
+    coordinator.dispose();
+  });
 });

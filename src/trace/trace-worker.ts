@@ -522,7 +522,11 @@ export class TraceWorkerRuntime {
           }
           slot.finishing = true;
           await this.drainSlotQueue(slot);
-          const res = await slot.store.finish(msg.reason);
+          const res = await slot.store.finish(msg.reason, {
+            ...(msg.terminalState ? { terminalState: msg.terminalState } : {}),
+            ...(msg.failureCode ? { failureCode: msg.failureCode } : {}),
+            ...(msg.diagnostics ? { diagnostics: msg.diagnostics } : {}),
+          });
           slot.finishing = false;
           if (res.ok) {
             slot.finished = true;

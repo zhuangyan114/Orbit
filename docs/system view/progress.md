@@ -215,3 +215,33 @@
 - 独立复验：用 1,002,005 事件核对精确分页和 2,505,036 字节原始导出的一致性，复验主机等待预算、目录与自导出保护、乱序后重试与查询取消。实际强制退出 Worker 后，档案标记 interrupted，准确导出已提交的 65 B 前缀，保留 13 B 未提交尾部的诊断。默认全量 1486 项通过、1 项跳过。打包清单保留 Worker 和原生 helper，排除阶段验收目录。
 - 剩余事项：4.4 接入 DAP/RTT 录制协调器并实测 Continuous、Single-Shot 和 Post-Mortem。
 - 提交：`实现 RTOS 阶段 4.3：增加 Trace 存储与范围查询`。
+
+## 4.4 / 2026-11-19
+
+- 状态：已完成。自动化、独立模拟、VS Code 扩展开发宿主和 STM32H723 三种录制模式均已通过验收。
+- 实现：
+  - 新增 `src/trace/systemview-target-metadata.ts` 与 `src/trace/systemview-target-metadata.test.ts`：解析 DWARF 中 `_SEGGER_RTT`、`_SYSVIEW_Globals`（识别 `SEGGER_SYSVIEW_POST_MORTEM_MODE` 编译特征）与 `fixtureCapture` 字段布局；校验 RTT 描述符与 RAM 边界，计算 Single-Shot / Post-Mortem 环形时间顺序读取区间（不推进 `RdOff`）。
+  - 扩展 `src/debug/dap-session.ts`、`src/rtos/rtt-coordinator.ts` 与 `src/debug/dap-session-trace-target.test.ts`：新增内部请求 `orbitTraceTarget`（`inspect`、`readState`、`readMemoryRange`）与 `orbitTraceBootChanged` 事件，经单选 SWD/RTT owner 与 `liveAccess: true` 有界读取目标状态与缓冲区；在 `RttConsumptionCoordinator` 新增 `drainConsumer` 与 DAP `orbitRttTransport` `drain` 动作及 `flushCallbackQueue`，在保持单物理 reader、每批预算、共享 RTT 多消费者单次分发、`pull` 模式及 3.4 `unsubscribe` 不变的前提下：对暂停前已推进 `RdOff` 并落入缓存队列的 `callback` 批次，在 `setConsumerPaused(..., false)`、`drainConsumer` 与新批次投递前严格按 FIFO 先交付较旧序号（同时支持回调 `return false` 拒收重新触发 `backpressured`），退订前无法接收的滞留队列如实触发 `host-drop` 丢包事件（不再静默滞留并造成下一序号跳变 gap）。
+  - 新增 `src/trace/trace-recording-coordinator.ts` 与 `src/trace/trace-recording-coordinator.test.ts`：在 Extension Host 精确绑定当前 `vscode.DebugSession` 与 `(sessionId, sessionGeneration, bootGeneration)`，接入 Continuous / Single-Shot / Post-Mortem 三模式与 Worker 查询/导出透传；包含首次 `await` 前同步槽位预约与同 `recordId` 幂等重入、迟到 `createRecording`/`subscribe` 自清理、START 边界与陈旧 Up 积压防护、`batchSequence` 跳号 `transport-gap` 分段；`stopContinuous` 默认 `stopDrainTimeoutMs` 设为 `4000` 并于 `unsubscribe` 与在途批结算后单次采样同步写入 `channelInfo`、`error.diagnostics` 与 `manifest.failureDiagnostics`（含 `StopDrainHostDrop` / `shared-consumer-uncertain` / `unavailable`）；不自动 `halt`/`reset`，不对不确定 Down 写重试。
+  - 扩展 `src/trace/trace-format.ts`、`src/trace/trace-recording-store.ts`、`src/trace/trace-worker-protocol.ts`、`src/trace/trace-worker.ts`、`src/trace/trace-worker-client.ts`：为 `finish` / `finishRecording` 增加显式 `terminalState: 'completed' | 'interrupted' | 'failed'` 与 `failureCode` / `diagnostics`，非正常结束写 `FAILURE_MARK` 并保留已提交有效前缀，`manifest.json` / `journal.otj` / `open()` 重开状态一致，保留 4.3 正常完成路径不变。
+  - 扩展 `src/extension.ts`：绑定会话生命周期与自定义事件，注册内部命令 `orbit.internal.traceRecording` 并在 `ExtensionMode.Test` 返回 `{ rtosProvider, traceCoordinator, extensionContext }`，保持 4.5 UI 泳道与 5.x 公开 API/MCP 边界不提前扩张。
+- 设计变更：将 `orbit.internal.traceRecording` 作为阶段 4.4 的 Extension Host 内部调测与验收入口；针对 `codex-r3-h7-low-rate-tail.json` 与 `codex-r3-h7-low-rate-timeout.json` 暴露的 `inFlight` 读落入 `callback` 消费者缓存队列在恢复时未被 FIFO 清空的问题，增加 `flushCallbackQueue` 与退订丢包显式上报。
+- 检查：
+  - `npm run typecheck` 通过（0 errors）；`npm run build`（含 `dist/extension.js`、`dist/debugadapter.js`、`dist/trace-worker.js` 等全部产物）通过；`git diff --check` 通过。
+  - 聚焦 Vitest（`src/rtos/rtt-coordinator.test.ts` 5 项 + `src/trace/trace-recording-coordinator.test.ts` 10 项，及 `systemview-target-metadata.test.ts` 4 项、`dap-session-trace-target.test.ts` 2 项）：覆盖悬挂 `inFlight` 读暂停入队 -> 恢复/`drainConsumer` 严格按序投递与共享消费者单次接收、回调拒收背压、退订未消费 `host-drop`、R3 三处快照一致与 `StopDrain*` 诊断，全部通过。
+  - 独立模拟复验与真实 Extension Host 验证（`out/rtos-stage4/acceptance-4.4/`）：
+    - `node out/rtos-stage4/acceptance-4.4/independent-start-race.cjs`（`pass: true`）。
+    - `node out/rtos-stage4/acceptance-4.4/independent-stale-start-confirm.cjs`（`pass: true`）。
+    - `node out/rtos-stage4/acceptance-4.4/independent-interrupted-manifest.cjs`（`pass: true`）。
+    - `node out/rtos-stage4/acceptance-4.4/verify-vscode-host.cjs`（`pass: true`）。
+    - `node out/rtos-stage4/acceptance-4.4/offline-acceptance.cjs`（`allOfflineEvidencePresentAndPassing: true`）。
+  - 默认全量 `npm test -- --minWorkers=1 --maxWorkers=2`（**119 文件、1503 项通过、1 项已有跳过**，31.14s）。
+- 硬件：在现有 `h7vgt6_test` 扩展开发宿主使用 STM32H723VGT6 与 RMLink 二号机（`b81f3fc30470`、固件 0.3.4、Wi-Fi 512 B、SWD 4 MHz）。沿用阶段 0 的 FreeRTOS 10.3.1 和 SystemView 3.32 样本对象。原 ELF 的加载段重叠，在专用测试目录使用显式 Flash 和 DTCM 加载段重新链接后烧录，链接脚本和段布局记录在验收目录。
+  - Continuous 标准负载落盘 19,123 B、解码 3,232 包，目标过载计数 1,609，归档保留溢出状态。停止后 `RdOff = WrOff = 509`。
+  - Continuous 低负载用同一夹具的 100 Hz Tick 变体，在读请求进行中暂停宿主，积压 5,019 B 再停止。落盘 6,666 B、解码 1,091 包、目标零丢包，只出现正常的 EOF 段结束记录。实测 `RdOff = WrOff = 7418`，恰等于预启动剔除的 752 B 与归档的 6,666 B 之和。
+  - 同一低负载在 50 ms STOP 排空预算下返回 `StopDrainTimeout`。目标实测 `RdOff=3090`、`WrOff=7656`，返回值和磁盘都记录还剩 4,566 B。归档标为 `interrupted`，离线重新打开并核对了已提交的 2,219 B 和 SHA-256。
+  - Single-Shot 读出 499 B，Post-Mortem 读出回卷后的 8,191 B。两者与独立读取的目标环字节及 SHA-256 一致，冻结代次和读写游标一致。Post-Mortem 标出 `prefix-overwritten`，解码 846 包和 616 个 Marker 点。
+- 独立复验：`npm run typecheck`、`npm run build` 和 `git diff --check` 通过，完整 Vitest 1503 项通过、1 项跳过。独立 START 竞态、旧数据确认及中断归档脚本通过。
+- 证据：`src/trace/systemview-target-metadata.ts`、`src/trace/trace-recording-coordinator.ts`、`src/rtos/rtt-coordinator.ts`、`src/debug/dap-session.ts`、`src/trace/trace-format.ts`、`src/trace/trace-recording-store.ts`、`src/trace/trace-worker*.ts`、`src/extension.ts`、`out/rtos-stage4/acceptance-4.4/{README.md,offline-acceptance.json,vscode-host-report.json,independent-*.json,codex-*}`。
+- 剩余事项：4.5 接入 Trace Timeline。J-Link native 和 CMSIS-DAP WinUSB/HID 实板矩阵仍待补验。
+- 提交：`实现 RTOS 阶段 4.4：接入实时与缓冲录制模式`。

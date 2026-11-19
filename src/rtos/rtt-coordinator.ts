@@ -195,6 +195,26 @@ export interface RttUnsubscribeResult {
   message?: string;
 }
 
+export interface RttDrainOptions {
+  timeoutMs?: number;
+}
+
+export interface RttDrainResult {
+  ok: boolean;
+  bufferIndex: number;
+  consumerId: string;
+  drained: boolean;
+  reason: 'empty' | 'timeout' | 'paused' | 'backpressured' | 'xr-paused' | 'control' | 'reset' | 'aborted' | 'error';
+  batchesDrained: number;
+  bytesDrained: number;
+  lastBatchSequence: number;
+  lastRdOff?: number;
+  lastWrOff?: number;
+  bufferSize?: number;
+  errorCode?: string;
+  message?: string;
+}
+
 export interface RttChannelStatus {
   bufferIndex: number;
   channelName?: string;
@@ -1367,6 +1387,32 @@ export class RttConsumptionCoordinator {
         drainedBatch = await this.drainChannelLastBatch(channel, consumerId, options.drainTimeoutMs ?? 1000);
       }
 
+      const leavingConsumer = channel.consumers.get(consumerId);
+      if (leavingConsumer && leavingConsumer.deliveryMode === 'callback' && leavingConsumer.queue.length > 0) {
+        if (!leavingConsumer.paused && !leavingConsumer.backpressured) {
+          this.flushCallbackQueue(channel, leavingConsumer);
+        }
+        if (leavingConsumer.queue.length > 0) {
+          const droppedBatches = leavingConsumer.queue.length;
+          const droppedBytes = leavingConsumer.queuedBytes;
+          leavingConsumer.queue.length = 0;
+          leavingConsumer.queuedBytes = 0;
+          leavingConsumer.hostDroppedBytes += droppedBytes;
+          leavingConsumer.hostDroppedBatches += droppedBatches;
+          channel.hostDroppedBytes += droppedBytes;
+          channel.congested = true;
+          leavingConsumer.onDrop?.({
+            bufferIndex: channel.bufferIndex,
+            consumerId: leavingConsumer.consumerId,
+            reason: 'host-drop',
+            droppedBytes,
+            droppedBatches,
+            totalHostDroppedBytes: leavingConsumer.hostDroppedBytes,
+            totalTargetOverruns: channel.targetOverruns,
+          });
+        }
+      }
+
       channel.consumers.delete(consumerId);
       const remaining = channel.consumers.size;
       if (remaining === 0) {
@@ -1467,17 +1513,254 @@ export class RttConsumptionCoordinator {
     if (!channel || !consumer) return false;
     consumer.paused = paused;
     if (!paused) {
-      const lowWater = Math.floor(consumer.maxQueueBytes * LOW_WATER_RATIO);
-      if (consumer.queuedBytes <= lowWater && consumer.queue.length < consumer.maxQueueBatches) {
+      if (consumer.deliveryMode === 'callback') {
         consumer.backpressured = false;
+        this.flushCallbackQueue(channel, consumer);
+      } else {
+        const lowWater = Math.floor(consumer.maxQueueBytes * LOW_WATER_RATIO);
+        if (consumer.queuedBytes <= lowWater && consumer.queue.length < consumer.maxQueueBatches) {
+          consumer.backpressured = false;
+        }
       }
     }
     this.evaluateBackpressurePause(channel);
     this.notifyChannelState(channel);
-    if (!paused && !this.suspendedForReset && channel.pausedReason === 'none') {
+    if (!paused && !consumer.backpressured && !this.suspendedForReset && channel.pausedReason === 'none') {
       this.ensureChannelTimerScheduled(channel);
     }
     return true;
+  }
+
+  /**
+   * Explicitly drains queued RTT Up bytes on an active subscription across multiple
+   * single-owner, budget-sized batches until the ring empties (`bytes.length === 0` or
+   * `committedRdOff === wrOff`), the consumer/channel is paused/backpressured, an error
+   * or identity change occurs, or `timeoutMs` expires.
+   *
+   * Existing `unsubscribe()` behavior for all 3.4 consumers remains unchanged.
+   */
+  async drainConsumer(
+    consumerId: string,
+    bufferIndex: number,
+    options: RttDrainOptions = {},
+  ): Promise<RttDrainResult> {
+    const channel = this.channels.get(bufferIndex);
+    const consumer = channel?.consumers.get(consumerId);
+    if (!channel || !consumer) {
+      return {
+        ok: false,
+        bufferIndex,
+        consumerId,
+        drained: false,
+        reason: 'error',
+        batchesDrained: 0,
+        bytesDrained: 0,
+        lastBatchSequence: channel?.batchSequence ?? 0,
+        errorCode: 'InvalidRequest',
+        message: `No active subscription for consumerId=${consumerId} on channel ${bufferIndex}`,
+      };
+    }
+
+    const now = () => (this.host.nowMs ? this.host.nowMs() : Date.now());
+    const timeoutMs = Math.max(1, options.timeoutMs ?? 2000);
+    const deadlineMs = now() + timeoutMs;
+
+    if (channel.timer) {
+      clearTimeout(channel.timer);
+      channel.timer = null;
+      this.host.onTimerStateChanged?.();
+    }
+
+    if (channel.inFlightPromise) {
+      const waitMs = Math.max(1, Math.min(timeoutMs, deadlineMs - now()));
+      await Promise.race([
+        channel.inFlightPromise,
+        new Promise<void>(resolve => setTimeout(resolve, waitMs)),
+      ]);
+    }
+
+    if (consumer.deliveryMode === 'callback' && consumer.queue.length > 0 && !consumer.paused && !consumer.backpressured) {
+      this.flushCallbackQueue(channel, consumer);
+    }
+
+    const generation = channel.generation;
+    const coordinatorGen = this.coordinatorGeneration;
+    let batchesDrained = 0;
+    let bytesDrained = 0;
+    let stopReason: RttDrainResult['reason'] = 'empty';
+    let failureCode: string | undefined;
+    let failureMessage: string | undefined;
+
+    const buildResult = (ok: boolean, drained: boolean): RttDrainResult => ({
+      ok,
+      bufferIndex: channel.bufferIndex,
+      consumerId,
+      drained,
+      reason: stopReason,
+      batchesDrained,
+      bytesDrained,
+      lastBatchSequence: channel.batchSequence,
+      ...(channel.lastRdOff !== undefined ? { lastRdOff: channel.lastRdOff } : {}),
+      ...(channel.lastWrOff !== undefined ? { lastWrOff: channel.lastWrOff } : {}),
+      ...(channel.bufferSize !== undefined ? { bufferSize: channel.bufferSize } : {}),
+      ...(failureCode ? { errorCode: failureCode } : {}),
+      ...(failureMessage ? { message: failureMessage } : {}),
+    });
+
+    try {
+      while (true) {
+        if (this.disposed || this.host.isTerminating() || generation !== channel.generation
+          || coordinatorGen !== this.coordinatorGeneration || !channel.consumers.has(consumerId)) {
+          stopReason = 'aborted';
+          return buildResult(true, false);
+        }
+        if (this.suspendedForReset) {
+          stopReason = 'reset';
+          return buildResult(true, false);
+        }
+        if (consumer.paused) {
+          stopReason = 'paused';
+          return buildResult(true, false);
+        }
+        if (consumer.backpressured) {
+          stopReason = 'backpressured';
+          return buildResult(true, false);
+        }
+        if (this.shouldPauseForXr(channel)) {
+          channel.pausedReason = 'xr-timeline-active';
+          stopReason = 'xr-paused';
+          return buildResult(true, false);
+        }
+        if (this.host.isControlInProgress()) {
+          channel.pausedReason = 'control';
+          stopReason = 'control';
+          return buildResult(true, false);
+        }
+
+        const remainingMs = deadlineMs - now();
+        if (remainingMs <= 0) {
+          stopReason = 'timeout';
+          return buildResult(true, false);
+        }
+
+        const abort = new AbortController();
+        const gateAcquired = await this.host.acquireReadGate('background', Math.max(1, remainingMs), abort.signal);
+        if (!gateAcquired) {
+          stopReason = this.host.isTerminating() || this.disposed
+            ? 'aborted'
+            : this.suspendedForReset
+              ? 'reset'
+              : this.host.isControlInProgress()
+                ? 'control'
+                : 'timeout';
+          return buildResult(true, false);
+        }
+
+        let readResult: OzoneCommandResult;
+        const identityBefore = this.host.identity();
+        const batchSize = this.effectiveBatchBytes(channel);
+        try {
+          if (this.disposed || this.host.isTerminating() || generation !== channel.generation
+            || coordinatorGen !== this.coordinatorGeneration) {
+            stopReason = 'aborted';
+            return buildResult(true, false);
+          }
+          if (this.suspendedForReset) {
+            stopReason = 'reset';
+            return buildResult(true, false);
+          }
+          if (this.host.isControlInProgress()) {
+            stopReason = 'control';
+            return buildResult(true, false);
+          }
+
+          if (!this.ownerStarted || this.ownerTransitionPending > 0) {
+            if (this.controlBlockAddress === undefined) {
+              const resolved = await this.host.ensureControlBlockAddress();
+              if (!resolved.ok) {
+                const failRes: Extract<OzoneCommandResult, { ok: false }> = {
+                  ok: false,
+                  errorCode: resolved.errorCode,
+                  error: resolved.message,
+                  diagnostics: resolved.diagnostics,
+                };
+                this.handleTransportFailure(channel, 'startRtt', failRes);
+                stopReason = 'error';
+                failureCode = resolved.errorCode;
+                failureMessage = resolved.message;
+                return buildResult(false, false);
+              }
+              this.controlBlockAddress = resolved.address;
+            }
+            const startRes = await this.requestOwnerStart(this.controlBlockAddress, {
+              ...(this.customRamRanges ? { ramRanges: this.customRamRanges } : {}),
+              ...(this.memoryBacked ? { memoryBacked: true } : {}),
+            });
+            if (!startRes.ok) {
+              this.handleTransportFailure(channel, 'startRtt', startRes);
+              stopReason = 'error';
+              failureCode = startRes.errorCode || 'RttStartFailed';
+              failureMessage = startRes.error;
+              return buildResult(false, false);
+            }
+          }
+
+          readResult = await this.host.readRtt(channel.bufferIndex, batchSize, abort.signal);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const code = typeof (err as { errorCode?: unknown })?.errorCode === 'string'
+            ? (err as { errorCode: string }).errorCode
+            : 'RttDrainReadFailed';
+          stopReason = 'error';
+          failureCode = code;
+          failureMessage = msg;
+          return buildResult(false, false);
+        } finally {
+          this.host.releaseReadGate();
+        }
+
+        const identityAfter = this.host.identity();
+        if (this.disposed || this.host.isTerminating() || generation !== channel.generation
+          || coordinatorGen !== this.coordinatorGeneration) {
+          stopReason = 'aborted';
+          return buildResult(true, false);
+        }
+        if (identityAfter.sessionGeneration !== identityBefore.sessionGeneration
+          || identityAfter.bootGeneration !== identityBefore.bootGeneration) {
+          stopReason = 'reset';
+          failureCode = 'TargetReset';
+          failureMessage = 'Target session/boot generation changed during RTT drain';
+          return buildResult(false, false);
+        }
+
+        const emitted = this.handleReadResult(channel, readResult, batchSize, false);
+        if (!readResult.ok) {
+          stopReason = 'error';
+          failureCode = readResult.errorCode || 'RttReadFailed';
+          failureMessage = readResult.error;
+          return buildResult(false, false);
+        }
+        if (!emitted) {
+          stopReason = 'empty';
+          return buildResult(true, true);
+        }
+
+        batchesDrained++;
+        bytesDrained += emitted.bytes.length;
+
+        if (emitted.committedRdOff !== undefined && emitted.wrOff !== undefined
+          && emitted.committedRdOff === emitted.wrOff && !emitted.writerAdvanced) {
+          stopReason = 'empty';
+          return buildResult(true, true);
+        }
+      }
+    } finally {
+      if (!this.disposed && !this.suspendedForReset && this.rttAvailable
+        && channel.consumers.size > 0 && channel.pausedReason === 'none') {
+        this.ensureChannelTimerScheduled(channel);
+      }
+      this.host.onTimerStateChanged?.();
+    }
   }
 
   /**
@@ -2041,6 +2324,55 @@ export class RttConsumptionCoordinator {
     return baseBatch;
   }
 
+  private flushCallbackQueue(channel: ChannelReaderState, consumer: ConsumerState): boolean {
+    if (consumer.deliveryMode !== 'callback') return true;
+    while (
+      consumer.queue.length > 0
+      && !consumer.paused
+      && !consumer.backpressured
+      && channel.consumers.has(consumer.consumerId)
+    ) {
+      const next = consumer.queue.shift()!;
+      consumer.queuedBytes = Math.max(0, consumer.queuedBytes - next.bytes.length);
+      try {
+        const keepFlowing = consumer.onBatch?.(next);
+        if (keepFlowing === false) {
+          consumer.backpressured = true;
+          this.evaluateBackpressurePause(channel);
+          this.notifyChannelState(channel);
+          return false;
+        }
+      } catch (error) {
+        log.dap(`[rtt] callback queue flush failed consumer=${consumer.consumerId} buffer=${channel.bufferIndex} error=${String(error)}`);
+      }
+    }
+    return consumer.queue.length === 0 && !consumer.paused && !consumer.backpressured;
+  }
+
+  private handleCallbackUnavailableBatch(
+    channel: ChannelReaderState,
+    consumer: ConsumerState,
+    batch: RttChannelBatch,
+  ): void {
+    if (consumer.backpressurePolicy === 'pause-reader') {
+      this.enqueueForPullConsumer(channel, consumer, batch);
+      return;
+    }
+    consumer.hostDroppedBytes += batch.bytes.length;
+    consumer.hostDroppedBatches += 1;
+    channel.hostDroppedBytes += batch.bytes.length;
+    channel.congested = true;
+    consumer.onDrop?.({
+      bufferIndex: channel.bufferIndex,
+      consumerId: consumer.consumerId,
+      reason: 'host-drop',
+      droppedBytes: batch.bytes.length,
+      droppedBatches: 1,
+      totalHostDroppedBytes: consumer.hostDroppedBytes,
+      totalTargetOverruns: channel.targetOverruns,
+    });
+  }
+
   private deliverBatchToConsumers(channel: ChannelReaderState, baseBatch: RttChannelBatch): void {
     const consumerList = [...channel.consumers.values()];
     const multi = consumerList.length > 1;
@@ -2055,23 +2387,12 @@ export class RttConsumptionCoordinator {
       }
 
       if (consumer.paused || consumer.backpressured) {
-        if (consumer.backpressurePolicy === 'pause-reader') {
-          this.enqueueForPullConsumer(channel, consumer, batch);
-        } else {
-          consumer.hostDroppedBytes += batch.bytes.length;
-          consumer.hostDroppedBatches += 1;
-          channel.hostDroppedBytes += batch.bytes.length;
-          channel.congested = true;
-          consumer.onDrop?.({
-            bufferIndex: channel.bufferIndex,
-            consumerId: consumer.consumerId,
-            reason: 'host-drop',
-            droppedBytes: batch.bytes.length,
-            droppedBatches: 1,
-            totalHostDroppedBytes: consumer.hostDroppedBytes,
-            totalTargetOverruns: channel.targetOverruns,
-          });
-        }
+        this.handleCallbackUnavailableBatch(channel, consumer, batch);
+        continue;
+      }
+
+      if (consumer.queue.length > 0 && !this.flushCallbackQueue(channel, consumer)) {
+        this.handleCallbackUnavailableBatch(channel, consumer, batch);
         continue;
       }
 

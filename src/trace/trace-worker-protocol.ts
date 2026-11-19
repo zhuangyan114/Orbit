@@ -124,6 +124,9 @@ export type TraceWorkerRequest =
       readonly type: 'finishRecording';
       readonly recordId: string;
       readonly reason?: string;
+      readonly terminalState?: 'completed' | 'interrupted' | 'failed';
+      readonly failureCode?: string;
+      readonly diagnostics?: Record<string, unknown>;
     }
   | {
       readonly reqId: number;

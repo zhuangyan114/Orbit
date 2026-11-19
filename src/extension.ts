@@ -4,6 +4,7 @@ import { WatchProvider } from './debug-providers/watch-provider';
 import { WatchWebviewProvider } from './debug-providers/watch-webview-provider';
 import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
 import { RtosWebviewProvider } from './webview/rtos/rtos-provider';
+import { TraceRecordingCoordinator } from './trace/trace-recording-coordinator';
 import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { SvdBackgroundDownloader } from './debug/svd-background-downloader';
@@ -33,6 +34,7 @@ let watchWebviewProvider: WatchWebviewProvider;
 let dataSamplingManager: DataSamplingManager;
 let timelineProvider: TimelineWebviewProvider;
 let rtosProvider: RtosWebviewProvider;
+let traceCoordinator: TraceRecordingCoordinator;
 let watchPollTimer: NodeJS.Timeout | null = null;
 let watchPollGeneration = 0;
 let activeWatchSession: vscode.DebugSession | null = null;
@@ -162,6 +164,12 @@ export async function activate(context: vscode.ExtensionContext) {
     const tl = new TimelineWebviewProvider(context, dsm, isUsableWatchSession, symbolPicker);
     timelineProvider = tl;
     rtosProvider = new RtosWebviewProvider(context);
+    traceCoordinator = new TraceRecordingCoordinator({
+      storageRoot: path.join(context.globalStorageUri.fsPath, 'trace-recordings'),
+    });
+    if (initialSession && isOrbitDebugSessionType(initialSession.type)) {
+      traceCoordinator.bindSession(initialSession);
+    }
 
     // Bounded automation event ring and the exact DebugSession registry with
     // the instance-level generation fence (plan Task 3). The ring pulls its
@@ -316,6 +324,9 @@ export async function activate(context: vscode.ExtensionContext) {
         new OzoneDebugConfigurationProvider(svdCacheRoot)
       ),
       vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
+        if (isOrbitDebugSessionType(event.session.type)) {
+          traceCoordinator.onCustomEvent(event.session, event.event, event.body);
+        }
         if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneClearDebugConsole') {
           vscode.commands.executeCommand('workbench.debug.action.clearRepl');
         } else if (isOrbitDebugSessionType(event.session.type) && event.event === 'ozoneRttStarted') {
@@ -382,6 +393,9 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
       vscode.debug.onDidStartDebugSession((session) => {
         if (isOrbitDebugSessionType(session.type)) {
+          if (!traceCoordinator.activeSession || vscode.debug.activeDebugSession === session) {
+            traceCoordinator.bindSession(session);
+          }
           setActiveWatchSession(session);
           if (!session.configuration.svdFile && !session.configuration.svdPath) {
             void svdDownloads.start(String(session.configuration.device ?? session.configuration.deviceName ?? ''), {
@@ -394,10 +408,16 @@ export async function activate(context: vscode.ExtensionContext) {
         sessionRegistry.onStarted(session);
       }),
       vscode.debug.onDidChangeActiveDebugSession((session) => {
+        traceCoordinator.bindSession(session && isOrbitDebugSessionType(session.type) ? session : undefined);
         setActiveWatchSession(session);
         sessionRegistry.onActiveChanged(session);
       }),
       vscode.debug.onDidTerminateDebugSession((session) => {
+        traceCoordinator.onSessionTerminated(session);
+        const next = vscode.debug.activeDebugSession;
+        if (next && next !== session && isOrbitDebugSessionType(next.type)) {
+          traceCoordinator.bindSession(next);
+        }
         terminateWatchSession(session);
         sessionRegistry.onTerminated(session);
       }),
@@ -441,6 +461,63 @@ export async function activate(context: vscode.ExtensionContext) {
 
       vscode.commands.registerCommand('ozone.api.getEndpoint', () => {
         return automationApiLifecycle?.getActive()?.getEndpointInfo();
+      }),
+
+      vscode.commands.registerCommand('orbit.internal.traceRecording', async (rawArgs?: Record<string, unknown>) => {
+        const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+        const action = typeof args.action === 'string' ? args.action : 'status';
+        switch (action) {
+          case 'inspect':
+            return traceCoordinator.inspectTarget({
+              includeEnumerate: args.includeEnumerate === true,
+              ...(typeof args.timeoutMs === 'number' ? { timeoutMs: args.timeoutMs } : {}),
+            });
+          case 'start':
+            return traceCoordinator.startRecording(args as any);
+          case 'stop':
+            return traceCoordinator.stopRecording(typeof args.recordId === 'string' ? args.recordId : undefined);
+          case 'cancel':
+            return traceCoordinator.cancelRecording(typeof args.recordId === 'string' ? args.recordId : undefined);
+          case 'pause':
+            return traceCoordinator.pauseReceiving(typeof args.recordId === 'string' ? args.recordId : undefined);
+          case 'resume':
+            return traceCoordinator.resumeReceiving(typeof args.recordId === 'string' ? args.recordId : undefined);
+          case 'status':
+            return traceCoordinator.getStatus(typeof args.recordId === 'string' ? args.recordId : undefined);
+          case 'list':
+            return traceCoordinator.listRecordings();
+          case 'queryRange':
+            return traceCoordinator.queryRange(String(args.recordId || ''), args.request as any);
+          case 'queryLod':
+            return traceCoordinator.queryLod(String(args.recordId || ''), args.request as any);
+          case 'getSegments':
+            return traceCoordinator.getSegments(String(args.recordId || ''));
+          case 'getGaps':
+            return traceCoordinator.getGaps(String(args.recordId || ''));
+          case 'getStats':
+            return traceCoordinator.getWorkerStats(typeof args.recordId === 'string' ? args.recordId : undefined);
+          case 'exportRaw':
+            return traceCoordinator.exportRawToFile(
+              String(args.recordId || ''),
+              String(args.outputPath || ''),
+              args.verifyChunkCrc32 !== false,
+            );
+          case 'openRecording':
+            return traceCoordinator.openRecording(
+              String(args.recordingDir || ''),
+              typeof args.recordId === 'string' ? args.recordId : undefined,
+              args.verifyRawSha256 !== false,
+            );
+          case 'inspectDir':
+            return traceCoordinator.inspectRecordingDirectory(
+              String(args.recordingDir || ''),
+              args.verifyRawSha256 !== false,
+            );
+          case 'close':
+            return traceCoordinator.closeRecording(String(args.recordId || ''));
+          default:
+            return { ok: false, errorCode: 'InvalidRequest', message: `Unsupported internal traceRecording action: ${action}` };
+        }
       }),
 
       vscode.commands.registerCommand('ozone.addToDataSampling', async (item) => {
@@ -506,7 +583,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     if (activeWatchSession) startWatchPolling();
     if (context.extensionMode === vscode.ExtensionMode.Test) {
-      return { rtosProvider, extensionContext: context };
+      return { rtosProvider, traceCoordinator, extensionContext: context };
     }
   } catch (e: any) {
     console.error('[Orbit] activate FAILED:', e.message);
@@ -639,5 +716,6 @@ export async function deactivate() {
   sessionRegistry?.dispose();
   eventHub?.dispose();
   await timelineProvider?.dispose();
+  await traceCoordinator?.dispose();
   rtosProvider?.dispose();
 }

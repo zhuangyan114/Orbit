@@ -508,6 +508,7 @@ export class TraceRecordingStore {
   private state: RecordingLifecycleState = 'recording';
   private closeReason?: string;
   private failureCode?: string;
+  private failureDiagnostics?: Record<string, unknown>;
   private createdAtMs: number;
   private updatedAtMs: number;
   private closedAtMs?: number;
@@ -692,6 +693,7 @@ export class TraceRecordingStore {
     store.state = inspection.status;
     store.closeReason = manifest?.closeReason;
     store.failureCode = manifest?.failureCode;
+    store.failureDiagnostics = manifest?.failureDiagnostics;
     store.closedAtMs = manifest?.closedAtMs;
     store.rawSha256 = manifest?.rawSha256;
     store.inspection = inspection;
@@ -884,6 +886,7 @@ export class TraceRecordingStore {
       state: this.state,
       closeReason: this.closeReason,
       failureCode: this.failureCode,
+      ...(this.failureDiagnostics ? { failureDiagnostics: this.failureDiagnostics } : {}),
       decoderOptions: this.decoderOptions,
       committed: { ...this.committed },
       rawSha256: this.rawSha256,
@@ -1440,14 +1443,26 @@ export class TraceRecordingStore {
   }
 
   /**
-   * 有序关闭录制：结束解码与重建状态机，落盘剩余页，写入 `CLEAN_CLOSE` 帧与 `rawSha256`，
-   * 并原子更新 `manifest.json`（`state='completed'`）与 `index.otidx`。
+   * 封存录制：
+   * - 默认（`terminalState` 未指定或为 `'completed'`）：有序关闭，写入 `CLEAN_CLOSE` 帧与 `rawSha256`，
+   *   并原子更新 `manifest.json`（`state='completed'`）与 `index.otidx`（保留 4.3 原有行为）。
+   * - 显式失败/中断（`terminalState: 'interrupted' | 'failed'`）：保留已解码与已提交的有效前缀后，
+   *   写入 `FAILURE_MARK` 帧（绝不写 `CLEAN_CLOSE`），保存明确 `state`、`failureCode`、`closeReason` 与诊断，
+   *   确保落盘 `manifest.json` / `journal.otj` / `open()` 重开状态完全一致。
    */
-  public async finish(reason = 'clean-finish'): Promise<TraceStorageResult<TraceRecordingManifest>> {
+  public async finish(
+    reason = 'clean-finish',
+    options?: {
+      terminalState?: 'completed' | 'interrupted' | 'failed';
+      failureCode?: string;
+      diagnostics?: Record<string, unknown>;
+    },
+  ): Promise<TraceStorageResult<TraceRecordingManifest>> {
     const writableErr = this.checkWriteWritable();
     if (writableErr) {
       return writableErr;
     }
+    const terminalState = options?.terminalState ?? 'completed';
     if (this.decoder && this.reconstructor) {
       const endDecode = this.decoder.finish();
       const r1 = this.reconstructor.pushBatch(endDecode, { identity: this.identity });
@@ -1463,7 +1478,7 @@ export class TraceRecordingStore {
       await this.absorbBatches({ packets: [], syncs: [], gaps: [], segments: [], diagnostics: [] }, r2);
     }
 
-    // 先提交所有剩余原始字节和挂起页
+    // 先提交所有剩余有效原始字节和挂起页，保留完整前缀
     const preCommit = await this.commitPending(JOURNAL_FRAME_KIND.CHUNK_COMMIT, true);
     if (!preCommit.ok) {
       return preCommit;
@@ -1472,22 +1487,36 @@ export class TraceRecordingStore {
     const rawSha256 = this.rawHash.digest('hex');
     this.rawSha256 = rawSha256;
 
-    // 写入 CLEAN_CLOSE 帧
-    const closeMeta: JournalCommitMetadata = {
-      bootGeneration: this.identity.bootGeneration,
-      identity: { ...this.identity },
-      closeSummary: {
-        reason,
-        rawSha256,
-        totalRawBytes: this.committed.rawBytes,
-        totalDataBytes: this.committed.dataBytes,
-        committed: { ...this.committed },
-      },
-    };
+    const isAbnormalFinish = terminalState === 'interrupted' || terminalState === 'failed';
+    const terminalMeta: JournalCommitMetadata = isAbnormalFinish
+      ? {
+          bootGeneration: this.identity.bootGeneration,
+          identity: { ...this.identity },
+          failureSummary: {
+            errorCode: options?.failureCode || (terminalState === 'interrupted' ? 'Interrupted' : 'Failed'),
+            message: reason,
+            terminalState,
+            rawSha256,
+            totalRawBytes: this.committed.rawBytes,
+            committed: { ...this.committed },
+            ...(options?.diagnostics ? { diagnostics: options.diagnostics } : {}),
+          },
+        }
+      : {
+          bootGeneration: this.identity.bootGeneration,
+          identity: { ...this.identity },
+          closeSummary: {
+            reason,
+            rawSha256,
+            totalRawBytes: this.committed.rawBytes,
+            totalDataBytes: this.committed.dataBytes,
+            committed: { ...this.committed },
+          },
+        };
 
     try {
       const closeFrame = encodeJournalFrame({
-        frameKind: JOURNAL_FRAME_KIND.CLEAN_CLOSE,
+        frameKind: isAbnormalFinish ? JOURNAL_FRAME_KIND.FAILURE_MARK : JOURNAL_FRAME_KIND.CLEAN_CLOSE,
         commitSeq: this.committed.commitSeq + 1,
         rawOffset: this.committed.rawBytes,
         rawLength: 0,
@@ -1495,7 +1524,7 @@ export class TraceRecordingStore {
         dataOffset: this.committed.dataBytes,
         dataLength: 0,
         dataCrc32: 0,
-        meta: closeMeta,
+        meta: terminalMeta,
       });
       await writeAllChecked(this.journalHandle!, closeFrame, this.committed.journalBytes, this.limits.rawChunkBytes);
       await this.journalHandle!.sync();
@@ -1506,8 +1535,15 @@ export class TraceRecordingStore {
         journalBytes: this.committed.journalBytes + closeFrame.length,
         segmentCount: this.index.getSegments().length,
       };
-      this.state = 'completed';
+      this.state = terminalState;
       this.closeReason = reason;
+      if (isAbnormalFinish) {
+        this.failureCode = options?.failureCode || (terminalState === 'interrupted' ? 'Interrupted' : 'Failed');
+        this.failureDiagnostics = options?.diagnostics;
+      } else {
+        this.failureCode = undefined;
+        this.failureDiagnostics = undefined;
+      }
       this.closedAtMs = Date.now();
       this.updatedAtMs = this.closedAtMs;
 

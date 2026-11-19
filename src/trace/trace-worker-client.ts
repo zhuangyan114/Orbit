@@ -740,12 +740,20 @@ export class TraceWorkerClient {
   public async finishRecording(
     recordId: string,
     reason?: string,
+    options?: {
+      terminalState?: 'completed' | 'interrupted' | 'failed';
+      failureCode?: string;
+      diagnostics?: Record<string, unknown>;
+    },
   ): Promise<TraceStorageResult<TraceRecordingManifest>> {
     const res = await this.sendRaw({
       reqId: this.nextReqId++,
       type: 'finishRecording',
       recordId,
       reason,
+      ...(options?.terminalState ? { terminalState: options.terminalState } : {}),
+      ...(options?.failureCode ? { failureCode: options.failureCode } : {}),
+      ...(options?.diagnostics ? { diagnostics: options.diagnostics } : {}),
     });
     return this.toResult(res);
   }

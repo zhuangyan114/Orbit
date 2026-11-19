@@ -32,6 +32,15 @@ import {
   unavailableRttCapabilities,
   validateRttMemoryRanges,
 } from '../ozone-backend/rtt-contract';
+import {
+  compileSystemViewTargetMetadata,
+  decodeFixtureCapture,
+  decodeSystemViewGlobals,
+  FixtureCaptureValues,
+  isRangeInMemoryRanges,
+  SystemViewGlobalsValues,
+  SystemViewTargetMetadataLayout,
+} from '../trace/systemview-target-metadata';
 import { PRtLogDecoder } from './p-rtlog-decoder';
 import { configureLogger, log } from '../utils/logger';
 import { ProbeTimelineSampler } from './probe-timeline-sampler';
@@ -268,6 +277,7 @@ export class DapSession extends EventEmitter {
   private rtosPort?: PortContract;
   private rtosSnapshots?: RtosSnapshotService;
   private rtosRodataCache?: { sha256: string; segments: Array<{ address: number; bytes: Uint8Array }> };
+  private traceMetadataCache?: { sha256: string; layout: SystemViewTargetMetadataLayout };
   private targetReadInProgress = false;
   private lowPriorityReadBlockedUntil = 0;
   private pendingForegroundTargetReads = 0;
@@ -1880,6 +1890,8 @@ export class DapSession extends EventEmitter {
           return this.handleRtosSnapshot(msg);
         case 'orbitRttTransport':
           return this.handleRttTransport(msg);
+        case 'orbitTraceTarget':
+          return this.handleTraceTarget(msg);
         case AUTOMATION_CONTROL_COMMAND:
           return this.handleAutomationControl(msg);
         case AUTOMATION_BREAKPOINTS_COMMAND:
@@ -2151,6 +2163,7 @@ export class DapSession extends EventEmitter {
       const targetConfig = normalizeDapLaunchConfig(args);
       this.rtosSnapshots?.dispose();
       this.rtosSnapshots = undefined;
+      this.traceMetadataCache = undefined;
       this.rttCoordinator?.dispose(false);
       this.rttCoordinator = null;
       this.rttOwnerKind = 'none';
@@ -2564,8 +2577,20 @@ export class DapSession extends EventEmitter {
     this.breakpointAddresses.clear();
   }
 
-  private rememberFlashedFirmware(elfPath: string, identity?: FlashedFirmwareIdentity): void {
+  private advanceRtosBootGeneration(reason: string): void {
     this.rtosBootGeneration++;
+    if (this.targetConnectionEstablished && !this.isSessionTerminating()) {
+      this.sendEvent('orbitTraceBootChanged', {
+        sessionId: this.rtosSessionId,
+        sessionGeneration: this.rtosSessionGeneration,
+        bootGeneration: this.rtosBootGeneration,
+        reason,
+      });
+    }
+  }
+
+  private rememberFlashedFirmware(elfPath: string, identity?: FlashedFirmwareIdentity): void {
+    this.advanceRtosBootGeneration('flash');
     this.rtosSnapshots?.invalidate('Firmware flashed');
     this._lastFlashedFirmware = identity ?? readFirmwareIdentity(elfPath);
   }
@@ -3388,7 +3413,7 @@ export class DapSession extends EventEmitter {
   }
 
   private async handleRestart(msg: DebugProtocolMessage) {
-    this.rtosBootGeneration++;
+    this.advanceRtosBootGeneration('restart');
     await this.withStepLock(async () => {
       this.beginControl();
       this.stopRttLogPolling(false);
@@ -4853,6 +4878,31 @@ export class DapSession extends EventEmitter {
       this.sendResponse(msg, wire);
       return;
     }
+    if (action === 'drain') {
+      const consumerCheck = validateNonEmptyString(args.consumerId, 'consumerId');
+      if (!consumerCheck.ok) { rejectInvalid(consumerCheck.errorCode, consumerCheck.message, consumerCheck.diagnostics); return; }
+      const idxCheck = validateStrictInt(args.bufferIndex, 'bufferIndex', 0, 63);
+      if (!idxCheck.ok) { rejectInvalid(idxCheck.errorCode, idxCheck.message, idxCheck.diagnostics); return; }
+      let timeoutMs: number | undefined;
+      if (args.timeoutMs !== undefined) {
+        const v = validateStrictInt(args.timeoutMs, 'timeoutMs', 1, 60000);
+        if (!v.ok) { rejectInvalid(v.errorCode, v.message, v.diagnostics); return; }
+        timeoutMs = v.value;
+      }
+
+      const coordinator = getBoundCoordinator();
+      const res = await coordinator.drainConsumer(consumerCheck.value, idxCheck.value, {
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+      if (!res.ok) {
+        sendRttTransportFailure(res.errorCode || 'RttDrainFailed', res.message || 'drain failed', {
+          extraFields: { ...res },
+        });
+        return;
+      }
+      this.sendResponse(msg, res);
+      return;
+    }
     if (action === 'pull') {
       const consumerCheck = validateNonEmptyString(args.consumerId, 'consumerId');
       if (!consumerCheck.ok) { rejectInvalid(consumerCheck.errorCode, consumerCheck.message, consumerCheck.diagnostics); return; }
@@ -4973,6 +5023,409 @@ export class DapSession extends EventEmitter {
     }
 
     rejectInvalid('InvalidRequest', `Unsupported orbitRttTransport action: ${action}`);
+  }
+
+  private async getTraceMetadataLayout(): Promise<SystemViewTargetMetadataLayout | undefined> {
+    const elfSha256 = this._loadedFirmware?.sha256 || '';
+    if (this.traceMetadataCache && elfSha256 && this.traceMetadataCache.sha256 === elfSha256) {
+      return this.traceMetadataCache.layout;
+    }
+    const catalogRes = await this.backend.execute({ cmd: 'getSymbolCatalog' });
+    if (!catalogRes.ok || !catalogRes.data) {
+      return undefined;
+    }
+    const layout = compileSystemViewTargetMetadata(catalogRes.data as SymbolCatalog, elfSha256);
+    if (elfSha256) {
+      this.traceMetadataCache = { sha256: elfSha256, layout };
+    }
+    return layout;
+  }
+
+  private async readTraceLiveBytes(
+    address: number,
+    size: number,
+    priority: 'watch' | 'background',
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; errorCode: string; message: string }> {
+    const acquired = await this.beginTargetReadWhenAvailable(priority, timeoutMs, signal);
+    if (!acquired) {
+      return {
+        ok: false,
+        errorCode: signal?.aborted ? 'TargetReadCancelled' : (this.controlInProgress ? 'TargetBusy' : 'TargetReadUnavailable'),
+        message: signal?.aborted ? 'Target read cancelled' : 'Target read gate unavailable',
+      };
+    }
+    try {
+      if (signal?.aborted || this.isSessionTerminating() || this.controlInProgress) {
+        return { ok: false, errorCode: 'TargetReadCancelled', message: 'Target read cancelled by control or termination' };
+      }
+      const res = await this.backend.execute({
+        cmd: 'readMemory',
+        address,
+        size,
+        signal,
+        liveAccess: true,
+      });
+      if (!res.ok) {
+        return { ok: false, errorCode: res.errorCode || 'MemoryReadFailed', message: res.error || 'Memory read failed' };
+      }
+      const block = res.data as MemoryBlock;
+      const bytes = Uint8Array.from(block?.data ?? []);
+      if (bytes.length !== size) {
+        return { ok: false, errorCode: 'ShortRead', message: `Short read at 0x${address.toString(16)}: expected ${size}, got ${bytes.length}` };
+      }
+      return { ok: true, bytes };
+    } finally {
+      this.endTargetRead();
+    }
+  }
+
+  private async handleTraceTarget(msg: DebugProtocolMessage): Promise<void> {
+    const sendTraceTargetFailure = (
+      errorCode: string,
+      rawMessage: unknown,
+      diagnostics?: Record<string, unknown>,
+    ) => {
+      const msgText = typeof rawMessage === 'string' && rawMessage.length > 0 ? rawMessage : errorCode;
+      const formatted = msgText.includes(errorCode) ? msgText : `${errorCode}: ${msgText}`;
+      this.sendResponse(
+        msg,
+        {
+          ok: false,
+          errorCode,
+          message: msgText,
+          error: {
+            id: 1,
+            format: '{_message}',
+            variables: { _message: formatted },
+            showUser: false,
+          },
+          ...(diagnostics ? { diagnostics } : {}),
+        },
+        false,
+        formatted,
+      );
+    };
+
+    if (msg.arguments !== undefined && (msg.arguments === null || typeof msg.arguments !== 'object' || Array.isArray(msg.arguments))) {
+      sendTraceTargetFailure('InvalidRequest', 'orbitTraceTarget arguments must be an object');
+      return;
+    }
+    const args = (msg.arguments ?? {}) as Record<string, unknown>;
+    const action = typeof args.action === 'string' && args.action ? args.action : 'inspect';
+    if (this.isSessionTerminating()) {
+      sendTraceTargetFailure('SessionTerminating', 'Debug session is terminating');
+      return;
+    }
+    if (!this.targetConnectionEstablished || this.phase !== 'connected') {
+      sendTraceTargetFailure('SessionChanged', 'No connected debug session');
+      return;
+    }
+
+    const resolveTargetRanges = () => {
+      try {
+        const target = resolveFlashTarget(this._device);
+        return {
+          ramRanges: target.ramRegions.map(r => ({ address: r.address, size: r.size })),
+          roRanges: [{ address: target.flashBase, size: target.flashSize }],
+          ramRangesAvailable: true,
+        };
+      } catch {
+        return { ramRanges: [] as Array<{ address: number; size: number }>, roRanges: [] as Array<{ address: number; size: number }>, ramRangesAvailable: false };
+      }
+    };
+
+    const normalizeState = async (context: string): Promise<{ ok: true; state: 'Running' | 'Halted' | 'Unknown' } | { ok: false; errorCode: string; message: string }> => {
+      if (this.controlInProgress) {
+        return { ok: true, state: this.targetRunning ? 'Running' : 'Halted' };
+      }
+      const res = await this.queryTargetState(context);
+      if (!res.ok) {
+        return { ok: false, errorCode: res.errorCode || 'TargetStateReadFailed', message: res.error || 'Failed to read target state' };
+      }
+      const raw = res.data;
+      if (raw === TargetState.Running || raw === 'Running' || raw === 'running') {
+        return { ok: true, state: 'Running' };
+      }
+      if (raw === TargetState.Halted || raw === 'Halted' || raw === 'halted') {
+        return { ok: true, state: 'Halted' };
+      }
+      return { ok: true, state: 'Unknown' };
+    };
+
+    const readLiveStructs = async (
+      layout: SystemViewTargetMetadataLayout | undefined,
+      ramRanges: readonly { address: number; size: number }[],
+      timeoutMs: number,
+    ): Promise<{
+      globalsValues?: SystemViewGlobalsValues;
+      globalsReadError?: string;
+      fixtureCaptureValues?: FixtureCaptureValues;
+      fixtureCaptureReadError?: string;
+    }> => {
+      let globalsValues: SystemViewGlobalsValues | undefined;
+      let globalsReadError: string | undefined;
+      let fixtureCaptureValues: FixtureCaptureValues | undefined;
+      let fixtureCaptureReadError: string | undefined;
+
+      if (layout?.globals && isRangeInMemoryRanges(layout.globals.address, layout.globals.size, ramRanges)) {
+        const read = await this.readTraceLiveBytes(layout.globals.address, layout.globals.size, 'watch', timeoutMs);
+        if (read.ok) {
+          try {
+            globalsValues = decodeSystemViewGlobals(read.bytes, layout.globals);
+          } catch (err) {
+            globalsReadError = err instanceof Error ? err.message : String(err);
+          }
+        } else {
+          globalsReadError = `${read.errorCode}: ${read.message}`;
+        }
+      }
+      if (layout?.fixtureCapture && isRangeInMemoryRanges(layout.fixtureCapture.address, layout.fixtureCapture.size, ramRanges)) {
+        const read = await this.readTraceLiveBytes(layout.fixtureCapture.address, layout.fixtureCapture.size, 'watch', timeoutMs);
+        if (read.ok) {
+          try {
+            fixtureCaptureValues = decodeFixtureCapture(read.bytes, layout.fixtureCapture);
+          } catch (err) {
+            fixtureCaptureReadError = err instanceof Error ? err.message : String(err);
+          }
+        } else {
+          fixtureCaptureReadError = `${read.errorCode}: ${read.message}`;
+        }
+      }
+      return { globalsValues, globalsReadError, fixtureCaptureValues, fixtureCaptureReadError };
+    };
+
+    if (action === 'inspect') {
+      const sessionGenBefore = this.rtosSessionGeneration;
+      const bootGenBefore = this.rtosBootGeneration;
+      const stateRes = await normalizeState('trace-inspect');
+      if (!stateRes.ok) {
+        sendTraceTargetFailure(stateRes.errorCode, stateRes.message);
+        return;
+      }
+      const { ramRanges, roRanges, ramRangesAvailable } = resolveTargetRanges();
+      const capsRes = await this.backend.execute({ cmd: 'getRttCapabilities' });
+      const rttCapabilities = capsRes.ok && isValidRttCapabilities(capsRes.data)
+        ? capsRes.data
+        : unavailableRttCapabilities(this.rttOwnerKind as RttCapabilities['ownerKind'], 'RTT capabilities unavailable');
+      const metadataLayout = await this.getTraceMetadataLayout();
+      if (this.rttControlBlockAddress === undefined) {
+        if (metadataLayout?.rttControlBlockAddress !== undefined) {
+          this.rttControlBlockAddress = metadataLayout.rttControlBlockAddress;
+          this.rttControlBlockSource = 'elf-symbol';
+        } else {
+          await this.ensureRttControlBlockAddress();
+        }
+      }
+      const structs = ramRangesAvailable && !this.controlInProgress
+        ? await readLiveStructs(metadataLayout, ramRanges, 1000)
+        : {};
+      if (this.isSessionTerminating() || sessionGenBefore !== this.rtosSessionGeneration || bootGenBefore !== this.rtosBootGeneration) {
+        sendTraceTargetFailure('SessionChanged', 'Session or boot generation changed during trace inspect');
+        return;
+      }
+      const coordinator = this.getOrCreateRttCoordinator();
+      this.sendResponse(msg, {
+        ok: true,
+        identity: {
+          sessionId: this.rtosSessionId,
+          sessionGeneration: this.rtosSessionGeneration,
+          bootGeneration: this.rtosBootGeneration,
+          operationGeneration: this.rtosOperationGeneration,
+          elfSha256: this._loadedFirmware?.sha256 || '',
+          elfPath: this._elfPath,
+          device: this._device,
+        },
+        ownerKind: rttCapabilities.ownerKind,
+        transportKind: this.rttTransportKind || (this.backend.supportsProbeSubscriptions ? 'rmlink-service' : ''),
+        targetState: stateRes.state,
+        controlInProgress: this.controlInProgress,
+        ramRanges,
+        roRanges,
+        ramRangesAvailable,
+        rttControlBlockAddress: this.rttControlBlockAddress,
+        rttCapabilities,
+        rttBudgets: {
+          channel0: coordinator.getBudget(0, false),
+          binaryChannel: coordinator.getBudget(1, true),
+        },
+        metadataLayout,
+        ...structs,
+      });
+      return;
+    }
+
+    if (action === 'readState') {
+      const sessionGenBefore = this.rtosSessionGeneration;
+      const bootGenBefore = this.rtosBootGeneration;
+      let timeoutMs = 1000;
+      if (args.timeoutMs !== undefined) {
+        const v = validateStrictInt(args.timeoutMs, 'timeoutMs', 1, 60000);
+        if (!v.ok) { sendTraceTargetFailure(v.errorCode, v.message, v.diagnostics); return; }
+        timeoutMs = v.value;
+      }
+      const stateRes = await normalizeState('trace-read-state');
+      if (!stateRes.ok) {
+        sendTraceTargetFailure(stateRes.errorCode, stateRes.message);
+        return;
+      }
+      const { ramRanges, roRanges, ramRangesAvailable } = resolveTargetRanges();
+      const metadataLayout = await this.getTraceMetadataLayout();
+      if (this.rttControlBlockAddress === undefined) {
+        if (metadataLayout?.rttControlBlockAddress !== undefined) {
+          this.rttControlBlockAddress = metadataLayout.rttControlBlockAddress;
+          this.rttControlBlockSource = 'elf-symbol';
+        } else {
+          await this.ensureRttControlBlockAddress();
+        }
+      }
+      const structs = ramRangesAvailable
+        ? await readLiveStructs(metadataLayout, ramRanges, timeoutMs)
+        : {};
+      let enumerateResult: unknown;
+      let enumerateError: { errorCode: string; message: string } | undefined;
+      if (args.includeEnumerate !== false && this.rttControlBlockAddress !== undefined && ramRangesAvailable) {
+        const gate = await this.beginTargetReadWhenAvailable('watch', timeoutMs);
+        if (!gate) {
+          enumerateError = { errorCode: 'TargetBusy', message: 'Target read gate unavailable for enumerateRtt' };
+        } else {
+          try {
+            const enumRes = await this.backend.execute({
+              cmd: 'enumerateRtt',
+              controlBlockAddress: this.rttControlBlockAddress,
+              options: { ramRanges, roRanges, timeoutMs },
+            });
+            if (enumRes.ok) {
+              enumerateResult = enumRes.data;
+            } else {
+              enumerateError = {
+                errorCode: enumRes.errorCode || 'RttEnumerateFailed',
+                message: enumRes.error || 'enumerateRtt failed',
+              };
+            }
+          } finally {
+            this.endTargetRead();
+          }
+        }
+      }
+      if (this.isSessionTerminating() || sessionGenBefore !== this.rtosSessionGeneration || bootGenBefore !== this.rtosBootGeneration) {
+        sendTraceTargetFailure('SessionChanged', 'Session or boot generation changed during trace readState');
+        return;
+      }
+      this.sendResponse(msg, {
+        ok: true,
+        sessionId: this.rtosSessionId,
+        sessionGeneration: this.rtosSessionGeneration,
+        bootGeneration: this.rtosBootGeneration,
+        targetState: stateRes.state,
+        rttControlBlockAddress: this.rttControlBlockAddress,
+        metadataLayout,
+        ...structs,
+        ...(enumerateResult !== undefined ? { enumerate: enumerateResult } : {}),
+        ...(enumerateError !== undefined ? { enumerateError } : {}),
+      });
+      return;
+    }
+
+    if (action === 'readMemoryRange') {
+      const addrCheck = validatePositiveUint32(args.address, 'address');
+      if (!addrCheck.ok) { sendTraceTargetFailure(addrCheck.errorCode, addrCheck.message, addrCheck.diagnostics); return; }
+      const sizeCheck = validateStrictInt(args.size, 'size', 1, 1024 * 1024);
+      if (!sizeCheck.ok) { sendTraceTargetFailure(sizeCheck.errorCode, sizeCheck.message, sizeCheck.diagnostics); return; }
+      const address = addrCheck.value >>> 0;
+      const size = sizeCheck.value;
+      if (address + size > 0x1_0000_0000) {
+        sendTraceTargetFailure('InvalidAddress', 'Read range overflows 32-bit address space');
+        return;
+      }
+
+      let expectedSessionGen: number | undefined;
+      if (args.expectedSessionGeneration !== undefined) {
+        const v = validateStrictInt(args.expectedSessionGeneration, 'expectedSessionGeneration', 0, 0x7fffffff);
+        if (!v.ok) { sendTraceTargetFailure(v.errorCode, v.message, v.diagnostics); return; }
+        expectedSessionGen = v.value;
+      }
+      let expectedBootGen: number | undefined;
+      if (args.expectedBootGeneration !== undefined) {
+        const v = validateStrictInt(args.expectedBootGeneration, 'expectedBootGeneration', 0, 0x7fffffff);
+        if (!v.ok) { sendTraceTargetFailure(v.errorCode, v.message, v.diagnostics); return; }
+        expectedBootGen = v.value;
+      }
+      if ((expectedSessionGen !== undefined && expectedSessionGen !== this.rtosSessionGeneration)
+        || (expectedBootGen !== undefined && expectedBootGen !== this.rtosBootGeneration)) {
+        sendTraceTargetFailure('SessionChanged', 'Session or boot generation mismatch before readMemoryRange');
+        return;
+      }
+
+      let ramRanges: Array<{ address: number; size: number }>;
+      if (args.ramRanges !== undefined) {
+        const checked = validateRttMemoryRanges(args.ramRanges, false, 'ramRanges');
+        if (!checked.ok) { sendTraceTargetFailure('DapInvalidRequest', checked.message); return; }
+        ramRanges = checked.normalized;
+      } else {
+        const target = resolveTargetRanges();
+        if (!target.ramRangesAvailable || target.ramRanges.length === 0) {
+          sendTraceTargetFailure('UnsupportedCapability', `No registered RAM description for ${this._device}`);
+          return;
+        }
+        ramRanges = target.ramRanges;
+      }
+      if (!isRangeInMemoryRanges(address, size, ramRanges)) {
+        sendTraceTargetFailure('InvalidAddress', `Range [0x${address.toString(16)}, +${size}) lies outside valid RAM ranges`);
+        return;
+      }
+
+      const timeoutPerChunkMs = typeof args.chunkTimeoutMs === 'number' && Number.isInteger(args.chunkTimeoutMs)
+        ? Math.max(50, Math.min(10000, args.chunkTimeoutMs))
+        : 1000;
+      const maxChunk = this.backend.supportsProbeSubscriptions ? 128 : 256;
+      const sessionGenBefore = this.rtosSessionGeneration;
+      const bootGenBefore = this.rtosBootGeneration;
+      const readEpoch = this.readCancelEpoch;
+      const out = new Uint8Array(size);
+      let offset = 0;
+
+      while (offset < size) {
+        if (this.isSessionTerminating()
+          || sessionGenBefore !== this.rtosSessionGeneration
+          || bootGenBefore !== this.rtosBootGeneration) {
+          sendTraceTargetFailure('SessionChanged', 'Session or boot generation changed during readMemoryRange');
+          return;
+        }
+        if (readEpoch !== this.readCancelEpoch || this.controlInProgress) {
+          sendTraceTargetFailure('TargetReadCancelled', 'Target read cancelled by control operation during readMemoryRange');
+          return;
+        }
+        const chunkLen = Math.min(maxChunk, size - offset);
+        const chunk = await this.readTraceLiveBytes((address + offset) >>> 0, chunkLen, 'background', timeoutPerChunkMs);
+        if (!chunk.ok) {
+          sendTraceTargetFailure(chunk.errorCode, chunk.message, { address: (address + offset) >>> 0, offset, chunkLen });
+          return;
+        }
+        if (this.isSessionTerminating()
+          || sessionGenBefore !== this.rtosSessionGeneration
+          || bootGenBefore !== this.rtosBootGeneration) {
+          sendTraceTargetFailure('SessionChanged', 'Session or boot generation changed after readMemoryRange chunk');
+          return;
+        }
+        out.set(chunk.bytes, offset);
+        offset += chunkLen;
+      }
+
+      this.sendResponse(msg, {
+        ok: true,
+        address,
+        bytesRead: size,
+        dataBase64: Buffer.from(out).toString('base64'),
+        sessionId: this.rtosSessionId,
+        sessionGeneration: this.rtosSessionGeneration,
+        bootGeneration: this.rtosBootGeneration,
+      });
+      return;
+    }
+
+    sendTraceTargetFailure('InvalidRequest', `Unsupported orbitTraceTarget action: ${action}`);
   }
 
   // --- RTT log snapshot bridge (plan Task 11 extension) ----------------------
@@ -5252,7 +5705,7 @@ export class DapSession extends EventEmitter {
     request: AutomationControlRequest,
     startedAt: number,
   ): Promise<void> {
-    this.rtosBootGeneration++;
+    this.advanceRtosBootGeneration('automation-reset');
     const mode = request.mode ?? 'halt';
     const capture: AutomationCapture = { synthetic: msg, recorded: false, success: false };
     await this.withStepLock(async () => {

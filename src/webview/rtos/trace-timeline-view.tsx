@@ -14,6 +14,7 @@ import {
   pixelXToBigInt,
   resolveGapAnchors,
   segmentScopeKey,
+  TRACE_ARCHIVE_CAPABILITIES,
   type SwimlaneRow,
   type TraceActivationDto,
   type TraceAxisDomain,
@@ -68,6 +69,18 @@ export interface TraceTimelineViewProps {
   onSelectRecord: (recordId: string) => void;
   onOpenRecording: (recordingDir?: string) => void;
   onSaveRecording: (recordId: string, targetDir?: string) => void;
+  onExportRaw?: (recordId: string, outputPath?: string) => void;
+  onExportCsv?: (req: {
+    recordId: string;
+    exportSource: 'trace-viewport' | 'ab-selection' | 'full';
+    unit: TraceTimeUnit;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    crossesGap?: boolean;
+    outputPath?: string;
+  }) => void;
   onCloseRecording: (recordId: string) => void;
   onQueryViewport: (req: {
     querySeq: number;
@@ -218,6 +231,8 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     onSelectRecord,
     onOpenRecording,
     onSaveRecording,
+    onExportRaw,
+    onExportCsv,
     onCloseRecording,
     onQueryViewport,
     onInspectPoint,
@@ -925,6 +940,97 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     };
   }, [activeRecordId, cursorA, focusedEvent, cursorAInspect]);
 
+  const cursorContinuity = useMemo(() => {
+    if (!cursorA || !cursorB || !selectedRecord) return null;
+    const ptA: TraceCursorPoint = { ...cursorA, inspect: cursorAInspect };
+    const ptB: TraceCursorPoint = { ...cursorB, inspect: cursorBInspect };
+    return evaluateCursorSpanContinuity(ptA, ptB, selectedRecord.segments, selectedRecord.gaps, activeUnit);
+  }, [cursorA, cursorB, cursorAInspect, cursorBInspect, selectedRecord, activeUnit]);
+
+  const activeAnyLive = traceState.records.some(
+    r => r.state === 'recording' || r.state === 'preparing' || r.state === 'paused' || r.state === 'stopping',
+  );
+  const canStart = (session.phase === 'connected' || session.phase === 'starting') && !activeAnyLive;
+  const activeRecordingRecord = traceState.records.find(
+    r => r.state === 'recording' || r.state === 'preparing' || r.state === 'paused' || r.state === 'stopping',
+  );
+  const canSaveSelected = Boolean(
+    selectedRecord
+    && selectedRecord.recordingDir
+    && selectedRecord.state !== 'recording'
+    && selectedRecord.state !== 'preparing'
+    && selectedRecord.state !== 'paused'
+    && selectedRecord.state !== 'stopping',
+  );
+  const canExportRawSelected = Boolean(
+    onExportRaw
+    && selectedRecord
+    && selectedRecord.state !== 'recording'
+    && selectedRecord.state !== 'preparing'
+    && selectedRecord.state !== 'paused'
+    && selectedRecord.state !== 'stopping',
+  );
+  const canExportViewportCsv = Boolean(
+    onExportCsv
+    && activeRecordId
+    && axisDomain.valid
+    && viewRange
+    && BigInt(viewRange.end) > BigInt(viewRange.start),
+  );
+  const canExportSelectionCsv = Boolean(
+    onExportCsv
+    && activeRecordId
+    && axisDomain.valid
+    && cursorA
+    && cursorB
+    && cursorA.unit === activeUnit
+    && cursorB.unit === activeUnit
+    && BigInt(cursorA.timeStr) !== BigInt(cursorB.timeStr),
+  );
+
+  const triggerExportViewportCsv = useCallback((outputPath?: string): boolean => {
+    if (!onExportCsv || !activeRecordId || !axisDomain.valid || !viewRange) return false;
+    const startStr = viewRange.start;
+    const endStr = viewRange.end === axisDomain.displayMaxStr
+      ? (BigInt(viewRange.end) + 1n).toString()
+      : viewRange.end;
+    if (BigInt(endStr) <= BigInt(startStr)) return false;
+    onExportCsv({
+      recordId: activeRecordId,
+      exportSource: 'trace-viewport',
+      unit: activeUnit,
+      ...(axisDomain.bootGeneration !== undefined ? { bootGeneration: axisDomain.bootGeneration } : {}),
+      ...(axisDomain.segmentId !== undefined ? { segmentId: axisDomain.segmentId } : {}),
+      start: startStr,
+      end: endStr,
+      ...(outputPath ? { outputPath } : {}),
+    });
+    return true;
+  }, [onExportCsv, activeRecordId, axisDomain, viewRange, activeUnit]);
+
+  const triggerExportSelectionCsv = useCallback((outputPath?: string): boolean => {
+    if (!onExportCsv || !activeRecordId || !axisDomain.valid || !cursorA || !cursorB) return false;
+    if (cursorA.unit !== activeUnit || cursorB.unit !== activeUnit) return false;
+    const tA = BigInt(cursorA.timeStr);
+    const tB = BigInt(cursorB.timeStr);
+    if (tA === tB) return false;
+    const lo = tA < tB ? tA : tB;
+    const hi = tA < tB ? tB : tA;
+    const endStr = hi.toString() === axisDomain.displayMaxStr ? (hi + 1n).toString() : hi.toString();
+    onExportCsv({
+      recordId: activeRecordId,
+      exportSource: 'ab-selection',
+      unit: activeUnit,
+      ...(axisDomain.bootGeneration !== undefined ? { bootGeneration: axisDomain.bootGeneration } : {}),
+      ...(axisDomain.segmentId !== undefined ? { segmentId: axisDomain.segmentId } : {}),
+      start: lo.toString(),
+      end: endStr,
+      crossesGap: cursorContinuity ? !cursorContinuity.continuous : false,
+      ...(outputPath ? { outputPath } : {}),
+    });
+    return true;
+  }, [onExportCsv, activeRecordId, axisDomain, cursorA, cursorB, activeUnit, cursorContinuity]);
+
   // Expose deterministic test/benchmark hooks on window when running in browser
   useEffect(() => {
     (window as any).__orbitTraceTimelineTestApi = {
@@ -936,6 +1042,22 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
         viewRange,
         cursorA,
         cursorB,
+        selectedRecord: selectedRecord
+          ? {
+              recordId: selectedRecord.recordId,
+              source: selectedRecord.source,
+              state: selectedRecord.state,
+              inspectionStatus: selectedRecord.inspectionStatus ?? null,
+              indexStatus: selectedRecord.indexStatus ?? null,
+              recoveryDisposition: selectedRecord.recoveryDisposition ?? null,
+              recoverableRawBytes: selectedRecord.recoverableRawBytes ?? selectedRecord.counters.committedRawBytes,
+              actualRawFileBytes: selectedRecord.actualRawFileBytes ?? null,
+              rawSha256Verified: selectedRecord.rawSha256Verified ?? null,
+              integrity: selectedRecord.integrity ?? null,
+            }
+          : null,
+        lastActionMessage: traceState.lastActionMessage,
+        svdatSupported: TRACE_ARCHIVE_CAPABILITIES.svdat.available,
         lanes: lanes.map(l => ({ id: l.id, kind: l.kind, label: l.label })),
         perf: { ...perfRef.current },
       }),
@@ -975,6 +1097,22 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
         onJumpToEventInEvents?.(target);
         return true;
       },
+      exportCsvViewport: (outputPath?: string) => triggerExportViewportCsv(outputPath),
+      exportCsvSelection: (outputPath?: string) => triggerExportSelectionCsv(outputPath),
+      exportRaw: (outputPath?: string) => {
+        if (!activeRecordId || !onExportRaw) return false;
+        onExportRaw(activeRecordId, outputPath);
+        return true;
+      },
+      saveRecording: (targetDir?: string) => {
+        if (!activeRecordId) return false;
+        onSaveRecording(activeRecordId, targetDir);
+        return true;
+      },
+      openRecording: (recordingDir?: string) => {
+        onOpenRecording(recordingDir);
+        return true;
+      },
       reportPerfNow: () => {
         onPerfReport?.({ ...perfRef.current });
         return { ...perfRef.current };
@@ -989,6 +1127,8 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     cursorA,
     cursorB,
     cursorAInspect,
+    selectedRecord,
+    traceState.lastActionMessage,
     lanes,
     axisDomain,
     onUpdateSettings,
@@ -996,6 +1136,11 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     issueExactPointQuery,
     buildJumpToEventsTarget,
     onJumpToEventInEvents,
+    triggerExportViewportCsv,
+    triggerExportSelectionCsv,
+    onExportRaw,
+    onSaveRecording,
+    onOpenRecording,
     onPerfReport,
   ]);
 
@@ -1153,29 +1298,6 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     setViewRange({ start: nextStart.toString(), end: maxB.toString() });
   };
 
-  const cursorContinuity = useMemo(() => {
-    if (!cursorA || !cursorB || !selectedRecord) return null;
-    const ptA: TraceCursorPoint = { ...cursorA, inspect: cursorAInspect };
-    const ptB: TraceCursorPoint = { ...cursorB, inspect: cursorBInspect };
-    return evaluateCursorSpanContinuity(ptA, ptB, selectedRecord.segments, selectedRecord.gaps, activeUnit);
-  }, [cursorA, cursorB, cursorAInspect, cursorBInspect, selectedRecord, activeUnit]);
-
-  const activeAnyLive = traceState.records.some(
-    r => r.state === 'recording' || r.state === 'preparing' || r.state === 'paused' || r.state === 'stopping',
-  );
-  const canStart = (session.phase === 'connected' || session.phase === 'starting') && !activeAnyLive;
-  const activeRecordingRecord = traceState.records.find(
-    r => r.state === 'recording' || r.state === 'preparing' || r.state === 'paused' || r.state === 'stopping',
-  );
-  const canSaveSelected = Boolean(
-    selectedRecord
-    && selectedRecord.recordingDir
-    && selectedRecord.state !== 'recording'
-    && selectedRecord.state !== 'preparing'
-    && selectedRecord.state !== 'paused'
-    && selectedRecord.state !== 'stopping',
-  );
-
   const probe = traceState.targetProbe;
   const recStateBadge = selectedRecord ? stateLabel(selectedRecord.state) : null;
   const recIntegrityBadge = selectedRecord?.integrity ? integrityLabel(selectedRecord.integrity) : null;
@@ -1264,7 +1386,7 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
             type="button"
             className="rtos-btn rtos-btn-secondary"
             disabled={!canSaveSelected}
-            title="保存 orbit-trace-v1 归档副本供离线查看（非 SEGGER .SVDat）"
+            title={`保存 orbit-trace-v1 归档副本供离线查看（${TRACE_ARCHIVE_CAPABILITIES.svdat.reason}）`}
             onClick={() => selectedRecord && onSaveRecording(selectedRecord.recordId)}
           >
             保存录制
@@ -1277,6 +1399,39 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
           >
             打开录制
           </button>
+          <button
+            type="button"
+            className="rtos-btn rtos-btn-secondary"
+            disabled={!canExportRawSelected}
+            title="流式导出原始 SystemView 字节流 (.bin，非 SEGGER .SVDat)"
+            onClick={() => selectedRecord && onExportRaw?.(selectedRecord.recordId)}
+          >
+            导出 .bin
+          </button>
+          <button
+            type="button"
+            className="rtos-btn rtos-btn-secondary"
+            disabled={!canExportViewportCsv}
+            title="从 Worker 流式导出当前 Trace 视口事件 CSV"
+            onClick={() => { triggerExportViewportCsv(); }}
+          >
+            导出视口 CSV
+          </button>
+          <button
+            type="button"
+            className="rtos-btn rtos-btn-secondary"
+            disabled={!canExportSelectionCsv}
+            title="从 Worker 流式导出游标 A-B 选区事件 CSV"
+            onClick={() => { triggerExportSelectionCsv(); }}
+          >
+            导出选区 CSV
+          </button>
+          <span
+            className="rtos-cap off"
+            title={TRACE_ARCHIVE_CAPABILITIES.svdat.reason}
+          >
+            − .SVDat 未支持
+          </span>
 
           {traceState.records.length > 0 && (
             <select
@@ -1389,6 +1544,21 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
             {recIntegrityBadge && (
               <span className={`rtos-pill rtos-tone-${recIntegrityBadge.tone}`}>
                 完整性: {recIntegrityBadge.label}
+              </span>
+            )}
+            {selectedRecord.recoveryDisposition === 'rebuilt-bad-index' && (
+              <span className="rtos-pill rtos-tone-warn" title="index.otidx 校验失败，已由 journal.otj 权威重建，原始流完整">
+                坏索引已重建
+              </span>
+            )}
+            {selectedRecord.recoveryDisposition === 'recovered-prefix-bad-chunk' && (
+              <span className="rtos-pill rtos-tone-error" title="已提交分块存在校验损坏，仅加载损坏点之前的有效前缀">
+                坏分块前缀恢复 ({selectedRecord.recoverableRawBytes ?? 0}/{selectedRecord.actualRawFileBytes ?? 0} B)
+              </span>
+            )}
+            {selectedRecord.recoveryDisposition === 'recovered-interrupted' && (
+              <span className="rtos-pill rtos-tone-warn" title="录制未完整关闭或尾部帧截断，已恢复全部已提交前缀">
+                合法中断恢复 ({selectedRecord.recoverableRawBytes ?? 0} B)
               </span>
             )}
             <span className="trace-stat-text rtos-mono">

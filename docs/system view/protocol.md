@@ -91,7 +91,7 @@ Provider 通过精确的 vscode.DebugSession.customRequest('orbitRtosSnapshot', 
 | FreeRTOS | STM32CubeH7 1.12.1 中 10.3.1 及 CMSIS v1/v2 | 与原版 V10.3.1-kernel-only 区分，记录插桩差异及许可 |
 | 许可 | SystemView 源文件头、RTT LICENSE.md、FreeRTOS MIT、CMSIS Apache-2.0、ST 组件许可 | 仅纳入必要源码和许可证，不复制桌面程序及商业软件许可包 |
 | API 描述 | SEGGER_SYSVIEW_FreeRTOS.h 的 apiID 与 trace 宏 | apiID_OFFSET=32，参数逐宏核对；尚无独立官方 FreeRTOS 描述文件快照，列为后续 Events 解释缺口 |
-| SVDat | 阶段 5.3 官方工具双向互操作专项 | 当前未验证容器，不输出自定义 .SVDat；原始流用 .bin |
+| SVDat | 阶段 5.3 官方工具双向互操作评估 | `UM08027` V4.10b 对某些抓取允许裸流命名为 `.SVDat`/`.bin`，但不证明 GUI 带元数据归档双向互通；本地 `SystemView.exe` V4.10b 加载前即受 `"No Commercial-Use License"` 对话框阻断（`License_SystemView.txt` 录有 SFL/CUL 条款）；Orbit 仅导出裸流为 `.bin`，`.SVDat` 保持不可用（`svdat.available = false`），禁止输出 `.SVDat` 文件 |
 
 ### 4.1 RTT 结构
 

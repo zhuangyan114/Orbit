@@ -22,6 +22,10 @@ import type {
   TraceAnalysisQueryResult,
 } from './trace-analytics';
 import type {
+  TraceCsvExportRequest,
+  TraceCsvExportResult,
+} from './trace-csv-export';
+import type {
   TraceEventLocateRequest,
   TraceEventLocateResult,
   TraceEventsQueryRequest,
@@ -1086,6 +1090,95 @@ export class TraceWorkerClient {
         cancelSlot: slotGuard.slot,
         cancelToken: slotGuard.token,
         verifyChunkCrc32: options.verifyChunkCrc32,
+      });
+      return this.toResult(res);
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort);
+      slotGuard.release();
+      this.releaseQuerySlot();
+    }
+  }
+
+  public async saveArchive(
+    recordId: string,
+    targetDir: string,
+    options: { signal?: AbortSignal; verifyChunkCrc32?: boolean } = {},
+  ): Promise<TraceStorageResult<{ targetDir: string; inspection: RecordingInspectionResult }>> {
+    if (options.signal?.aborted) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '保存归档在发送前已取消' };
+    }
+    if (!this.tryAcquireQuerySlot()) {
+      return {
+        ok: false,
+        errorCode: 'QueryQueueFull' as any,
+        message: `宿主机并发查询/导出数已达上限 ${this.limits.maxPendingQueries}`,
+      };
+    }
+    const queryId = `save-${this.nextSeqId++}`;
+    const slotGuard = this.acquireCancelSlot();
+    const onAbort = () => {
+      slotGuard.cancel();
+      void this.cancelQuery(queryId).catch(() => {});
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const res = await this.sendRaw({
+        reqId: this.nextReqId++,
+        type: 'saveArchive',
+        recordId,
+        queryId,
+        targetDir,
+        cancelSlot: slotGuard.slot,
+        cancelToken: slotGuard.token,
+        verifyChunkCrc32: options.verifyChunkCrc32,
+      });
+      return this.toResult(res);
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort);
+      slotGuard.release();
+      this.releaseQuerySlot();
+    }
+  }
+
+  public async exportCsvToFile(
+    recordId: string,
+    outputPath: string,
+    request: TraceCsvExportRequest,
+    options: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+    } = {},
+  ): Promise<TraceStorageResult<TraceCsvExportResult>> {
+    if (options.signal?.aborted) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'CSV 导出在发送前已取消' };
+    }
+    if (!this.tryAcquireQuerySlot()) {
+      return {
+        ok: false,
+        errorCode: 'QueryQueueFull' as any,
+        message: `宿主机并发查询/导出数已达上限 ${this.limits.maxPendingQueries}`,
+      };
+    }
+    const queryId = `csv-${this.nextSeqId++}`;
+    const slotGuard = this.acquireCancelSlot();
+    const onAbort = () => {
+      slotGuard.cancel();
+      void this.cancelQuery(queryId).catch(() => {});
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const res = await this.sendRaw({
+        reqId: this.nextReqId++,
+        type: 'exportCsvToFile',
+        recordId,
+        queryId,
+        outputPath,
+        request,
+        cancelSlot: slotGuard.slot,
+        cancelToken: slotGuard.token,
+        yieldEveryPages: options.yieldEveryPages,
+        yieldEveryItems: options.yieldEveryItems,
       });
       return this.toResult(res);
     } finally {

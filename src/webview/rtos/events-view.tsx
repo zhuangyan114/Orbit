@@ -61,6 +61,22 @@ export interface EventsViewProps {
     contextKey?: string;
     onlyWithDiagnostics: boolean;
   }) => void;
+  onExportCsv?: (req: {
+    recordId: string;
+    exportSource: 'events-page';
+    unit: TraceTimeUnit;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    filter: {
+      category: TraceEventCategoryFilter;
+      searchText: string;
+      contextKey?: string;
+      onlyWithDiagnostics: boolean;
+    };
+    outputPath?: string;
+  }) => void;
   onLocateEvent: (req: {
     querySeq: number;
     recordId: string;
@@ -160,6 +176,7 @@ export function EventsView(props: EventsViewProps) {
     onSelectFocusedEvent,
     onJumpToTimelineEvent,
     onQueryEvents,
+    onExportCsv,
     onLocateEvent,
     onPerfReport,
   } = props;
@@ -565,6 +582,28 @@ export function EventsView(props: EventsViewProps) {
       jumpToSelectedTimeline: () => {
         if (selectedEvent) onJumpToTimelineEvent(selectedEvent);
       },
+      exportCsv: (outputPath?: string) => {
+        if (!onExportCsv || !activeRecordId || !axisDomain.valid || !resolvedRange.valid || !resolvedRange.start || !expectedQueryEnd) {
+          return false;
+        }
+        onExportCsv({
+          recordId: activeRecordId,
+          exportSource: 'events-page',
+          unit: activeUnit,
+          ...(axisDomain.bootGeneration !== undefined ? { bootGeneration: axisDomain.bootGeneration } : {}),
+          ...(axisDomain.segmentId !== undefined ? { segmentId: axisDomain.segmentId } : {}),
+          start: resolvedRange.start,
+          end: expectedQueryEnd,
+          filter: {
+            category,
+            searchText,
+            ...(contextKeyFilter ? { contextKey: contextKeyFilter } : {}),
+            onlyWithDiagnostics,
+          },
+          ...(outputPath ? { outputPath } : {}),
+        });
+        return true;
+      },
     };
   }, [
     activeRecordId,
@@ -583,6 +622,13 @@ export function EventsView(props: EventsViewProps) {
     focusedEvent,
     activeEventsResp,
     onJumpToTimelineEvent,
+    onExportCsv,
+    axisDomain.valid,
+    axisDomain.bootGeneration,
+    axisDomain.segmentId,
+    resolvedRange.valid,
+    resolvedRange.start,
+    expectedQueryEnd,
   ]);
 
   const effectiveSelectedKey = selectedEvent?.eventKey ?? focusedEvent?.eventKey ?? null;
@@ -671,6 +717,32 @@ export function EventsView(props: EventsViewProps) {
             }}
           >
             跳行
+          </button>
+          <button
+            type="button"
+            className="rtos-mini-btn"
+            disabled={!onExportCsv || !activeRecordId || !axisDomain.valid || !resolvedRange.valid || !resolvedRange.start || !expectedQueryEnd}
+            title="从 Worker 流式导出当前范围与筛选条件的全部匹配事件 CSV（支持百万级记录）"
+            onClick={() => {
+              if (!onExportCsv || !activeRecordId || !axisDomain.valid || !resolvedRange.valid || !resolvedRange.start || !expectedQueryEnd) return;
+              onExportCsv({
+                recordId: activeRecordId,
+                exportSource: 'events-page',
+                unit: activeUnit,
+                ...(axisDomain.bootGeneration !== undefined ? { bootGeneration: axisDomain.bootGeneration } : {}),
+                ...(axisDomain.segmentId !== undefined ? { segmentId: axisDomain.segmentId } : {}),
+                start: resolvedRange.start,
+                end: expectedQueryEnd,
+                filter: {
+                  category,
+                  searchText,
+                  ...(contextKeyFilter ? { contextKey: contextKeyFilter } : {}),
+                  onlyWithDiagnostics,
+                },
+              });
+            }}
+          >
+            导出 CSV
           </button>
         </div>
       </div>

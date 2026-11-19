@@ -924,6 +924,164 @@ export async function executeEventsQuery(
   };
 }
 
+export interface TraceStreamEventsSummary {
+  readonly unit: TraceQueryTimeUnit;
+  readonly start: string;
+  readonly end: string;
+  readonly totalMatched: number;
+  readonly gapsInWindow: readonly StoredGapEntry[];
+  readonly segmentsInWindow: readonly SegmentIndexMetadata[];
+  readonly candidatePagesScanned: number;
+  readonly totalCandidatePages: number;
+  readonly skippedUnanchoredSegments: readonly number[];
+  readonly skippedNoFrequencySegments: readonly number[];
+}
+
+export async function streamMatchedEvents(
+  host: TraceEventsExecutionHost,
+  request: {
+    readonly unit: TraceQueryTimeUnit;
+    readonly bootGeneration?: number;
+    readonly segmentId?: number;
+    readonly filter?: TraceEventFilter;
+  },
+  qStart: bigint,
+  qEnd: bigint,
+  onBatch: (dtos: readonly TraceEventDto[], segmentMeta: SegmentIndexMetadata) => Promise<void> | void,
+): Promise<{ ok: true; data: TraceStreamEventsSummary } | { ok: false; cancelled: true }> {
+  if (host.isCancelled()) return { ok: false, cancelled: true };
+
+  const filter = request.filter;
+  const filterEmpty = isFilterEmpty(filter);
+  const category = filter?.category ?? 'all';
+  const searchLower = (filter?.searchText ?? '').trim().slice(0, 128).toLowerCase();
+
+  const { partitions, skippedUnanchoredSegments, skippedNoFrequencySegments } = host.index.getMatchingPartitions({
+    bootGeneration: request.bootGeneration,
+    segmentId: request.segmentId,
+    unit: request.unit,
+    start: qStart,
+    end: qEnd,
+  });
+
+  if (qStart >= qEnd || partitions.length === 0) {
+    return {
+      ok: true,
+      data: {
+        unit: request.unit,
+        start: qStart.toString(),
+        end: qEnd.toString(),
+        totalMatched: 0,
+        gapsInWindow: [],
+        segmentsInWindow: [],
+        candidatePagesScanned: 0,
+        totalCandidatePages: 0,
+        skippedUnanchoredSegments,
+        skippedNoFrequencySegments,
+      },
+    };
+  }
+
+  const pageEntries: Array<{ part: SegmentPartition; desc: IndexedPageDescriptor }> = [];
+  for (const part of partitions) {
+    const pages = await host.index.findCandidatePages(part, 'packets', request.unit, qStart, qEnd);
+    for (const desc of pages) {
+      pageEntries.push({ part, desc });
+    }
+  }
+
+  const segmentsInWindow = partitions.map(p => p.meta);
+  const gapsInWindow = collectWindowGaps(host, partitions, request.unit, qStart, qEnd);
+  let candidatePagesScanned = 0;
+  let itemsCheckedSinceYield = 0;
+  let totalMatched = 0;
+
+  for (let pIdx = 0; pIdx < pageEntries.length; pIdx++) {
+    if (host.isCancelled()) return { ok: false, cancelled: true };
+    const { part, desc } = pageEntries[pIdx];
+    const bootGen = part.meta.bootGeneration ?? desc.bootGeneration;
+    const page = await host.loadPage(desc);
+    candidatePagesScanned++;
+    const pkts = page.items as readonly DecodedSystemViewPacket[];
+    const fullInside = pageFullyInsideRange(desc, request.unit, qStart, qEnd);
+
+    const preMatchedIndices: number[] = [];
+    for (let i = 0; i < pkts.length; i++) {
+      itemsCheckedSinceYield++;
+      if (itemsCheckedSinceYield >= host.yieldEveryItems) {
+        itemsCheckedSinceYield = 0;
+        if (host.isCancelled()) return { ok: false, cancelled: true };
+        await host.yieldToLoop();
+        if (host.isCancelled()) return { ok: false, cancelled: true };
+      }
+      const pkt = pkts[i];
+      absorbPacketMetadata(host.metadata, bootGen, pkt);
+      if (!filterEmpty) {
+        if (filter?.eventId !== undefined && pkt.eventId !== filter.eventId) continue;
+        if (!isPacketInCategory(pkt, category)) continue;
+      }
+      if (!fullInside) {
+        const pt = getPacketTimeForUnit(pkt, request.unit, part.meta.sysFreqHz);
+        if (!pt || !intersectsHalfOpen(pt.start, pt.end, qStart, qEnd, pt.isPoint)) continue;
+      }
+      preMatchedIndices.push(i);
+    }
+
+    if (preMatchedIndices.length > 0) {
+      const firstPkt = pkts[preMatchedIndices[0]];
+      const lastPkt = pkts[preMatchedIndices[preMatchedIndices.length - 1]];
+      const slices = await loadSlicesForPacketRange(
+        host,
+        part,
+        firstPkt.segmentRelativeTicksBigInt,
+        lastPkt.segmentRelativeTicksBigInt,
+      );
+
+      const batchDtos: TraceEventDto[] = [];
+      for (const i of preMatchedIndices) {
+        const pkt = pkts[i];
+        const sliceCtx = slices.length > 0 ? findSliceForPacket(pkt, slices) : undefined;
+        const dto = formatTraceEventDto({
+          pkt,
+          bootGeneration: bootGen,
+          meta: host.metadata,
+          sliceCtx,
+          rodataLookup: host.rodataLookup,
+          segmentSysFreqHz: part.meta.sysFreqHz,
+        });
+        if (!filterEmpty && !eventMatchesFilter(dto, filter!, searchLower)) continue;
+        batchDtos.push(dto);
+      }
+
+      if (batchDtos.length > 0) {
+        totalMatched += batchDtos.length;
+        await onBatch(batchDtos, part.meta);
+      }
+    }
+
+    if (candidatePagesScanned % host.yieldEveryPages === 0) {
+      await host.yieldToLoop();
+      if (host.isCancelled()) return { ok: false, cancelled: true };
+    }
+  }
+
+  return {
+    ok: true,
+    data: {
+      unit: request.unit,
+      start: qStart.toString(),
+      end: qEnd.toString(),
+      totalMatched,
+      gapsInWindow,
+      segmentsInWindow,
+      candidatePagesScanned,
+      totalCandidatePages: pageEntries.length,
+      skippedUnanchoredSegments,
+      skippedNoFrequencySegments,
+    },
+  };
+}
+
 export async function executeEventLocate(
   host: TraceEventsExecutionHost,
   request: TraceEventLocateRequest,

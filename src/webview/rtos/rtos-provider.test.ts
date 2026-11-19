@@ -705,6 +705,94 @@ describe('RtosWebviewProvider', () => {
       await (provider as any).handleMessage({ command: 'traceCloseRecording', recordId: openedId });
       expect(provider.currentTraceState.records.some(r => r.recordId === openedId)).toBe(false);
 
+      // 3. Stage 5.3: 离线恢复分类打开、归档另存、原始 .bin 导出、视口/选区/Events CSV 导出与 .SVDat 拒绝
+      const expRawPath = path.join(tmpRoot, 'exported-raw.bin');
+      await (provider as any).handleMessage({ command: 'traceOpenRecording', recordingDir: copyDir });
+      const savedRecId = provider.currentTraceState.selectedRecordId;
+      expect(savedRecId).toBeTruthy();
+
+      await (provider as any).handleMessage({ command: 'traceExportRaw', recordId: savedRecId, outputPath: expRawPath });
+      expect((provider as any).lastTraceActionResult?.ok).toBe(true);
+      expect((provider as any).lastTraceActionResult?.action).toBe('exportRaw');
+      await (provider as any).handleMessage({ command: 'traceExportRaw', recordId: savedRecId, outputPath: expRawPath });
+      expect((provider as any).lastTraceActionResult?.ok).toBe(false);
+      await (provider as any).handleMessage({ command: 'traceExportRaw', recordId: savedRecId, outputPath: path.join(tmpRoot, 'bad.SVDat') });
+      expect((provider as any).lastTraceActionResult?.errorCode).toBe('UnsupportedCapability');
+
+      const csvVpPath = path.join(tmpRoot, 'vp.csv');
+      await (provider as any).handleMessage({
+        command: 'traceExportCsv',
+        exportSource: 'trace-viewport',
+        recordId: savedRecId,
+        unit: 'relative-ticks',
+        start: '0',
+        end: '1000',
+        outputPath: csvVpPath,
+      });
+      expect((provider as any).lastTraceActionResult?.ok).toBe(true);
+      expect((provider as any).lastTraceActionResult?.exportedRows).toBeGreaterThan(0);
+
+      const csvSelPath = path.join(tmpRoot, 'sel.csv');
+      await (provider as any).handleMessage({
+        command: 'traceExportCsv',
+        exportSource: 'ab-selection',
+        recordId: savedRecId,
+        unit: 'relative-ticks',
+        start: '0',
+        end: '1000',
+        outputPath: csvSelPath,
+      });
+      expect((provider as any).lastTraceActionResult?.ok).toBe(true);
+
+      const csvEvPath = path.join(tmpRoot, 'events.csv');
+      await (provider as any).handleMessage({
+        command: 'traceExportCsv',
+        exportSource: 'events-page',
+        recordId: savedRecId,
+        unit: 'relative-ticks',
+        start: '0',
+        end: '1000',
+        filter: { category: 'all' },
+        outputPath: csvEvPath,
+      });
+      expect((provider as any).lastTraceActionResult?.ok).toBe(true);
+      await (provider as any).handleMessage({
+        command: 'traceExportCsv',
+        exportSource: 'events-page',
+        recordId: savedRecId,
+        unit: 'relative-ticks',
+        start: '0',
+        end: '1000',
+        outputPath: path.join(tmpRoot, 'disallowed.svdat'),
+      });
+      expect((provider as any).lastTraceActionResult?.errorCode).toBe('UnsupportedCapability');
+
+      // Bad index -> rebuilt-bad-index
+      const badIdxDir = path.join(tmpRoot, 'bad-idx-copy');
+      await fs.cp(copyDir, badIdxDir, { recursive: true });
+      await fs.writeFile(path.join(badIdxDir, 'index.otidx'), Buffer.from('BAD'));
+      await (provider as any).handleMessage({ command: 'traceOpenRecording', recordingDir: badIdxDir });
+      expect((provider as any).lastTraceActionResult?.recoveryDisposition).toBe('rebuilt-bad-index');
+      expect(provider.currentTraceState.lastActionMessage?.text).toContain('重建');
+
+      // Unsupported formatVersion 999 -> rejected
+      const badVerDir = path.join(tmpRoot, 'bad-ver-999');
+      await fs.cp(copyDir, badVerDir, { recursive: true });
+      const badMan = JSON.parse(await fs.readFile(path.join(badVerDir, 'manifest.json'), 'utf8'));
+      badMan.formatVersion = 999;
+      await fs.writeFile(path.join(badVerDir, 'manifest.json'), JSON.stringify(badMan));
+      await (provider as any).handleMessage({ command: 'traceOpenRecording', recordingDir: badVerDir });
+      expect((provider as any).lastTraceActionResult?.ok).toBe(false);
+      expect((provider as any).lastTraceActionResult?.errorCode).toBe('UnsupportedArchiveVersion');
+
+      // Save archive to .SVDat -> rejected
+      await (provider as any).handleMessage({
+        command: 'traceSaveRecording',
+        recordId: savedRecId,
+        targetDir: path.join(tmpRoot, 'archive.SVDat'),
+      });
+      expect((provider as any).lastTraceActionResult?.errorCode).toBe('UnsupportedCapability');
+
       provider.dispose();
     } finally {
       await coordinator.dispose();

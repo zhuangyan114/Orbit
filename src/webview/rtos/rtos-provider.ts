@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomBytes } from 'crypto';
 import type { RtosSnapshot } from '../../rtos/model';
 import { AUTOMATION_CONTROL_EVENT, AUTOMATION_LIFECYCLE_EVENT } from '../../debug/dap-automation-protocol';
-import { ORBIT_TRACE_FILES, type SegmentIndexMetadata } from '../../trace/trace-format';
+import type { SegmentIndexMetadata } from '../../trace/trace-format';
 import type { DecodedSystemViewPacket } from '../../trace/systemview-decoder';
 import type {
   ContextActivationInterval,
@@ -42,6 +43,7 @@ import {
   projectTargetProbeState,
 } from './trace-dto';
 import type { TraceEventCategoryFilter, TraceTerminalLevelFilter } from '../../trace/trace-events';
+import type { TraceCsvExportRequest, TraceCsvExportSource } from '../../trace/trace-csv-export';
 import type {
   TraceAnalysisResponse,
   TraceAnalysisSourceKind,
@@ -91,6 +93,7 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   private traceTargetProbe: TraceTargetProbeState | null = null;
   private traceProbing = false;
   private traceActionMessage: TracePanelState['lastActionMessage'] = null;
+  private _lastTraceActionResult: Record<string, unknown> | null = null;
   private traceProbeGen = 0;
   private traceOfflineSeq = 0;
   private traceLiveTimer: NodeJS.Timeout | null = null;
@@ -238,6 +241,10 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
 
   get terminalPerfSeq(): number {
     return this._terminalPerfSeq;
+  }
+
+  get lastTraceActionResult(): Record<string, unknown> | null {
+    return this._lastTraceActionResult;
   }
 
   public invokeUiAction(action: string, payload?: Record<string, unknown>, timeoutMs = 10000): Promise<unknown> {
@@ -773,6 +780,15 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           typeof msg.targetDir === 'string' ? msg.targetDir : undefined,
         );
         break;
+      case 'traceExportRaw':
+        await this.handleTraceExportRaw(
+          typeof msg.recordId === 'string' ? msg.recordId : (this.selectedTraceRecordId || ''),
+          typeof msg.outputPath === 'string' ? msg.outputPath : undefined,
+        );
+        break;
+      case 'traceExportCsv':
+        await this.handleTraceExportCsv(msg);
+        break;
       case 'traceCloseRecording':
         await this.handleTraceCloseRecording(typeof msg.recordId === 'string' ? msg.recordId : '');
         break;
@@ -1185,6 +1201,17 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       if (rec.source === 'offline' && rec.recordingDir && path.resolve(rec.recordingDir) === resolvedDir) {
         await this.handleTraceSelectRecord(id);
         this.setTraceActionMessage('info', `已切换到已打开的离线录制: ${resolvedDir}`);
+        this.postTraceActionResult({
+          ok: true,
+          action: 'open',
+          reused: true,
+          recordId: id,
+          recordingDir: resolvedDir,
+          inspectionStatus: rec.inspectionStatus,
+          recoveryDisposition: rec.recoveryDisposition,
+          indexStatus: rec.indexStatus,
+          recoverableRawBytes: rec.recoverableRawBytes,
+        });
         return;
       }
     }
@@ -1194,7 +1221,13 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     const openRes = await this.traceCoordinator.openRecording(resolvedDir, viewRecordId, true);
     if (!openRes.ok) {
       this.setTraceActionMessage('error', `打开离线录制失败 (${openRes.errorCode}): ${openRes.message}`);
-      this.postMessage({ command: 'traceActionResult', ok: false, action: 'open', errorCode: openRes.errorCode, message: openRes.message });
+      this.postTraceActionResult({
+        ok: false,
+        action: 'open',
+        recordingDir: resolvedDir,
+        errorCode: openRes.errorCode,
+        message: openRes.message,
+      });
       return;
     }
     const [segsRes, gapsRes] = await Promise.all([
@@ -1210,17 +1243,58 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     this.traceRecords.set(viewRecordId, summary);
     this.cancelAllTraceQueries();
     this.selectedTraceRecordId = viewRecordId;
-    const tone = summary.inspectionStatus === 'completed' ? 'ok' : summary.inspectionStatus === 'corrupted' ? 'error' : 'warn';
-    this.setTraceActionMessage(tone, `已打开离线录制 (${summary.inspectionStatus}): ${resolvedDir}`);
+    let tone: 'ok' | 'warn' | 'error' = summary.inspectionStatus === 'completed' ? 'ok' : 'warn';
+    let openMsg = `已打开离线录制 (${summary.inspectionStatus}, ${summary.recoverableRawBytes ?? 0} B): ${resolvedDir}`;
+    if (summary.recoveryDisposition === 'rebuilt-bad-index') {
+      tone = 'warn';
+      openMsg = `已打开离线录制 (索引损坏 index.otidx 已从 journal 重建，原始流完整 ${summary.recoverableRawBytes ?? 0} B): ${resolvedDir}`;
+    } else if (summary.recoveryDisposition === 'recovered-prefix-bad-chunk') {
+      tone = 'warn';
+      openMsg = `已打开损坏归档的可恢复前缀 (${summary.recoverableRawBytes ?? 0} / ${summary.actualRawFileBytes ?? summary.recoverableRawBytes ?? 0} B): ${resolvedDir}`;
+    } else if (summary.recoveryDisposition === 'recovered-interrupted' || summary.recoveryDisposition === 'recovered-failed') {
+      tone = 'warn';
+      openMsg = `已打开未完整关闭录制 (${summary.inspectionStatus}, 可恢复前缀 ${summary.recoverableRawBytes ?? 0} B): ${resolvedDir}`;
+    } else if (summary.inspectionStatus === 'corrupted') {
+      tone = 'error';
+    }
+    this.setTraceActionMessage(tone, openMsg);
     this.postMessage({ command: 'traceRecordMeta', record: summary });
-    this.postMessage({
-      command: 'traceActionResult',
+    this.postTraceActionResult({
       ok: true,
       action: 'open',
       recordId: viewRecordId,
       recordingDir: resolvedDir,
       inspectionStatus: summary.inspectionStatus,
+      recoveryDisposition: summary.recoveryDisposition,
+      indexStatus: summary.indexStatus,
+      hasCommittedChunkCorruption: summary.hasCommittedChunkCorruption,
+      rawSha256Verified: summary.rawSha256Verified,
+      recoverableRawBytes: summary.recoverableRawBytes,
+      actualRawFileBytes: summary.actualRawFileBytes,
     });
+  }
+
+  private async runWithCancellableProgress<T>(
+    title: string,
+    interactive: boolean,
+    fn: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    if (interactive && typeof vscode.window?.withProgress === 'function') {
+      return vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title, cancellable: true },
+        (_progress, token) => {
+          const sub = token.onCancellationRequested(() => controller.abort());
+          return fn(controller.signal).finally(() => sub.dispose());
+        },
+      );
+    }
+    return fn(controller.signal);
+  }
+
+  private postTraceActionResult(payload: Record<string, unknown>): void {
+    this._lastTraceActionResult = payload;
+    this.postMessage({ command: 'traceActionResult', ...payload });
   }
 
   private async handleTraceSaveRecording(recordId: string, explicitTargetDir?: string): Promise<void> {
@@ -1228,85 +1302,286 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     const rec = this.traceRecords.get(recordId);
     if (!rec || !rec.recordingDir) {
       this.setTraceActionMessage('error', '当前选中的录制没有可保存的归档目录');
+      this.postTraceActionResult({ ok: false, action: 'save', errorCode: 'RecordNotFound', message: '当前选中的录制没有可保存的归档目录' });
       return;
     }
     if (rec.state === 'recording' || rec.state === 'preparing' || rec.state === 'stopping' || rec.state === 'paused') {
       this.setTraceActionMessage('warn', '请先停止当前录制，待归档封存完成后再保存副本');
+      this.postTraceActionResult({ ok: false, action: 'save', errorCode: 'RecordingNotFinalized', message: '录制仍在进行中，请先停止后再保存' });
       return;
     }
+    const interactive = !explicitTargetDir?.trim();
     let targetDir = explicitTargetDir?.trim();
     if (!targetDir) {
       const defaultUri = vscode.Uri.file(path.join(path.dirname(rec.recordingDir), `${rec.recordId}-saved`));
       const picked = await vscode.window?.showSaveDialog?.({
         defaultUri,
         saveLabel: '保存 Orbit Trace 归档目录',
-        title: '选择保存 Orbit Trace 录制的目标目录',
+        title: '选择保存 Orbit Trace 录制的目标目录（orbit-trace-v1，非 .SVDat）',
       });
-      if (!picked) return;
+      if (!picked) {
+        this.postTraceActionResult({ ok: false, action: 'save', cancelled: true, errorCode: 'Cancelled', message: '已取消保存归档' });
+        return;
+      }
       targetDir = picked.fsPath;
     }
-    const srcDir = path.resolve(rec.recordingDir);
-    const dstDir = path.resolve(targetDir);
-    if (srcDir.toLowerCase() === dstDir.toLowerCase()) {
-      this.setTraceActionMessage('warn', '目标目录与源录制目录相同，无需复制');
+    if (/\.svdat$/i.test(targetDir)) {
+      const msg = '不支持保存或导出为 SEGGER .SVDat 格式；请选择 Orbit 归档目录（或导出 .bin / .csv）';
+      this.setTraceActionMessage('error', msg);
+      this.postTraceActionResult({ ok: false, action: 'save', errorCode: 'UnsupportedCapability', message: msg });
       return;
     }
 
+    const dstDir = path.resolve(targetDir);
     try {
-      try {
-        const entries = await fs.readdir(dstDir);
-        if (entries.length > 0) {
-          this.setTraceActionMessage('error', `目标目录非空，拒绝覆盖既有文件: ${dstDir}`);
-          this.postMessage({ command: 'traceActionResult', ok: false, action: 'save', errorCode: 'RecordingDirectoryNotEmpty', message: `目标目录非空: ${dstDir}` });
-          return;
-        }
-      } catch (err: any) {
-        if (err?.code !== 'ENOENT') throw err;
-        await fs.mkdir(dstDir, { recursive: true });
-      }
-
-      const candidateFiles = [
-        ORBIT_TRACE_FILES.manifest,
-        ORBIT_TRACE_FILES.raw,
-        ORBIT_TRACE_FILES.data,
-        ORBIT_TRACE_FILES.journal,
-        ORBIT_TRACE_FILES.index,
-        'index-spill.otidx',
-      ];
-      for (const name of candidateFiles) {
-        const srcFile = path.join(srcDir, name);
-        try {
-          await fs.access(srcFile);
-          await fs.copyFile(srcFile, path.join(dstDir, name));
-        } catch (err: any) {
-          if (err?.code !== 'ENOENT') throw err;
-        }
-      }
-
-      const inspectRes = await this.traceCoordinator.inspectRecordingDirectory(dstDir, true);
-      if (!inspectRes.ok) {
-        this.setTraceActionMessage('error', `保存后校验失败 (${inspectRes.errorCode}): ${inspectRes.message}`);
-        this.postMessage({ command: 'traceActionResult', ok: false, action: 'save', errorCode: inspectRes.errorCode, message: inspectRes.message });
+      const saveRes = await this.runWithCancellableProgress(`正在保存 Orbit 归档到 ${path.basename(dstDir)}…`, interactive, (signal) =>
+        this.traceCoordinator!.saveArchive(recordId, dstDir, { signal, verifyChunkCrc32: true }),
+      );
+      if (!saveRes.ok) {
+        const tone = saveRes.cancelled ? 'warn' : 'error';
+        this.setTraceActionMessage(tone, `保存归档${saveRes.cancelled ? '已取消' : '失败'} (${saveRes.errorCode}): ${saveRes.message}`);
+        this.postTraceActionResult({
+          ok: false,
+          action: 'save',
+          recordId,
+          targetDir: dstDir,
+          cancelled: Boolean(saveRes.cancelled),
+          errorCode: saveRes.errorCode,
+          message: saveRes.message,
+        });
         return;
       }
-      const st = inspectRes.data.status;
+
+      const insp = saveRes.data.inspection;
       this.setTraceActionMessage(
-        st === 'completed' ? 'ok' : 'warn',
-        `已保存录制归档到 ${dstDir}（校验=${st}, ${inspectRes.data.recoverableRawBytes} B）`,
+        insp.status === 'completed' ? 'ok' : 'warn',
+        `已保存录制归档到 ${dstDir}（校验=${insp.status}, ${insp.recoverableRawBytes} B, SHA=${insp.rawSha256Verified ? 'verified' : 'unverified'}）`,
       );
-      this.postMessage({
-        command: 'traceActionResult',
+      this.postTraceActionResult({
         ok: true,
         action: 'save',
         recordId,
         targetDir: dstDir,
-        inspectionStatus: st,
-        recoverableRawBytes: inspectRes.data.recoverableRawBytes,
+        inspectionStatus: insp.status,
+        recoveryDisposition: insp.recoveryDisposition,
+        recoverableRawBytes: insp.recoverableRawBytes,
+        rawSha256Verified: insp.rawSha256Verified,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.setTraceActionMessage('error', `保存录制失败: ${message}`);
-      this.postMessage({ command: 'traceActionResult', ok: false, action: 'save', errorCode: 'SaveFailed', message });
+      this.postTraceActionResult({ ok: false, action: 'save', errorCode: 'SaveFailed', message });
+    }
+  }
+
+  private async handleTraceExportRaw(recordId: string, explicitOutputPath?: string): Promise<void> {
+    if (!this.traceCoordinator) return;
+    const rec = this.traceRecords.get(recordId);
+    if (!rec) {
+      this.setTraceActionMessage('error', '未选中可导出的 Trace 记录');
+      this.postTraceActionResult({ ok: false, action: 'exportRaw', errorCode: 'RecordNotFound', message: '未选中可导出的 Trace 记录' });
+      return;
+    }
+    if (rec.state === 'recording' || rec.state === 'preparing' || rec.state === 'stopping' || rec.state === 'paused') {
+      this.setTraceActionMessage('warn', '请先停止当前录制后再导出原始 .bin 流');
+      this.postTraceActionResult({ ok: false, action: 'exportRaw', errorCode: 'RecordingNotFinalized', message: '请先停止录制再导出' });
+      return;
+    }
+    const interactive = !explicitOutputPath?.trim();
+    let outputPath = explicitOutputPath?.trim();
+    if (!outputPath) {
+      const baseDir = rec.recordingDir ? path.dirname(rec.recordingDir) : osTmpOrHome();
+      const defaultUri = vscode.Uri.file(path.join(baseDir, `${rec.recordId}.bin`));
+      const picked = await vscode.window?.showSaveDialog?.({
+        defaultUri,
+        filters: { 'SystemView Raw Stream (.bin)': ['bin'] },
+        saveLabel: '导出原始 SystemView 流 (.bin)',
+        title: '导出原始 RTT SystemView 字节流 (.bin，非 .SVDat)',
+      });
+      if (!picked) {
+        this.postTraceActionResult({ ok: false, action: 'exportRaw', cancelled: true, errorCode: 'Cancelled', message: '已取消导出原始流' });
+        return;
+      }
+      outputPath = picked.fsPath;
+    }
+    if (/\.svdat$/i.test(outputPath)) {
+      const msg = '不支持导出 SEGGER .SVDat 格式；请导出为原始 .bin 流或 .csv';
+      this.setTraceActionMessage('error', msg);
+      this.postTraceActionResult({ ok: false, action: 'exportRaw', errorCode: 'UnsupportedCapability', message: msg });
+      return;
+    }
+
+    const dstPath = path.resolve(outputPath);
+    try {
+      const res = await this.runWithCancellableProgress(`正在导出原始流 ${path.basename(dstPath)}…`, interactive, (signal) =>
+        this.traceCoordinator!.exportRawToFile(recordId, dstPath, { signal, verifyChunkCrc32: true }),
+      );
+      if (!res.ok) {
+        const tone = res.cancelled ? 'warn' : 'error';
+        this.setTraceActionMessage(tone, `导出原始流${res.cancelled ? '已取消' : '失败'} (${res.errorCode}): ${res.message}`);
+        this.postTraceActionResult({
+          ok: false,
+          action: 'exportRaw',
+          recordId,
+          outputPath: dstPath,
+          cancelled: Boolean(res.cancelled),
+          errorCode: res.errorCode,
+          message: res.message,
+        });
+        return;
+      }
+      this.setTraceActionMessage('ok', `已导出原始流 (${res.data.exportedBytes} B, SHA256=${res.data.sha256.slice(0, 12)}…) 到 ${dstPath}`);
+      this.postTraceActionResult({
+        ok: true,
+        action: 'exportRaw',
+        recordId,
+        outputPath: dstPath,
+        exportedBytes: res.data.exportedBytes,
+        sha256: res.data.sha256,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.setTraceActionMessage('error', `导出原始流失败: ${message}`);
+      this.postTraceActionResult({ ok: false, action: 'exportRaw', errorCode: 'ExportFailed', message });
+    }
+  }
+
+  private async handleTraceExportCsv(msg: any): Promise<void> {
+    if (!this.traceCoordinator) return;
+    const recordId = typeof msg.recordId === 'string' && msg.recordId ? msg.recordId : (this.selectedTraceRecordId || '');
+    const rec = this.traceRecords.get(recordId);
+    if (!rec) {
+      this.setTraceActionMessage('error', '未选中可导出的 Trace 记录');
+      this.postTraceActionResult({ ok: false, action: 'exportCsv', errorCode: 'RecordNotFound', message: '未选中可导出的 Trace 记录' });
+      return;
+    }
+
+    const exportSource: TraceCsvExportSource =
+      msg.exportSource === 'ab-selection' || msg.exportSource === 'events-page' || msg.exportSource === 'full'
+        ? msg.exportSource
+        : 'trace-viewport';
+    const unit: TraceTimeUnit =
+      msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    const start = String(msg.start ?? '0');
+    const end = String(msg.end ?? '0');
+    let startBig: bigint;
+    let endBig: bigint;
+    try {
+      startBig = BigInt(start);
+      endBig = BigInt(end);
+    } catch {
+      this.setTraceActionMessage('error', 'CSV 导出时间范围格式无效');
+      this.postTraceActionResult({ ok: false, action: 'exportCsv', errorCode: 'InvalidArgument', message: 'CSV 导出时间范围格式无效' });
+      return;
+    }
+    if (endBig <= startBig) {
+      this.setTraceActionMessage('warn', 'CSV 导出区间为空或零长度（请先放置有效的 A/B 选区或视口）');
+      this.postTraceActionResult({ ok: false, action: 'exportCsv', errorCode: 'InvalidArgument', message: 'CSV 导出区间为空或零长度' });
+      return;
+    }
+
+    const explicitOutputPath = typeof msg.outputPath === 'string' ? msg.outputPath.trim() : '';
+    const interactive = !explicitOutputPath;
+    let outputPath = explicitOutputPath;
+    if (!outputPath) {
+      const baseDir = rec.recordingDir ? path.dirname(rec.recordingDir) : osTmpOrHome();
+      const defaultUri = vscode.Uri.file(path.join(baseDir, `${rec.recordId}-${exportSource}.csv`));
+      const picked = await vscode.window?.showSaveDialog?.({
+        defaultUri,
+        filters: { 'CSV Files (.csv)': ['csv'] },
+        saveLabel: '导出 Trace CSV',
+        title: `导出 Trace CSV (${exportSource})`,
+      });
+      if (!picked) {
+        this.postTraceActionResult({ ok: false, action: 'exportCsv', exportSource, cancelled: true, errorCode: 'Cancelled', message: '已取消导出 CSV' });
+        return;
+      }
+      outputPath = picked.fsPath;
+    }
+    if (/\.svdat$/i.test(outputPath)) {
+      const msgText = '不支持导出 SEGGER .SVDat 格式；请使用 .csv 或 .bin';
+      this.setTraceActionMessage('error', msgText);
+      this.postTraceActionResult({ ok: false, action: 'exportCsv', exportSource, errorCode: 'UnsupportedCapability', message: msgText });
+      return;
+    }
+
+    const rawFilter = msg.filter && typeof msg.filter === 'object' ? msg.filter : undefined;
+    const csvReq: TraceCsvExportRequest = {
+      exportSource,
+      unit,
+      start: startBig.toString(),
+      end: endBig.toString(),
+      ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+      ...(segmentId !== undefined ? { segmentId } : {}),
+      ...(msg.crossesGap ? { crossesGap: true } : {}),
+      ...(rawFilter
+        ? {
+            filter: {
+              category: typeof rawFilter.category === 'string' ? (rawFilter.category as TraceEventCategoryFilter) : 'all',
+              ...(typeof rawFilter.searchText === 'string' && rawFilter.searchText ? { searchText: rawFilter.searchText.slice(0, 128) } : {}),
+              ...(typeof rawFilter.contextKey === 'string' && rawFilter.contextKey ? { contextKey: rawFilter.contextKey } : {}),
+              ...(rawFilter.onlyWithDiagnostics ? { onlyWithDiagnostics: true } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const dstPath = path.resolve(outputPath);
+    try {
+      const res = await this.runWithCancellableProgress(`正在导出 CSV ${path.basename(dstPath)}…`, interactive, (signal) =>
+        this.traceCoordinator!.exportCsvToFile(recordId, dstPath, csvReq, { signal }),
+      );
+      if (!res.ok) {
+        const tone = res.cancelled ? 'warn' : 'error';
+        this.setTraceActionMessage(tone, `导出 CSV ${res.cancelled ? '已取消' : '失败'} (${res.errorCode}): ${res.message}`);
+        this.postTraceActionResult({
+          ok: false,
+          action: 'exportCsv',
+          exportSource,
+          recordId,
+          outputPath: dstPath,
+          cancelled: Boolean(res.cancelled),
+          errorCode: res.errorCode,
+          message: res.message,
+        });
+        return;
+      }
+      const d = res.data;
+      const warnings: string[] = [];
+      if (d.skippedUnanchoredSegments.length > 0) warnings.push(`跳过 ${d.skippedUnanchoredSegments.length} 个未锚定段`);
+      if (d.skippedNoFrequencySegments.length > 0) warnings.push(`跳过 ${d.skippedNoFrequencySegments.length} 个无频率段`);
+      if (d.hasTargetOverflow) warnings.push('含目标过载缺口');
+      if (d.hasHostDrop) warnings.push('含主机/传输丢包');
+      const warnSuffix = warnings.length > 0 ? ` [${warnings.join('; ')}]` : '';
+      this.setTraceActionMessage(
+        warnings.length > 0 || d.archiveState !== 'completed' ? 'warn' : 'ok',
+        `已导出 CSV ${d.exportedRows.toLocaleString()} 行 (${d.exportedBytes} B, ${d.unit})${warnSuffix} 到 ${dstPath}`,
+      );
+      this.postTraceActionResult({
+        ok: true,
+        action: 'exportCsv',
+        exportSource,
+        recordId,
+        outputPath: dstPath,
+        exportedRows: d.exportedRows,
+        exportedBytes: d.exportedBytes,
+        sha256: d.sha256,
+        unit: d.unit,
+        start: d.start,
+        end: d.end,
+        archiveState: d.archiveState,
+        recoveryDisposition: d.recoveryDisposition,
+        skippedUnanchoredSegments: d.skippedUnanchoredSegments,
+        skippedNoFrequencySegments: d.skippedNoFrequencySegments,
+        hasTargetOverflow: d.hasTargetOverflow,
+        hasHostDrop: d.hasHostDrop,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.setTraceActionMessage('error', `导出 CSV 失败: ${message}`);
+      this.postTraceActionResult({ ok: false, action: 'exportCsv', exportSource, errorCode: 'ExportFailed', message });
     }
   }
 
@@ -2050,4 +2325,8 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     this.traceActionMessage = { tone, text };
     this.postState();
   }
+}
+
+function osTmpOrHome(): string {
+  return os.homedir() || os.tmpdir();
 }

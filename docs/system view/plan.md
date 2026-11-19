@@ -504,13 +504,13 @@ git diff --check
 | 2：面板与对象 | 已完成 | 2.1～2.4：内建 RTOS 面板、Queue/Mutex/Sem/WaitGraph、Timers/Heap 与旧 RTOS Views 专属清理已通过自动化与真实 VS Code 出口检查。 |
 | 3：RTT 传输 | 进行中 | 3.1～3.3 已通过独立 mock 验收；3.4 通过全量自动化和 RMLink 二号机 H723 回环验收。J-Link native、CMSIS-DAP WinUSB/HID 对应实板门槛待补验。4.1 可用现有独立样本开展离线解码。 |
 | 4：Trace 引擎 | 已完成 | 4.1～4.3 通过独立样本与百万事件验收。4.4 在 STM32H723 与 RMLink 二号机验收三种录制模式，4.5 通过真实 VS Code 的实时录制、离线回放、缩放与精确游标复验，并冻结可复跑的 Trace 性能门槛。30 分钟长稳与跨探针矩阵列入 6.2。 |
-| 5：分析与联动 | 进行中 | 5.1 已完成；5.2 已完成：Events 虚拟事件表与 Trace Terminal（Worker 有界分页、取消、精确双向定位、FreeRTOS API 参数说明、严格有限词法格式化与零参数目标字面文本无损保留、EX_PRINT_ELF/坏包/超限/嵌套 ISR/跨断段与多启动代次诊断），离线/Oracle/H723 归档与 1M 真实 VS Code 验收及 5.1/4.5/2 回归通过；5.3～5.5 待执行。 |
+| 5：分析与联动 | 进行中 | 5.1 已完成；5.2 已完成；5.3 已完成（含第二轮提交时原子无覆盖发布并发返工），待 Codex 独立复验与本地提交：Orbit 归档保存/离线打开/校验/恢复（`rebuilt-bad-index`/`recovered-prefix-bad-chunk`/`recovered-interrupted`/拒绝 `formatVersion: 999`）、Trace 视口/A-B 选区/Events 有界流式 39 列 LF CSV 导出（遵循 RFC 4180 引号转义、公式中和、提交时原子无覆盖发布与写失败/取消回滚），以及 `.SVDat` 独立评估（Orbit 仅导出裸流为 `.bin`，本机官方工具受 `"No Commercial-Use License"` 弹窗阻断实测，`.SVDat` 保持不可用例外）；5.4～5.5 待执行。 |
 | 6：首版验收 | 未开始 | 6.1～6.4 待执行。 |
 | 7：后续扩展 | 未排期 | 不计入首版范围。 |
 
 ### 12.2 记录要求
 
-当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[阶段 1 冻结性能门槛](stage1-performance-gates.json)、[阶段 4.5 Trace 验收与基准](stage4-trace-validation.md)、[阶段 4.5 Trace 冻结门槛](stage4-trace-performance-gates.json)。
+当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[阶段 1 冻结性能门槛](stage1-performance-gates.json)、[阶段 4.5 Trace 验收与基准](stage4-trace-validation.md)、[阶段 4.5 Trace 冻结门槛](stage4-trace-performance-gates.json)、[阶段 5.3 归档与 SVDat 评估](stage5-archive-validation.md)。
 
 后续详细设计、证据索引、基准与交接文件统一放在 `docs/system view/` 下，在本节补相对链接。开始阶段 0 时建立 `progress.md`、`compatibility.md`、`protocol.md` 和 `validation.md`，记录已确定内容；不要预填虚假的测试结果。
 

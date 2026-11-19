@@ -286,10 +286,23 @@ export interface ParsedJournalFrame {
   readonly meta: JournalCommitMetadata;
 }
 
+export type RecordingIndexStatus = 'valid' | 'missing' | 'corrupt';
+
+export type RecordingRecoveryDisposition =
+  | 'intact'
+  | 'rebuilt-bad-index'
+  | 'recovered-prefix-bad-chunk'
+  | 'recovered-interrupted'
+  | 'recovered-failed'
+  | 'unrecoverable';
+
 export interface RecordingDiagnostic {
   readonly code:
     | 'missing-manifest'
     | 'corrupt-manifest'
+    | 'unsupported-format'
+    | 'unsupported-version'
+    | 'corrupt-index'
     | 'unclean-close'
     | 'uncommitted-raw-tail'
     | 'uncommitted-data-tail'
@@ -311,10 +324,15 @@ export interface RecordingDiagnostic {
 export interface RecordingInspectionResult {
   readonly format: typeof ORBIT_TRACE_FORMAT;
   readonly formatVersion: typeof ORBIT_TRACE_FORMAT_VERSION;
+  readonly detectedFormat?: string;
+  readonly detectedFormatVersion?: number;
   readonly status: RecordingLifecycleState;
   readonly isComplete: boolean;
   readonly isRecoverable: boolean;
   readonly isCorrupted: boolean;
+  readonly indexStatus: RecordingIndexStatus;
+  readonly hasCommittedChunkCorruption: boolean;
+  readonly recoveryDisposition: RecordingRecoveryDisposition;
   readonly recoverableRawBytes: number;
   readonly recoverableDataBytes: number;
   readonly actualRawFileBytes: number;
@@ -356,10 +374,12 @@ export interface TraceFileSystem {
   writeFile(filePath: string, data: Uint8Array | string): Promise<void>;
   writeFileExclusive?(filePath: string, data: Uint8Array | string): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
+  link?(existingPath: string, newPath: string): Promise<void>;
   stat(filePath: string): Promise<TraceFileStat>;
   lstat?(filePath: string): Promise<TraceFileStat>;
   readdir?(dirPath: string): Promise<string[]>;
   unlink?(filePath: string): Promise<void>;
+  rmdir?(dirPath: string): Promise<void>;
   realpath?(filePath: string): Promise<string>;
   exists(filePath: string): Promise<boolean>;
 }
@@ -397,6 +417,10 @@ export class NodeTraceFileSystem implements TraceFileSystem {
     await fs.rename(oldPath, newPath);
   }
 
+  public async link(existingPath: string, newPath: string): Promise<void> {
+    await fs.link(existingPath, newPath);
+  }
+
   public async stat(filePath: string): Promise<TraceFileStat> {
     const st = await fs.stat(filePath);
     return { size: st.size, dev: st.dev, ino: st.ino };
@@ -413,6 +437,10 @@ export class NodeTraceFileSystem implements TraceFileSystem {
 
   public async unlink(filePath: string): Promise<void> {
     await fs.unlink(filePath);
+  }
+
+  public async rmdir(dirPath: string): Promise<void> {
+    await fs.rmdir(dirPath);
   }
 
   public async realpath(filePath: string): Promise<string> {
@@ -1722,19 +1750,55 @@ export async function inspectRecordingDirectory(
 
   let manifest: TraceRecordingManifest | undefined;
   let manifestCorrupt = false;
+  let detectedFormat: string | undefined;
+  let detectedFormatVersion: number | undefined;
   if (await fileSystem.exists(manifestPath)) {
     try {
       const rawText = Buffer.from(await fileSystem.readFile(manifestPath)).toString('utf8');
-      const parsed = JSON.parse(rawText) as TraceRecordingManifest;
-      if (parsed.format !== ORBIT_TRACE_FORMAT || parsed.formatVersion !== ORBIT_TRACE_FORMAT_VERSION) {
+      const parsed = JSON.parse(rawText) as Partial<TraceRecordingManifest> | null;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         manifestCorrupt = true;
         diagnostics.push({
           code: 'corrupt-manifest',
           file: ORBIT_TRACE_FILES.manifest,
-          message: `不支持的录制格式或版本: format=${String(parsed.format)}, version=${String(parsed.formatVersion)}`,
+          message: 'manifest.json 顶层结构必须是 JSON 对象',
         });
       } else {
-        manifest = parsed;
+        if (typeof parsed.format === 'string') detectedFormat = parsed.format;
+        if (typeof parsed.formatVersion === 'number') detectedFormatVersion = parsed.formatVersion;
+        if (parsed.format !== ORBIT_TRACE_FORMAT) {
+          manifestCorrupt = true;
+          diagnostics.push({
+            code: 'unsupported-format',
+            file: ORBIT_TRACE_FILES.manifest,
+            message: `不支持的录制格式: format=${String(parsed.format)} (预期 ${ORBIT_TRACE_FORMAT})`,
+          });
+        } else if (parsed.formatVersion !== ORBIT_TRACE_FORMAT_VERSION) {
+          manifestCorrupt = true;
+          diagnostics.push({
+            code: 'unsupported-version',
+            file: ORBIT_TRACE_FILES.manifest,
+            message: `不支持的录制格式版本: formatVersion=${String(parsed.formatVersion)} (支持版本 ${ORBIT_TRACE_FORMAT_VERSION})`,
+          });
+        } else if (
+          typeof parsed.recordId !== 'string' ||
+          parsed.recordId.length === 0 ||
+          !parsed.identity ||
+          typeof parsed.identity !== 'object' ||
+          !parsed.committed ||
+          typeof parsed.committed !== 'object' ||
+          typeof parsed.committed.rawBytes !== 'number' ||
+          !['recording', 'completed', 'interrupted', 'failed', 'corrupted'].includes(String(parsed.state))
+        ) {
+          manifestCorrupt = true;
+          diagnostics.push({
+            code: 'corrupt-manifest',
+            file: ORBIT_TRACE_FILES.manifest,
+            message: 'manifest.json 缺少必需元数据字段或状态无效',
+          });
+        } else {
+          manifest = parsed as TraceRecordingManifest;
+        }
       }
     } catch (err) {
       manifestCorrupt = true;
@@ -1755,12 +1819,16 @@ export async function inspectRecordingDirectory(
   const rawExists = await fileSystem.exists(rawPath);
   const dataExists = await fileSystem.exists(dataPath);
   const journalExists = await fileSystem.exists(journalPath);
+  const indexPath = path.join(recordingDir, ORBIT_TRACE_FILES.index);
+  const indexExists = await fileSystem.exists(indexPath);
 
   const actualRawFileBytes = rawExists ? (await fileSystem.stat(rawPath)).size : 0;
   const actualDataFileBytes = dataExists ? (await fileSystem.stat(dataPath)).size : 0;
   const actualJournalFileBytes = journalExists ? (await fileSystem.stat(journalPath)).size : 0;
 
   const frames: ParsedJournalFrame[] = [];
+  const journalSegKeys = new Set<string>();
+  let journalGapCount = 0;
   let recoverableRawBytes = 0;
   let recoverableDataBytes = 0;
   let lastValidCommitSeq = 0;
@@ -1770,6 +1838,7 @@ export async function inspectRecordingDirectory(
   let failureExpectedSha: string | undefined;
   let hasCommittedCorruption = false;
   let hasTruncatedJournalTail = false;
+  let indexStatus: RecordingIndexStatus = indexExists ? 'valid' : 'missing';
 
   let rawHandle: TraceFileHandle | undefined;
   let dataHandle: TraceFileHandle | undefined;
@@ -1970,6 +2039,14 @@ export async function inspectRecordingDirectory(
           dataCrc32,
           meta,
         });
+        if (meta.segments) {
+          for (const seg of meta.segments) {
+            journalSegKeys.add(`${seg.bootGeneration}:${seg.segmentId}`);
+          }
+        }
+        if (meta.gaps) {
+          journalGapCount += meta.gaps.length;
+        }
 
         lastValidCommitSeq = commitSeq;
         recoverableRawBytes = rawOffset + rawLength;
@@ -2034,7 +2111,11 @@ export async function inspectRecordingDirectory(
     let rawSha256Verified = false;
     const cleanFrame = cleanCloseFound ? frames[frames.length - 1] : undefined;
     const expectedSha = cleanFrame?.meta.closeSummary?.rawSha256 ?? failureExpectedSha ?? manifest?.rawSha256;
-    if ((cleanCloseFound || (failureFound && expectedSha !== undefined)) && expectedSha && (options.verifyRawSha256 ?? true)) {
+    const canVerifySha =
+      cleanCloseFound ||
+      (failureFound && expectedSha !== undefined) ||
+      (hasTruncatedJournalTail && !hasCommittedCorruption && manifest !== undefined && manifest.committed.rawBytes === recoverableRawBytes);
+    if (canVerifySha && expectedSha && (options.verifyRawSha256 ?? true)) {
       if (recoverableRawBytes === 0) {
         const emptySha = createHash('sha256').digest('hex');
         if (emptySha === expectedSha) {
@@ -2062,14 +2143,61 @@ export async function inspectRecordingDirectory(
       }
     }
 
+    // 校验可选 index.otidx（区分坏索引与坏分块：坏索引可从 journal.otj 权威重建）
+    if (indexExists) {
+      try {
+        const idxBuf = await fileSystem.readFile(indexPath);
+        const snap = decodeIndexSnapshot(idxBuf);
+        if (snap.format !== ORBIT_TRACE_FORMAT || snap.formatVersion !== ORBIT_TRACE_FORMAT_VERSION) {
+          indexStatus = 'corrupt';
+          diagnostics.push({
+            code: 'corrupt-index',
+            file: ORBIT_TRACE_FILES.index,
+            offset: 0,
+            message: `index.otidx 格式或版本不匹配: format=${String(snap.format)}, version=${String(snap.formatVersion)}`,
+          });
+        } else if (
+          cleanCloseFound &&
+          !hasCommittedCorruption &&
+          (snap.segments.length !== journalSegKeys.size || snap.gaps.length !== journalGapCount)
+        ) {
+          indexStatus = 'corrupt';
+          diagnostics.push({
+            code: 'corrupt-index',
+            file: ORBIT_TRACE_FILES.index,
+            offset: 0,
+            message: `index.otidx 索引摘要与 journal.otj 不一致 (segments=${snap.segments.length}/${journalSegKeys.size}, gaps=${snap.gaps.length}/${journalGapCount})`,
+          });
+        } else {
+          indexStatus = 'valid';
+        }
+      } catch (err) {
+        indexStatus = 'corrupt';
+        diagnostics.push({
+          code: 'corrupt-index',
+          file: ORBIT_TRACE_FILES.index,
+          offset: 0,
+          message: `index.otidx 校验失败，将从 journal.otj 重建索引: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+
     // 检查 manifest 宣称 completed 但 journal 缺少 CLEAN_CLOSE 或数量不一致
     if (manifest?.state === 'completed' && !cleanCloseFound) {
-      hasCommittedCorruption = true;
-      diagnostics.push({
-        code: 'unclean-close',
-        file: ORBIT_TRACE_FILES.journal,
-        message: 'manifest.json 标记 completed，但 journal.otj 缺少 CLEAN_CLOSE 帧',
-      });
+      if (hasTruncatedJournalTail && !hasCommittedCorruption) {
+        diagnostics.push({
+          code: 'unclean-close',
+          file: ORBIT_TRACE_FILES.journal,
+          message: 'journal.otj 最终提交帧被截断（缺少完整 CLEAN_CLOSE 边界），可恢复至已提交前缀',
+        });
+      } else {
+        hasCommittedCorruption = true;
+        diagnostics.push({
+          code: 'unclean-close',
+          file: ORBIT_TRACE_FILES.journal,
+          message: 'manifest.json 标记 completed，但 journal.otj 缺少 CLEAN_CLOSE 帧',
+        });
+      }
     } else if (manifest && (manifest.state === 'interrupted' || manifest.state === 'failed') && cleanCloseFound) {
       hasCommittedCorruption = true;
       diagnostics.push({
@@ -2077,7 +2205,7 @@ export async function inspectRecordingDirectory(
         file: ORBIT_TRACE_FILES.journal,
         message: `manifest.json 标记 ${manifest.state}，但 journal.otj 存在矛盾的 CLEAN_CLOSE 帧`,
       });
-    } else if (manifest?.state === 'completed' && manifest.committed.rawBytes !== recoverableRawBytes) {
+    } else if (manifest?.state === 'completed' && manifest.committed.rawBytes !== recoverableRawBytes && !hasTruncatedJournalTail) {
       hasCommittedCorruption = true;
       diagnostics.push({
         code: 'sequence-mismatch',
@@ -2093,11 +2221,11 @@ export async function inspectRecordingDirectory(
     }
 
     let status: RecordingLifecycleState;
-    if (hasCommittedCorruption || manifestCorrupt) {
+    if (hasCommittedCorruption || manifestCorrupt || indexStatus === 'corrupt') {
       status = 'corrupted';
     } else if (cleanCloseFound && manifest?.state === 'completed') {
       status = 'completed';
-    } else if (manifest?.state === 'interrupted' || failureTerminalState === 'interrupted') {
+    } else if (manifest?.state === 'interrupted' || failureTerminalState === 'interrupted' || hasTruncatedJournalTail) {
       status = 'interrupted';
     } else if (failureFound || manifest?.state === 'failed') {
       status = 'failed';
@@ -2105,21 +2233,45 @@ export async function inspectRecordingDirectory(
       status = 'interrupted';
     }
 
+    const hasAnyArchiveFile = Boolean(manifest) || rawExists || dataExists || journalExists;
+    const isRecoverable =
+      !manifestCorrupt &&
+      hasAnyArchiveFile &&
+      (frames.length > 0 || (!hasCommittedCorruption && manifest !== undefined && recoverableRawBytes === 0));
+
     const isComplete =
       status === 'completed' &&
       cleanCloseFound &&
+      indexStatus !== 'corrupt' &&
       uncommittedTrailingRawBytes === 0 &&
       uncommittedTrailingDataBytes === 0 &&
       !hasTruncatedJournalTail &&
       (options.verifyRawSha256 === false || rawSha256Verified);
 
+    const recoveryDisposition: RecordingRecoveryDisposition = !isRecoverable
+      ? 'unrecoverable'
+      : status === 'completed'
+        ? 'intact'
+        : indexStatus === 'corrupt' && !hasCommittedCorruption
+          ? 'rebuilt-bad-index'
+          : hasCommittedCorruption
+            ? 'recovered-prefix-bad-chunk'
+            : status === 'failed'
+              ? 'recovered-failed'
+              : 'recovered-interrupted';
+
     return {
       format: ORBIT_TRACE_FORMAT,
       formatVersion: ORBIT_TRACE_FORMAT_VERSION,
+      ...(detectedFormat !== undefined ? { detectedFormat } : {}),
+      ...(detectedFormatVersion !== undefined ? { detectedFormatVersion } : {}),
       status,
       isComplete,
-      isRecoverable: !manifestCorrupt && (frames.length > 0 || (manifest !== undefined && recoverableRawBytes === 0)),
+      isRecoverable,
       isCorrupted: status === 'corrupted',
+      indexStatus,
+      hasCommittedChunkCorruption: hasCommittedCorruption,
+      recoveryDisposition,
       recoverableRawBytes,
       recoverableDataBytes,
       actualRawFileBytes,

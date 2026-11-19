@@ -464,4 +464,81 @@ describe('worker_threads Trace Worker 与宿主客户端 (阶段 4.3)', () => {
     await client.closeRecording('rec-hb');
     await client.shutdown();
   });
+
+  it('支持通过真实 Worker saveArchive 与 exportCsvToFile（含取消与版本校验）', async () => {
+    const sample = await fs.readFile('scripts/rtos/fixtures/samples/continuous.bin');
+    const dir = await makeTempDir('orbit-worker-s53-');
+    const recDir = path.join(dir, 'rec-src');
+    const client = new TraceWorkerClient();
+    clientsToCleanup.push(client);
+
+    await client.createRecording({
+      recordingDir: recDir,
+      recordId: 'rec-s53',
+      identity: { sessionId: 's-53', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-s53' },
+      commitOnEachIngest: true,
+    });
+    expect((await client.ingestChunk({
+      recordId: 'rec-s53',
+      sessionId: 's-53',
+      sessionGeneration: 1,
+      batchSequence: 1,
+      chunk: sample,
+    })).ok).toBe(true);
+    expect((await client.finishRecording('rec-s53')).ok).toBe(true);
+
+    // 1. saveArchive 到新目录
+    const archiveOut = path.join(dir, 'archive-copy');
+    const saveRes = await client.saveArchive('rec-s53', archiveOut);
+    expect(saveRes.ok).toBe(true);
+    if (saveRes.ok) {
+      expect(saveRes.data.inspection.recoverableRawBytes).toBe(sample.length);
+    }
+
+    // 2. exportCsvToFile 到目标 CSV
+    const csvOut = path.join(dir, 'trace-export.csv');
+    const csvRes = await client.exportCsvToFile('rec-s53', csvOut, {
+      exportSource: 'events-page',
+      unit: 'relative-ticks',
+      start: '0',
+      end: '10000',
+    });
+    expect(csvRes.ok).toBe(true);
+    if (csvRes.ok) {
+      expect(csvRes.data.exportedRows).toBeGreaterThan(0);
+    }
+    const csvText = await fs.readFile(csvOut, 'utf8');
+    expect(csvText.split(/\r?\n/)[0]).toContain('recordId,archiveFormat,archiveState');
+
+    // 3. AbortSignal 预取消不产生输出文件
+    const ac = new AbortController();
+    ac.abort();
+    const cancelledCsv = path.join(dir, 'cancelled.csv');
+    const cancelRes = await client.exportCsvToFile(
+      'rec-s53',
+      cancelledCsv,
+      { exportSource: 'events-page', unit: 'relative-ticks', start: '0', end: '10000' },
+      { signal: ac.signal },
+    );
+    expect(cancelRes.ok).toBe(false);
+    if (!cancelRes.ok) expect(cancelRes.errorCode).toBe('QueryCancelled');
+    await expect(fs.stat(cancelledCsv)).rejects.toThrow();
+
+    await client.closeRecording('rec-s53');
+
+    // 4. 非法 formatVersion=999 通过 openRecording 返回结构化 UnsupportedArchiveVersion
+    const badVerDir = path.join(dir, 'bad-ver-999');
+    await fs.cp(archiveOut, badVerDir, { recursive: true });
+    const manifestPath = path.join(badVerDir, 'manifest.json');
+    const man = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    man.formatVersion = 999;
+    await fs.writeFile(manifestPath, JSON.stringify(man, null, 2));
+    const openBad = await client.openRecording({ recordId: 'rec-bad-ver', recordingDir: badVerDir });
+    expect(openBad.ok).toBe(false);
+    if (!openBad.ok) {
+      expect(openBad.errorCode).toBe('UnsupportedArchiveVersion');
+    }
+
+    await client.shutdown();
+  });
 });

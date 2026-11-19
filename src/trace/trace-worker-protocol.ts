@@ -28,6 +28,10 @@ import type {
   TraceTerminalQueryResult,
 } from './trace-events';
 import type {
+  TraceCsvExportRequest,
+  TraceCsvExportResult,
+} from './trace-csv-export';
+import type {
   CreateTraceRecordingOptions,
   IngestBatchSummary,
   TraceLodQueryRequest,
@@ -41,6 +45,8 @@ import type {
 export type {
   TraceAnalysisQueryRequest,
   TraceAnalysisQueryResult,
+  TraceCsvExportRequest,
+  TraceCsvExportResult,
   TraceEventLocateRequest,
   TraceEventLocateResult,
   TraceEventsQueryRequest,
@@ -241,16 +247,38 @@ export type TraceWorkerRequest =
       readonly type: 'cancelQuery';
       readonly queryId: string;
     }
-  | {
-      readonly reqId: number;
-      readonly type: 'exportRawToFile';
-      readonly recordId: string;
-      readonly queryId: string;
-      readonly outputPath: string;
-      readonly cancelSlot?: number;
-      readonly cancelToken?: number;
-      readonly verifyChunkCrc32?: boolean;
-    }
+    | {
+        readonly reqId: number;
+        readonly type: 'exportRawToFile';
+        readonly recordId: string;
+        readonly queryId: string;
+        readonly outputPath: string;
+        readonly cancelSlot?: number;
+        readonly cancelToken?: number;
+        readonly verifyChunkCrc32?: boolean;
+      }
+    | {
+        readonly reqId: number;
+        readonly type: 'saveArchive';
+        readonly recordId: string;
+        readonly queryId: string;
+        readonly targetDir: string;
+        readonly cancelSlot?: number;
+        readonly cancelToken?: number;
+        readonly verifyChunkCrc32?: boolean;
+      }
+    | {
+        readonly reqId: number;
+        readonly type: 'exportCsvToFile';
+        readonly recordId: string;
+        readonly queryId: string;
+        readonly outputPath: string;
+        readonly request: TraceCsvExportRequest;
+        readonly cancelSlot?: number;
+        readonly cancelToken?: number;
+        readonly yieldEveryPages?: number;
+        readonly yieldEveryItems?: number;
+      }
   | {
       readonly reqId: number;
       readonly type: 'startRawExportStream';

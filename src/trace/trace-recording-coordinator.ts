@@ -18,6 +18,8 @@ import type {
   StoredGapEntry,
   TraceAnalysisQueryRequest,
   TraceAnalysisQueryResult,
+  TraceCsvExportRequest,
+  TraceCsvExportResult,
   TraceEventLocateRequest,
   TraceEventLocateResult,
   TraceEventsQueryRequest,
@@ -196,8 +198,19 @@ export interface TraceWorkerClientLike {
   exportRawToFile(
     recordId: string,
     outputPath: string,
-    options?: { verifyChunkCrc32?: boolean },
+    options?: { signal?: AbortSignal; verifyChunkCrc32?: boolean },
   ): Promise<TraceStorageResult<{ exportedBytes: number; sha256: string }>>;
+  saveArchive?(
+    recordId: string,
+    targetDir: string,
+    options?: { signal?: AbortSignal; verifyChunkCrc32?: boolean },
+  ): Promise<TraceStorageResult<{ targetDir: string; inspection: RecordingInspectionResult }>>;
+  exportCsvToFile?(
+    recordId: string,
+    outputPath: string,
+    request: TraceCsvExportRequest,
+    options?: { signal?: AbortSignal; yieldEveryPages?: number; yieldEveryItems?: number },
+  ): Promise<TraceStorageResult<TraceCsvExportResult>>;
   getStats(recordId?: string): Promise<TraceStorageResult<TraceWorkerStatsSnapshot>>;
   shutdown(reason?: string): Promise<{ exitCode: number; forced: boolean }>;
 }
@@ -1195,9 +1208,35 @@ export class TraceRecordingCoordinator {
   public async exportRawToFile(
     recordId: string,
     outputPath: string,
-    verifyChunkCrc32 = true,
+    verifyOrOptions: boolean | { signal?: AbortSignal; verifyChunkCrc32?: boolean } = true,
   ): Promise<TraceStorageResult<{ exportedBytes: number; sha256: string }>> {
-    return this.ensureWorker().exportRawToFile(recordId, outputPath, { verifyChunkCrc32 });
+    const opts = typeof verifyOrOptions === 'boolean' ? { verifyChunkCrc32: verifyOrOptions } : verifyOrOptions;
+    return this.ensureWorker().exportRawToFile(recordId, outputPath, opts);
+  }
+
+  public async saveArchive(
+    recordId: string,
+    targetDir: string,
+    options?: { signal?: AbortSignal; verifyChunkCrc32?: boolean },
+  ): Promise<TraceStorageResult<{ targetDir: string; inspection: RecordingInspectionResult }>> {
+    const worker = this.ensureWorker();
+    if (!worker.saveArchive) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持归档保存' };
+    }
+    return worker.saveArchive(recordId, targetDir, options);
+  }
+
+  public async exportCsvToFile(
+    recordId: string,
+    outputPath: string,
+    request: TraceCsvExportRequest,
+    options?: { signal?: AbortSignal; yieldEveryPages?: number; yieldEveryItems?: number },
+  ): Promise<TraceStorageResult<TraceCsvExportResult>> {
+    const worker = this.ensureWorker();
+    if (!worker.exportCsvToFile) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持 CSV 导出' };
+    }
+    return worker.exportCsvToFile(recordId, outputPath, request, options);
   }
 
   public async openRecording(

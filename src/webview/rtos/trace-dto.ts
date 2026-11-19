@@ -463,7 +463,7 @@ export function projectRecordFromOpened(
       ? 'target-overflow'
       : gaps.some(g => g.kind === 'prefix-overwritten')
         ? 'prefix-overwritten'
-        : inspection.status === 'completed'
+        : inspection.status === 'completed' || inspection.recoveryDisposition === 'rebuilt-bad-index'
           ? 'complete'
           : 'incomplete',
     counters: {
@@ -496,6 +496,21 @@ export function projectRecordFromOpened(
     ...(manifest?.closedAtMs ? { stoppedAtMs: manifest.closedAtMs } : {}),
     ...(manifest?.nonStandardNotice ? { nonStandardNotice: manifest.nonStandardNotice } : {}),
     ...(manifest?.formatVersion ? { formatVersion: manifest.formatVersion } : {}),
+    indexStatus: inspection.indexStatus,
+    recoveryDisposition: inspection.recoveryDisposition,
+    hasCommittedChunkCorruption: inspection.hasCommittedChunkCorruption,
+    rawSha256Verified: inspection.rawSha256Verified,
+    actualRawFileBytes: inspection.actualRawFileBytes,
+    ...(inspection.diagnostics.length > 0
+      ? {
+          inspectionDiagnostics: inspection.diagnostics.map(d => ({
+            code: d.code,
+            file: d.file,
+            ...(d.offset !== undefined ? { offset: d.offset } : {}),
+            message: d.message,
+          })),
+        }
+      : {}),
     recoverableRawBytes: inspection.recoverableRawBytes,
     uncommittedTailBytes: inspection.uncommittedTrailingRawBytes,
     segments: segments.map(projectSegmentDto),

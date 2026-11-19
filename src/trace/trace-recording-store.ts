@@ -65,6 +65,11 @@ import {
   TraceAnalysisQueryResult,
 } from './trace-analytics';
 import {
+  streamEventsToCsvWriter,
+  type TraceCsvExportRequest,
+  type TraceCsvExportResult,
+} from './trace-csv-export';
+import {
   buildRecordingDiagnosticsResult,
   createTraceEventMetadataContext,
   executeEventLocate,
@@ -142,8 +147,11 @@ export type TraceStorageErrorCode =
   | 'RecordingFailed'
   | 'RecordingCorrupted'
   | 'RecordingNotFinished'
+  | 'RecordingNotFinalized'
   | 'RecordingDirectoryNotEmpty'
   | 'RecordingDirectoryBusy'
+  | 'UnsupportedArchiveFormat'
+  | 'UnsupportedArchiveVersion'
   | 'ExportPathConflict'
   | 'ExportTargetExists'
   | 'BatchSequenceGap'
@@ -707,6 +715,27 @@ export class TraceRecordingStore {
       verifyRawSha256: options.verifyRawSha256,
     });
 
+    if (!inspection.isRecoverable) {
+      const diagSummary = inspection.diagnostics.map((d) => d.message).join('; ');
+      const code: TraceStorageErrorCode = inspection.diagnostics.some((d) => d.code === 'unsupported-version')
+        ? 'UnsupportedArchiveVersion'
+        : inspection.diagnostics.some((d) => d.code === 'unsupported-format')
+          ? 'UnsupportedArchiveFormat'
+          : 'RecordingCorrupted';
+      const err = createCodedError(code, diagSummary || `录制归档不可恢复或格式无效: ${options.recordingDir}`) as Error & {
+        code: TraceStorageErrorCode;
+        diagnostics?: Record<string, unknown>;
+      };
+      err.diagnostics = {
+        status: inspection.status,
+        recoveryDisposition: inspection.recoveryDisposition,
+        detectedFormat: inspection.detectedFormat,
+        detectedFormatVersion: inspection.detectedFormatVersion,
+        diagnostics: inspection.diagnostics,
+      };
+      throw err;
+    }
+
     const manifest = inspection.manifest;
     const recordId = manifest?.recordId ?? path.basename(options.recordingDir);
     const identity: TraceReconstructionIdentity = manifest?.identity ?? {
@@ -889,9 +918,9 @@ export class TraceRecordingStore {
       }
     }
 
-    // 若有序关闭提供了 index.otidx 且目录未损坏，可补充检验（但以 journal.otj 可恢复提交边界为准）
+    // 若有序关闭提供了有效 index.otidx 且目录未损坏，可补充检验（但以 journal.otj 可恢复提交边界为准）
     const indexPath = path.join(this.recordingDir, ORBIT_TRACE_FILES.index);
-    if (inspection.isComplete && (await this.fs.exists(indexPath))) {
+    if (inspection.isComplete && inspection.indexStatus === 'valid' && (await this.fs.exists(indexPath))) {
       try {
         const snap = decodeIndexSnapshot(await this.fs.readFile(indexPath));
         for (const seg of snap.segments) {
@@ -1857,7 +1886,7 @@ export class TraceRecordingStore {
   private updateSegmentFromDecoder(bootGen: number, decSeg: TraceSegmentSummary): void {
     const key = `${bootGen}:${decSeg.segmentId}`;
     const existing = this.pendingSegments.get(key) ?? this.index.getSegment(bootGen, decSeg.segmentId);
-    const freq = decSeg.metadata.sysFreqHz ?? existing?.sysFreqHz;
+    const freq = decSeg.metadata?.sysFreqHz ?? existing?.sysFreqHz;
     const minNs =
       decSeg.firstAbsoluteTicks !== undefined && freq && freq > 0
         ? ticksToNsBigInt(BigInt(decSeg.firstAbsoluteTicks), freq).toString()
@@ -3110,15 +3139,11 @@ export class TraceRecordingStore {
           await outHandle.sync();
           await outHandle.close();
           outHandle = null;
-          if (await this.fs.exists(options.outputPath)) {
-            return {
-              ok: false,
-              errorCode: 'ExportTargetExists',
-              message: `导出目标已存在，拒绝覆盖: ${options.outputPath}`,
-            };
+          const pubErr = await this.publishStagedFileNoOverwrite(tmpOutputPath, options.outputPath, options.cancel);
+          if (pubErr) {
+            return pubErr;
           }
-          await this.fs.rename(tmpOutputPath, options.outputPath);
-          tmpOutputPath = null;
+          // tmpOutputPath 由 finally 清理
         }
         return { ok: true, data: { exportedBytes: 0, sha256: hash.digest('hex') } };
       }
@@ -3236,12 +3261,11 @@ export class TraceRecordingStore {
         await outHandle.sync();
         await outHandle.close();
         outHandle = null;
-        const postErr = await this.validateExportOutputPath(options.outputPath);
-        if (postErr) {
-          return postErr;
+        const pubErr = await this.publishStagedFileNoOverwrite(tmpOutputPath, options.outputPath, options.cancel);
+        if (pubErr) {
+          return pubErr;
         }
-        await this.fs.rename(tmpOutputPath, options.outputPath);
-        tmpOutputPath = null;
+        // tmpOutputPath 由 finally 清理
       }
       return {
         ok: true,
@@ -3267,9 +3291,552 @@ export class TraceRecordingStore {
     }
   }
 
+  /**
+   * 有界分块流式保存 Orbit `orbit-trace-v1` 归档副本到新目录：
+   * - 仅拷贝经 `journal.otj` 校验的已提交前缀 `[0, committed.*)`；
+   * - 拒绝覆盖源目录/嵌套目录/非空目标目录/已有文件及 `.SVDat` 路径；
+   * - 支持 `AbortSignal`/`SharedArrayBuffer` 取消与写失败（ENOSPC/ShortWrite/EIO）全量清理回滚。
+   */
+  public async saveArchive(options: {
+    targetDir: string;
+    cancel?: TraceQueryCancelToken;
+    verifyChunkCrc32?: boolean;
+  }): Promise<TraceStorageResult<{ targetDir: string; inspection: RecordingInspectionResult }>> {
+    if (this.closed) {
+      return { ok: false, errorCode: 'RecordingClosed', message: '存储已关闭，无法保存归档副本' };
+    }
+    if (this.mode === 'write' && this.state === 'recording') {
+      return { ok: false, errorCode: 'RecordingNotFinalized', message: '录制仍在进行中，请先停止并封存后再保存归档副本' };
+    }
+    if (!options.targetDir || options.targetDir.trim().length === 0) {
+      return { ok: false, errorCode: 'InvalidArgument', message: 'targetDir 不能为空' };
+    }
+    if (/\.svdat$/i.test(options.targetDir.trim())) {
+      return {
+        ok: false,
+        errorCode: 'UnsupportedCapability',
+        message: '不支持导出 SEGGER .SVDat 格式；请保存为 Orbit 归档目录或使用 .bin / .csv',
+      };
+    }
+    if (isQueryCancelled(options.cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '保存归档已取消' };
+    }
+
+    const srcKey = await canonicalizeDirectoryKey(this.recordingDir, this.fs);
+    const dstKey = await canonicalizeDirectoryKey(options.targetDir, this.fs);
+    const sep = path.sep;
+    const srcPrefix = srcKey.endsWith(sep) ? srcKey : srcKey + sep;
+    const dstPrefix = dstKey.endsWith(sep) ? dstKey : dstKey + sep;
+    if (dstKey === srcKey || dstKey.startsWith(srcPrefix) || srcKey.startsWith(dstPrefix)) {
+      return {
+        ok: false,
+        errorCode: 'ExportPathConflict',
+        message: `禁止将归档保存到源录制目录自身、内部子目录或父级冲突路径: ${options.targetDir}`,
+      };
+    }
+    if (activeCreateDirectories.has(dstKey)) {
+      return {
+        ok: false,
+        errorCode: 'RecordingDirectoryBusy',
+        message: `目标目录正被其他录制创建/保存任务占用: ${options.targetDir}`,
+      };
+    }
+
+    // 检查目标路径是否已有文件或非空目录
+    if (this.fs.lstat) {
+      try {
+        const st = await this.fs.lstat(options.targetDir);
+        if (st.isSymbolicLink) {
+          return {
+            ok: false,
+            errorCode: 'ExportPathConflict',
+            message: `目标路径为符号链接，拒绝覆盖: ${options.targetDir}`,
+          };
+        }
+      } catch {
+        // 不存在则继续
+      }
+    }
+    if (await this.fs.exists(options.targetDir)) {
+      if (this.fs.readdir) {
+        try {
+          const entries = await this.fs.readdir(options.targetDir);
+          if (entries.length > 0) {
+            return {
+              ok: false,
+              errorCode: 'RecordingDirectoryNotEmpty',
+              message: `目标归档目录非空，拒绝覆盖既有文件: ${options.targetDir}`,
+            };
+          }
+        } catch {
+          return {
+            ok: false,
+            errorCode: 'ExportTargetExists',
+            message: `目标路径已存在且不是可写空目录: ${options.targetDir}`,
+          };
+        }
+      } else {
+        return {
+          ok: false,
+          errorCode: 'RecordingDirectoryNotEmpty',
+          message: `目标路径已存在，拒绝覆盖: ${options.targetDir}`,
+        };
+      }
+    }
+
+    activeCreateDirectories.add(dstKey);
+    const createdFiles: string[] = [];
+    const openedHandles: TraceFileHandle[] = [];
+    let createdTargetDir = false;
+    let srcJournalHandle: TraceFileHandle | null = null;
+    let srcIndexHandle: TraceFileHandle | null = null;
+    let srcSpillHandle: TraceFileHandle | null = null;
+
+    const cleanupOnAbortOrError = async () => {
+      await Promise.allSettled(openedHandles.map((h) => h.close()));
+      if (this.fs.unlink) {
+        await Promise.allSettled(createdFiles.map((f) => this.fs.unlink!(f)));
+      }
+      if (createdTargetDir && this.fs.rmdir) {
+        await this.fs.rmdir(options.targetDir).catch(() => {});
+      }
+    };
+
+    const streamCopySpan = async (
+      srcHandle: TraceFileHandle,
+      dstPath: string,
+      totalBytes: number,
+      verifyRawFrames?: readonly ParsedJournalFrame[],
+    ): Promise<{ sha256: string } | TraceStorageFailure> => {
+      let dstHandle: TraceFileHandle | null = null;
+      try {
+        dstHandle = await this.fs.open(dstPath, 'wx');
+        createdFiles.push(dstPath);
+        openedHandles.push(dstHandle);
+      } catch (err) {
+        if (isAlreadyExistsError(err)) {
+          return { ok: false, errorCode: 'RecordingDirectoryNotEmpty', message: `目标文件已存在: ${dstPath}` };
+        }
+        throw err;
+      }
+
+      const hash = createHash('sha256');
+      let offset = 0;
+
+      if (verifyRawFrames && verifyRawFrames.length > 0) {
+        for (const frame of verifyRawFrames) {
+          if (frame.rawLength === 0) continue;
+          if (frame.rawOffset !== offset) {
+            return {
+              ok: false,
+              errorCode: 'RecordingCorrupted',
+              message: `保存归档时检测到非连续原始块偏移 ${frame.rawOffset} !== ${offset}`,
+            };
+          }
+          let rem = frame.rawLength;
+          let frameCrc = 0;
+          while (rem > 0) {
+            if (isQueryCancelled(options.cancel)) {
+              return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '保存归档已取消' };
+            }
+            const toRead = Math.min(this.limits.rawChunkBytes, rem);
+            const buf = await readExactFromHandle(srcHandle, offset, toRead);
+            frameCrc = computeCrc32(buf, frameCrc);
+            hash.update(buf);
+            await writeAllChecked(dstHandle, buf, offset, this.limits.rawChunkBytes);
+            offset += toRead;
+            rem -= toRead;
+            await yieldToEventLoop();
+          }
+          if (frameCrc !== frame.rawCrc32) {
+            return {
+              ok: false,
+              errorCode: 'RecordingCorrupted',
+              message: `保存归档时原始块 CRC32 校验失败 (commitSeq=${frame.commitSeq})`,
+            };
+          }
+        }
+      }
+
+      while (offset < totalBytes) {
+        if (isQueryCancelled(options.cancel)) {
+          return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '保存归档已取消' };
+        }
+        const toRead = Math.min(this.limits.rawChunkBytes, totalBytes - offset);
+        const buf = await readExactFromHandle(srcHandle, offset, toRead);
+        hash.update(buf);
+        await writeAllChecked(dstHandle, buf, offset, this.limits.rawChunkBytes);
+        offset += toRead;
+        await yieldToEventLoop();
+      }
+
+      await dstHandle.sync();
+      await dstHandle.close();
+      const idx = openedHandles.indexOf(dstHandle);
+      if (idx >= 0) openedHandles.splice(idx, 1);
+      return { sha256: hash.digest('hex') };
+    };
+
+    try {
+      if (!(await this.fs.exists(options.targetDir))) {
+        await this.fs.mkdir(options.targetDir, { recursive: true });
+        createdTargetDir = true;
+      }
+
+      const totalRaw = this.committed.rawBytes;
+      const totalData = this.committed.dataBytes;
+      const totalJournal = this.committed.journalBytes;
+
+      if (totalRaw > 0 && !this.rawHandle) {
+        await cleanupOnAbortOrError();
+        return { ok: false, errorCode: 'StorageReadError', message: 'raw.otbin 句柄不可用' };
+      }
+      if (totalData > 0 && !this.dataHandle) {
+        await cleanupOnAbortOrError();
+        return { ok: false, errorCode: 'StorageReadError', message: 'data.otd 句柄不可用' };
+      }
+
+      const verifyCrc = options.verifyChunkCrc32 ?? true;
+      const rawFrames = verifyCrc ? this.inspection?.frames : undefined;
+      let savedRawSha = createHash('sha256').digest('hex');
+
+      if (this.rawHandle) {
+        const rawCopy = await streamCopySpan(
+          this.rawHandle,
+          path.join(options.targetDir, ORBIT_TRACE_FILES.raw),
+          totalRaw,
+          rawFrames,
+        );
+        if ('ok' in rawCopy) {
+          await cleanupOnAbortOrError();
+          return rawCopy;
+        }
+        savedRawSha = rawCopy.sha256;
+      } else {
+        const emptyRaw = await this.fs.open(path.join(options.targetDir, ORBIT_TRACE_FILES.raw), 'wx');
+        createdFiles.push(path.join(options.targetDir, ORBIT_TRACE_FILES.raw));
+        await emptyRaw.sync();
+        await emptyRaw.close();
+      }
+
+      if (this.dataHandle) {
+        const dataCopy = await streamCopySpan(
+          this.dataHandle,
+          path.join(options.targetDir, ORBIT_TRACE_FILES.data),
+          totalData,
+        );
+        if ('ok' in dataCopy) {
+          await cleanupOnAbortOrError();
+          return dataCopy;
+        }
+      } else {
+        const emptyData = await this.fs.open(path.join(options.targetDir, ORBIT_TRACE_FILES.data), 'wx');
+        createdFiles.push(path.join(options.targetDir, ORBIT_TRACE_FILES.data));
+        await emptyData.sync();
+        await emptyData.close();
+      }
+
+      const srcJournalPath = path.join(this.recordingDir, ORBIT_TRACE_FILES.journal);
+      if (totalJournal > 0 && (await this.fs.exists(srcJournalPath))) {
+        srcJournalHandle = await this.fs.open(srcJournalPath, 'r');
+        const journalCopy = await streamCopySpan(
+          srcJournalHandle,
+          path.join(options.targetDir, ORBIT_TRACE_FILES.journal),
+          totalJournal,
+        );
+        await srcJournalHandle.close().catch(() => {});
+        srcJournalHandle = null;
+        if ('ok' in journalCopy) {
+          await cleanupOnAbortOrError();
+          return journalCopy;
+        }
+      } else {
+        const emptyJournal = await this.fs.open(path.join(options.targetDir, ORBIT_TRACE_FILES.journal), 'wx');
+        createdFiles.push(path.join(options.targetDir, ORBIT_TRACE_FILES.journal));
+        await emptyJournal.sync();
+        await emptyJournal.close();
+      }
+
+      const srcSpillPath = path.join(this.recordingDir, 'index-spill.otidx');
+      const dstSpillPath = path.join(options.targetDir, 'index-spill.otidx');
+      let spillCopied = false;
+      if (this.index.getCompactedBlocks().length > 0 && (await this.fs.exists(srcSpillPath))) {
+        const spillStat = await this.fs.stat(srcSpillPath);
+        if (spillStat.size > 0) {
+          srcSpillHandle = await this.fs.open(srcSpillPath, 'r');
+          const spillCopy = await streamCopySpan(srcSpillHandle, dstSpillPath, spillStat.size);
+          await srcSpillHandle.close().catch(() => {});
+          srcSpillHandle = null;
+          if ('ok' in spillCopy) {
+            await cleanupOnAbortOrError();
+            return spillCopy;
+          }
+          spillCopied = true;
+        }
+      }
+      if (!spillCopied) {
+        const emptySpill = await this.fs.open(dstSpillPath, 'wx');
+        createdFiles.push(dstSpillPath);
+        await emptySpill.sync();
+        await emptySpill.close();
+      }
+
+      if (isQueryCancelled(options.cancel)) {
+        await cleanupOnAbortOrError();
+        return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '保存归档已取消' };
+      }
+
+      const srcIndexPath = path.join(this.recordingDir, ORBIT_TRACE_FILES.index);
+      const dstIndexPath = path.join(options.targetDir, ORBIT_TRACE_FILES.index);
+      const canCopySourceIndex =
+        this.inspection !== undefined
+          ? this.inspection.isComplete && this.inspection.indexStatus === 'valid'
+          : this.state === 'completed';
+
+      if (canCopySourceIndex && (await this.fs.exists(srcIndexPath))) {
+        const idxSize = (await this.fs.stat(srcIndexPath)).size;
+        srcIndexHandle = await this.fs.open(srcIndexPath, 'r');
+        const idxCopy = await streamCopySpan(srcIndexHandle, dstIndexPath, idxSize);
+        await srcIndexHandle.close().catch(() => {});
+        srcIndexHandle = null;
+        if ('ok' in idxCopy) {
+          await cleanupOnAbortOrError();
+          return idxCopy;
+        }
+      } else if (
+        this.inspection?.recoveryDisposition === 'rebuilt-bad-index' &&
+        this.index.getCompactedBlocks().length === 0
+      ) {
+        const rebuiltIdx = encodeIndexSnapshot({
+          format: ORBIT_TRACE_FORMAT,
+          formatVersion: ORBIT_TRACE_FORMAT_VERSION,
+          segments: this.index.getSegments(),
+          pages: this.index.getAllInMemoryPages(),
+          gaps: this.index.getGaps(),
+          tasks: Array.from(this.pendingTasks.values()),
+        });
+        const idxH = await this.fs.open(dstIndexPath, 'wx');
+        createdFiles.push(dstIndexPath);
+        openedHandles.push(idxH);
+        await writeAllChecked(idxH, rebuiltIdx, 0, this.limits.rawChunkBytes);
+        await idxH.sync();
+        await idxH.close();
+        const pos = openedHandles.indexOf(idxH);
+        if (pos >= 0) openedHandles.splice(pos, 1);
+      }
+
+      const savedState: RecordingLifecycleState =
+        this.inspection?.recoveryDisposition === 'rebuilt-bad-index'
+          ? 'completed'
+          : this.inspection?.hasCommittedChunkCorruption
+            ? 'interrupted'
+            : this.state === 'recording'
+              ? 'interrupted'
+              : this.state;
+
+      const savedManifest: TraceRecordingManifest = {
+        ...this.getManifestSnapshot(),
+        state: savedState,
+        updatedAtMs: Date.now(),
+        ...(this.inspection?.hasCommittedChunkCorruption
+          ? {
+              closeReason: 'recovered-prefix',
+              failureCode: 'RecoveredPrefix',
+              failureDiagnostics: {
+                ...(this.failureDiagnostics ?? {}),
+                sourceStatus: this.state,
+                recoveredRawBytes: this.committed.rawBytes,
+              },
+            }
+          : {}),
+        committed: { ...this.committed },
+        rawSha256: savedRawSha,
+      };
+
+      const manifestTmpPath = path.join(options.targetDir, ORBIT_TRACE_FILES.manifestTmp);
+      const manifestFinalPath = path.join(options.targetDir, ORBIT_TRACE_FILES.manifest);
+      const manifestBuf = Buffer.from(safeTraceJsonStringify(savedManifest, 2) + '\n', 'utf8');
+      const mh = await this.fs.open(manifestTmpPath, 'wx');
+      createdFiles.push(manifestTmpPath);
+      openedHandles.push(mh);
+      await writeAllChecked(mh, manifestBuf, 0, this.limits.rawChunkBytes);
+      await mh.sync();
+      await mh.close();
+      const mhIdx = openedHandles.indexOf(mh);
+      if (mhIdx >= 0) openedHandles.splice(mhIdx, 1);
+      const manifestPubErr = await this.publishStagedFileNoOverwrite(manifestTmpPath, manifestFinalPath, options.cancel);
+      if (manifestPubErr) {
+        await cleanupOnAbortOrError();
+        return manifestPubErr;
+      }
+      if (this.fs.unlink) {
+        await this.fs.unlink(manifestTmpPath).catch(() => {});
+      }
+      const tmpPos = createdFiles.indexOf(manifestTmpPath);
+      if (tmpPos >= 0) createdFiles.splice(tmpPos, 1);
+      createdFiles.push(manifestFinalPath);
+
+      const savedInspection = await inspectRecordingDirectory(options.targetDir, this.fs, {
+        verifyRawSha256: true,
+      });
+      return {
+        ok: true,
+        data: {
+          targetDir: options.targetDir,
+          inspection: savedInspection,
+        },
+      };
+    } catch (err) {
+      await cleanupOnAbortOrError();
+      const classified = classifyStorageWriteError(err);
+      return {
+        ok: false,
+        errorCode: classified.errorCode,
+        message: classified.message,
+      };
+    } finally {
+      await Promise.allSettled([
+        srcJournalHandle?.close(),
+        srcIndexHandle?.close(),
+        srcSpillHandle?.close(),
+      ]);
+      activeCreateDirectories.delete(dstKey);
+    }
+  }
+
+  /**
+   * 有界分块流式导出 CSV（复用 Worker 分页/过滤/格式化引擎）：
+   * - 按页流式读取 `data.otd`，以有界缓冲区写入独占临时文件后原子重命名提交；
+   * - 显式携带记录元数据、时间单位、时基（`timeDomain`/`timeAnchorStatus`/`sysFreqHz`）与不确定性标志；
+   * - 拒绝覆盖已有文件、自导出到录制目录及 `.SVDat` 路径；支持取消与写失败清理回滚。
+   */
+  public async exportCsv(options: {
+    outputPath: string;
+    request: TraceCsvExportRequest;
+    cancel?: TraceQueryCancelToken;
+  }): Promise<TraceStorageResult<TraceCsvExportResult>> {
+    if (this.closed || !this.dataHandle) {
+      return { ok: false, errorCode: 'RecordingClosed', message: '存储已关闭，无法导出 CSV' };
+    }
+    if (isQueryCancelled(options.cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'CSV 导出已取消' };
+    }
+
+    let qStart: bigint;
+    let qEnd: bigint;
+    try {
+      qStart = parseRangeBoundBigInt(options.request.start, 'start');
+      qEnd = parseRangeBoundBigInt(options.request.end, 'end');
+    } catch (err) {
+      return { ok: false, errorCode: 'InvalidArgument', message: err instanceof Error ? err.message : String(err) };
+    }
+    if (qEnd <= qStart) {
+      return { ok: false, errorCode: 'InvalidArgument', message: `CSV 导出区间无效: start=${qStart} >= end=${qEnd}` };
+    }
+
+    const pathErr = await this.validateExportOutputPath(options.outputPath);
+    if (pathErr) {
+      return pathErr;
+    }
+
+    await this.ensureSegmentLeadMetadata(options.cancel);
+    if (isQueryCancelled(options.cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'CSV 导出已取消' };
+    }
+
+    let outHandle: TraceFileHandle | null = null;
+    let tmpOutputPath: string | null = null;
+    let writeOffset = 0;
+
+    try {
+      tmpOutputPath = `${options.outputPath}.orbit-csv-${process.pid}-${++exportTempSeq}.tmp`;
+      outHandle = await this.fs.open(tmpOutputPath, 'wx');
+
+      const archiveState = this.inspection?.status ?? this.state;
+      const recoveryDisposition =
+        this.inspection?.recoveryDisposition ??
+        (archiveState === 'completed'
+          ? 'intact'
+          : archiveState === 'failed'
+            ? 'recovered-failed'
+            : 'recovered-interrupted');
+
+      const streamRes = await streamEventsToCsvWriter({
+        host: this.createEventsHost(options.cancel),
+        recordId: this.recordId,
+        archiveState,
+        recoveryDisposition,
+        request: options.request,
+        qStart,
+        qEnd,
+        chunkSizeBytes: this.limits.rawChunkBytes,
+        writeChunk: async (chunk) => {
+          await writeAllChecked(outHandle!, chunk, writeOffset, this.limits.rawChunkBytes);
+          writeOffset += chunk.length;
+        },
+      });
+
+      if (!streamRes.ok) {
+        return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'CSV 导出已取消' };
+      }
+
+      await outHandle.sync();
+      await outHandle.close();
+      outHandle = null;
+
+      const pubErr = await this.publishStagedFileNoOverwrite(tmpOutputPath, options.outputPath, options.cancel);
+      if (pubErr) {
+        return pubErr;
+      }
+      // tmpOutputPath 由 finally 清理
+
+      return {
+        ok: true,
+        data: {
+          outputPath: options.outputPath,
+          exportedRows: streamRes.data.exportedRows,
+          exportedBytes: streamRes.data.exportedBytes,
+          sha256: streamRes.data.sha256,
+          exportSource: options.request.exportSource,
+          unit: options.request.unit,
+          start: qStart.toString(),
+          end: qEnd.toString(),
+          archiveState,
+          recoveryDisposition,
+          skippedUnanchoredSegments: streamRes.data.skippedUnanchoredSegments,
+          skippedNoFrequencySegments: streamRes.data.skippedNoFrequencySegments,
+          gapsInWindow: streamRes.data.gapsInWindow,
+          hasTargetOverflow: streamRes.data.hasTargetOverflow,
+          hasHostDrop: streamRes.data.hasHostDrop,
+        },
+      };
+    } catch (err) {
+      const classified = classifyStorageWriteError(err);
+      return {
+        ok: false,
+        errorCode: classified.errorCode,
+        message: classified.message,
+      };
+    } finally {
+      if (outHandle) {
+        await outHandle.close().catch(() => {});
+      }
+      if (tmpOutputPath && this.fs.unlink) {
+        await this.fs.unlink(tmpOutputPath).catch(() => {});
+      }
+    }
+  }
+
   private async validateExportOutputPath(outputPath: string): Promise<TraceStorageFailure | null> {
     if (!outputPath || outputPath.trim().length === 0) {
       return { ok: false, errorCode: 'InvalidArgument', message: 'outputPath 不能为空' };
+    }
+    if (/\.svdat$/i.test(outputPath.trim())) {
+      return {
+        ok: false,
+        errorCode: 'UnsupportedCapability',
+        message: '不支持导出 SEGGER .SVDat 格式，请使用 .bin、.csv 或 Orbit 归档目录',
+      };
     }
     const recDirKey = await canonicalizeDirectoryKey(this.recordingDir, this.fs);
     const outKey = await canonicalizeFilePathKey(outputPath, this.fs);
@@ -3342,6 +3909,98 @@ export class TraceRecordingStore {
     }
 
     return null;
+  }
+
+  /**
+   * 提交时原子拒绝既有目标的无覆盖发布：
+   * 1. 优先使用同文件系统原子硬链接 `link(stagedPath, destinationPath)`（若目标已存在则内核原子返回 `EEXIST`）；
+   * 2. 当底层文件系统不支持硬链接或自定义 `TraceFileSystem` 未实现 `link` 时，退回排他创建 `open(destinationPath, 'wx')` 并分块拷贝；
+   * 3. 全程禁止先检查再用可覆盖目标的 `rename`，亦绝不删除非本调用排他创建的外部目标文件。
+   */
+  private async publishStagedFileNoOverwrite(
+    stagedPath: string,
+    destinationPath: string,
+    cancel?: TraceQueryCancelToken,
+  ): Promise<TraceStorageFailure | null> {
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '发布导出文件前已取消' };
+    }
+
+    if (typeof this.fs.link === 'function') {
+      try {
+        await this.fs.link(stagedPath, destinationPath);
+        return null;
+      } catch (err) {
+        const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+        if (isAlreadyExistsError(err) || code === 'EISDIR') {
+          return {
+            ok: false,
+            errorCode: 'ExportTargetExists',
+            message: `导出目标在提交时已存在，拒绝覆盖既有文件: ${destinationPath}`,
+          };
+        }
+        if (!isUnsupportedLinkError(err)) {
+          throw err;
+        }
+      }
+    }
+
+    let dstHandle: TraceFileHandle | null = null;
+    let srcHandle: TraceFileHandle | null = null;
+    let dstOwnedByUs = false;
+    try {
+      try {
+        dstHandle = await this.fs.open(destinationPath, 'wx');
+        dstOwnedByUs = true;
+      } catch (err) {
+        const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+        if (isAlreadyExistsError(err) || code === 'EISDIR') {
+          return {
+            ok: false,
+            errorCode: 'ExportTargetExists',
+            message: `导出目标在提交时已存在，拒绝覆盖既有文件: ${destinationPath}`,
+          };
+        }
+        throw err;
+      }
+
+      srcHandle = await this.fs.open(stagedPath, 'r');
+      const copyBuf = Buffer.allocUnsafe(Math.max(4096, Math.min(this.limits.rawChunkBytes, 256 * 1024)));
+      let offset = 0;
+      while (true) {
+        if (isQueryCancelled(cancel)) {
+          await srcHandle.close().catch(() => {});
+          srcHandle = null;
+          await dstHandle.close().catch(() => {});
+          dstHandle = null;
+          if (dstOwnedByUs && this.fs.unlink) {
+            await this.fs.unlink(destinationPath).catch(() => {});
+          }
+          return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '导出发布过程中已取消' };
+        }
+        const readRes = await srcHandle.read(copyBuf, 0, copyBuf.length, offset);
+        if (readRes.bytesRead <= 0) {
+          break;
+        }
+        const slice = copyBuf.subarray(0, readRes.bytesRead);
+        await writeAllChecked(dstHandle, slice, offset, this.limits.rawChunkBytes);
+        offset += readRes.bytesRead;
+        await yieldToEventLoop();
+      }
+      await srcHandle.close().catch(() => {});
+      srcHandle = null;
+      await dstHandle.sync();
+      await dstHandle.close();
+      dstHandle = null;
+      return null;
+    } catch (err) {
+      await srcHandle?.close().catch(() => {});
+      await dstHandle?.close().catch(() => {});
+      if (dstOwnedByUs && this.fs.unlink) {
+        await this.fs.unlink(destinationPath).catch(() => {});
+      }
+      throw err;
+    }
   }
 }
 
@@ -3671,6 +4330,20 @@ function isAlreadyExistsError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const code = (err as { code?: unknown }).code;
   return code === 'EEXIST' || code === 'RecordingDirectoryNotEmpty';
+}
+
+function isUnsupportedLinkError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  return (
+    code === 'EXDEV' ||
+    code === 'ENOTSUP' ||
+    code === 'EOPNOTSUPP' ||
+    code === 'ENOSYS' ||
+    code === 'EPERM' ||
+    code === 'UNKNOWN' ||
+    code === 'EINVAL'
+  );
 }
 
 function normalizePlatformPath(p: string): string {

@@ -157,6 +157,22 @@ export interface ContextsViewProps {
   }) => void;
   onEventsPerfReport?: (perf: Record<string, unknown>) => void;
   onTerminalPerfReport?: (perf: Record<string, unknown>) => void;
+  onExportCsv?: (req: {
+    recordId: string;
+    exportSource: 'events-page';
+    unit: TraceTimeUnit;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    filter: {
+      category: TraceEventCategoryFilter;
+      searchText: string;
+      contextKey?: string;
+      onlyWithDiagnostics: boolean;
+    };
+    outputPath?: string;
+  }) => void;
 }
 
 const CHART_HEIGHT = 112;
@@ -231,6 +247,7 @@ export function ContextsView(props: ContextsViewProps) {
     onGetDiagnostics,
     onEventsPerfReport,
     onTerminalPerfReport,
+    onExportCsv,
   } = props;
 
   const [internalSubTab, setInternalSubTab] = useState<ContextsSubTab>('contexts');
@@ -910,6 +927,7 @@ export function ContextsView(props: ContextsViewProps) {
           onSelectFocusedEvent={handleSelectFocusedEventProp}
           onJumpToTimelineEvent={handleJumpToTimelineEventProp}
           onQueryEvents={handleQueryEventsProp}
+          onExportCsv={onExportCsv}
           onLocateEvent={handleLocateEventProp}
           onPerfReport={onEventsPerfReport}
         />

@@ -307,6 +307,26 @@ export function RtosApp() {
               cursorBarText: firstCursorRowText,
               jumpToEventsButtonPresent: Boolean(jumpBtn),
             };
+          } else if (action === 'trace.getState') {
+            data = w.__orbitTraceTimelineTestApi?.getState?.() ?? null;
+          } else if (action === 'trace.exportCsvViewport') {
+            data = { triggered: Boolean(w.__orbitTraceTimelineTestApi?.exportCsvViewport?.(payload.outputPath)) };
+          } else if (action === 'trace.exportCsvSelection') {
+            data = { triggered: Boolean(w.__orbitTraceTimelineTestApi?.exportCsvSelection?.(payload.outputPath)) };
+          } else if (action === 'trace.exportRaw') {
+            data = { triggered: Boolean(w.__orbitTraceTimelineTestApi?.exportRaw?.(payload.outputPath)) };
+          } else if (action === 'trace.saveRecording') {
+            data = { triggered: Boolean(w.__orbitTraceTimelineTestApi?.saveRecording?.(payload.targetDir)) };
+          } else if (action === 'trace.openRecording') {
+            data = { triggered: Boolean(w.__orbitTraceTimelineTestApi?.openRecording?.(payload.recordingDir)) };
+          } else if (action === 'trace.setRange') {
+            w.__orbitTraceTimelineTestApi?.setRange?.(String(payload.startStr), String(payload.endStr));
+            data = { ok: true };
+          } else if (action === 'trace.setCursor') {
+            w.__orbitTraceTimelineTestApi?.setCursor?.(payload.kind === 'B' ? 'B' : 'A', String(payload.timeStr));
+            data = { ok: true };
+          } else if (action === 'events.exportCsv') {
+            data = { triggered: Boolean(w.__orbitRtosEventsTestApi?.exportCsv?.(payload.outputPath)) };
           } else if (action === 'timeline.clickJumpToEventsButton') {
             const jumpBtn = Array.from(document.querySelectorAll('.trace-cursor-row button')).find(b => (b.textContent ?? '').includes('在 Events 中定位')) as HTMLElement | undefined;
             jumpBtn?.click();
@@ -969,6 +989,8 @@ export function RtosApp() {
             onSelectRecord={recordId => vscodeApi.postMessage({ command: 'traceSelectRecord', recordId })}
             onOpenRecording={recordingDir => vscodeApi.postMessage({ command: 'traceOpenRecording', ...(recordingDir ? { recordingDir } : {}) })}
             onSaveRecording={(recordId, targetDir) => vscodeApi.postMessage({ command: 'traceSaveRecording', recordId, ...(targetDir ? { targetDir } : {}) })}
+            onExportRaw={(recordId, outputPath) => vscodeApi.postMessage({ command: 'traceExportRaw', recordId, ...(outputPath ? { outputPath } : {}) })}
+            onExportCsv={req => vscodeApi.postMessage({ command: 'traceExportCsv', ...req })}
             onCloseRecording={recordId => vscodeApi.postMessage({ command: 'traceCloseRecording', recordId })}
             onQueryViewport={handleQueryViewport}
             onInspectPoint={handleInspectPoint}
@@ -1017,6 +1039,7 @@ export function RtosApp() {
             onGetDiagnostics={handleGetDiagnostics}
             onEventsPerfReport={handleEventsPerfReport}
             onTerminalPerfReport={handleTerminalPerfReport}
+            onExportCsv={req => vscodeApi.postMessage({ command: 'traceExportCsv', ...req })}
           />
         ) : panel.session.phase === 'none' ? (
           <div className="rtos-empty" role="status">

@@ -767,10 +767,69 @@ export class TraceWorkerRuntime {
             return;
           }
           try {
-            const res = await slot.store.exportRaw({
-              outputPath: msg.outputPath,
+          const res = await slot.store.exportRaw({
+            outputPath: msg.outputPath,
+            cancel: guard.token,
+            verifyChunkCrc32: msg.verifyChunkCrc32,
+          });
+          this.replyFromStoreResult(msg.reqId, res);
+          } finally {
+            guard.cleanup();
+          }
+          return;
+        }
+
+        case 'saveArchive': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const guard = this.buildCancelToken(msg.queryId, msg.recordId, msg.cancelSlot, msg.cancelToken);
+          if (!guard.ok) {
+            this.replyErr(msg.reqId, 'QueryQueueFull', `并发查询/导出数已达上限 ${this.limits.maxPendingQueries}`, {
+              backpressure: true,
+            });
+            return;
+          }
+          try {
+            const res = await slot.store.saveArchive({
+              targetDir: msg.targetDir,
               cancel: guard.token,
               verifyChunkCrc32: msg.verifyChunkCrc32,
+            });
+            this.replyFromStoreResult(msg.reqId, res);
+          } finally {
+            guard.cleanup();
+          }
+          return;
+        }
+
+        case 'exportCsvToFile': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const guard = this.buildCancelToken(
+            msg.queryId,
+            msg.recordId,
+            msg.cancelSlot,
+            msg.cancelToken,
+            msg.yieldEveryPages,
+            msg.yieldEveryItems,
+          );
+          if (!guard.ok) {
+            this.replyErr(msg.reqId, 'QueryQueueFull', `并发查询/导出数已达上限 ${this.limits.maxPendingQueries}`, {
+              backpressure: true,
+            });
+            return;
+          }
+          try {
+            const res = await slot.store.exportCsv({
+              outputPath: msg.outputPath,
+              request: msg.request,
+              cancel: guard.token,
             });
             this.replyFromStoreResult(msg.reqId, res);
           } finally {
@@ -941,10 +1000,15 @@ export class TraceWorkerRuntime {
         code === 'EEXIST'
           ? 'RecordingDirectoryNotEmpty'
           : code;
+      const diagnostics =
+        err && typeof err === 'object' && (err as { diagnostics?: unknown }).diagnostics && typeof (err as { diagnostics?: unknown }).diagnostics === 'object'
+          ? (err as { diagnostics: Record<string, unknown> }).diagnostics
+          : undefined;
       this.replyErr(
         msg.reqId,
         mappedCode,
         err instanceof Error ? err.message : String(err),
+        diagnostics ? { diagnostics } : {},
       );
     }
   }

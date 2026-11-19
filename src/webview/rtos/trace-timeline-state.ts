@@ -285,11 +285,48 @@ export interface TraceRecordSummary {
   readonly stoppedAtMs?: number;
   readonly nonStandardNotice?: string;
   readonly formatVersion?: number;
+  readonly indexStatus?: 'valid' | 'missing' | 'corrupt';
+  readonly recoveryDisposition?:
+    | 'intact'
+    | 'rebuilt-bad-index'
+    | 'recovered-prefix-bad-chunk'
+    | 'recovered-interrupted'
+    | 'recovered-failed'
+    | 'unrecoverable';
+  readonly hasCommittedChunkCorruption?: boolean;
+  readonly rawSha256Verified?: boolean;
+  readonly actualRawFileBytes?: number;
+  readonly inspectionDiagnostics?: ReadonlyArray<{
+    readonly code: string;
+    readonly file: string;
+    readonly offset?: number;
+    readonly message: string;
+  }>;
   readonly recoverableRawBytes?: number;
   readonly uncommittedTailBytes?: number;
   readonly segments: readonly TraceSegmentDto[];
   readonly gaps: readonly TraceGapDto[];
 }
+
+export const TRACE_ARCHIVE_CAPABILITIES = {
+  orbitArchive: {
+    available: true,
+    evidence: 'offline' as const,
+  },
+  rawBin: {
+    available: true,
+    evidence: 'offline' as const,
+  },
+  csvExport: {
+    available: true,
+    evidence: 'offline' as const,
+  },
+  svdat: {
+    available: false,
+    reason: 'SEGGER 手册允许特定抓取导出裸流命名，但不等价于官方 GUI 带元数据 .SVDat 归档双向互通；本机 SystemView V4.10b 打开裸流时弹出 "No Commercial-Use License" 对话框阻断实测，故 .SVDat 保持不可用，裸原始流仅导出 .bin',
+    evidence: 'offline' as const,
+  },
+} as const;
 
 export interface TraceTargetProbeState {
   readonly ok: boolean;

@@ -237,4 +237,99 @@ describe('Orbit 内部 Trace 格式与校验 (阶段 4.3)', () => {
     expect(inspCorrupt.diagnostics.some((d) => d.code === 'raw-crc-mismatch')).toBe(true);
     expect(createHash('sha256').update(sample.subarray(0, prefixLen)).digest('hex')).toBeTypeOf('string');
   });
+
+  it('精确区分坏索引、截断最终 journal 帧（可按已验证 SHA 恢复）、以及非法格式/版本号拒绝', async () => {
+    const sample = await fs.readFile('scripts/rtos/fixtures/samples/continuous.bin');
+    const sampleSha = createHash('sha256').update(sample).digest('hex');
+
+    // 1. corrupt-index: 破坏 index.otidx 但 journal.otj 完整 -> 可由 journal 重建索引
+    const dirBadIdx = await makeTempDir('orbit-fmt-badidx-');
+    const sIdx = await TraceRecordingStore.create({
+      recordingDir: dirBadIdx,
+      recordId: 'rec-badidx',
+      identity: { sessionId: 's1', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-badidx' },
+      commitOnEachIngest: true,
+    });
+    expect((await sIdx.ingestRawChunk(sample, { batchSequence: 1 })).ok).toBe(true);
+    expect((await sIdx.finish()).ok).toBe(true);
+    await sIdx.close();
+
+    await fs.writeFile(path.join(dirBadIdx, ORBIT_TRACE_FILES.index), Buffer.from('CORRUPT-IDX'));
+    const inspBadIdx = await inspectRecordingDirectory(dirBadIdx);
+    expect(inspBadIdx.indexStatus).toBe('corrupt');
+    expect(inspBadIdx.recoveryDisposition).toBe('rebuilt-bad-index');
+    expect(inspBadIdx.isRecoverable).toBe(true);
+    expect(inspBadIdx.recoverableRawBytes).toBe(sample.length);
+    expect(inspBadIdx.rawSha256Verified).toBe(true);
+    expect(inspBadIdx.diagnostics.some((d) => d.code === 'corrupt-index')).toBe(true);
+
+    const { store: reopenedIdx } = await TraceRecordingStore.open({ recordingDir: dirBadIdx });
+    const outIdxDir = await makeTempDir('orbit-fmt-outidx-');
+    const expIdx = path.join(outIdxDir, 'rebuilt.bin');
+    expect((await reopenedIdx.exportRaw({ outputPath: expIdx })).ok).toBe(true);
+    expect(createHash('sha256').update(await fs.readFile(expIdx)).digest('hex')).toBe(sampleSha);
+    await reopenedIdx.close();
+
+    // 2. truncated-final-journal-frame (无已提交块损坏):
+    // 2a. 未 finish 崩溃 -> manifest.rawSha256 不存在 -> status=interrupted, rawSha256Verified=false
+    const dirTruncJ = await makeTempDir('orbit-fmt-truncj-');
+    const sTj = await TraceRecordingStore.create({
+      recordingDir: dirTruncJ,
+      recordId: 'rec-truncj',
+      identity: { sessionId: 's1', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-truncj' },
+      commitOnEachIngest: true,
+    });
+    expect((await sTj.ingestRawChunk(sample, { batchSequence: 1 })).ok).toBe(true);
+    await sTj.close(); // unclean close without finish
+    await fs.appendFile(path.join(dirTruncJ, ORBIT_TRACE_FILES.journal), Buffer.from([0x4f, 0x54, 0x4a, 0x31, 0x00, 0x00]));
+    const inspTruncJ = await inspectRecordingDirectory(dirTruncJ);
+    expect(inspTruncJ.status).toBe('interrupted');
+    expect(inspTruncJ.recoveryDisposition).toBe('recovered-interrupted');
+    expect(inspTruncJ.isRecoverable).toBe(true);
+    expect(inspTruncJ.rawSha256Verified).toBe(false);
+    expect(inspTruncJ.recoverableRawBytes).toBe(sample.length);
+    expect(inspTruncJ.diagnostics.some((d) => d.code === 'truncated-journal-tail')).toBe(true);
+
+    // 2b. 已 finish（含 manifest.rawSha256）但最终 clean_close journal 帧写入半截截断 -> status=interrupted 且 rawSha256Verified=true
+    const dirTruncJFin = await makeTempDir('orbit-fmt-truncj-fin-');
+    const sTjFin = await TraceRecordingStore.create({
+      recordingDir: dirTruncJFin,
+      recordId: 'rec-truncj-fin',
+      identity: { sessionId: 's1', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-truncj-fin' },
+      commitOnEachIngest: true,
+    });
+    expect((await sTjFin.ingestRawChunk(sample, { batchSequence: 1 })).ok).toBe(true);
+    expect((await sTjFin.finish()).ok).toBe(true);
+    await sTjFin.close();
+    const jPathFin = path.join(dirTruncJFin, ORBIT_TRACE_FILES.journal);
+    const jBytesFin = await fs.readFile(jPathFin);
+    await fs.writeFile(jPathFin, jBytesFin.subarray(0, jBytesFin.length - 10));
+    const inspTruncJFin = await inspectRecordingDirectory(dirTruncJFin);
+    expect(inspTruncJFin.status).toBe('interrupted');
+    expect(inspTruncJFin.recoveryDisposition).toBe('recovered-interrupted');
+    expect(inspTruncJFin.isRecoverable).toBe(true);
+    expect(inspTruncJFin.rawSha256Verified).toBe(true);
+    expect(inspTruncJFin.recoverableRawBytes).toBe(sample.length);
+
+    // 3. unsupported-version (999) & unsupported-format: 必须拒绝打开
+    const dirBadVer = await makeTempDir('orbit-fmt-ver999-');
+    await fs.cp(dirTruncJ, dirBadVer, { recursive: true });
+    const manifestPath = path.join(dirBadVer, ORBIT_TRACE_FILES.manifest);
+    const man = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    man.formatVersion = 999;
+    await fs.writeFile(manifestPath, JSON.stringify(man, null, 2));
+    const inspBadVer = await inspectRecordingDirectory(dirBadVer);
+    expect(inspBadVer.detectedFormatVersion).toBe(999);
+    expect(inspBadVer.isRecoverable).toBe(false);
+    expect(inspBadVer.diagnostics.some((d) => d.code === 'unsupported-version')).toBe(true);
+    await expect(TraceRecordingStore.open({ recordingDir: dirBadVer })).rejects.toMatchObject({ code: 'UnsupportedArchiveVersion' });
+
+    const dirBadFmt = await makeTempDir('orbit-fmt-badfmt-');
+    await fs.cp(dirTruncJ, dirBadFmt, { recursive: true });
+    const manFmtPath = path.join(dirBadFmt, ORBIT_TRACE_FILES.manifest);
+    const manFmt = JSON.parse(await fs.readFile(manFmtPath, 'utf8'));
+    manFmt.format = 'custom-unknown-v9';
+    await fs.writeFile(manFmtPath, JSON.stringify(manFmt, null, 2));
+    await expect(TraceRecordingStore.open({ recordingDir: dirBadFmt })).rejects.toMatchObject({ code: 'UnsupportedArchiveFormat' });
+  });
 });

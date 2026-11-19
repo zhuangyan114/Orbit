@@ -848,4 +848,249 @@ describe('TraceRecordingStore 存储、索引、LOD 与异常恢复 (阶段 4.3)
     expect((await bStore.ingestRawChunk(sample.subarray(35, 44), { batchSequence: 3 })).ok).toBe(false);
     await bStore.close();
   });
+
+  it('saveArchive 支持完整/坏索引/坏块精确前缀恢复、路径安全保护与取消/写失败回滚', async () => {
+    const sample = await fs.readFile('scripts/rtos/fixtures/samples/continuous.bin');
+    const sandbox = await makeTempDir('orbit-save-sandbox-');
+    const dirSrc = path.join(sandbox, 'src');
+    const store = await TraceRecordingStore.create({
+      recordingDir: dirSrc,
+      recordId: 'rec-save',
+      identity: { sessionId: 's-save', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-save' },
+      commitOnEachIngest: true,
+    });
+    expect((await store.ingestRawChunk(sample.subarray(0, 35), { batchSequence: 1 })).ok).toBe(true);
+    expect((await store.ingestRawChunk(sample.subarray(35), { batchSequence: 2 })).ok).toBe(true);
+    expect((await store.finish()).ok).toBe(true);
+
+    // 1. 路径安全拒绝：自导出、子目录、父目录、非空目标目录、.svdat 扩展名
+    const sameRes = await store.saveArchive({ targetDir: dirSrc });
+    expect(sameRes.ok).toBe(false);
+    if (!sameRes.ok) expect(sameRes.errorCode).toBe('ExportPathConflict');
+
+    const childRes = await store.saveArchive({ targetDir: path.join(dirSrc, 'nested-copy') });
+    expect(childRes.ok).toBe(false);
+    if (!childRes.ok) expect(childRes.errorCode).toBe('ExportPathConflict');
+
+    const parentRes = await store.saveArchive({ targetDir: path.dirname(dirSrc) });
+    expect(parentRes.ok).toBe(false);
+    if (!parentRes.ok) expect(parentRes.errorCode).toBe('ExportPathConflict');
+
+    const nonEmptyDir = path.join(sandbox, 'nonempty');
+    await fs.mkdir(nonEmptyDir, { recursive: true });
+    await fs.writeFile(path.join(nonEmptyDir, 'keep.txt'), 'do-not-overwrite');
+    const nonEmptyRes = await store.saveArchive({ targetDir: nonEmptyDir });
+    expect(nonEmptyRes.ok).toBe(false);
+    if (!nonEmptyRes.ok) expect(nonEmptyRes.errorCode).toBe('RecordingDirectoryNotEmpty');
+
+    const svdatArchiveRes = await store.saveArchive({ targetDir: path.join(sandbox, 'bad.SVDat') });
+    expect(svdatArchiveRes.ok).toBe(false);
+    if (!svdatArchiveRes.ok) expect(svdatArchiveRes.errorCode).toBe('UnsupportedCapability');
+
+    // 2. 正常保存到空目录并重开校验一致性
+    const cleanOut = path.join(sandbox, 'saved-clean');
+    const saveOk = await store.saveArchive({ targetDir: cleanOut });
+    expect(saveOk).toMatchObject({ ok: true });
+    if (saveOk.ok) {
+      expect(saveOk.data.inspection.recoverableRawBytes).toBe(sample.length);
+      expect(saveOk.data.inspection.rawSha256Verified).toBe(true);
+    }
+    const { store: reopenedClean, inspection: cleanInsp } = await TraceRecordingStore.open({ recordingDir: cleanOut });
+    expect(cleanInsp.status).toBe('completed');
+    await reopenedClean.close();
+    await store.close();
+
+    // 3. 损坏第 2 批已提交块 -> 只恢复精确的第 1 批前缀（35 B）
+    const dirCorrupt = path.join(sandbox, 'corrupt-src');
+    await fs.cp(dirSrc, dirCorrupt, { recursive: true });
+    const rawPath = path.join(dirCorrupt, ORBIT_TRACE_FILES.raw);
+    const rawBuf = await fs.readFile(rawPath);
+    rawBuf[40] ^= 0xff;
+    await fs.writeFile(rawPath, rawBuf);
+    const { store: corruptStore } = await TraceRecordingStore.open({ recordingDir: dirCorrupt });
+    expect(corruptStore.getInspection()?.recoveryDisposition).toBe('recovered-prefix-bad-chunk');
+    const recoveredOut = path.join(sandbox, 'saved-recovered-prefix');
+    const recRes = await corruptStore.saveArchive({ targetDir: recoveredOut });
+    expect(recRes.ok).toBe(true);
+    if (recRes.ok) {
+      expect(recRes.data.inspection.recoverableRawBytes).toBe(35);
+      expect(recRes.data.inspection.recoveryDisposition).toBe('recovered-interrupted');
+      const expRaw = path.join(sandbox, 'prefix.bin');
+      const { store: reopenedRec } = await TraceRecordingStore.open({ recordingDir: recoveredOut });
+      expect((await reopenedRec.exportRaw({ outputPath: expRaw })).ok).toBe(true);
+      expect(createHash('sha256').update(await fs.readFile(expRaw)).digest('hex')).toBe(
+        createHash('sha256').update(sample.subarray(0, 35)).digest('hex'),
+      );
+      await reopenedRec.close();
+    }
+    await corruptStore.close();
+
+    // 4. 取消与写失败（ENOSPC）回滚，不能残留临时目录或部分输出
+    const { store: reopenedForFail } = await TraceRecordingStore.open({ recordingDir: cleanOut });
+    const cancelOut = path.join(sandbox, 'saved-cancelled');
+    const cancelRes = await reopenedForFail.saveArchive({
+      targetDir: cancelOut,
+      cancel: { isCancelled: () => true },
+    });
+    expect(cancelRes.ok).toBe(false);
+    if (!cancelRes.ok) expect(cancelRes.errorCode).toBe('QueryCancelled');
+    await expect(fs.stat(cancelOut)).rejects.toThrow();
+
+    const failFs = new (class extends NodeTraceFileSystem {
+      override async open(filePath: string, flags: string): Promise<TraceFileHandle> {
+        const handle = await super.open(filePath, flags);
+        if (flags === 'wx' && filePath.includes('saved-enospc')) {
+          return {
+            async write() {
+              const e: NodeJS.ErrnoException = new Error('No space left on device');
+              e.code = 'ENOSPC';
+              throw e;
+            },
+            read: handle.read.bind(handle),
+            truncate: handle.truncate.bind(handle),
+            stat: handle.stat.bind(handle),
+            sync: handle.sync.bind(handle),
+            close: handle.close.bind(handle),
+          };
+        }
+        return handle;
+      }
+    })();
+    const enospcDir = path.join(sandbox, 'saved-enospc');
+    const { store: reopenEnospc } = await TraceRecordingStore.open({ recordingDir: cleanOut, fileSystem: failFs });
+    const enospcRes = await reopenEnospc.saveArchive({ targetDir: enospcDir });
+    expect(enospcRes.ok).toBe(false);
+    if (!enospcRes.ok) expect(enospcRes.errorCode).toBe('ENOSPC');
+    await expect(fs.stat(enospcDir)).rejects.toThrow();
+    await reopenEnospc.close();
+    await reopenedForFail.close();
+  });
+
+  it('exportRaw 同路径并发、提交时目标抢占（含硬链接/EXDEV回退wx）与发布取消均不覆盖赢家文件', async () => {
+    const sample = await fs.readFile('scripts/rtos/fixtures/samples/continuous.bin');
+    const sandbox = await makeTempDir('orbit-raw-race-');
+    const recDir = path.join(sandbox, 'rec');
+    const s = await TraceRecordingStore.create({
+      recordingDir: recDir,
+      recordId: 'rec-raw-race',
+      identity: { sessionId: 's-rr', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-raw-race' },
+      commitOnEachIngest: true,
+    });
+    expect((await s.ingestRawChunk(sample, { batchSequence: 1 })).ok).toBe(true);
+    expect((await s.finish()).ok).toBe(true);
+    await s.close();
+
+    // 1. 两个并发 exportRaw 竞争同一 outputPath：恰好 1 胜 1 负（ExportTargetExists），赢家内容完整且无残留临时文件
+    const sameRawOut = path.join(sandbox, 'concurrent.bin');
+    const { store: s1 } = await TraceRecordingStore.open({ recordingDir: recDir });
+    const { store: s2 } = await TraceRecordingStore.open({ recordingDir: recDir });
+    const [r1, r2] = await Promise.all([
+      s1.exportRaw({ outputPath: sameRawOut }),
+      s2.exportRaw({ outputPath: sameRawOut }),
+    ]);
+    await Promise.all([s1.close(), s2.close()]);
+    const oks = [r1, r2].filter((r) => r.ok);
+    const errs = [r1, r2].filter((r) => !r.ok);
+    expect(oks.length).toBe(1);
+    expect(errs.length).toBe(1);
+    if (!errs[0].ok) expect(errs[0].errorCode).toBe('ExportTargetExists');
+    expect((await fs.readFile(sameRawOut)).length).toBe(sample.length);
+    expect((await fs.readdir(sandbox)).filter((n) => n.includes('.orbit-export-'))).toEqual([]);
+
+    // 2. 提交时在 link() 之前并发写入外部文件，以及 EXDEV 回退 'wx' 前并发写入外部文件：均拒绝覆盖并保护外部赢家
+    const externalContent = Buffer.from('EXTERNAL_RAW_WINNER');
+    for (const mode of ['link-race', 'exdev-wx-race'] as const) {
+      const targetOut = path.join(sandbox, `${mode}.bin`);
+      const raceFs = new (class extends NodeTraceFileSystem {
+        override async link(existingPath: string, newPath: string): Promise<void> {
+          if (newPath === targetOut) {
+            if (mode === 'link-race') {
+              await fs.writeFile(newPath, externalContent, { flag: 'wx' });
+            } else {
+              const e: NodeJS.ErrnoException = new Error('EXDEV unsupported');
+              e.code = 'EXDEV';
+              throw e;
+            }
+          }
+          return super.link(existingPath, newPath);
+        }
+        override async open(filePath: string, flags: string): Promise<TraceFileHandle> {
+          if (mode === 'exdev-wx-race' && flags === 'wx' && filePath === targetOut) {
+            await fs.writeFile(targetOut, externalContent, { flag: 'wx' });
+          }
+          return super.open(filePath, flags);
+        }
+      })();
+      const { store: sr } = await TraceRecordingStore.open({ recordingDir: recDir, fileSystem: raceFs });
+      const res = await sr.exportRaw({ outputPath: targetOut });
+      await sr.close();
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.errorCode).toBe('ExportTargetExists');
+      expect(await fs.readFile(targetOut)).toEqual(externalContent);
+      expect((await fs.readdir(sandbox)).filter((n) => n.includes('.orbit-export-'))).toEqual([]);
+    }
+
+    // 3. 发布阶段 fallback wx 拷贝途中取消：清理新建部分文件与临时文件，且 0 字节录制同样走无覆盖发布
+    let cancelFlag = false;
+    const cancelFallbackFs = new (class extends NodeTraceFileSystem {
+      override async link(): Promise<void> {
+        const e: NodeJS.ErrnoException = new Error('ENOTSUP');
+        e.code = 'ENOTSUP';
+        throw e;
+      }
+      override async open(filePath: string, flags: string): Promise<TraceFileHandle> {
+        const h = await super.open(filePath, flags);
+        if (flags === 'wx' && filePath.endsWith('cancel-pub.bin')) {
+          return {
+            async write(buf, offset, length, position) {
+              cancelFlag = true;
+              return h.write(buf, offset, length, position);
+            },
+            read: h.read.bind(h),
+            truncate: h.truncate.bind(h),
+            stat: h.stat.bind(h),
+            sync: h.sync.bind(h),
+            close: h.close.bind(h),
+          };
+        }
+        return h;
+      }
+    })();
+    const cancelOut = path.join(sandbox, 'cancel-pub.bin');
+    const { store: sc } = await TraceRecordingStore.open({ recordingDir: recDir, fileSystem: cancelFallbackFs });
+    const cancelRes = await sc.exportRaw({
+      outputPath: cancelOut,
+      cancel: { isCancelled: () => cancelFlag },
+    });
+    await sc.close();
+    expect(cancelRes.ok).toBe(false);
+    if (!cancelRes.ok) expect(cancelRes.errorCode).toBe('QueryCancelled');
+    await expect(fs.stat(cancelOut)).rejects.toThrow();
+    expect((await fs.readdir(sandbox)).filter((n) => n.includes('.orbit-export-'))).toEqual([]);
+
+    // 4. 0 字节导出在提交前目标被并发创建：同样拒绝覆盖
+    const emptyDir = path.join(sandbox, 'empty-rec');
+    const se = await TraceRecordingStore.create({
+      recordingDir: emptyDir,
+      recordId: 'rec-empty-race',
+      identity: { sessionId: 's-er', sessionGeneration: 1, bootGeneration: 1, recordId: 'rec-empty-race' },
+    });
+    expect((await se.finish()).ok).toBe(true);
+    await se.close();
+    const emptyTarget = path.join(sandbox, 'empty-race.bin');
+    const emptyRaceFs = new (class extends NodeTraceFileSystem {
+      override async link(existingPath: string, newPath: string): Promise<void> {
+        if (newPath === emptyTarget) {
+          await fs.writeFile(newPath, externalContent, { flag: 'wx' });
+        }
+        return super.link(existingPath, newPath);
+      }
+    })();
+    const { store: seOpen } = await TraceRecordingStore.open({ recordingDir: emptyDir, fileSystem: emptyRaceFs });
+    const seRes = await seOpen.exportRaw({ outputPath: emptyTarget });
+    await seOpen.close();
+    expect(seRes.ok).toBe(false);
+    if (!seRes.ok) expect(seRes.errorCode).toBe('ExportTargetExists');
+    expect(await fs.readFile(emptyTarget)).toEqual(externalContent);
+  });
 });

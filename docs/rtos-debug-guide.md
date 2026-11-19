@@ -23,6 +23,15 @@ Orbit 内置底部 **RTOS** 面板（`Tasks & Objects`），直接通过当前�
 - **未检测到 FreeRTOS 内核 (`RtosNotDetected`)**：ELF 中缺少 `pxCurrentTCB`、`uxCurrentNumberOfTasks` 或 `pxReadyTasksLists`。
 - **部分结果 (`partial`)**：目标运行中读取期间链表发生变动，或单帧详情预算达到上限；界面会明确标示降级原因并保留已独立校验的数据。
 
+## Trace 录制、离线归档与导出
+
+1. 在底部 **RTOS** 面板切换到 **Trace Timeline** 或 **Contexts & Events**：
+   - 可离线打开既有 `orbit-trace-v1` 录制目录（或选中 `manifest.json`），支持查看损坏归档的精确已校验前缀并按原样/修复索引保存副本。
+   - **保存归档**：将经校验的已提交前缀保存到新的空目录，禁止覆盖源目录或非空目标目录。
+   - **导出 `.bin`**：仅将经校验的连续裸原始 SystemView 字节流导出为 `.bin`（不包含未提交尾部或损坏前缀之后的字节）。
+   - **导出 `.csv`**：支持 **Trace 视口**、**A/B 选区** 与 **Events 当前过滤范围** 三种范围的有界流式导出；CSV 采用 LF（`\n`）行分隔与 RFC 4180 引号规则，固定输出 39 列并标注时间单位、时钟域、系统主频、锚定状态及缺口/过载/前缀恢复等不确定性标志。所有导出均采用提交时无覆盖发布，禁止覆盖或竞争替换既有文件及自导出到源目录内部。
+2. 关于 SEGGER `.SVDat`：Orbit 当前保持 `.SVDat` 能力**不可用**（SEGGER 手册对部分裸流抓取虽允许 `.SVDat`/`.bin` 命名，但本机官方带元信息样本与 GUI 归档双向互通未能在 `"No Commercial-Use License"` 弹窗下完成实测验证），Orbit 只将裸流导出 `.bin`，界面及接口均会直接拒绝 `.SVDat` 路径，请改用 Orbit 归档目录、`.bin` 或 `.csv`。
+
 ## 外部视图扩展兼容性
 
 - Memory View（`memory-view`）、Peripheral Viewer 及 `mcu-debug.debug-tracker-vscode` 等外部扩展仍可通过 Orbit 提供的标准 DAP 能力（`supportsReadMemoryRequest`、`readMemory`、`writeMemory`、`variables`、`evaluate` 与 `memoryReference`）独立工作。

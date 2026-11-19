@@ -51,3 +51,14 @@ J-Link native、CMSIS-DAP WinUSB/HID、J-Link legacy 和其他 RMLink/XR 路径�
 | 配置变体 | 新输出目录重建及类型图复验通过 | CMSIS v1/v2、优化、stats/stack-bound 关闭及 tickless 仍只有离线证据 |
 
 上文“离线选定配置/阶段 0 当前状态”是阶段 0 的冻结记录。阶段 1 的精确环境、哈希、门槛及限制见 [验收报告](stage1-validation.md) 和 [原始证据索引](stage1-evidence.json)。阶段 2 内建面板、阶段 3 RTT 扩展、阶段 4 Trace 录制与阶段 6 其他链路/长稳门槛继续保留。
+
+## 阶段 5.3 归档、CSV 与 SVDat 支持矩阵（2026-11-19）
+
+| 格式 / 能力 | 状态 | 实际边界与依据 |
+|---|---|---|
+| Orbit 原始录制归档（`orbit-trace-v1` 目录） | 已支持 | 通过真实 Worker 保存/离线打开，支持 `manifest.json` 格式/版本号校验、`raw.otbin`/`data.otd`/`journal.otj`/`index.otidx` 逐帧 CRC32 与 `rawSha256` 核对；区分坏索引重建（`rebuilt-bad-index`）、坏块精确前缀截断恢复（`recovered-prefix-bad-chunk`）与未完整关闭恢复（`recovered-interrupted`），拒绝高于支持版本的归档（如 `formatVersion: 999`） |
+| 原始 SystemView 二进制流（`.bin`） | 已支持（只读导出） | Orbit 仅将经 `journal.otj` 与 CRC32 校验的已提交 `raw.otbin` 裸原始流导出为 `.bin`；采用提交时原子无覆盖发布（`link` 优先，不支持时退回 `'wx'` 拷贝），禁止覆盖既有文件、目录内导出及 `.SVDat` 扩展名 |
+| Trace CSV 导出（`.csv`） | 已支持 | 在 Worker 中有界分块流式导出 Trace 视口、A/B 选区与 Events 当前筛选范围；采用 LF（`\n`）行分隔、RFC 4180 字段引号转义（逗号、换行、单双引号）与原子无覆盖发布；固定 39 列元数据/时间单位/不确定性标志，对来自记录或 `manifest.json` 的外部字符串前缀中和 `=`/`+`/`-`/`@`/空白/`\t`/`\r`/`\n`，数值列保持原数值；不把百万事件或大文件整包传进 Webview |
+| SEGGER `.SVDat` 导入 / 导出 | 不支持（保留例外） | 官方手册（`UM08027` V4.10b）对特定抓取场景允许裸流命名为 `.SVDat` 或 `.bin`，但本机 `Sample/*.SVDat` 带 `;` 文本元信息头，前者不证明 GUI 保存的带元数据归档可双向互通；`License_SystemView.txt` 包含 SFL/CUL 条款与第 `1(a)` 条限制描述，且本机 `SystemView.exe` V4.10b 打开 H723 `.bin` 在加载前即被 `"No Commercial-Use License"` 对话框阻断实测。Orbit 仅以 `.bin` 导出裸流，`.SVDat` 能力保持不可用，界面及接口均显式拒绝 `.SVDat` |
+
+详见 [阶段 5.3 归档与 SVDat 评估报告](stage5-archive-validation.md)。

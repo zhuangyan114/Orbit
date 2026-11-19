@@ -18,6 +18,7 @@ import type {
   MarkerInterval,
   MarkerPointEvent,
   ReadyWaitInterval,
+  ReconstructorDiagnostic,
   TaskInstanceSummary,
   TraceReconstructionIdentity,
   TraceTimePoint,
@@ -236,6 +237,9 @@ export interface JournalCommitMetadata {
   readonly segments?: readonly SegmentIndexMetadata[];
   readonly gaps?: readonly StoredGapEntry[];
   readonly tasks?: readonly TaskInstanceSummary[];
+  readonly decoderDiagnostics?: readonly TraceDiagnostic[];
+  readonly reconstructorDiagnostics?: readonly ReconstructorDiagnostic[];
+  readonly droppedDiagnosticsCount?: number;
   readonly countsDelta?: {
     readonly packetCount?: number;
     readonly sliceCount?: number;

@@ -18,12 +18,19 @@ import type {
   StoredGapEntry,
   TraceAnalysisQueryRequest,
   TraceAnalysisQueryResult,
+  TraceEventLocateRequest,
+  TraceEventLocateResult,
+  TraceEventsQueryRequest,
+  TraceEventsQueryResult,
   TraceLodQueryRequest,
   TraceLodQueryResult,
   TraceRangeQueryRequest,
   TraceRangeQueryResult,
+  TraceRecordingDiagnosticsResult,
   TraceRecordingManifest,
   TraceStorageStats,
+  TraceTerminalQueryRequest,
+  TraceTerminalQueryResult,
   TraceWorkerStatsSnapshot,
 } from './trace-worker-protocol';
 import type { TraceStorageResult } from './trace-recording-store';
@@ -150,6 +157,40 @@ export interface TraceWorkerClientLike {
       queryId?: string;
     },
   ): Promise<TraceStorageResult<TraceAnalysisQueryResult>>;
+  queryEvents?(
+    recordId: string,
+    request: TraceEventsQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceEventsQueryResult>>;
+  locateEvent?(
+    recordId: string,
+    request: TraceEventLocateRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceEventLocateResult>>;
+  queryTerminal?(
+    recordId: string,
+    request: TraceTerminalQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceTerminalQueryResult>>;
+  getDiagnostics?(
+    recordId: string,
+    options?: { bootGeneration?: number; segmentId?: number; limit?: number },
+  ): Promise<TraceStorageResult<TraceRecordingDiagnosticsResult>>;
   getSegments(recordId: string): Promise<TraceStorageResult<readonly SegmentIndexMetadata[]>>;
   getGaps(recordId: string): Promise<TraceStorageResult<readonly StoredGapEntry[]>>;
   exportRawToFile(
@@ -1037,6 +1078,68 @@ export class TraceRecordingCoordinator {
       return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持统计分析聚合' };
     }
     return worker.queryAnalysis(recordId, request, options);
+  }
+
+  public async queryEvents(
+    recordId: string,
+    request: TraceEventsQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceEventsQueryResult>> {
+    const worker = this.ensureWorker();
+    if (!worker.queryEvents) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持事件分页查询' };
+    }
+    return worker.queryEvents(recordId, request, options);
+  }
+
+  public async locateEvent(
+    recordId: string,
+    request: TraceEventLocateRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceEventLocateResult>> {
+    const worker = this.ensureWorker();
+    if (!worker.locateEvent) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持事件定位查询' };
+    }
+    return worker.locateEvent(recordId, request, options);
+  }
+
+  public async queryTerminal(
+    recordId: string,
+    request: TraceTerminalQueryRequest,
+    options?: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    },
+  ): Promise<TraceStorageResult<TraceTerminalQueryResult>> {
+    const worker = this.ensureWorker();
+    if (!worker.queryTerminal) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持 Trace Terminal 查询' };
+    }
+    return worker.queryTerminal(recordId, request, options);
+  }
+
+  public async getDiagnostics(
+    recordId: string,
+    options?: { bootGeneration?: number; segmentId?: number; limit?: number },
+  ): Promise<TraceStorageResult<TraceRecordingDiagnosticsResult>> {
+    const worker = this.ensureWorker();
+    if (!worker.getDiagnostics) {
+      return { ok: false, errorCode: 'UnsupportedCapability', message: '当前 Trace Worker 不支持录制诊断查询' };
+    }
+    return worker.getDiagnostics(recordId, options);
   }
 
   public async flushRecording(

@@ -1,15 +1,24 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TaskSnapshot } from '../../rtos/model';
-import { ContextsView } from './contexts-view';
+import type { TraceEventDto } from '../../trace/systemview-formatter';
+import type { TraceEventCategoryFilter, TraceTerminalLevelFilter, TraceTerminalLineDto } from '../../trace/trace-events';
+import { ContextsView, type ContextsSubTab } from './contexts-view';
 import { ObjectsView } from './objects-view';
 import { TimersHeapView } from './timers-heap-view';
 import { TraceTimelineView, type SharedTraceCursor } from './trace-timeline-view';
 import {
   computeAxisDomain,
+  computeTimelineJumpForEvent,
+  resolveEventTimeStrForUnit,
   type TraceAnalysisResponse,
   type TraceAnalysisSourceKind,
+  type TraceDiagnosticsResponse,
+  type TraceEventLocateResponse,
+  type TraceEventsResponse,
+  type TraceFocusedEventRef,
   type TracePointInspectResponse,
   type TraceRecordSummary,
+  type TraceTerminalResponse,
   type TraceTimeUnit,
   type TraceViewportResponse,
 } from './trace-timeline-state';
@@ -104,6 +113,10 @@ export function RtosApp() {
   const [themeKind, setThemeKind] = useState<'dark' | 'light' | 'hc'>(() => detectThemeKind());
   const [traceViewport, setTraceViewport] = useState<TraceViewportResponse | null>(null);
   const [traceAnalysis, setTraceAnalysis] = useState<TraceAnalysisResponse | null>(null);
+  const [traceEvents, setTraceEvents] = useState<TraceEventsResponse | null>(null);
+  const [traceEventLocate, setTraceEventLocate] = useState<TraceEventLocateResponse | null>(null);
+  const [traceTerminal, setTraceTerminal] = useState<TraceTerminalResponse | null>(null);
+  const [traceDiagnostics, setTraceDiagnostics] = useState<TraceDiagnosticsResponse | null>(null);
   const [hoverInspect, setHoverInspect] = useState<TracePointInspectResponse | null>(null);
   const [cursorAInspect, setCursorAInspect] = useState<TracePointInspectResponse | null>(null);
   const [cursorBInspect, setCursorBInspect] = useState<TracePointInspectResponse | null>(null);
@@ -112,10 +125,28 @@ export function RtosApp() {
   const [cursorA, setCursorA] = useState<SharedTraceCursor | null>(null);
   const [cursorB, setCursorB] = useState<SharedTraceCursor | null>(null);
   const [contextsRangeSource, setContextsRangeSource] = useState<TraceAnalysisSourceKind>('viewport');
+  const [contextsSubTab, setContextsSubTab] = useState<ContextsSubTab>('contexts');
+  const [focusedEvent, setFocusedEvent] = useState<TraceFocusedEventRef | null>(null);
+  const [pendingLocateTarget, setPendingLocateTarget] = useState<{
+    readonly seq: number;
+    readonly recordId: string;
+    readonly unit: TraceTimeUnit;
+    readonly bootGeneration?: number;
+    readonly segmentId?: number;
+    readonly timeStr: string;
+    readonly packetIndexInSegment?: number;
+    readonly streamByteOffset?: number;
+  } | null>(null);
+  const locateTriggerSeqRef = useRef(0);
   const hostVersionRef = useRef(-1);
   const selectedTraceIdRef = useRef<string | null>(null);
   const prevTraceRecordRef = useRef<string | null>(null);
   const prevTraceAxisKeyRef = useRef<string>('');
+  const pendingTimelineJumpRef = useRef<{
+    axisKey: string;
+    viewRange: { start: string; end: string };
+    cursorA: SharedTraceCursor;
+  } | null>(null);
 
   useEffect(() => {
     const refreshTheme = () => setThemeKind(detectThemeKind());
@@ -135,6 +166,12 @@ export function RtosApp() {
           selectedTraceIdRef.current = nextRecId;
           setTraceViewport(null);
           setTraceAnalysis(null);
+          setTraceEvents(null);
+          setTraceEventLocate(null);
+          setTraceTerminal(null);
+          setTraceDiagnostics(null);
+          setFocusedEvent(null);
+          setPendingLocateTarget(null);
           setHoverInspect(null);
           setCursorAInspect(null);
           setCursorBInspect(null);
@@ -162,12 +199,141 @@ export function RtosApp() {
         if (res.recordId === selectedTraceIdRef.current) {
           setTraceAnalysis(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
         }
+      } else if (msg.command === 'traceEventsResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TraceEventsResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          setTraceEvents(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
+        }
+      } else if (msg.command === 'traceEventLocateResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TraceEventLocateResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          setTraceEventLocate(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
+        }
+      } else if (msg.command === 'traceTerminalResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TraceTerminalResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          setTraceTerminal(prev => (prev && res.querySeq < prev.querySeq ? prev : res));
+        }
+      } else if (msg.command === 'traceDiagnosticsResult' && msg.result && typeof msg.result === 'object') {
+        const res = msg.result as TraceDiagnosticsResponse;
+        if (res.recordId === selectedTraceIdRef.current) {
+          setTraceDiagnostics(res);
+        }
       } else if (msg.command === 'tracePointInspectResult' && msg.result && typeof msg.result === 'object') {
         const res = msg.result as TracePointInspectResponse;
         if (res.recordId === selectedTraceIdRef.current) {
           if (res.targetKind === 'hover') setHoverInspect(res);
           else if (res.targetKind === 'cursorA') setCursorAInspect(res);
           else if (res.targetKind === 'cursorB') setCursorBInspect(res);
+        }
+      } else if (msg.command === 'rtosUiTestAction' && typeof msg.requestId === 'number') {
+        const requestId = msg.requestId as number;
+        const action = String(msg.action ?? '');
+        const payload = (msg.payload && typeof msg.payload === 'object' ? msg.payload : {}) as Record<string, any>;
+        try {
+          const w = window as any;
+          let data: unknown = null;
+          if (action === 'tasks.getState') {
+            const rowTexts = Array.from(document.querySelectorAll('.rtos-table tbody tr.rtos-row')).map(tr => (tr.textContent ?? '').replace(/\s+/g, ' ').trim());
+            const activeSubTabText = (document.querySelector('.rtos-subtab.active')?.textContent ?? '').trim();
+            const activePageText = (document.querySelector('.rtos-nav-btn.active')?.textContent ?? '').trim();
+            data = {
+              domTaskRows: rowTexts.length,
+              rowTexts,
+              activeSubTabText,
+              activePageText,
+              hostVersion: hostVersionRef.current,
+            };
+          } else if (action === 'contexts.setSubTab') {
+            w.__orbitRtosContextsTestApi?.setSubTab?.(payload.tab);
+            data = { ok: true };
+          } else if (action === 'contexts.setRangeSource') {
+            w.__orbitRtosContextsTestApi?.setRangeSource?.(payload.source);
+            data = { ok: true };
+          } else if (action === 'contexts.setScopeKey') {
+            w.__orbitRtosContextsTestApi?.setScopeKey?.(payload.scopeKey);
+            data = { ok: true };
+          } else if (action === 'contexts.getState') {
+            data = w.__orbitRtosContextsTestApi?.getState?.() ?? null;
+          } else if (action === 'events.getState') {
+            data = {
+              ...(w.__orbitRtosEventsTestApi?.getState?.() ?? {}),
+              domVrows: document.querySelectorAll('.events-vrow').length,
+              detailText: document.querySelector('.events-detail-pane')?.textContent ?? '',
+            };
+          } else if (action === 'events.setFilter') {
+            if (payload.category !== undefined) w.__orbitRtosEventsTestApi?.setCategory?.(payload.category);
+            if (payload.searchText !== undefined) w.__orbitRtosEventsTestApi?.setSearchText?.(payload.searchText);
+            data = { ok: true };
+          } else if (action === 'events.jumpToRow') {
+            w.__orbitRtosEventsTestApi?.jumpToRow?.(Number(payload.rowIndex) || 0);
+            data = { ok: true };
+          } else if (action === 'events.clickDomRow') {
+            const rows = document.querySelectorAll('.events-vrow');
+            const idx = Math.max(0, Math.min(rows.length - 1, Number(payload.index) || 0));
+            const el = rows[idx] as HTMLElement | undefined;
+            el?.click();
+            data = { clicked: Boolean(el), totalDomRows: rows.length };
+          } else if (action === 'events.jumpToSelectedTimeline') {
+            w.__orbitRtosEventsTestApi?.jumpToSelectedTimeline?.();
+            data = { ok: true };
+          } else if (action === 'terminal.getState') {
+            const diagItems = Array.from(document.querySelectorAll('.terminal-diag-item')).map(e => e.textContent ?? '');
+            const lineTexts = Array.from(document.querySelectorAll('.terminal-line-text')).map(e => e.textContent ?? '');
+            data = {
+              ...(w.__orbitRtosTerminalTestApi?.getState?.() ?? {}),
+              domLines: document.querySelectorAll('.terminal-line').length,
+              domLineTexts: lineTexts,
+              domDiagnostics: diagItems,
+            };
+          } else if (action === 'terminal.clickJumpToTimelineByText') {
+            const needle = String(payload.text ?? '');
+            const lineEls = Array.from(document.querySelectorAll('.terminal-line'));
+            const matchLine = lineEls.find(el => (el.querySelector('.terminal-line-text')?.textContent ?? '').includes(needle));
+            const btns = matchLine ? Array.from(matchLine.querySelectorAll('button')) : [];
+            const jumpBtn = btns.find(b => (b.textContent ?? '').includes('定位Trace')) as HTMLElement | undefined;
+            jumpBtn?.click();
+            data = { foundLine: Boolean(matchLine), clicked: Boolean(jumpBtn) };
+          } else if (action === 'terminal.setFilter') {
+            if (payload.level !== undefined) w.__orbitRtosTerminalTestApi?.setLevel?.(payload.level);
+            if (payload.searchText !== undefined) w.__orbitRtosTerminalTestApi?.setSearchText?.(payload.searchText);
+            if (payload.mergeAppend !== undefined) w.__orbitRtosTerminalTestApi?.setMergeAppend?.(Boolean(payload.mergeAppend));
+            data = { ok: true };
+          } else if (action === 'timeline.getState') {
+            const jumpBtn = Array.from(document.querySelectorAll('.trace-cursor-row button')).find(b => (b.textContent ?? '').includes('在 Events 中定位'));
+            const firstCursorRowText = document.querySelector('.trace-cursor-row')?.textContent ?? '';
+            data = {
+              ...(w.__orbitTraceTimelineTestApi?.getState?.() ?? {}),
+              cursorBarText: firstCursorRowText,
+              jumpToEventsButtonPresent: Boolean(jumpBtn),
+            };
+          } else if (action === 'timeline.clickJumpToEventsButton') {
+            const jumpBtn = Array.from(document.querySelectorAll('.trace-cursor-row button')).find(b => (b.textContent ?? '').includes('在 Events 中定位')) as HTMLElement | undefined;
+            jumpBtn?.click();
+            data = { clicked: Boolean(jumpBtn) };
+          } else if (action === 'timeline.setCursorAndJumpToEvents') {
+            if (payload.startStr && payload.endStr) {
+              w.__orbitTraceTimelineTestApi?.setRange?.(String(payload.startStr), String(payload.endStr));
+            }
+            if (payload.timeStr) {
+              w.__orbitTraceTimelineTestApi?.setCursor?.('A', String(payload.timeStr));
+            }
+            setTimeout(() => {
+              const ok = Boolean(w.__orbitTraceTimelineTestApi?.jumpToEventsAtCursorA?.());
+              vscodeApi.postMessage({ command: 'rtosUiTestActionResult', requestId, ok: true, data: { jumped: ok } });
+            }, 350);
+            return;
+          } else {
+            throw new Error(`Unknown UI action: ${action}`);
+          }
+          vscodeApi.postMessage({ command: 'rtosUiTestActionResult', requestId, ok: true, data });
+        } catch (err) {
+          vscodeApi.postMessage({
+            command: 'rtosUiTestActionResult',
+            requestId,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     };
@@ -238,6 +404,82 @@ export function RtosApp() {
     vscodeApi.postMessage({ command: 'contextsPerfReport', perf });
   }, []);
 
+  const handleQueryEvents = useCallback((req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    scopeKey: string;
+    sourceKind: TraceAnalysisSourceKind;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    offset: number;
+    limit: number;
+    category: TraceEventCategoryFilter;
+    searchText: string;
+    contextKey?: string;
+    onlyWithDiagnostics: boolean;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceQueryEvents', ...req });
+  }, []);
+
+  const handleLocateEvent = useCallback((req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    targetTime?: string;
+    targetBootGeneration?: number;
+    targetSegmentId?: number;
+    targetPacketIndex?: number;
+    targetByteOffset?: number;
+    category: TraceEventCategoryFilter;
+    searchText: string;
+    contextKey?: string;
+    onlyWithDiagnostics: boolean;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceLocateEvent', ...req });
+  }, []);
+
+  const handleQueryTerminal = useCallback((req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    scopeKey: string;
+    sourceKind: TraceAnalysisSourceKind;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    offset: number;
+    limit: number;
+    level: TraceTerminalLevelFilter;
+    searchText: string;
+    mergeAppend: boolean;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceQueryTerminal', ...req });
+  }, []);
+
+  const handleGetDiagnostics = useCallback((req: {
+    recordId: string;
+    bootGeneration?: number;
+    segmentId?: number;
+  }) => {
+    vscodeApi.postMessage({ command: 'traceGetDiagnostics', ...req });
+  }, []);
+
+  const handleEventsPerfReport = useCallback((perf: Record<string, unknown>) => {
+    vscodeApi.postMessage({ command: 'eventsPerfReport', perf });
+  }, []);
+
+  const handleTerminalPerfReport = useCallback((perf: Record<string, unknown>) => {
+    vscodeApi.postMessage({ command: 'terminalPerfReport', perf });
+  }, []);
+
   const traceState = panel.trace ?? INITIAL_TRACE_PANEL_STATE;
   const selectedTraceRecord: TraceRecordSummary | null = useMemo(() => {
     if (!traceState.records.length) return null;
@@ -265,17 +507,35 @@ export function RtosApp() {
       setCursorB(null);
       setTraceViewRange(null);
       setTraceAnalysis(null);
+      setFocusedEvent(null);
+      setPendingLocateTarget(null);
     }
     if (prevTraceAxisKeyRef.current !== axisKey) {
       prevTraceAxisKeyRef.current = axisKey;
-      setCursorA(null);
+      const pendingJump = pendingTimelineJumpRef.current;
+      if (pendingJump && pendingJump.axisKey === axisKey) {
+        pendingTimelineJumpRef.current = null;
+        setCursorA(pendingJump.cursorA);
+        setCursorB(null);
+        setTraceAnalysis(null);
+        setTraceViewRange(pendingJump.viewRange);
+      } else {
+        setCursorA(null);
+        setCursorB(null);
+        setTraceAnalysis(null);
+        if (traceAxisDomain.valid) {
+          setTraceViewRange({ start: traceAxisDomain.minStr, end: traceAxisDomain.displayMaxStr });
+        } else {
+          setTraceViewRange(null);
+        }
+      }
+    } else if (pendingTimelineJumpRef.current && pendingTimelineJumpRef.current.axisKey === axisKey) {
+      const pendingJump = pendingTimelineJumpRef.current;
+      pendingTimelineJumpRef.current = null;
+      setCursorA(pendingJump.cursorA);
       setCursorB(null);
       setTraceAnalysis(null);
-      if (traceAxisDomain.valid) {
-        setTraceViewRange({ start: traceAxisDomain.minStr, end: traceAxisDomain.displayMaxStr });
-      } else {
-        setTraceViewRange(null);
-      }
+      setTraceViewRange(pendingJump.viewRange);
     }
   }, [activeTraceRecordId, traceAxisDomain.scopeKey, traceAxisDomain.unit, traceAxisDomain.valid, traceAxisDomain.minStr, traceAxisDomain.displayMaxStr]);
 
@@ -311,6 +571,157 @@ export function RtosApp() {
     }
     setTraceViewRange({ start, end });
   }, [traceAxisDomain.valid, traceAxisDomain.displayMaxStr, settings.traceAutoFollow, updateSettings]);
+
+  const handleSelectFocusedEvent = useCallback((ev: TraceEventDto) => {
+    if (!activeTraceRecordId) return;
+    const tStr = resolveEventTimeStrForUnit(ev, traceAxisDomain.unit) ?? ev.relTicks;
+    const tUnit: TraceTimeUnit = resolveEventTimeStrForUnit(ev, traceAxisDomain.unit) !== undefined
+      ? traceAxisDomain.unit
+      : 'relative-ticks';
+    setFocusedEvent({
+      recordId: activeTraceRecordId,
+      eventKey: ev.eventKey,
+      bootGeneration: ev.bootGeneration,
+      segmentId: ev.segmentId,
+      packetIndexInSegment: ev.packetIndexInSegment,
+      streamByteOffset: ev.streamByteOffset,
+      timeStr: tStr,
+      unit: tUnit,
+      label: ev.eventName,
+    });
+  }, [activeTraceRecordId, traceAxisDomain.unit]);
+
+  const handleJumpToTimelineEvent = useCallback((ev: {
+    bootGeneration: number;
+    segmentId: number;
+    packetIndexInSegment: number;
+    streamByteOffset: number;
+    relTicks: string;
+    absTicks?: string;
+    ns?: string;
+    sysFreqHz?: number;
+    eventKey: string;
+    eventName?: string;
+  }) => {
+    if (!selectedTraceRecord) return;
+    const plan = computeTimelineJumpForEvent(
+      ev,
+      selectedTraceRecord.segments,
+      traceScopeKey,
+      settings.traceTimeUnit,
+    );
+    if (!plan.ok) return;
+
+    const nextCursorA: SharedTraceCursor = {
+      timeStr: plan.timeStr,
+      unit: plan.unit,
+      bootGeneration: plan.bootGeneration,
+      segmentId: plan.segmentId,
+    };
+    setFocusedEvent({
+      recordId: selectedTraceRecord.recordId,
+      eventKey: ev.eventKey,
+      bootGeneration: ev.bootGeneration,
+      segmentId: ev.segmentId,
+      packetIndexInSegment: ev.packetIndexInSegment,
+      streamByteOffset: ev.streamByteOffset,
+      timeStr: plan.timeStr,
+      unit: plan.unit,
+      label: ev.eventName,
+    });
+
+    const targetAxisKey = `${selectedTraceRecord.recordId}::${plan.scopeKey}::${plan.unit}`;
+    const currentEffectiveAxisKey = `${selectedTraceRecord.recordId}::${traceAxisDomain.scopeKey}::${traceAxisDomain.unit}`;
+    if (targetAxisKey !== currentEffectiveAxisKey) {
+      pendingTimelineJumpRef.current = {
+        axisKey: targetAxisKey,
+        viewRange: { start: plan.viewStart, end: plan.viewEnd },
+        cursorA: nextCursorA,
+      };
+    } else {
+      pendingTimelineJumpRef.current = null;
+      setCursorA(nextCursorA);
+      setCursorB(null);
+      setTraceViewRange({ start: plan.viewStart, end: plan.viewEnd });
+    }
+    if (plan.scopeKey !== traceScopeKey) {
+      setTraceScopeKey(plan.scopeKey);
+    }
+
+    const patch: Partial<RtosViewSettings> = { activePage: 'trace' };
+    if (plan.unit !== settings.traceTimeUnit) {
+      patch.traceTimeUnit = plan.unit;
+    }
+    if (settings.traceAutoFollow) {
+      patch.traceAutoFollow = false;
+    }
+    updateSettings(patch);
+  }, [
+    selectedTraceRecord,
+    traceScopeKey,
+    traceAxisDomain.scopeKey,
+    traceAxisDomain.unit,
+    settings.traceTimeUnit,
+    settings.traceAutoFollow,
+    updateSettings,
+  ]);
+
+  const handleTimelinePointClick = useCallback((target: {
+    recordId: string;
+    unit: TraceTimeUnit;
+    timeStr: string;
+    bootGeneration?: number;
+    segmentId?: number;
+  }) => {
+    setFocusedEvent(null);
+    const seq = ++locateTriggerSeqRef.current;
+    setPendingLocateTarget({
+      seq,
+      recordId: target.recordId,
+      unit: target.unit,
+      bootGeneration: target.bootGeneration,
+      segmentId: target.segmentId,
+      timeStr: target.timeStr,
+    });
+  }, []);
+
+  const handleJumpToEventInEvents = useCallback((target: {
+    recordId: string;
+    unit: TraceTimeUnit;
+    timeStr: string;
+    bootGeneration?: number;
+    segmentId?: number;
+    packetIndexInSegment?: number;
+    streamByteOffset?: number;
+  }) => {
+    setTraceEventLocate(null);
+    const seq = ++locateTriggerSeqRef.current;
+    setPendingLocateTarget({
+      seq,
+      ...target,
+    });
+    setContextsSubTab('events');
+    updateSettings({ activePage: 'contexts' });
+  }, [updateSettings]);
+
+  const handleLocateLineInEvents = useCallback((line: TraceTerminalLineDto) => {
+    if (!activeTraceRecordId) return;
+    const tStr = resolveEventTimeStrForUnit(line, traceAxisDomain.unit) ?? line.relTicks;
+    const tUnit: TraceTimeUnit = resolveEventTimeStrForUnit(line, traceAxisDomain.unit) !== undefined
+      ? traceAxisDomain.unit
+      : 'relative-ticks';
+    const seq = ++locateTriggerSeqRef.current;
+    setPendingLocateTarget({
+      seq,
+      recordId: activeTraceRecordId,
+      unit: tUnit,
+      bootGeneration: line.bootGeneration,
+      segmentId: line.segmentId,
+      timeStr: tStr,
+      packetIndexInSegment: line.packetIndexInSegment,
+      streamByteOffset: line.streamByteOffset,
+    });
+  }, [activeTraceRecordId, traceAxisDomain.unit]);
 
   const toggleLive = (enabled: boolean) => {
     setPanel(prev => ({ ...prev, settings: { ...prev.settings, liveEnabled: enabled } }));
@@ -562,6 +973,9 @@ export function RtosApp() {
             onQueryViewport={handleQueryViewport}
             onInspectPoint={handleInspectPoint}
             onPerfReport={handlePerfReport}
+            focusedEvent={focusedEvent}
+            onTimelinePointClick={handleTimelinePointClick}
+            onJumpToEventInEvents={handleJumpToEventInEvents}
           />
         ) : settings.activePage === 'contexts' ? (
           <ContextsView
@@ -586,6 +1000,23 @@ export function RtosApp() {
             onQueryAnalysis={handleQueryAnalysis}
             onJumpToTimelineRange={handleJumpToTimelineRange}
             onPerfReport={handleContextsPerfReport}
+            activeSubTab={contextsSubTab}
+            onChangeSubTab={setContextsSubTab}
+            eventsResult={traceEvents}
+            locateResult={traceEventLocate}
+            terminalResult={traceTerminal}
+            diagnosticsResult={traceDiagnostics}
+            focusedEvent={focusedEvent}
+            pendingLocateTarget={pendingLocateTarget}
+            onSelectFocusedEvent={handleSelectFocusedEvent}
+            onJumpToTimelineEvent={handleJumpToTimelineEvent}
+            onLocateLineInEvents={handleLocateLineInEvents}
+            onQueryEvents={handleQueryEvents}
+            onLocateEvent={handleLocateEvent}
+            onQueryTerminal={handleQueryTerminal}
+            onGetDiagnostics={handleGetDiagnostics}
+            onEventsPerfReport={handleEventsPerfReport}
+            onTerminalPerfReport={handleTerminalPerfReport}
           />
         ) : panel.session.phase === 'none' ? (
           <div className="rtos-empty" role="status">
@@ -1134,4 +1565,41 @@ const STYLES = `
 .contexts-kind-idle { opacity:.75; }
 .contexts-kind-scheduler { border-color:var(--vscode-charts-purple, #c586c0); }
 .contexts-kind-timer { border-color:var(--vscode-charts-green, #4ec9b0); }
+.rtos-inline-error { color:var(--vscode-errorForeground, #f48771); font-size:11px; }
+.events-shell { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+.events-filter-bar { gap:6px; }
+.events-meta-bar { justify-content:space-between; }
+.events-jump-input { width:84px; min-width:72px; flex:0 0 auto; }
+.events-workspace { flex:1; min-height:0; display:flex; overflow:hidden; }
+.events-table-wrap { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+.events-thead { display:grid; grid-template-columns:64px 128px 64px 126px 150px minmax(180px, 1fr) 74px; gap:6px; padding:4px 8px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); font-size:11px; font-weight:600; color:var(--vscode-descriptionForeground); flex-shrink:0; }
+.events-vscroll { flex:1; min-height:0; overflow-y:auto; overflow-x:auto; position:relative; }
+.events-vspacer { position:relative; width:100%; }
+.events-vwindow { position:absolute; top:0; left:0; right:0; will-change:transform; }
+.events-vrow { display:grid; grid-template-columns:64px 128px 64px 126px 150px minmax(180px, 1fr) 74px; gap:6px; align-items:center; height:26px; padding:0 8px; border-bottom:1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); cursor:pointer; font-size:11px; }
+.events-vrow:hover { background:var(--vscode-list-hoverBackground); }
+.events-vrow.selected { background:var(--vscode-list-activeSelectionBackground); color:var(--vscode-list-activeSelectionForeground); }
+.events-vrow.has-warn { border-left:2px solid var(--vscode-charts-yellow, #cca700); padding-left:6px; }
+.events-vrow > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ev-domain-tag { font-style:normal; font-size:9px; opacity:.75; }
+.ev-rel-pill { margin-left:4px; padding:0 4px; border-radius:2px; font-size:9px; border:1px solid var(--vscode-charts-yellow, #cca700); color:var(--vscode-charts-yellow, #cca700); }
+.events-detail-pane { width:340px; min-width:260px; max-width:44%; border-left:1px solid var(--vscode-panel-border); padding:8px 10px; overflow:auto; background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; }
+.events-detail-content { display:flex; flex-direction:column; gap:8px; }
+.events-detail-header { display:flex; align-items:center; justify-content:space-between; gap:6px; flex-wrap:wrap; }
+.events-detail-section { border-top:1px solid var(--vscode-panel-border); padding-top:6px; display:flex; flex-direction:column; gap:4px; }
+.events-detail-subtitle { font-size:11px; font-weight:600; color:var(--vscode-foreground); }
+.events-terminal-preview { padding:4px 6px; border-radius:3px; border:1px solid var(--vscode-panel-border); background:var(--vscode-editor-background, var(--vscode-panel-background)); white-space:pre-wrap; word-break:break-word; }
+.terminal-shell { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+.terminal-body { flex:1; min-height:0; display:flex; overflow:hidden; }
+.terminal-log-list { flex:1; min-width:0; overflow:auto; padding:6px 10px; display:flex; flex-direction:column; gap:6px; }
+.terminal-line { border:1px solid var(--vscode-panel-border); border-radius:3px; padding:5px 8px; background:var(--vscode-editor-background, var(--vscode-panel-background)); display:flex; flex-direction:column; gap:3px; }
+.terminal-line.term-lvl-warn { border-left:3px solid var(--vscode-charts-yellow, #cca700); }
+.terminal-line.term-lvl-error { border-left:3px solid var(--vscode-charts-red, #f48771); }
+.terminal-line-meta { display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:10px; }
+.term-actions { margin-left:auto; display:inline-flex; gap:4px; }
+.terminal-line-text { margin:0; font-family:var(--vscode-editor-font-family, monospace); font-size:12px; white-space:pre-wrap; word-break:break-word; }
+.terminal-line-warnings { display:flex; flex-direction:column; gap:2px; font-size:10px; }
+.terminal-diag-pane { width:340px; min-width:260px; max-width:44%; border-left:1px solid var(--vscode-panel-border); padding:8px 10px; overflow:auto; background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; display:flex; flex-direction:column; gap:6px; }
+.terminal-diag-list { display:flex; flex-direction:column; gap:4px; font-size:11px; }
+.terminal-diag-item { padding:3px 5px; border-radius:2px; border:1px solid color-mix(in srgb, var(--vscode-panel-border) 70%, transparent); word-break:break-word; }
 `;

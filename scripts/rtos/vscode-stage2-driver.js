@@ -12,7 +12,8 @@ async function waitFor(fn, timeoutMs = 15000, label = 'condition') {
     if (val) return val;
     await delay(50);
   }
-  throw new Error(`Timed out waiting for: ${label}`);
+  const resolvedLabel = typeof label === 'function' ? label() : label;
+  throw new Error(`Timed out waiting for: ${resolvedLabel}`);
 }
 
 class MockRtosDebugAdapter {
@@ -300,6 +301,12 @@ exports.run = async function run() {
     let sessionNoDwarf;
     let sessionFreeRtosA;
     let sessionFreeRtosB;
+    let movedReadyCount = 0;
+    let explorerVisible = false;
+    let panelReadyCount = 0;
+    let panelVisible = false;
+    let panelFocusAttempts = 0;
+    let panelRenderState = null;
     const trackStart = vscode.debug.onDidStartDebugSession(session => {
       if (session.name === 'No DWARF Session') sessionNoDwarf = session;
       if (session.name === 'FreeRTOS Session A') sessionFreeRtosA = session;
@@ -362,14 +369,83 @@ exports.run = async function run() {
       await vscode.commands.executeCommand('ozoneRtos.focus');
       await waitFor(() => provider.isVisible, 10000, 'RTOS panel re-shown');
 
-      // 6. Recreate Webview view by moving to Explorer and back to RTOS container, verifying remount + state.
+      // 6. Recreate Webview view by moving to Explorer and resetting back to RTOS Panel container,
+      // verifying remount, visibility, and genuine Chromium DOM render (matching Stage 4.5 focus pattern).
       await vscode.commands.executeCommand('vscode.moveViews', { viewIds: ['ozoneRtos'], destinationId: 'workbench.view.explorer' });
+      let lastExplorerFocusAt = 0;
+      const ensureExplorerFocused = async () => {
+        if ((!provider.isVisible || provider.readyCount === initialReadyCount) && Date.now() - lastExplorerFocusAt >= 250) {
+          lastExplorerFocusAt = Date.now();
+          await vscode.commands.executeCommand('ozoneRtos.focus');
+        }
+      };
       await vscode.commands.executeCommand('ozoneRtos.focus');
-      await waitFor(() => provider.readyCount > initialReadyCount && provider.isVisible, 10000, 'RTOS webview recreated in Explorer');
-      const movedReadyCount = provider.readyCount;
-      await vscode.commands.executeCommand('vscode.moveViews', { viewIds: ['ozoneRtos'], destinationId: 'workbench.view.extension.ozone-rtos-panel' });
+      await waitFor(
+        async () => {
+          if (provider.readyCount > initialReadyCount && provider.isVisible) {
+            return true;
+          }
+          await ensureExplorerFocused();
+          return false;
+        },
+        10000,
+        () => `RTOS webview recreated in Explorer (initial=${initialReadyCount}, ready=${provider.readyCount}, visible=${provider.isVisible})`,
+      );
+      movedReadyCount = provider.readyCount;
+      explorerVisible = provider.isVisible;
+
+      const registeredCommands = await vscode.commands.getCommands(true);
+      assert.ok(registeredCommands.includes('ozoneRtos.resetViewLocation'), 'Built-in ozoneRtos.resetViewLocation command must exist');
+      await vscode.commands.executeCommand('ozoneRtos.resetViewLocation');
+      let lastPanelFocusAt = 0;
+      const ensureRestoredPanelFocused = async () => {
+        if ((!provider.isVisible || provider.readyCount === movedReadyCount) && Date.now() - lastPanelFocusAt >= 250) {
+          lastPanelFocusAt = Date.now();
+          panelFocusAttempts++;
+          await vscode.commands.executeCommand('workbench.view.extension.ozone-rtos-panel');
+          await vscode.commands.executeCommand('ozoneRtos.focus');
+        }
+      };
+      await waitFor(
+        async () => {
+          if (provider.readyCount > movedReadyCount && provider.isVisible) {
+            return true;
+          }
+          await ensureRestoredPanelFocused();
+          return false;
+        },
+        10000,
+        () => `RTOS webview recreated in Panel (moved=${movedReadyCount}, ready=${provider.readyCount}, visible=${provider.isVisible}, focusAttempts=${panelFocusAttempts})`,
+      );
+      panelReadyCount = provider.readyCount;
+      panelVisible = provider.isVisible;
+
+      // Prove restored Panel Webview actually rendered current Tasks state in Chromium DOM.
+      await waitFor(
+        async () => {
+          await ensureRestoredPanelFocused();
+          if (!provider.isVisible) return false;
+          try {
+            const st = await provider.invokeUiAction('tasks.getState', {}, 500);
+            if (st && st.domTaskRows >= 1 && Array.isArray(st.rowTexts) && st.rowTexts.some(t => t.includes('ctrlB'))) {
+              panelRenderState = st;
+              return true;
+            }
+          } catch {
+            // Webview listener may still be settling right after mount.
+          }
+          return false;
+        },
+        10000,
+        () => `Restored Panel Webview DOM render proof (ready=${provider.readyCount}, visible=${provider.isVisible})`,
+      );
+
+      // Confirm restored view truly lives in the Panel container (switching to Watch hides it, switching back shows it).
+      await vscode.commands.executeCommand('workbench.view.extension.ozone-watch-panel');
+      await waitFor(() => !provider.isVisible, 10000, 'Restored RTOS view hidden when Panel switches to Watch');
+      await vscode.commands.executeCommand('workbench.view.extension.ozone-rtos-panel');
       await vscode.commands.executeCommand('ozoneRtos.focus');
-      await waitFor(() => provider.readyCount > movedReadyCount && provider.isVisible, 10000, 'RTOS webview recreated in Panel');
+      await waitFor(() => provider.isVisible, 10000, 'Restored RTOS view visible again in RTOS Panel');
 
       // 7. Persist settings & verify Objects sub-tab + on-demand object inspection in real VS Code host.
       await provider.handleMessage({
@@ -412,6 +488,18 @@ exports.run = async function run() {
       ok: true,
       initialReadyCount,
       recreatedReadyCount: provider.readyCount,
+      panelMoveTrace: {
+        method: 'resetViewLocation',
+        initialReadyCount,
+        explorerReadyCount: movedReadyCount,
+        explorerVisible,
+        panelReadyCount,
+        panelVisible,
+        panelFocusAttempts,
+        panelRenderedRows: panelRenderState?.domTaskRows ?? 0,
+        panelRenderedCtrlB: Boolean(panelRenderState?.rowTexts?.some(t => t.includes('ctrlB'))),
+        restoredContainerVerified: true,
+      },
       emptyErrorCode: 'DwarfUnavailable',
       switchedTasks: ['ctrlA', 'ctrlB'],
       objectsVerified: ['busLock'],

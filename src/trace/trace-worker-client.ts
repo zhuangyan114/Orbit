@@ -22,6 +22,15 @@ import type {
   TraceAnalysisQueryResult,
 } from './trace-analytics';
 import type {
+  TraceEventLocateRequest,
+  TraceEventLocateResult,
+  TraceEventsQueryRequest,
+  TraceEventsQueryResult,
+  TraceRecordingDiagnosticsResult,
+  TraceTerminalQueryRequest,
+  TraceTerminalQueryResult,
+} from './trace-events';
+import type {
   IngestBatchSummary,
   TraceLodQueryRequest,
   TraceLodQueryResult,
@@ -930,6 +939,110 @@ export class TraceWorkerClient {
       slotGuard.release();
       this.releaseQuerySlot();
     }
+  }
+
+  private async runCancellableWorkerQuery<TReq, TRes>(
+    type: 'queryEvents' | 'locateEvent' | 'queryTerminal',
+    prefix: string,
+    recordId: string,
+    request: TReq,
+    options: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    } = {},
+  ): Promise<TraceStorageResult<TRes>> {
+    if (options.signal?.aborted) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '查询在发送前已取消' };
+    }
+    if (!this.tryAcquireQuerySlot()) {
+      return {
+        ok: false,
+        errorCode: 'QueryQueueFull' as any,
+        message: `宿主机并发查询数已达上限 ${this.limits.maxPendingQueries}`,
+      };
+    }
+    const queryId = options.queryId ?? `${prefix}-${this.nextSeqId++}`;
+    const slotGuard = this.acquireCancelSlot();
+    const onAbort = () => {
+      slotGuard.cancel();
+      void this.cancelQuery(queryId).catch(() => {});
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      const res = await this.sendRaw({
+        reqId: this.nextReqId++,
+        type,
+        recordId,
+        queryId,
+        request: request as any,
+        cancelSlot: slotGuard.slot,
+        cancelToken: slotGuard.token,
+        yieldEveryPages: options.yieldEveryPages,
+        yieldEveryItems: options.yieldEveryItems,
+      } as TraceWorkerRequest);
+      return this.toResult(res);
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort);
+      slotGuard.release();
+      this.releaseQuerySlot();
+    }
+  }
+
+  public async queryEvents(
+    recordId: string,
+    request: TraceEventsQueryRequest,
+    options: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    } = {},
+  ): Promise<TraceStorageResult<TraceEventsQueryResult>> {
+    return this.runCancellableWorkerQuery('queryEvents', 'ev', recordId, request, options);
+  }
+
+  public async locateEvent(
+    recordId: string,
+    request: TraceEventLocateRequest,
+    options: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    } = {},
+  ): Promise<TraceStorageResult<TraceEventLocateResult>> {
+    return this.runCancellableWorkerQuery('locateEvent', 'loc', recordId, request, options);
+  }
+
+  public async queryTerminal(
+    recordId: string,
+    request: TraceTerminalQueryRequest,
+    options: {
+      signal?: AbortSignal;
+      yieldEveryPages?: number;
+      yieldEveryItems?: number;
+      queryId?: string;
+    } = {},
+  ): Promise<TraceStorageResult<TraceTerminalQueryResult>> {
+    return this.runCancellableWorkerQuery('queryTerminal', 'term', recordId, request, options);
+  }
+
+  public async getDiagnostics(
+    recordId: string,
+    options: { bootGeneration?: number; segmentId?: number; limit?: number } = {},
+  ): Promise<TraceStorageResult<TraceRecordingDiagnosticsResult>> {
+    const res = await this.sendRaw({
+      reqId: this.nextReqId++,
+      type: 'getDiagnostics',
+      recordId,
+      bootGeneration: options.bootGeneration,
+      segmentId: options.segmentId,
+      limit: options.limit,
+    });
+    return this.toResult(res);
   }
 
   public async cancelQuery(queryId: string): Promise<TraceStorageResult<{ cancelled: boolean; active: boolean }>> {

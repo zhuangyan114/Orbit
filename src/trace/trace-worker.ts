@@ -640,6 +640,108 @@ export class TraceWorkerRuntime {
           return;
         }
 
+        case 'queryEvents': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const guard = this.buildCancelToken(
+            msg.queryId,
+            msg.recordId,
+            msg.cancelSlot,
+            msg.cancelToken,
+            msg.yieldEveryPages,
+            msg.yieldEveryItems,
+          );
+          if (!guard.ok) {
+            this.replyErr(msg.reqId, 'QueryQueueFull', `并发查询数已达上限 ${this.limits.maxPendingQueries}`, {
+              backpressure: true,
+            });
+            return;
+          }
+          try {
+            const res = await slot.store.queryEvents(msg.request, guard.token);
+            this.replyFromStoreResult(msg.reqId, res);
+          } finally {
+            guard.cleanup();
+          }
+          return;
+        }
+
+        case 'locateEvent': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const guard = this.buildCancelToken(
+            msg.queryId,
+            msg.recordId,
+            msg.cancelSlot,
+            msg.cancelToken,
+            msg.yieldEveryPages,
+            msg.yieldEveryItems,
+          );
+          if (!guard.ok) {
+            this.replyErr(msg.reqId, 'QueryQueueFull', `并发查询数已达上限 ${this.limits.maxPendingQueries}`, {
+              backpressure: true,
+            });
+            return;
+          }
+          try {
+            const res = await slot.store.locateEvent(msg.request, guard.token);
+            this.replyFromStoreResult(msg.reqId, res);
+          } finally {
+            guard.cleanup();
+          }
+          return;
+        }
+
+        case 'queryTerminal': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const guard = this.buildCancelToken(
+            msg.queryId,
+            msg.recordId,
+            msg.cancelSlot,
+            msg.cancelToken,
+            msg.yieldEveryPages,
+            msg.yieldEveryItems,
+          );
+          if (!guard.ok) {
+            this.replyErr(msg.reqId, 'QueryQueueFull', `并发查询数已达上限 ${this.limits.maxPendingQueries}`, {
+              backpressure: true,
+            });
+            return;
+          }
+          try {
+            const res = await slot.store.queryTerminal(msg.request, guard.token);
+            this.replyFromStoreResult(msg.reqId, res);
+          } finally {
+            guard.cleanup();
+          }
+          return;
+        }
+
+        case 'getDiagnostics': {
+          const slot = this.records.get(msg.recordId);
+          if (!slot || slot.closing) {
+            this.replyErr(msg.reqId, 'RecordNotFound', `未找到活动录制 recordId=${msg.recordId}`);
+            return;
+          }
+          const diag = slot.store.getDiagnostics({
+            bootGeneration: msg.bootGeneration,
+            segmentId: msg.segmentId,
+            limit: msg.limit,
+          });
+          this.replyOk(msg.reqId, diag);
+          return;
+        }
+
         case 'cancelQuery': {
           const q = this.activeQueries.get(msg.queryId);
           if (q) {

@@ -504,7 +504,7 @@ git diff --check
 | 2：面板与对象 | 已完成 | 2.1～2.4：内建 RTOS 面板、Queue/Mutex/Sem/WaitGraph、Timers/Heap 与旧 RTOS Views 专属清理已通过自动化与真实 VS Code 出口检查。 |
 | 3：RTT 传输 | 进行中 | 3.1～3.3 已通过独立 mock 验收；3.4 通过全量自动化和 RMLink 二号机 H723 回环验收。J-Link native、CMSIS-DAP WinUSB/HID 对应实板门槛待补验。4.1 可用现有独立样本开展离线解码。 |
 | 4：Trace 引擎 | 已完成 | 4.1～4.3 通过独立样本与百万事件验收。4.4 在 STM32H723 与 RMLink 二号机验收三种录制模式，4.5 通过真实 VS Code 的实时录制、离线回放、缩放与精确游标复验，并冻结可复跑的 Trace 性能门槛。30 分钟长稳与跨探针矩阵列入 6.2。 |
-| 5：分析与联动 | 进行中 | 5.1 已完成：Worker 有界可取消上下文统计（独占/含嵌套 ISR 归属、完整与越界裁剪计数、Min/Avg/Max、Ready 延迟、Marker、复用 TCB 实例隔离与断段/跳频/缺口 unknown 语义）、Trace 视口与 A/B 选区联动 CPU Load 分箱、离线/热录制/H723 实板只读副本与百万事件及真实 VS Code 联动验收；5.2～5.5 待执行。 |
+| 5：分析与联动 | 进行中 | 5.1 已完成；5.2 已完成：Events 虚拟事件表与 Trace Terminal（Worker 有界分页、取消、精确双向定位、FreeRTOS API 参数说明、严格有限词法格式化与零参数目标字面文本无损保留、EX_PRINT_ELF/坏包/超限/嵌套 ISR/跨断段与多启动代次诊断），离线/Oracle/H723 归档与 1M 真实 VS Code 验收及 5.1/4.5/2 回归通过；5.3～5.5 待执行。 |
 | 6：首版验收 | 未开始 | 6.1～6.4 待执行。 |
 | 7：后续扩展 | 未排期 | 不计入首版范围。 |
 

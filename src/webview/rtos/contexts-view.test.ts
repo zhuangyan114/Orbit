@@ -383,6 +383,7 @@ describe('Contexts & CPU Load 视图状态与渲染 (阶段 5.1)', () => {
     expect(html).toContain('#g2');
     expect(html).toContain('[含嵌套]');
     expect(html).toContain('unknown (缺端点/不完整 1)');
-    expect(html).toContain('Events / Terminal: 阶段 5.2 待接入');
+    expect(html).toContain('事件列表 (Events');
+    expect(html).toContain('Trace 终端');
   });
 });

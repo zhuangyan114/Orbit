@@ -18,6 +18,7 @@ import {
   type TraceActivationDto,
   type TraceAxisDomain,
   type TraceCursorPoint,
+  type TraceFocusedEventRef,
   type TraceGapAnchor,
   type TraceMarkerDto,
   type TraceMarkerPointDto,
@@ -92,6 +93,23 @@ export interface TraceTimelineViewProps {
     segmentId?: number;
   }) => void;
   onPerfReport?: (perf: Record<string, unknown>) => void;
+  focusedEvent?: TraceFocusedEventRef | null;
+  onTimelinePointClick?: (target: {
+    recordId: string;
+    unit: TraceTimeUnit;
+    timeStr: string;
+    bootGeneration?: number;
+    segmentId?: number;
+  }) => void;
+  onJumpToEventInEvents?: (target: {
+    recordId: string;
+    unit: TraceTimeUnit;
+    timeStr: string;
+    bootGeneration?: number;
+    segmentId?: number;
+    packetIndexInSegment?: number;
+    streamByteOffset?: number;
+  }) => void;
 }
 
 const LANE_HEADER_WIDTH = 164;
@@ -204,6 +222,9 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     onQueryViewport,
     onInspectPoint,
     onPerfReport,
+    focusedEvent = null,
+    onTimelinePointClick,
+    onJumpToEventInEvents,
   } = props;
 
   const [hoverInfo, setHoverInfo] = useState<{ x: number; y: number; timeStr: string } | null>(null);
@@ -731,6 +752,32 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     drawCursorLine(xA, theme.cursorA, 'A');
     drawCursorLine(xB, theme.cursorB, 'B');
 
+    // 9b. Focused Event highlight marker from Events / Terminal bidirectional jump
+    if (
+      focusedEvent &&
+      activeRecordId &&
+      focusedEvent.recordId === activeRecordId &&
+      focusedEvent.unit === activeUnit
+    ) {
+      const xf = bigIntToPixelX(BigInt(focusedEvent.timeStr), vStart, vEnd, width);
+      if (xf >= 0 && xf <= width) {
+        ctx.save();
+        ctx.strokeStyle = isLight ? '#007ACC' : '#4FC1FF';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(xf, RULER_HEIGHT);
+        ctx.lineTo(xf, height);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = isLight ? '#007ACC' : '#4FC1FF';
+        ctx.beginPath();
+        ctx.arc(xf, RULER_HEIGHT + 5, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
     // 10. Hover hairline
     if (hoverInfo) {
       const hx = hoverInfo.x;
@@ -769,6 +816,7 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     cursorB,
     cursorAInspect,
     cursorBInspect,
+    focusedEvent,
     hoverInfo,
     onPerfReport,
   ]);
@@ -829,11 +877,53 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     if (kind === 'A') {
       setCursorA(point);
       issueExactPointQuery('cursorA', timeBig, 0n);
+      if (activeRecordId) {
+        onTimelinePointClick?.({
+          recordId: activeRecordId,
+          unit: activeUnit,
+          timeStr: timeBig.toString(),
+          bootGeneration: axisDomain.bootGeneration,
+          segmentId: axisDomain.segmentId,
+        });
+      }
     } else {
       setCursorB(point);
       issueExactPointQuery('cursorB', timeBig, 0n);
     }
-  }, [activeUnit, axisDomain.bootGeneration, axisDomain.segmentId, issueExactPointQuery]);
+  }, [activeRecordId, activeUnit, axisDomain.bootGeneration, axisDomain.segmentId, issueExactPointQuery, onTimelinePointClick]);
+
+  const buildJumpToEventsTarget = useCallback(() => {
+    if (!activeRecordId || !cursorA) return null;
+    const matchesFocused = Boolean(
+      focusedEvent &&
+      focusedEvent.recordId === activeRecordId &&
+      focusedEvent.unit === cursorA.unit &&
+      focusedEvent.timeStr === cursorA.timeStr &&
+      (cursorA.bootGeneration === undefined || focusedEvent.bootGeneration === cursorA.bootGeneration) &&
+      (cursorA.segmentId === undefined || focusedEvent.segmentId === cursorA.segmentId),
+    );
+    if (matchesFocused && focusedEvent) {
+      return {
+        recordId: activeRecordId,
+        unit: cursorA.unit,
+        timeStr: cursorA.timeStr,
+        bootGeneration: focusedEvent.bootGeneration,
+        segmentId: focusedEvent.segmentId,
+        packetIndexInSegment: focusedEvent.packetIndexInSegment,
+        streamByteOffset: focusedEvent.streamByteOffset,
+      };
+    }
+    const firstPkt = cursorAInspect?.packets[0];
+    return {
+      recordId: activeRecordId,
+      unit: cursorA.unit,
+      timeStr: cursorA.timeStr,
+      bootGeneration: cursorAInspect?.bootGeneration ?? firstPkt?.bootGeneration ?? cursorA.bootGeneration,
+      segmentId: cursorAInspect?.segmentId ?? firstPkt?.segmentId ?? cursorA.segmentId,
+      packetIndexInSegment: firstPkt?.packetIndexInSegment,
+      streamByteOffset: firstPkt?.streamByteOffset,
+    };
+  }, [activeRecordId, cursorA, focusedEvent, cursorAInspect]);
 
   // Expose deterministic test/benchmark hooks on window when running in browser
   useEffect(() => {
@@ -879,6 +969,12 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
       inspectAt: (timeStr: string) => {
         issueExactPointQuery('hover', BigInt(timeStr), 0n);
       },
+      jumpToEventsAtCursorA: () => {
+        const target = buildJumpToEventsTarget();
+        if (!target) return false;
+        onJumpToEventInEvents?.(target);
+        return true;
+      },
       reportPerfNow: () => {
         onPerfReport?.({ ...perfRef.current });
         return { ...perfRef.current };
@@ -892,11 +988,14 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
     viewRange,
     cursorA,
     cursorB,
+    cursorAInspect,
     lanes,
     axisDomain,
     onUpdateSettings,
     placeOrUpdateCursor,
     issueExactPointQuery,
+    buildJumpToEventsTarget,
+    onJumpToEventInEvents,
     onPerfReport,
   ]);
 
@@ -1370,6 +1469,19 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
               <span className="rtos-muted">
                 {describeInspectCompact(cursorAInspect)}
               </span>
+            )}
+            {cursorA && activeRecordId && onJumpToEventInEvents && (
+              <button
+                type="button"
+                className="rtos-mini-btn"
+                title="在 Contexts & Events 事件列表中定位该时刻/事件"
+                onClick={() => {
+                  const target = buildJumpToEventsTarget();
+                  if (target) onJumpToEventInEvents(target);
+                }}
+              >
+                在 Events 中定位
+              </button>
             )}
           </div>
           <div className="trace-cursor-row rtos-mono">

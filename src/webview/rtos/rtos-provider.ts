@@ -41,13 +41,18 @@ import {
   projectSliceDto,
   projectTargetProbeState,
 } from './trace-dto';
+import type { TraceEventCategoryFilter, TraceTerminalLevelFilter } from '../../trace/trace-events';
 import type {
   TraceAnalysisResponse,
   TraceAnalysisSourceKind,
+  TraceDiagnosticsResponse,
+  TraceEventLocateResponse,
+  TraceEventsResponse,
   TracePanelState,
   TracePointInspectResponse,
   TraceRecordSummary,
   TraceTargetProbeState,
+  TraceTerminalResponse,
   TraceTimeUnit,
   TraceViewportResponse,
 } from './trace-timeline-state';
@@ -96,6 +101,15 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   private inFlightAnalysisAbort: AbortController | null = null;
   private latestAnalysisQuerySeq = 0;
   private analysisRequestEpoch = 0;
+  private inFlightEventsAbort: AbortController | null = null;
+  private latestEventsQuerySeq = 0;
+  private eventsRequestEpoch = 0;
+  private inFlightLocateAbort: AbortController | null = null;
+  private latestLocateQuerySeq = 0;
+  private locateRequestEpoch = 0;
+  private inFlightTerminalAbort: AbortController | null = null;
+  private latestTerminalQuerySeq = 0;
+  private terminalRequestEpoch = 0;
   private readonly inFlightInspectAborts = new Map<'hover' | 'cursorA' | 'cursorB', AbortController>();
   private readonly latestInspectSeq = new Map<'hover' | 'cursorA' | 'cursorB', number>();
   private readonly inspectRequestEpoch = new Map<'hover' | 'cursorA' | 'cursorB', number>();
@@ -103,6 +117,16 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
   private _tracePerfSeq = 0;
   private lastWebviewContextsPerf: Record<string, unknown> | null = null;
   private _contextsPerfSeq = 0;
+  private lastWebviewEventsPerf: Record<string, unknown> | null = null;
+  private _eventsPerfSeq = 0;
+  private lastWebviewTerminalPerf: Record<string, unknown> | null = null;
+  private _terminalPerfSeq = 0;
+  private uiTestActionSeq = 0;
+  private readonly pendingUiTestActions = new Map<number, {
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+    timer: NodeJS.Timeout;
+  }>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -198,6 +222,37 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
 
   get contextsPerfSeq(): number {
     return this._contextsPerfSeq;
+  }
+
+  get currentEventsPerf(): Record<string, unknown> | null {
+    return this.lastWebviewEventsPerf;
+  }
+
+  get eventsPerfSeq(): number {
+    return this._eventsPerfSeq;
+  }
+
+  get currentTerminalPerf(): Record<string, unknown> | null {
+    return this.lastWebviewTerminalPerf;
+  }
+
+  get terminalPerfSeq(): number {
+    return this._terminalPerfSeq;
+  }
+
+  public invokeUiAction(action: string, payload?: Record<string, unknown>, timeoutMs = 10000): Promise<unknown> {
+    if (this.disposed || !this.view) {
+      return Promise.reject(new Error('RTOS webview is not available'));
+    }
+    const requestId = ++this.uiTestActionSeq;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingUiTestActions.delete(requestId);
+        reject(new Error(`UI test action timed out: ${action}`));
+      }, timeoutMs);
+      this.pendingUiTestActions.set(requestId, { resolve, reject, timer });
+      this.postMessage({ command: 'rtosUiTestAction', requestId, action, payload });
+    });
   }
 
   get currentState(): RtosPanelState {
@@ -584,6 +639,9 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
         this._readyCount++;
         this.latestViewportQuerySeq = 0;
         this.latestAnalysisQuerySeq = 0;
+        this.latestEventsQuerySeq = 0;
+        this.latestLocateQuerySeq = 0;
+        this.latestTerminalQuerySeq = 0;
         this.latestInspectSeq.clear();
         this.postState();
         if (this.activeSession && this.isVisible) {
@@ -724,6 +782,18 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       case 'traceQueryAnalysis':
         await this.handleTraceQueryAnalysis(msg);
         break;
+      case 'traceQueryEvents':
+        await this.handleTraceQueryEvents(msg);
+        break;
+      case 'traceLocateEvent':
+        await this.handleTraceLocateEvent(msg);
+        break;
+      case 'traceQueryTerminal':
+        await this.handleTraceQueryTerminal(msg);
+        break;
+      case 'traceGetDiagnostics':
+        await this.handleTraceGetDiagnostics(msg);
+        break;
       case 'traceInspectPoint':
         await this.handleTraceInspectPoint(msg);
         break;
@@ -739,6 +809,32 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
           this._contextsPerfSeq++;
         }
         break;
+      case 'eventsPerfReport':
+        if (msg.perf && typeof msg.perf === 'object') {
+          this.lastWebviewEventsPerf = msg.perf as Record<string, unknown>;
+          this._eventsPerfSeq++;
+        }
+        break;
+      case 'terminalPerfReport':
+        if (msg.perf && typeof msg.perf === 'object') {
+          this.lastWebviewTerminalPerf = msg.perf as Record<string, unknown>;
+          this._terminalPerfSeq++;
+        }
+        break;
+      case 'rtosUiTestActionResult': {
+        const requestId = typeof msg.requestId === 'number' ? msg.requestId : -1;
+        const pending = this.pendingUiTestActions.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingUiTestActions.delete(requestId);
+          if (msg.ok) {
+            pending.resolve(msg.data);
+          } else {
+            pending.reject(new Error(typeof msg.error === 'string' ? msg.error : 'UI action failed'));
+          }
+        }
+        break;
+      }
     }
   }
 
@@ -818,6 +914,12 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     this.inFlightViewportAbort = null;
     this.inFlightAnalysisAbort?.abort();
     this.inFlightAnalysisAbort = null;
+    this.inFlightEventsAbort?.abort();
+    this.inFlightEventsAbort = null;
+    this.inFlightLocateAbort?.abort();
+    this.inFlightLocateAbort = null;
+    this.inFlightTerminalAbort?.abort();
+    this.inFlightTerminalAbort = null;
     for (const ctrl of this.inFlightInspectAborts.values()) {
       ctrl.abort();
     }
@@ -1495,6 +1597,319 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       if (this.inFlightAnalysisAbort === controller) {
         this.inFlightAnalysisAbort = null;
       }
+    }
+  }
+
+  private async handleTraceQueryEvents(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const querySeq = Number(msg.querySeq);
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const unit: TraceTimeUnit = msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const scopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey : 'all-anchored';
+    const sourceKind: TraceAnalysisSourceKind = msg.sourceKind === 'selection' || msg.sourceKind === 'full' ? msg.sourceKind : 'viewport';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    const start = String(msg.start ?? '0');
+    const end = String(msg.end ?? '0');
+    const offset = Math.max(0, Math.floor(Number(msg.offset) || 0));
+    const limit = Math.max(1, Math.min(500, Math.floor(Number(msg.limit) || 150)));
+    const category: TraceEventCategoryFilter = typeof msg.category === 'string' ? (msg.category as TraceEventCategoryFilter) : 'all';
+    const searchText = typeof msg.searchText === 'string' ? msg.searchText.slice(0, 128) : '';
+    const contextKey = typeof msg.contextKey === 'string' && msg.contextKey ? msg.contextKey : undefined;
+    const onlyWithDiagnostics = Boolean(msg.onlyWithDiagnostics);
+    const maxScanPages = typeof msg.maxScanPages === 'number' && msg.maxScanPages > 0 ? Math.floor(msg.maxScanPages) : undefined;
+
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    if (Number.isFinite(querySeq)) {
+      this.latestEventsQuerySeq = querySeq;
+    }
+    const myEpoch = ++this.eventsRequestEpoch;
+
+    this.inFlightEventsAbort?.abort();
+    const controller = new AbortController();
+    this.inFlightEventsAbort = controller;
+    const t0 = performance.now();
+
+    const makeErrorResult = (error: string): TraceEventsResponse => ({
+      querySeq,
+      recordId,
+      unit,
+      scopeKey,
+      sourceKind,
+      category,
+      searchText,
+      ...(contextKey ? { contextKey } : {}),
+      onlyWithDiagnostics,
+      queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      error,
+    });
+
+    try {
+      const evRes = await this.traceCoordinator.queryEvents(
+        recordId,
+        {
+          start,
+          end,
+          unit,
+          offset,
+          limit,
+          ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+          ...(segmentId !== undefined ? { segmentId } : {}),
+          ...(maxScanPages !== undefined ? { maxScanPages } : {}),
+          filter: {
+            category,
+            searchText,
+            ...(contextKey ? { contextKey } : {}),
+            ...(onlyWithDiagnostics ? { onlyWithDiagnostics: true } : {}),
+          },
+        },
+        { signal: controller.signal },
+      );
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) return;
+      if (myEpoch !== this.eventsRequestEpoch) return;
+
+      if (!evRes.ok) {
+        if (evRes.cancelled) return;
+        this.postMessage({ command: 'traceEventsResult', result: makeErrorResult(`${evRes.errorCode}: ${evRes.message}`) });
+        return;
+      }
+
+      const result: TraceEventsResponse = {
+        querySeq,
+        recordId,
+        unit,
+        scopeKey,
+        sourceKind,
+        category,
+        searchText,
+        ...(contextKey ? { contextKey } : {}),
+        onlyWithDiagnostics,
+        result: evRes.data,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      };
+      this.postMessage({ command: 'traceEventsResult', result });
+    } catch (err) {
+      if (controller.signal.aborted || this.disposed) return;
+      this.postMessage({
+        command: 'traceEventsResult',
+        result: makeErrorResult(err instanceof Error ? err.message : String(err)),
+      });
+    } finally {
+      if (this.inFlightEventsAbort === controller) {
+        this.inFlightEventsAbort = null;
+      }
+    }
+  }
+
+  private async handleTraceLocateEvent(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const querySeq = Number(msg.querySeq);
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const unit: TraceTimeUnit = msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    const start = String(msg.start ?? '0');
+    const end = String(msg.end ?? '0');
+    const targetTime = msg.targetTime !== undefined ? String(msg.targetTime) : undefined;
+    const targetBootGeneration = typeof msg.targetBootGeneration === 'number' ? msg.targetBootGeneration : undefined;
+    const targetSegmentId = typeof msg.targetSegmentId === 'number' ? msg.targetSegmentId : undefined;
+    const targetPacketIndex = typeof msg.targetPacketIndex === 'number' ? msg.targetPacketIndex : undefined;
+    const targetByteOffset = typeof msg.targetByteOffset === 'number' ? msg.targetByteOffset : undefined;
+    const category: TraceEventCategoryFilter = typeof msg.category === 'string' ? (msg.category as TraceEventCategoryFilter) : 'all';
+    const searchText = typeof msg.searchText === 'string' ? msg.searchText.slice(0, 128) : '';
+    const contextKey = typeof msg.contextKey === 'string' && msg.contextKey ? msg.contextKey : undefined;
+    const onlyWithDiagnostics = Boolean(msg.onlyWithDiagnostics);
+
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    if (Number.isFinite(querySeq)) {
+      this.latestLocateQuerySeq = querySeq;
+    }
+    const myEpoch = ++this.locateRequestEpoch;
+
+    this.inFlightLocateAbort?.abort();
+    const controller = new AbortController();
+    this.inFlightLocateAbort = controller;
+    const t0 = performance.now();
+
+    try {
+      const locRes = await this.traceCoordinator.locateEvent(
+        recordId,
+        {
+          start,
+          end,
+          unit,
+          ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+          ...(segmentId !== undefined ? { segmentId } : {}),
+          ...(targetTime !== undefined ? { targetTime } : {}),
+          ...(targetBootGeneration !== undefined ? { targetBootGeneration } : {}),
+          ...(targetSegmentId !== undefined ? { targetSegmentId } : {}),
+          ...(targetPacketIndex !== undefined ? { targetPacketIndex } : {}),
+          ...(targetByteOffset !== undefined ? { targetByteOffset } : {}),
+          filter: {
+            category,
+            searchText,
+            ...(contextKey ? { contextKey } : {}),
+            ...(onlyWithDiagnostics ? { onlyWithDiagnostics: true } : {}),
+          },
+        },
+        { signal: controller.signal },
+      );
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) return;
+      if (myEpoch !== this.locateRequestEpoch) return;
+
+      if (!locRes.ok) {
+        if (locRes.cancelled) return;
+        const result: TraceEventLocateResponse = {
+          querySeq,
+          recordId,
+          unit,
+          queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+          error: `${locRes.errorCode}: ${locRes.message}`,
+        };
+        this.postMessage({ command: 'traceEventLocateResult', result });
+        return;
+      }
+
+      const result: TraceEventLocateResponse = {
+        querySeq,
+        recordId,
+        unit,
+        result: locRes.data,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      };
+      this.postMessage({ command: 'traceEventLocateResult', result });
+    } catch (err) {
+      if (controller.signal.aborted || this.disposed) return;
+      const result: TraceEventLocateResponse = {
+        querySeq,
+        recordId,
+        unit,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      this.postMessage({ command: 'traceEventLocateResult', result });
+    } finally {
+      if (this.inFlightLocateAbort === controller) {
+        this.inFlightLocateAbort = null;
+      }
+    }
+  }
+
+  private async handleTraceQueryTerminal(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const querySeq = Number(msg.querySeq);
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const unit: TraceTimeUnit = msg.unit === 'relative-ns' || msg.unit === 'absolute-ticks' || msg.unit === 'relative-ticks' ? msg.unit : 'ns';
+    const scopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey : 'all-anchored';
+    const sourceKind: TraceAnalysisSourceKind = msg.sourceKind === 'selection' || msg.sourceKind === 'full' ? msg.sourceKind : 'viewport';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    const start = String(msg.start ?? '0');
+    const end = String(msg.end ?? '0');
+    const offset = Math.max(0, Math.floor(Number(msg.offset) || 0));
+    const limit = Math.max(1, Math.min(500, Math.floor(Number(msg.limit) || 200)));
+    const level: TraceTerminalLevelFilter = msg.level === 'log' || msg.level === 'warning' || msg.level === 'error' ? msg.level : 'all';
+    const searchText = typeof msg.searchText === 'string' ? msg.searchText.slice(0, 128) : '';
+    const mergeAppend = msg.mergeAppend !== false;
+
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    if (Number.isFinite(querySeq)) {
+      this.latestTerminalQuerySeq = querySeq;
+    }
+    const myEpoch = ++this.terminalRequestEpoch;
+
+    this.inFlightTerminalAbort?.abort();
+    const controller = new AbortController();
+    this.inFlightTerminalAbort = controller;
+    const t0 = performance.now();
+
+    const makeErrorResult = (error: string): TraceTerminalResponse => ({
+      querySeq,
+      recordId,
+      unit,
+      scopeKey,
+      sourceKind,
+      level,
+      searchText,
+      mergeAppend,
+      queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      error,
+    });
+
+    try {
+      const termRes = await this.traceCoordinator.queryTerminal(
+        recordId,
+        {
+          start,
+          end,
+          unit,
+          offset,
+          limit,
+          level,
+          searchText,
+          mergeAppend,
+          ...(bootGeneration !== undefined ? { bootGeneration } : {}),
+          ...(segmentId !== undefined ? { segmentId } : {}),
+        },
+        { signal: controller.signal },
+      );
+
+      if (controller.signal.aborted || this.disposed || this.selectedTraceRecordId !== recordId) return;
+      if (myEpoch !== this.terminalRequestEpoch) return;
+
+      if (!termRes.ok) {
+        if (termRes.cancelled) return;
+        this.postMessage({ command: 'traceTerminalResult', result: makeErrorResult(`${termRes.errorCode}: ${termRes.message}`) });
+        return;
+      }
+
+      const result: TraceTerminalResponse = {
+        querySeq,
+        recordId,
+        unit,
+        scopeKey,
+        sourceKind,
+        level,
+        searchText,
+        mergeAppend,
+        result: termRes.data,
+        queryDurationMs: Math.round((performance.now() - t0) * 100) / 100,
+      };
+      this.postMessage({ command: 'traceTerminalResult', result });
+    } catch (err) {
+      if (controller.signal.aborted || this.disposed) return;
+      this.postMessage({
+        command: 'traceTerminalResult',
+        result: makeErrorResult(err instanceof Error ? err.message : String(err)),
+      });
+    } finally {
+      if (this.inFlightTerminalAbort === controller) {
+        this.inFlightTerminalAbort = null;
+      }
+    }
+  }
+
+  private async handleTraceGetDiagnostics(msg: any): Promise<void> {
+    if (!this.traceCoordinator || this.disposed) return;
+    const recordId = typeof msg.recordId === 'string' ? msg.recordId : '';
+    const bootGeneration = typeof msg.bootGeneration === 'number' ? msg.bootGeneration : undefined;
+    const segmentId = typeof msg.segmentId === 'number' ? msg.segmentId : undefined;
+    if (!recordId || !this.traceRecords.has(recordId)) return;
+    try {
+      const res = await this.traceCoordinator.getDiagnostics(recordId, { bootGeneration, segmentId, limit: 512 });
+      if (this.disposed || this.selectedTraceRecordId !== recordId) return;
+      const payload: TraceDiagnosticsResponse = res.ok
+        ? { recordId, diagnostics: res.data }
+        : { recordId, error: `${res.errorCode}: ${res.message}` };
+      this.postMessage({ command: 'traceDiagnosticsResult', result: payload });
+    } catch (err) {
+      if (this.disposed || this.selectedTraceRecordId !== recordId) return;
+      this.postMessage({
+        command: 'traceDiagnosticsResult',
+        result: { recordId, error: err instanceof Error ? err.message : String(err) } satisfies TraceDiagnosticsResponse,
+      });
     }
   }
 

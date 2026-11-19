@@ -19,6 +19,15 @@ import type {
   TraceAnalysisQueryResult,
 } from './trace-analytics';
 import type {
+  TraceEventLocateRequest,
+  TraceEventLocateResult,
+  TraceEventsQueryRequest,
+  TraceEventsQueryResult,
+  TraceRecordingDiagnosticsResult,
+  TraceTerminalQueryRequest,
+  TraceTerminalQueryResult,
+} from './trace-events';
+import type {
   CreateTraceRecordingOptions,
   IngestBatchSummary,
   TraceLodQueryRequest,
@@ -29,7 +38,17 @@ import type {
   TraceStorageStats,
 } from './trace-recording-store';
 
-export type { TraceAnalysisQueryRequest, TraceAnalysisQueryResult };
+export type {
+  TraceAnalysisQueryRequest,
+  TraceAnalysisQueryResult,
+  TraceEventLocateRequest,
+  TraceEventLocateResult,
+  TraceEventsQueryRequest,
+  TraceEventsQueryResult,
+  TraceRecordingDiagnosticsResult,
+  TraceTerminalQueryRequest,
+  TraceTerminalQueryResult,
+};
 
 export interface TraceWorkerLimits {
   readonly maxSingleBatchBytes: number;
@@ -175,6 +194,47 @@ export type TraceWorkerRequest =
       readonly cancelToken?: number;
       readonly yieldEveryPages?: number;
       readonly yieldEveryItems?: number;
+    }
+  | {
+      readonly reqId: number;
+      readonly type: 'queryEvents';
+      readonly recordId: string;
+      readonly queryId: string;
+      readonly request: TraceEventsQueryRequest;
+      readonly cancelSlot?: number;
+      readonly cancelToken?: number;
+      readonly yieldEveryPages?: number;
+      readonly yieldEveryItems?: number;
+    }
+  | {
+      readonly reqId: number;
+      readonly type: 'locateEvent';
+      readonly recordId: string;
+      readonly queryId: string;
+      readonly request: TraceEventLocateRequest;
+      readonly cancelSlot?: number;
+      readonly cancelToken?: number;
+      readonly yieldEveryPages?: number;
+      readonly yieldEveryItems?: number;
+    }
+  | {
+      readonly reqId: number;
+      readonly type: 'queryTerminal';
+      readonly recordId: string;
+      readonly queryId: string;
+      readonly request: TraceTerminalQueryRequest;
+      readonly cancelSlot?: number;
+      readonly cancelToken?: number;
+      readonly yieldEveryPages?: number;
+      readonly yieldEveryItems?: number;
+    }
+  | {
+      readonly reqId: number;
+      readonly type: 'getDiagnostics';
+      readonly recordId: string;
+      readonly bootGeneration?: number;
+      readonly segmentId?: number;
+      readonly limit?: number;
     }
   | {
       readonly reqId: number;

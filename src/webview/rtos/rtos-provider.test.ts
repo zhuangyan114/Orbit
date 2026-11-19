@@ -563,6 +563,114 @@ describe('RtosWebviewProvider', () => {
       expect(vpMsgs[vpMsgs.length - 1].result.querySeq).toBe(2);
       expect(vpMsgs[vpMsgs.length - 1].result.slices.length).toBeGreaterThan(0);
 
+      // Stage 5.2: traceQueryEvents / traceLocateEvent / traceQueryTerminal / traceGetDiagnostics + stale cancellation
+      const e1 = (provider as any).handleMessage({
+        command: 'traceQueryEvents',
+        querySeq: 1,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        offset: 0,
+        limit: 50,
+      });
+      const e2 = (provider as any).handleMessage({
+        command: 'traceQueryEvents',
+        querySeq: 2,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        offset: 0,
+        limit: 50,
+      });
+      await Promise.all([e1, e2]);
+      const evMsgs = view.posted.filter((m: any) => m.command === 'traceEventsResult');
+      expect(evMsgs.length).toBeGreaterThanOrEqual(1);
+      const lastEv = evMsgs[evMsgs.length - 1].result;
+      expect(lastEv.querySeq).toBe(2);
+      expect(lastEv.result.totalMatched).toBeGreaterThan(0);
+      expect(lastEv.result.items.length).toBeGreaterThan(0);
+
+      const firstItem = lastEv.result.items[0];
+      await (provider as any).handleMessage({
+        command: 'traceLocateEvent',
+        querySeq: 3,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        targetBootGeneration: firstItem.bootGeneration,
+        targetSegmentId: firstItem.segmentId,
+        targetPacketIndex: firstItem.packetIndexInSegment,
+        targetByteOffset: firstItem.streamByteOffset,
+      });
+      const locMsgs = view.posted.filter((m: any) => m.command === 'traceEventLocateResult');
+      expect(locMsgs.length).toBeGreaterThanOrEqual(1);
+      expect(locMsgs[locMsgs.length - 1].result.result.found).toBe(true);
+      expect(locMsgs[locMsgs.length - 1].result.result.exactMatch).toBe(true);
+
+      await (provider as any).handleMessage({
+        command: 'traceQueryTerminal',
+        querySeq: 1,
+        recordId: openedId,
+        unit: 'relative-ticks',
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+        start: '0',
+        end: '1000',
+        mergeAppend: true,
+        offset: 0,
+        limit: 50,
+      });
+      const termMsgs = view.posted.filter((m: any) => m.command === 'traceTerminalResult');
+      expect(termMsgs.length).toBeGreaterThanOrEqual(1);
+      expect(termMsgs[termMsgs.length - 1].result.querySeq).toBe(1);
+
+      await (provider as any).handleMessage({
+        command: 'traceGetDiagnostics',
+        querySeq: 1,
+        recordId: openedId,
+        scopeKey: '1:1',
+        bootGeneration: 1,
+        segmentId: 1,
+      });
+      const diagMsgs = view.posted.filter((m: any) => m.command === 'traceDiagnosticsResult');
+      expect(diagMsgs.length).toBeGreaterThanOrEqual(1);
+
+      await (provider as any).handleMessage({
+        command: 'eventsPerfReport',
+        perf: {
+          recordId: openedId,
+          querySeq: 2,
+          domRows: lastEv.result.items.length,
+          totalMatched: lastEv.result.totalMatched,
+          renderTimeMs: 4.5,
+        },
+      });
+      await (provider as any).handleMessage({
+        command: 'terminalPerfReport',
+        perf: {
+          recordId: openedId,
+          querySeq: 1,
+          domLines: termMsgs[termMsgs.length - 1].result.result.lines.length,
+          totalLines: termMsgs[termMsgs.length - 1].result.result.totalLines,
+          renderTimeMs: 2.1,
+        },
+      });
+      expect(provider.currentEventsPerf?.domRows).toBe(lastEv.result.items.length);
+      expect(provider.currentTerminalPerf?.totalLines).toBe(termMsgs[termMsgs.length - 1].result.result.totalLines);
+
       // 2. Hiding / disposing view MUST NOT stop an active recording in TraceRecordingCoordinator
       const stopSpy = vi.spyOn(coordinator, 'stopRecording');
       const fakeSession: any = {

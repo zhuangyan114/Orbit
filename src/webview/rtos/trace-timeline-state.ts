@@ -1,6 +1,15 @@
 import type { SegmentReliability, TimeAnchorStatus, TraceGapKind } from '../../trace/systemview-decoder';
 import type { ExecutionContextKind, IntervalCompleteness, LabelSource, ReadyOutcome } from '../../trace/systemview-reconstructor';
 import type { TraceAnalysisQueryResult, TraceContextStatsRow, TraceMarkerStatsRow } from '../../trace/trace-analytics';
+import type { TraceEventDto } from '../../trace/systemview-formatter';
+import type {
+  TraceEventCategoryFilter,
+  TraceEventLocateResult,
+  TraceEventsQueryResult,
+  TraceRecordingDiagnosticsResult,
+  TraceTerminalLevelFilter,
+  TraceTerminalQueryResult,
+} from '../../trace/trace-events';
 import type { TraceCaptureIntegrity, TraceFreezeEvidence, TraceRecordingMode, TraceRecordingState, TraceTargetState, TraceTransportAdequacy } from '../../trace/trace-recording-coordinator';
 
 export type TraceTimeUnit = 'ns' | 'relative-ns' | 'absolute-ticks' | 'relative-ticks';
@@ -1137,6 +1146,65 @@ export interface TraceAnalysisResponse {
   readonly error?: string;
 }
 
+export interface TraceEventsResponse {
+  readonly querySeq: number;
+  readonly recordId: string;
+  readonly unit: TraceTimeUnit;
+  readonly scopeKey: string;
+  readonly sourceKind: TraceAnalysisSourceKind;
+  readonly category: TraceEventCategoryFilter;
+  readonly searchText: string;
+  readonly contextKey?: string;
+  readonly onlyWithDiagnostics?: boolean;
+  readonly result?: TraceEventsQueryResult;
+  readonly queryDurationMs: number;
+  readonly cancelled?: boolean;
+  readonly error?: string;
+}
+
+export interface TraceEventLocateResponse {
+  readonly querySeq: number;
+  readonly recordId: string;
+  readonly unit: TraceTimeUnit;
+  readonly result?: TraceEventLocateResult;
+  readonly queryDurationMs: number;
+  readonly cancelled?: boolean;
+  readonly error?: string;
+}
+
+export interface TraceTerminalResponse {
+  readonly querySeq: number;
+  readonly recordId: string;
+  readonly unit: TraceTimeUnit;
+  readonly scopeKey: string;
+  readonly sourceKind: TraceAnalysisSourceKind;
+  readonly level: TraceTerminalLevelFilter;
+  readonly searchText: string;
+  readonly mergeAppend: boolean;
+  readonly result?: TraceTerminalQueryResult;
+  readonly queryDurationMs: number;
+  readonly cancelled?: boolean;
+  readonly error?: string;
+}
+
+export interface TraceDiagnosticsResponse {
+  readonly recordId: string;
+  readonly diagnostics?: TraceRecordingDiagnosticsResult;
+  readonly error?: string;
+}
+
+export interface TraceFocusedEventRef {
+  readonly recordId: string;
+  readonly eventKey: string;
+  readonly bootGeneration: number;
+  readonly segmentId: number;
+  readonly packetIndexInSegment: number;
+  readonly streamByteOffset: number;
+  readonly timeStr: string;
+  readonly unit: TraceTimeUnit;
+  readonly label?: string;
+}
+
 export interface ResolvedAnalysisRange {
   readonly valid: boolean;
   readonly sourceKind: TraceAnalysisSourceKind;
@@ -1345,4 +1413,181 @@ export function filterMarkerRows(
     const name = (m.name || '').toLowerCase();
     return idStr.includes(needle) || `m#${idStr}`.includes(needle) || name.includes(needle);
   });
+}
+
+export interface VirtualScrollMetrics {
+  readonly totalRows: number;
+  readonly rowHeightPx: number;
+  readonly viewportHeightPx: number;
+  readonly visibleRowCount: number;
+  readonly scrollHeightPx: number;
+  readonly maxScrollTopPx: number;
+  readonly maxStartRow: number;
+}
+
+export const MAX_VIRTUAL_SCROLL_HEIGHT_PX = 2_000_000;
+
+export function computeVirtualScrollMetrics(
+  totalRows: number,
+  rowHeightPx: number,
+  viewportHeightPx: number,
+  maxScrollHeightPx = MAX_VIRTUAL_SCROLL_HEIGHT_PX,
+): VirtualScrollMetrics {
+  const safeTotal = Math.max(0, Math.floor(totalRows));
+  const safeRowH = Math.max(12, Math.floor(rowHeightPx));
+  const safeVpH = Math.max(safeRowH, Math.floor(viewportHeightPx));
+  const visibleRowCount = Math.max(1, Math.ceil(safeVpH / safeRowH) + 2);
+  const rawHeight = safeTotal * safeRowH;
+  const scrollHeightPx = Math.max(safeVpH, Math.min(maxScrollHeightPx, rawHeight));
+  const maxScrollTopPx = Math.max(0, scrollHeightPx - safeVpH);
+  const exactVisible = Math.max(1, Math.floor(safeVpH / safeRowH));
+  const maxStartRow = Math.max(0, safeTotal - exactVisible);
+  return {
+    totalRows: safeTotal,
+    rowHeightPx: safeRowH,
+    viewportHeightPx: safeVpH,
+    visibleRowCount,
+    scrollHeightPx,
+    maxScrollTopPx,
+    maxStartRow,
+  };
+}
+
+export function scrollTopToRowIndex(scrollTop: number, metrics: VirtualScrollMetrics): number {
+  if (metrics.maxStartRow <= 0 || metrics.maxScrollTopPx <= 0) return 0;
+  const clamped = Math.max(0, Math.min(metrics.maxScrollTopPx, scrollTop));
+  const ratio = clamped / metrics.maxScrollTopPx;
+  return Math.max(0, Math.min(metrics.maxStartRow, Math.round(ratio * metrics.maxStartRow)));
+}
+
+export function rowIndexToScrollTop(rowIndex: number, metrics: VirtualScrollMetrics): number {
+  if (metrics.maxStartRow <= 0 || metrics.maxScrollTopPx <= 0) return 0;
+  const clamped = Math.max(0, Math.min(metrics.maxStartRow, Math.floor(rowIndex)));
+  return Math.round((clamped / metrics.maxStartRow) * metrics.maxScrollTopPx);
+}
+
+export function resolveEventTimeStrForUnit(
+  ev: Pick<TraceEventDto, 'relTicks' | 'absTicks' | 'ns' | 'sysFreqHz'>,
+  unit: TraceTimeUnit,
+): string | undefined {
+  switch (unit) {
+    case 'ns':
+      if (ev.ns !== undefined) return ev.ns;
+      if (ev.absTicks !== undefined && ev.sysFreqHz && ev.sysFreqHz > 0) {
+        return ((BigInt(ev.absTicks) * 1_000_000_000n) / BigInt(ev.sysFreqHz)).toString();
+      }
+      return undefined;
+    case 'relative-ns':
+      if (ev.sysFreqHz && ev.sysFreqHz > 0) {
+        return ((BigInt(ev.relTicks) * 1_000_000_000n) / BigInt(ev.sysFreqHz)).toString();
+      }
+      return undefined;
+    case 'absolute-ticks':
+      return ev.absTicks;
+    case 'relative-ticks':
+      return ev.relTicks;
+  }
+}
+
+export interface EventToTimelineJumpPlan {
+  readonly ok: boolean;
+  readonly reason?: string;
+  readonly scopeKey: string;
+  readonly unit: TraceTimeUnit;
+  readonly timeStr: string;
+  readonly viewStart: string;
+  readonly viewEnd: string;
+  readonly bootGeneration: number;
+  readonly segmentId: number;
+}
+
+export function computeTimelineJumpForEvent(
+  ev: Pick<TraceEventDto, 'bootGeneration' | 'segmentId' | 'relTicks' | 'absTicks' | 'ns' | 'sysFreqHz'>,
+  segments: readonly TraceSegmentDto[],
+  currentScopeKey: string,
+  currentUnit: TraceTimeUnit,
+): EventToTimelineJumpPlan {
+  const segKey = segmentScopeKey(ev.bootGeneration, ev.segmentId);
+  const currentDomain = computeAxisDomain(segments, currentUnit, currentScopeKey);
+  const segIncludedInCurrent =
+    currentDomain.valid &&
+    currentDomain.includedSegments.some(s => s.bootGeneration === ev.bootGeneration && s.segmentId === ev.segmentId);
+
+  let targetScopeKey = segIncludedInCurrent ? currentScopeKey : segKey;
+  let targetUnit = currentUnit;
+  let targetTimeStr = resolveEventTimeStrForUnit(ev, targetUnit);
+
+  if (!segIncludedInCurrent || targetTimeStr === undefined) {
+    targetScopeKey = segKey;
+    const segDomain = computeAxisDomain(segments, targetUnit, targetScopeKey);
+    if (!segDomain.valid || resolveEventTimeStrForUnit(ev, targetUnit) === undefined) {
+      const candidates: TraceTimeUnit[] = ['ns', 'relative-ns', 'absolute-ticks', 'relative-ticks'];
+      for (const cand of candidates) {
+        const t = resolveEventTimeStrForUnit(ev, cand);
+        const d = computeAxisDomain(segments, cand, targetScopeKey);
+        if (t !== undefined && d.valid) {
+          targetUnit = cand;
+          targetTimeStr = t;
+          break;
+        }
+      }
+    } else {
+      targetTimeStr = resolveEventTimeStrForUnit(ev, targetUnit);
+    }
+  }
+
+  const finalDomain = computeAxisDomain(segments, targetUnit, targetScopeKey);
+  if (!finalDomain.valid || targetTimeStr === undefined) {
+    return {
+      ok: false,
+      reason: finalDomain.reason ?? '无法解析该事件所在段的时间轴坐标',
+      scopeKey: targetScopeKey,
+      unit: targetUnit,
+      timeStr: ev.relTicks,
+      viewStart: '0',
+      viewEnd: '1',
+      bootGeneration: ev.bootGeneration,
+      segmentId: ev.segmentId,
+    };
+  }
+
+  const t = BigInt(targetTimeStr);
+  const dMin = BigInt(finalDomain.minStr);
+  const dMax = BigInt(finalDomain.displayMaxStr);
+  const dSpan = dMax > dMin ? dMax - dMin : 1n;
+
+  const isNs = targetUnit === 'ns' || targetUnit === 'relative-ns';
+  const minZoom = isNs ? 20_000n : 20n;
+  const maxZoom = isNs ? 5_000_000n : 5_000n;
+  let desiredSpan = dSpan / 10n;
+  if (desiredSpan < minZoom) desiredSpan = minZoom;
+  if (desiredSpan > maxZoom) desiredSpan = maxZoom;
+  if (desiredSpan > dSpan) desiredSpan = dSpan;
+  if (desiredSpan < 1n) desiredSpan = 1n;
+
+  const half = desiredSpan / 2n;
+  let vStart = t - half;
+  let vEnd = vStart + desiredSpan;
+  if (vStart < dMin) {
+    vStart = dMin;
+    vEnd = vStart + desiredSpan <= dMax ? vStart + desiredSpan : dMax;
+  }
+  if (vEnd > dMax) {
+    vEnd = dMax;
+    vStart = vEnd - desiredSpan >= dMin ? vEnd - desiredSpan : dMin;
+  }
+  if (vEnd <= vStart) {
+    vEnd = vStart + 1n;
+  }
+
+  return {
+    ok: true,
+    scopeKey: finalDomain.scopeKey,
+    unit: finalDomain.unit,
+    timeStr: t.toString(),
+    viewStart: vStart.toString(),
+    viewEnd: vEnd.toString(),
+    bootGeneration: ev.bootGeneration,
+    segmentId: ev.segmentId,
+  };
 }

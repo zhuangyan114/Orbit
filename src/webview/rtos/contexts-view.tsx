@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { TraceEventDto } from '../../trace/systemview-formatter';
 import type { TraceAnalysisQueryResult, TraceCpuLoadBin } from '../../trace/trace-analytics';
+import type { TraceEventCategoryFilter, TraceTerminalLevelFilter, TraceTerminalLineDto } from '../../trace/trace-events';
 import { readTimelineTheme } from '../timeline/timeline-theme';
+import { EventsView } from './events-view';
+import { TerminalView } from './terminal-view';
 import { formatHex32, type RtosViewSettings } from './rtos-view-state';
 import {
   bigIntToPixelX,
@@ -17,11 +21,18 @@ import {
   type TraceAnalysisResponse,
   type TraceAnalysisSourceKind,
   type TraceAxisDomain,
+  type TraceDiagnosticsResponse,
+  type TraceEventLocateResponse,
+  type TraceEventsResponse,
+  type TraceFocusedEventRef,
   type TracePanelState,
   type TracePointInspectResponse,
   type TraceRecordSummary,
+  type TraceTerminalResponse,
   type TraceTimeUnit,
 } from './trace-timeline-state';
+
+export type ContextsSubTab = 'contexts' | 'markers' | 'events' | 'terminal';
 
 export interface ContextsViewProps {
   visible: boolean;
@@ -56,6 +67,96 @@ export interface ContextsViewProps {
   }) => void;
   onJumpToTimelineRange: (start: string, end: string) => void;
   onPerfReport?: (perf: Record<string, unknown>) => void;
+  // Stage 5.2 props (optional so existing Stage 5.1 tests continue working cleanly)
+  activeSubTab?: ContextsSubTab;
+  onChangeSubTab?: (tab: ContextsSubTab) => void;
+  eventsResult?: TraceEventsResponse | null;
+  locateResult?: TraceEventLocateResponse | null;
+  terminalResult?: TraceTerminalResponse | null;
+  diagnosticsResult?: TraceDiagnosticsResponse | null;
+  focusedEvent?: TraceFocusedEventRef | null;
+  pendingLocateTarget?: {
+    readonly seq: number;
+    readonly recordId: string;
+    readonly unit: TraceTimeUnit;
+    readonly bootGeneration?: number;
+    readonly segmentId?: number;
+    readonly timeStr: string;
+    readonly packetIndexInSegment?: number;
+    readonly streamByteOffset?: number;
+  } | null;
+  onSelectFocusedEvent?: (ev: TraceEventDto) => void;
+  onJumpToTimelineEvent?: (ev: {
+    bootGeneration: number;
+    segmentId: number;
+    packetIndexInSegment: number;
+    streamByteOffset: number;
+    relTicks: string;
+    absTicks?: string;
+    ns?: string;
+    sysFreqHz?: number;
+    eventKey: string;
+    eventName?: string;
+  }) => void;
+  onLocateLineInEvents?: (line: TraceTerminalLineDto) => void;
+  onQueryEvents?: (req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    scopeKey: string;
+    sourceKind: TraceAnalysisSourceKind;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    offset: number;
+    limit: number;
+    category: TraceEventCategoryFilter;
+    searchText: string;
+    contextKey?: string;
+    onlyWithDiagnostics: boolean;
+  }) => void;
+  onLocateEvent?: (req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    targetTime?: string;
+    targetBootGeneration?: number;
+    targetSegmentId?: number;
+    targetPacketIndex?: number;
+    targetByteOffset?: number;
+    category: TraceEventCategoryFilter;
+    searchText: string;
+    contextKey?: string;
+    onlyWithDiagnostics: boolean;
+  }) => void;
+  onQueryTerminal?: (req: {
+    querySeq: number;
+    recordId: string;
+    unit: TraceTimeUnit;
+    scopeKey: string;
+    sourceKind: TraceAnalysisSourceKind;
+    bootGeneration?: number;
+    segmentId?: number;
+    start: string;
+    end: string;
+    offset: number;
+    limit: number;
+    level: TraceTerminalLevelFilter;
+    searchText: string;
+    mergeAppend: boolean;
+  }) => void;
+  onGetDiagnostics?: (req: {
+    recordId: string;
+    bootGeneration?: number;
+    segmentId?: number;
+  }) => void;
+  onEventsPerfReport?: (perf: Record<string, unknown>) => void;
+  onTerminalPerfReport?: (perf: Record<string, unknown>) => void;
 }
 
 const CHART_HEIGHT = 112;
@@ -113,9 +214,69 @@ export function ContextsView(props: ContextsViewProps) {
     onQueryAnalysis,
     onJumpToTimelineRange,
     onPerfReport,
+    activeSubTab,
+    onChangeSubTab,
+    eventsResult = null,
+    locateResult = null,
+    terminalResult = null,
+    diagnosticsResult = null,
+    focusedEvent = null,
+    pendingLocateTarget = null,
+    onSelectFocusedEvent,
+    onJumpToTimelineEvent,
+    onLocateLineInEvents,
+    onQueryEvents,
+    onLocateEvent,
+    onQueryTerminal,
+    onGetDiagnostics,
+    onEventsPerfReport,
+    onTerminalPerfReport,
   } = props;
 
-  const [subTab, setSubTab] = useState<'contexts' | 'markers'>('contexts');
+  const [internalSubTab, setInternalSubTab] = useState<ContextsSubTab>('contexts');
+  const subTab = activeSubTab ?? internalSubTab;
+  const setSubTab = useCallback((tab: ContextsSubTab) => {
+    setInternalSubTab(tab);
+    onChangeSubTab?.(tab);
+  }, [onChangeSubTab]);
+  const [eventsContextKeyFilter, setEventsContextKeyFilter] = useState<string | null>(null);
+
+  const handleClearEventsContextFilter = useCallback(() => {
+    setEventsContextKeyFilter(null);
+  }, []);
+  const handleSelectFocusedEventProp = useCallback((ev: TraceEventDto) => {
+    onSelectFocusedEvent?.(ev);
+  }, [onSelectFocusedEvent]);
+  const handleJumpToTimelineEventProp = useCallback((ev: {
+    bootGeneration: number;
+    segmentId: number;
+    packetIndexInSegment: number;
+    streamByteOffset: number;
+    relTicks: string;
+    absTicks?: string;
+    ns?: string;
+    sysFreqHz?: number;
+    eventKey: string;
+    eventName?: string;
+  }) => {
+    onJumpToTimelineEvent?.(ev);
+  }, [onJumpToTimelineEvent]);
+  const handleQueryEventsProp = useCallback((req: Parameters<NonNullable<ContextsViewProps['onQueryEvents']>>[0]) => {
+    onQueryEvents?.(req);
+  }, [onQueryEvents]);
+  const handleLocateEventProp = useCallback((req: Parameters<NonNullable<ContextsViewProps['onLocateEvent']>>[0]) => {
+    onLocateEvent?.(req);
+  }, [onLocateEvent]);
+  const handleQueryTerminalProp = useCallback((req: Parameters<NonNullable<ContextsViewProps['onQueryTerminal']>>[0]) => {
+    onQueryTerminal?.(req);
+  }, [onQueryTerminal]);
+  const handleGetDiagnosticsProp = useCallback((req: Parameters<NonNullable<ContextsViewProps['onGetDiagnostics']>>[0]) => {
+    onGetDiagnostics?.(req);
+  }, [onGetDiagnostics]);
+  const handleLocateLineInEventsProp = useCallback((line: TraceTerminalLineDto) => {
+    onLocateLineInEvents?.(line);
+    setSubTab('events');
+  }, [onLocateLineInEvents, setSubTab]);
   const [kindFilter, setKindFilter] = useState<ContextStatsKindFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortKey, setSortKey] = useState<ContextStatsSortKey>('cpu');
@@ -157,8 +318,11 @@ export function ContextsView(props: ContextsViewProps) {
     [axisDomain, viewRange, cursorA, cursorB, cursorAInspect, cursorBInspect, selectedRecord?.segments, selectedRecord?.gaps, rangeSource],
   );
 
-  // Trigger coalesced Worker analysis query when visible & target range changes
+  // Trigger coalesced Worker analysis query when visible & target range changes (contexts/markers tabs)
   useEffect(() => {
+    if (subTab !== 'contexts' && subTab !== 'markers') {
+      return;
+    }
     if (!visible || !activeRecordId || !axisDomain.valid || !resolvedRange.valid || !resolvedRange.start || !resolvedRange.end) {
       if (activeRecordId) {
         onPerfReport?.({
@@ -219,6 +383,7 @@ export function ContextsView(props: ContextsViewProps) {
     resolvedRange.end,
     committedBytes,
     chartWidth,
+    subTab,
     onQueryAnalysis,
   ]);
 
@@ -424,9 +589,10 @@ export function ContextsView(props: ContextsViewProps) {
         perf: { ...perfRef.current },
       }),
       setRangeSource: (src: TraceAnalysisSourceKind) => onChangeRangeSource(src),
-      setSubTab: (tab: 'contexts' | 'markers') => setSubTab(tab),
+      setScopeKey: (key: string) => onChangeScopeKey(key),
+      setSubTab: (tab: ContextsSubTab) => setSubTab(tab),
     };
-  }, [activeRecordId, activeUnit, activeScopeKey, rangeSource, resolvedRange, analysis, onChangeRangeSource]);
+  }, [activeRecordId, activeUnit, activeScopeKey, rangeSource, resolvedRange, analysis, onChangeRangeSource, onChangeScopeKey, setSubTab]);
 
   const toggleSort = (key: ContextStatsSortKey) => {
     if (sortKey === key) {
@@ -607,7 +773,8 @@ export function ContextsView(props: ContextsViewProps) {
         </div>
       )}
 
-      {/* CPU Load 有界分箱图表区 */}
+      {/* CPU Load 有界分箱图表区（Contexts / Markers 页签显示，Events / Terminal 页签折叠以留出大表高度） */}
+      {(subTab === 'contexts' || subTab === 'markers') && (
       <section className="contexts-cpuload-card" aria-label="CPU Load 分箱图">
         <div className="contexts-cpuload-header">
           <span className="contexts-legend">
@@ -649,10 +816,11 @@ export function ContextsView(props: ContextsViewProps) {
           />
         </div>
       </section>
+      )}
 
       {/* 子视图切换 & 搜索筛选 */}
       <div className="rtos-filter-bar">
-        <div className="rtos-filter-chips" role="tablist" aria-label="统计明细表">
+        <div className="rtos-filter-chips" role="tablist" aria-label="统计与事件子视图">
           <button
             type="button"
             role="tab"
@@ -670,6 +838,24 @@ export function ContextsView(props: ContextsViewProps) {
             onClick={() => setSubTab('markers')}
           >
             Markers ({analysis?.markers.length ?? 0}{analysis?.markersTruncated ? '+' : ''})
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={subTab === 'events'}
+            className={`rtos-chip${subTab === 'events' ? ' active' : ''}`}
+            onClick={() => setSubTab('events')}
+          >
+            事件列表 (Events{selectedRecord ? ` · ${selectedRecord.counters.packetsDecoded.toLocaleString()}` : ''})
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={subTab === 'terminal'}
+            className={`rtos-chip${subTab === 'terminal' ? ' active' : ''}`}
+            onClick={() => setSubTab('terminal')}
+          >
+            Trace 终端
           </button>
         </div>
 
@@ -695,21 +881,54 @@ export function ContextsView(props: ContextsViewProps) {
           </div>
         )}
 
-        <input
-          type="search"
-          aria-label="筛选上下文或 Marker"
-          className="rtos-search"
-          placeholder={subTab === 'contexts' ? '搜索任务名、TCB、IRQ…' : '搜索 Marker ID 或名称…'}
-          value={searchQuery}
-          onChange={e => setSearchQuery(e.target.value)}
-        />
-
-        <span className="rtos-muted" title="Events 虚拟事件列表与 Trace Terminal 将在阶段 5.2 接入">
-          Events / Terminal: 阶段 5.2 待接入
-        </span>
+        {(subTab === 'contexts' || subTab === 'markers') && (
+          <input
+            type="search"
+            aria-label="筛选上下文或 Marker"
+            className="rtos-search"
+            placeholder={subTab === 'contexts' ? '搜索任务名、TCB、IRQ…' : '搜索 Marker ID 或名称…'}
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+          />
+        )}
       </div>
 
-      {/* 明细表 */}
+      {/* 明细表 / 虚拟事件表 / Trace 终端 */}
+      {subTab === 'events' ? (
+        <EventsView
+          visible={visible && subTab === 'events'}
+          selectedRecord={selectedRecord}
+          axisDomain={axisDomain}
+          resolvedRange={resolvedRange}
+          rangeSource={rangeSource}
+          eventsResult={eventsResult}
+          locateResult={locateResult}
+          focusedEvent={focusedEvent}
+          pendingLocateTarget={pendingLocateTarget}
+          contextKeyFilter={eventsContextKeyFilter}
+          onClearContextKeyFilter={handleClearEventsContextFilter}
+          onSelectFocusedEvent={handleSelectFocusedEventProp}
+          onJumpToTimelineEvent={handleJumpToTimelineEventProp}
+          onQueryEvents={handleQueryEventsProp}
+          onLocateEvent={handleLocateEventProp}
+          onPerfReport={onEventsPerfReport}
+        />
+      ) : subTab === 'terminal' ? (
+        <TerminalView
+          visible={visible && subTab === 'terminal'}
+          selectedRecord={selectedRecord}
+          axisDomain={axisDomain}
+          resolvedRange={resolvedRange}
+          rangeSource={rangeSource}
+          terminalResult={terminalResult}
+          diagnosticsResult={diagnosticsResult}
+          onQueryTerminal={handleQueryTerminalProp}
+          onGetDiagnostics={handleGetDiagnosticsProp}
+          onLocateLineInEvents={handleLocateLineInEventsProp}
+          onJumpLineToTimeline={handleJumpToTimelineEventProp}
+          onPerfReport={onTerminalPerfReport}
+        />
+      ) : (
       <div className="rtos-table-scroll">
         {subTab === 'contexts' ? (
           <table className="rtos-table">
@@ -775,6 +994,19 @@ export function ContextsView(props: ContextsViewProps) {
                           <span className="rtos-evidence rtos-evidence-validated-tcb" title="TCB 地址复用后的独立任务代次">
                             #g{row.taskGeneration}
                           </span>
+                        )}
+                        {onQueryEvents && row.contextKind !== 'timer' && (
+                          <button
+                            type="button"
+                            className="rtos-mini-btn"
+                            title="筛选此上下文的 Trace 事件"
+                            onClick={() => {
+                              setEventsContextKeyFilter(row.contextKey);
+                              setSubTab('events');
+                            }}
+                          >
+                            事件
+                          </button>
                         )}
                       </div>
                     </td>
@@ -924,6 +1156,7 @@ export function ContextsView(props: ContextsViewProps) {
           </table>
         )}
       </div>
+      )}
     </div>
   );
 }

@@ -5,6 +5,7 @@ import {
   SystemViewDecodeBatch,
   SystemViewDecoderOptions,
   SystemViewStreamDecoder,
+  TraceDiagnostic,
   TraceGapInput,
   TraceSegmentSummary,
 } from './systemview-decoder';
@@ -14,7 +15,9 @@ import {
   MarkerInterval,
   MarkerPointEvent,
   ReadyWaitInterval,
+  ReconstructorDiagnostic,
   SystemViewTraceReconstructor,
+  TaskInstanceSummary,
   TraceReconstructBatch,
   TraceReconstructionIdentity,
   TraceSymbolMap,
@@ -61,6 +64,25 @@ import {
   TraceAnalysisQueryRequest,
   TraceAnalysisQueryResult,
 } from './trace-analytics';
+import {
+  buildRecordingDiagnosticsResult,
+  createTraceEventMetadataContext,
+  executeEventLocate,
+  executeEventsQuery,
+  executeTerminalQuery,
+  TraceEventLocateRequest,
+  TraceEventLocateResult,
+  TraceEventsExecutionHost,
+  TraceEventsQueryRequest,
+  TraceEventsQueryResult,
+  TraceRecordingDiagnosticsResult,
+  TraceTerminalQueryRequest,
+  TraceTerminalQueryResult,
+} from './trace-events';
+import type {
+  TraceEventMetadataContext,
+  VerifiedElfRodataLookup,
+} from './systemview-formatter';
 import {
   CompactedDirectoryBlock,
   getIntervalBoundsForUnit,
@@ -538,7 +560,16 @@ export class TraceRecordingStore {
   private pendingBatchSequences: number[] = [];
   private pendingSegments = new Map<string, SegmentIndexMetadata>();
   private pendingGaps: StoredGapEntry[] = [];
-  private pendingTasks = new Map<string, any>();
+  private pendingTasks = new Map<string, TaskInstanceSummary>();
+  private readonly eventMetadata: TraceEventMetadataContext = createTraceEventMetadataContext();
+  private readonly seededMetadataPartitions = new Set<string>();
+  private rodataLookup?: VerifiedElfRodataLookup;
+  private readonly storedDecoderDiagnostics: TraceDiagnostic[] = [];
+  private readonly storedReconstructorDiagnostics: ReconstructorDiagnostic[] = [];
+  private pendingDecoderDiagnostics: TraceDiagnostic[] = [];
+  private pendingReconstructorDiagnostics: ReconstructorDiagnostic[] = [];
+  private droppedRecordedDiagnostics = 0;
+  private static readonly MAX_STORED_DIAGNOSTICS = 512;
 
   private activePageBuffers = new Map<string, PendingPageBuffer>();
   private regularMaxEndByPartKind = new Map<string, bigint>();
@@ -821,6 +852,32 @@ export class TraceRecordingStore {
           }
         }
       }
+      if (frame.meta.tasks) {
+        for (const t of frame.meta.tasks) {
+          this.absorbTaskSummaryMetadata(t);
+        }
+      }
+      if (frame.meta.decoderDiagnostics) {
+        for (const d of frame.meta.decoderDiagnostics) {
+          if (this.storedDecoderDiagnostics.length < TraceRecordingStore.MAX_STORED_DIAGNOSTICS) {
+            this.storedDecoderDiagnostics.push(d);
+          } else {
+            this.droppedRecordedDiagnostics++;
+          }
+        }
+      }
+      if (frame.meta.reconstructorDiagnostics) {
+        for (const r of frame.meta.reconstructorDiagnostics) {
+          if (this.storedReconstructorDiagnostics.length < TraceRecordingStore.MAX_STORED_DIAGNOSTICS) {
+            this.storedReconstructorDiagnostics.push(r);
+          } else {
+            this.droppedRecordedDiagnostics++;
+          }
+        }
+      }
+      if (frame.meta.droppedDiagnosticsCount) {
+        this.droppedRecordedDiagnostics += frame.meta.droppedDiagnosticsCount;
+      }
       if (frame.meta.countsDelta) {
         packetCount += frame.meta.countsDelta.packetCount ?? 0;
         sliceCount += frame.meta.countsDelta.sliceCount ?? 0;
@@ -839,6 +896,9 @@ export class TraceRecordingStore {
         const snap = decodeIndexSnapshot(await this.fs.readFile(indexPath));
         for (const seg of snap.segments) {
           this.index.upsertSegment(seg);
+        }
+        for (const t of snap.tasks) {
+          this.absorbTaskSummaryMetadata(t);
         }
       } catch {
         // 索引快照仅作辅助，journal.otj 已完成权威重建
@@ -1612,6 +1672,7 @@ export class TraceRecordingStore {
     // 2. 分页吸纳解码包
     for (const pkt of decodeBatch.packets) {
       this.ensureSegmentForPacket(bootGen, pkt);
+      this.absorbPacketSummaryMetadata(bootGen, pkt);
       this.pendingCountsDelta.packetCount += 1;
       await this.appendItemToBuffer('packets', bootGen, pkt.segmentId, pkt, estimatePacketBytes(pkt));
     }
@@ -1674,6 +1735,24 @@ export class TraceRecordingStore {
 
     for (const t of reconBatch.taskUpdates) {
       this.pendingTasks.set(t.taskInstanceId, t);
+      this.absorbTaskSummaryMetadata(t);
+    }
+
+    for (const diag of decodeBatch.diagnostics) {
+      if (this.storedDecoderDiagnostics.length < TraceRecordingStore.MAX_STORED_DIAGNOSTICS) {
+        this.storedDecoderDiagnostics.push(diag);
+        this.pendingDecoderDiagnostics.push(diag);
+      } else {
+        this.droppedRecordedDiagnostics++;
+      }
+    }
+    for (const rdiag of reconBatch.diagnostics) {
+      if (this.storedReconstructorDiagnostics.length < TraceRecordingStore.MAX_STORED_DIAGNOSTICS) {
+        this.storedReconstructorDiagnostics.push(rdiag);
+        this.pendingReconstructorDiagnostics.push(rdiag);
+      } else {
+        this.droppedRecordedDiagnostics++;
+      }
     }
 
     // 更新活跃段当前相对/绝对时间边界
@@ -1961,6 +2040,9 @@ export class TraceRecordingStore {
       pages: pageDescs.length > 0 ? pageDescs : undefined,
       segments: this.pendingSegments.size > 0 ? Array.from(this.pendingSegments.values()) : undefined,
       gaps: this.pendingGaps.length > 0 ? [...this.pendingGaps] : undefined,
+      ...(this.pendingDecoderDiagnostics.length > 0 ? { decoderDiagnostics: [...this.pendingDecoderDiagnostics] } : {}),
+      ...(this.pendingReconstructorDiagnostics.length > 0 ? { reconstructorDiagnostics: [...this.pendingReconstructorDiagnostics] } : {}),
+      ...(this.droppedRecordedDiagnostics > 0 ? { droppedDiagnosticsCount: this.droppedRecordedDiagnostics } : {}),
       countsDelta: { ...this.pendingCountsDelta },
       ...extraMeta,
     };
@@ -2026,6 +2108,8 @@ export class TraceRecordingStore {
     this.pendingBatchSequences = [];
     this.pendingSegments.clear();
     this.pendingGaps = [];
+    this.pendingDecoderDiagnostics = [];
+    this.pendingReconstructorDiagnostics = [];
     let releasedQueueBytes = rawCombined.length;
     for (const q of this.queuedDataPages) {
       releasedQueueBytes += q.estimatedMemBytes;
@@ -2713,6 +2797,283 @@ export class TraceRecordingStore {
         message: `统计分析读取数据页失败: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
+  }
+
+  public setRodataLookup(lookup: VerifiedElfRodataLookup | undefined): void {
+    this.rodataLookup = lookup;
+  }
+
+  private absorbTaskSummaryMetadata(t: TaskInstanceSummary): void {
+    (this.eventMetadata.tasksByInstanceId as Map<string, TaskInstanceSummary>).set(t.taskInstanceId, t);
+    if (t.tcbAddress !== undefined) {
+      (this.eventMetadata.tasksByBootAddr as Map<string, TaskInstanceSummary>).set(
+        `${t.bootGeneration}:${t.tcbAddress >>> 0}`,
+        t,
+      );
+    }
+  }
+
+  private absorbPacketSummaryMetadata(bootGen: number, pkt: DecodedSystemViewPacket): void {
+    const d = pkt.decoded;
+    if (d.kind === 'sysdesc') {
+      let irqMap = this.eventMetadata.irqNamesByBoot.get(bootGen) as Map<number, string> | undefined;
+      if (!irqMap) {
+        irqMap = new Map();
+        (this.eventMetadata.irqNamesByBoot as Map<number, Map<number, string>>).set(bootGen, irqMap);
+      }
+      for (const [k, v] of Object.entries(d.parsed.interrupts)) {
+        const id = Number(k);
+        if (Number.isInteger(id)) irqMap.set(id, v);
+      }
+    } else if (d.kind === 'ex-name-marker') {
+      let mMap = this.eventMetadata.markerNamesByBoot.get(bootGen) as Map<number, string> | undefined;
+      if (!mMap) {
+        mMap = new Map();
+        (this.eventMetadata.markerNamesByBoot as Map<number, Map<number, string>>).set(bootGen, mMap);
+      }
+      mMap.set(d.markerId, d.name);
+    } else if (d.kind === 'name-resource' && d.resourceId !== undefined) {
+      let rMap = this.eventMetadata.resourceNamesByBoot.get(bootGen) as Map<number, string> | undefined;
+      if (!rMap) {
+        rMap = new Map();
+        (this.eventMetadata.resourceNamesByBoot as Map<number, Map<number, string>>).set(bootGen, rMap);
+      }
+      rMap.set(d.resourceId >>> 0, d.name);
+    } else if (d.kind === 'ex-register-data') {
+      let dMap = this.eventMetadata.dataNamesByBoot.get(bootGen) as Map<number, { name: string; unit?: string }> | undefined;
+      if (!dMap) {
+        dMap = new Map();
+        (this.eventMetadata.dataNamesByBoot as Map<number, Map<number, { name: string; unit?: string }>>).set(bootGen, dMap);
+      }
+      dMap.set(d.dataId, { name: d.name, unit: d.unit });
+    } else if (d.kind === 'task-info' && d.taskId !== undefined) {
+      const key = `${bootGen}:${d.taskId >>> 0}`;
+      if (!this.eventMetadata.tasksByBootAddr.has(key)) {
+        (this.eventMetadata.tasksByBootAddr as Map<string, TaskInstanceSummary>).set(key, {
+          taskInstanceId: `pkt-${bootGen}-${d.taskId >>> 0}`,
+          bootGeneration: bootGen,
+          firstSeenSegmentId: pkt.segmentId,
+          lastSeenSegmentId: pkt.segmentId,
+          tcbAddress: d.taskId >>> 0,
+          addressStatus: 'resolved',
+          shrunkTaskId: d.shrunkTaskId,
+          generation: 1,
+          name: d.name,
+          nameSource: 'task-info',
+          priority: d.priority,
+          createdInTrace: false,
+          terminated: false,
+          identityConfidence: 'task-info-in-boot',
+        });
+      }
+    }
+  }
+
+  /**
+   * 仅读取每段首包页（最多 64 段）以恢复老归档中的 SYSDESC/TASK_INFO/NAME_RESOURCE 元数据，不扫描全量数据。
+   */
+  private async ensureSegmentLeadMetadata(cancel?: TraceQueryCancelToken): Promise<void> {
+    if (!this.dataHandle) return;
+    const segments = this.index.getSegments();
+    const limitSegs = Math.min(segments.length, 64);
+    for (let i = 0; i < limitSegs; i++) {
+      if (isQueryCancelled(cancel)) return;
+      const seg = segments[i];
+      const partKey = `${seg.bootGeneration}:${seg.segmentId}`;
+      if (this.seededMetadataPartitions.has(partKey)) continue;
+      this.seededMetadataPartitions.add(partKey);
+      const { partitions } = this.index.getMatchingPartitions({
+        bootGeneration: seg.bootGeneration,
+        segmentId: seg.segmentId,
+        unit: 'relative-ticks',
+        start: BigInt(seg.minRelativeTicks),
+        end: BigInt(seg.maxRelativeTicks) + 1n,
+      });
+      if (partitions.length === 0) continue;
+      const pages = await this.index.findCandidatePages(
+        partitions[0],
+        'packets',
+        'relative-ticks',
+        BigInt(seg.minRelativeTicks),
+        BigInt(seg.maxRelativeTicks) + 1n,
+      );
+      if (pages.length === 0) continue;
+      try {
+        const firstPage = await this.loadPage(pages[0]);
+        for (const pkt of firstPage.items as readonly DecodedSystemViewPacket[]) {
+          this.absorbPacketSummaryMetadata(seg.bootGeneration, pkt);
+        }
+      } catch {
+        // 坏页将在具体查询时报告
+      }
+    }
+  }
+
+  private createEventsHost(cancel?: TraceQueryCancelToken): TraceEventsExecutionHost {
+    return {
+      index: this.index,
+      metadata: this.eventMetadata,
+      rodataLookup: this.rodataLookup,
+      decoderDiagnostics: this.storedDecoderDiagnostics,
+      reconstructorDiagnostics: this.storedReconstructorDiagnostics,
+      storageDiagnostics: this.inspection?.diagnostics ?? [],
+      droppedRecordedDiagnostics: this.droppedRecordedDiagnostics,
+      loadPage: desc => this.loadPage(desc),
+      getCacheStats: () => this.cache.getStats(),
+      isCancelled: () => isQueryCancelled(cancel),
+      yieldToLoop: () => yieldToEventLoop(),
+      yieldEveryPages: cancel?.yieldEveryPages ?? 1,
+      yieldEveryItems: cancel?.yieldEveryItems ?? 256,
+    };
+  }
+
+  /**
+   * 阶段 5.2：有界可取消的虚拟化事件分页查询。
+   */
+  public async queryEvents(
+    request: TraceEventsQueryRequest,
+    cancel?: TraceQueryCancelToken,
+  ): Promise<TraceStorageResult<TraceEventsQueryResult>> {
+    if (this.closed || !this.dataHandle) {
+      return { ok: false, errorCode: 'RecordingClosed', message: '存储已关闭，无法执行事件查询' };
+    }
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '事件查询已取消' };
+    }
+
+    let qStart: bigint;
+    let qEnd: bigint;
+    try {
+      qStart = parseRangeBoundBigInt(request.start, 'start');
+      qEnd = parseRangeBoundBigInt(request.end, 'end');
+    } catch (err) {
+      return { ok: false, errorCode: 'InvalidArgument', message: err instanceof Error ? err.message : String(err) };
+    }
+
+    await this.ensureSegmentLeadMetadata(cancel);
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '事件查询已取消' };
+    }
+
+    try {
+      const res = await executeEventsQuery(this.createEventsHost(cancel), request, qStart, qEnd);
+      if (!res.ok) {
+        return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '事件查询已取消' };
+      }
+      return { ok: true, data: res.data };
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'StorageReadError',
+        message: `事件查询读取数据页失败: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * 阶段 5.2：有界可取消的精确事件定位（支持 Trace Timeline 点击 -> Events 行号）。
+   */
+  public async locateEvent(
+    request: TraceEventLocateRequest,
+    cancel?: TraceQueryCancelToken,
+  ): Promise<TraceStorageResult<TraceEventLocateResult>> {
+    if (this.closed || !this.dataHandle) {
+      return { ok: false, errorCode: 'RecordingClosed', message: '存储已关闭，无法定位事件' };
+    }
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '事件定位已取消' };
+    }
+
+    let qStart: bigint;
+    let qEnd: bigint;
+    let targetTimeBig: bigint | undefined;
+    try {
+      qStart = parseRangeBoundBigInt(request.start, 'start');
+      qEnd = parseRangeBoundBigInt(request.end, 'end');
+      if (request.targetTime !== undefined) {
+        targetTimeBig = parseRangeBoundBigInt(request.targetTime, 'targetTime');
+      }
+    } catch (err) {
+      return { ok: false, errorCode: 'InvalidArgument', message: err instanceof Error ? err.message : String(err) };
+    }
+
+    await this.ensureSegmentLeadMetadata(cancel);
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '事件定位已取消' };
+    }
+
+    try {
+      const res = await executeEventLocate(this.createEventsHost(cancel), request, qStart, qEnd, targetTimeBig);
+      if (!res.ok) {
+        return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: '事件定位已取消' };
+      }
+      return { ok: true, data: res.data };
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'StorageReadError',
+        message: `事件定位读取数据页失败: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * 阶段 5.2：有界可取消的 Trace Terminal 格式化输出查询。
+   */
+  public async queryTerminal(
+    request: TraceTerminalQueryRequest,
+    cancel?: TraceQueryCancelToken,
+  ): Promise<TraceStorageResult<TraceTerminalQueryResult>> {
+    if (this.closed || !this.dataHandle) {
+      return { ok: false, errorCode: 'RecordingClosed', message: '存储已关闭，无法查询 Trace Terminal' };
+    }
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'Trace Terminal 查询已取消' };
+    }
+
+    let qStart: bigint;
+    let qEnd: bigint;
+    try {
+      qStart = parseRangeBoundBigInt(request.start, 'start');
+      qEnd = parseRangeBoundBigInt(request.end, 'end');
+    } catch (err) {
+      return { ok: false, errorCode: 'InvalidArgument', message: err instanceof Error ? err.message : String(err) };
+    }
+
+    await this.ensureSegmentLeadMetadata(cancel);
+    if (isQueryCancelled(cancel)) {
+      return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'Trace Terminal 查询已取消' };
+    }
+
+    try {
+      const res = await executeTerminalQuery(this.createEventsHost(cancel), request, qStart, qEnd);
+      if (!res.ok) {
+        return { ok: false, errorCode: 'QueryCancelled', cancelled: true, message: 'Trace Terminal 查询已取消' };
+      }
+      return { ok: true, data: res.data };
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'StorageReadError',
+        message: `Trace Terminal 读取数据页失败: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * 阶段 5.2：返回有界的解码、重建、存储与缺口诊断。
+   */
+  public getDiagnostics(options: { bootGeneration?: number; segmentId?: number; limit?: number } = {}): TraceRecordingDiagnosticsResult {
+    return buildRecordingDiagnosticsResult({
+      gaps: this.index.getGaps(),
+      decoderDiagnostics: this.storedDecoderDiagnostics,
+      reconstructorDiagnostics: this.storedReconstructorDiagnostics,
+      storageDiagnostics: this.inspection?.diagnostics ?? [],
+      droppedRecordedDiagnostics: this.droppedRecordedDiagnostics,
+      bootGeneration: options.bootGeneration,
+      segmentId: options.segmentId,
+      limit: options.limit,
+    });
   }
 
   /**

@@ -510,7 +510,7 @@ git diff --check
 
 ### 12.2 记录要求
 
-当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[阶段 1 冻结性能门槛](stage1-performance-gates.json)、[阶段 4.5 Trace 验收与基准](stage4-trace-validation.md)、[阶段 4.5 Trace 冻结门槛](stage4-trace-performance-gates.json)、[阶段 5.3 归档与 SVDat 评估](stage5-archive-validation.md)。
+当前索引：[进度](progress.md)、[兼容矩阵](compatibility.md)、[协议与契约](protocol.md)、[验证与基线](validation.md)、[阶段 1 验收](stage1-validation.md)、[阶段 1 证据](stage1-evidence.json)、[阶段 1 冻结性能门槛](stage1-performance-gates.json)、[阶段 4.5 Trace 验收与基准](stage4-trace-validation.md)、[阶段 4.5 Trace 冻结门槛](stage4-trace-performance-gates.json)、[阶段 5.3 归档与 SVDat 评估](stage5-archive-validation.md)、[使用指南](quick-start.md)。
 
 后续详细设计、证据索引、基准与交接文件统一放在 `docs/system view/` 下，在本节补相对链接。开始阶段 0 时建立 `progress.md`、`compatibility.md`、`protocol.md` 和 `validation.md`，记录已确定内容；不要预填虚假的测试结果。
 

@@ -123,7 +123,7 @@ Orbit 主要由个人维护，手头开发板和探针有限，目前仅覆盖�
 - **CMSIS-DAP / RMLink 烧录范围有限**：目前内置支持 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 和 `STM32F103C8T6`（其中 F103C8 尚未在实板上完整验证）。如果只是调试板上已有固件，可设置 `"flashBeforeDebug": false`。各型号支持详情见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 - **复杂表达式与局部变量**：表达式类型和地址依赖 ELF/DWARF 调试信息，局部变量只在暂停且对应栈帧有效时可读取；高频采样建议优先使用全局变量或简单成员表达式。
 - **采样与日志带宽共享**：展开大量 Watch 变量或高负载 RTT 输出会占用探针带宽；高速采样期间 RTT 文本轮询会自动暂停，采样结束后恢复。
-- **RTOS 视图**：目前仍有已知问题，暂不建议用于正式的任务分析。
+- **RTOS 视图**：查看 FreeRTOS 任务、同步对象和运行快照。固件接入 SystemView 后可录制任务与中断轨迹，查看事件、终端和区间统计，并保存为离线归档。运行态快照和跨面板时间关联显示各自的可靠性。[接入与使用指南](docs/system%20view/quick-start.md)
 
 遇到问题欢迎提 [Issue](https://github.com/zhuangyan114/Orbit/issues)。反馈时请尽量附上芯片型号、探针类型、Orbit 版本、`launch.json`、复现步骤和 `outputs/Log/` 下的相关日志（注意删掉个人路径等敏感信息），方便快速定位。
 

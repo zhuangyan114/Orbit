@@ -373,3 +373,8 @@
 - Windows x64 构建两种原生 helper 和四种 Flash Algorithm。CMSIS-DAP mock、算法镜像检查、XR 传输及 J-Link mock 通过，包括分步和断点恢复、RTT 多通道、断开与缺少可选 DLL 入口的分支。
 - 使用独立 VS Code 1.134.0 profile 重跑阶段 2、4.5、5.1、5.2、5.3，均退出 `0`。5.4 和 5.5 分别在对应真实 UI 脚本通过。既有 H723 启动项在 VS Code 1.146.0 开发宿主启动、探测并录制成功。原生 mock 和真实探针的证据分别记录，安装包复验见 6.4。
 - 报告位于 `out/rtos-stage6/acceptance-6.1/`，原生构建及 mock 日志位于 `out/rtos-stage5/acceptance-5.4/stage61-native-*.log`。
+
+### 6.3 用户文档
+
+- [使用指南](quick-start.md) 说明 FreeRTOS 快照、SystemView 固件接入、通道探测、录制与回放、跨面板时间误差、故障排查和 API 权限。README 入口更新为当前 RTOS 能力。
+- 从空输出目录重建 10 个 fixture 固件、去除 DWARF 的变体和 5 份独立样本，7 项 fixture 测试通过。证据见 `out/rtos-stage6/acceptance-6.3/clean-fixtures/verification.json`。使用新 profile 的 5.4 与 5.5 脚本复走离线游标和 API 查询步骤。

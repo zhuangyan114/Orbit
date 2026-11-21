@@ -344,6 +344,35 @@ class OrbitClient:
             if iterations is None or iteration < iterations:
                 time.sleep(max(0.0, interval))
 
+    def rtos_capabilities(self, *, include_trace: bool = True) -> dict[str, Any]:
+        return self.invoke("orbit.rtos.capabilities", {"includeTrace": include_trace}, context="target")
+
+    def rtos_snapshot(self, *, include_objects: bool = False, include_timers: bool = False,
+                      include_heap: bool = False) -> dict[str, Any]:
+        return self.invoke("orbit.rtos.snapshot", {
+            "includeObjects": include_objects, "includeTimers": include_timers, "includeHeap": include_heap,
+        }, context="target")
+
+    def trace_recordings(self, source: str = "all") -> dict[str, Any]:
+        return self.invoke("orbit.trace.list", {"source": source})
+
+    def trace_status(self, record_id: str, *, include_segments: bool = False) -> dict[str, Any]:
+        return self.invoke("orbit.trace.status", {"recordId": record_id, "includeSegments": include_segments})
+
+    def start_trace(self, idempotency_key: str, mode: str = "continuous") -> dict[str, Any]:
+        return self.invoke("orbit.trace.start", {"mode": mode},
+                           context="targetMutation", idempotency_key=idempotency_key)
+
+    def stop_trace(self, record_id: str, idempotency_key: str) -> dict[str, Any]:
+        return self.invoke("orbit.trace.stop", {"recordId": record_id},
+                           context="targetMutation", idempotency_key=idempotency_key)
+
+    def trace_events(self, window: Mapping[str, Any]) -> dict[str, Any]:
+        return self.invoke("orbit.trace.events", window)
+
+    def trace_statistics(self, window: Mapping[str, Any]) -> dict[str, Any]:
+        return self.invoke("orbit.trace.statistics", window)
+
     def paginate(
         self,
         method: str,

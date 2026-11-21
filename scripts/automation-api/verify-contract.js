@@ -82,6 +82,14 @@ orbit.rtt.stop
 orbit.rtt.read
 orbit.rttlog.read
 orbit.diagnostics.snapshot
+orbit.rtos.capabilities
+orbit.rtos.snapshot
+orbit.trace.list
+orbit.trace.status
+orbit.trace.start
+orbit.trace.stop
+orbit.trace.events
+orbit.trace.statistics
 `.trim().split(/\s+/);
 
 const scopes = new Set([
@@ -120,6 +128,9 @@ function policy(name) {
     'orbit.diagnostics.snapshot': [false, ['read'], false, false, false, 5000],
   };
   if (exact[name]) return exact[name];
+  if (/^orbit\.rtos\.(capabilities|snapshot)$/.test(name)) return [false, ['read'], false, false, true, 10000];
+  if (/^orbit\.trace\.(start|stop)$/.test(name)) return [false, ['record', 'rtt.control'], true, true, true, 30000];
+  if (/^orbit\.trace\.(list|status|events|statistics)$/.test(name)) return [false, ['read'], false, false, false, 10000];
   if (/^orbit\.(instance\.describe|project\.describe|system\.capabilities)$/.test(name)) return [true, [], false, false, false, 2000];
   if (/^orbit\.(operation\.get|project\.listLaunchConfigurations|session\.(list|snapshot))$/.test(name)) return [false, ['read'], false, false, false, 5000];
   if (/^orbit\.(session\.(stop|restart)|target\.(pause|continue|reset|stepOver|stepInto|stepOut|stepInstruction))$/.test(name)) return [false, ['session.control'], true, true, true, 30000];

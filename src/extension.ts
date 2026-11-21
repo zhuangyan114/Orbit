@@ -12,6 +12,7 @@ import { SvdBackgroundDownloader } from './debug/svd-background-downloader';
 import { findElfFiles } from './ozone-backend/flasher';
 import { SymbolPickerPanel } from './debug-providers/symbol-picker-panel';
 import { PluginApiServer } from './plugin-api/plugin-api-server';
+import { RtosTraceService } from './plugin-api/rtos-trace-service';
 import { AutomationApiLifecycle } from './plugin-api/automation-api-lifecycle';
 import { EventHub } from './plugin-api/event-hub';
 import { SessionRegistry, SessionUpdatePatch, automationLifecyclePatch } from './plugin-api/session-registry';
@@ -236,6 +237,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const sessionService = new SessionService({ registry: sessionRegistry });
     const breakpointService = new BreakpointService({ registry: sessionRegistry });
     const runtimeService = new RuntimeService({ registry: sessionRegistry });
+    const rtosTraceService = new RtosTraceService(sessionRegistry, traceCoordinator, () => rtos.currentTraceState.records);
 
     automationApiLifecycle = new AutomationApiLifecycle(
       () => new PluginApiServer(context, backend, {
@@ -245,6 +247,7 @@ export async function activate(context: vscode.ExtensionContext) {
         runtimeService,
         viewStateService: apiViewState,
         recordingService: apiRecording,
+        rtosTraceService,
         fastSampleSink,
         eventHub,
       }),

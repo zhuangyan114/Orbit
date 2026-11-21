@@ -70,6 +70,14 @@ orbit.rtt.stop
 orbit.rtt.read
 orbit.rttlog.read
 orbit.diagnostics.snapshot
+orbit.rtos.capabilities
+orbit.rtos.snapshot
+orbit.trace.list
+orbit.trace.status
+orbit.trace.start
+orbit.trace.stop
+orbit.trace.events
+orbit.trace.statistics
 `.trim().split(/\s+/);
 
 const errors = [];

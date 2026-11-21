@@ -281,6 +281,14 @@ describe('Orbit MCP adapter', () => {
       'orbit_write_many',
       'orbit_record',
       'orbit_experiment_run',
+      'orbit_rtos_capabilities',
+      'orbit_rtos_snapshot',
+      'orbit_trace_list',
+      'orbit_trace_status',
+      'orbit_trace_start',
+      'orbit_trace_stop',
+      'orbit_trace_events',
+      'orbit_trace_statistics',
     ]) {
       assert.ok(TOOL_NAMES.includes(name), `missing tool ${name}`);
     }
@@ -294,6 +302,24 @@ describe('Orbit MCP adapter', () => {
     const listed = successData(await adapter.callTool('orbit_instances', { projectId: PROJECT_ID }));
     assert.deepEqual(listed.items.map(item => item.instanceId).sort(), [INSTANCE_A, INSTANCE_B]);
     assert.equal(listed.items.every(item => !('token' in item)), true);
+  });
+
+  it('pages an offline Trace with read scope without refreshing a debug session', async () => {
+    const api = await startFakeApi((body, req, instanceId) => {
+      if (body.method === 'orbit.trace.events') return operationResult(body.id, { items: [{ eventKey: 'b1:s2:p6@44' }], nextOffset: 7 });
+      return defaultHandler(body, req, instanceId);
+    });
+    const registryPath = await writeRegistry([endpoint(api.port)]);
+    const adapter = createOrbitMcpAdapter({ registryPath });
+    const result = successData(await adapter.callTool('orbit_trace_events', {
+      instanceId: INSTANCE_A, recordId: 'offline-trace', unit: 'relative-ticks', start: '100', end: '180',
+      bootGeneration: 1, segmentId: 2, offset: 6, limit: 1,
+    }));
+    assert.equal(result.nextOffset, 7);
+    assert.deepEqual(api.requests.map(request => request.method), ['orbit.handshake', 'orbit.trace.events', 'orbit.connection.close']);
+    assert.deepEqual(api.requests[0].params.requestedScopes, ['read']);
+    assert.equal(api.requests[1].params.context.sessionId, undefined);
+    assert.equal(api.requests[1].params.start, '100');
   });
 
   it('rejects ambiguous mutation selection instead of picking the latest window', async () => {

@@ -249,6 +249,38 @@ export type RpcContextKind =
 export interface InvokeOptions {
   context?: RpcContextKind;
   idempotencyKey?: string;
+  signal?: AbortSignal;
+}
+
+export type TraceMode = 'continuous' | 'single-shot' | 'post-mortem';
+export type TraceSource = 'all' | 'session' | 'offline';
+export interface TraceWindow {
+  recordId: string;
+  unit: 'ns' | 'relative-ns' | 'absolute-ticks' | 'relative-ticks' | 'byte-offset';
+  start: string;
+  end: string;
+  bootGeneration?: number;
+  segmentId?: number;
+}
+export interface TraceRecordingHeader {
+  recordId: string;
+  source: Exclude<TraceSource, 'all'>;
+  mode?: TraceMode;
+  state: string;
+  integrity?: string;
+  committedRawBytes: number;
+  packetCount: number;
+  gapCount: number;
+  errorCode?: string;
+}
+export interface TraceEventsPage extends TraceWindow {
+  items: { eventKey: string; eventName: string; eventId: string; bootGeneration: number; segmentId: number; relTicks: string; summary: string }[];
+  offset: number;
+  limit: number;
+  totalMatched: number;
+  totalKnownExact: boolean;
+  scanTruncated: boolean;
+  nextOffset: number | null;
 }
 
 export interface OrbitClientOptions {
@@ -291,7 +323,7 @@ export class OrbitClient {
     return this.connectionIdValue;
   }
 
-  async rpc<T = unknown>(method: string, params: Record<string, unknown>): Promise<OperationResult<T>> {
+  async rpc<T = unknown>(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<OperationResult<T>> {
     const id = this.nextRequestId();
     const response = await this.fetchImpl(this.endpoint.rpcUrl, {
       method: 'POST',
@@ -300,6 +332,7 @@ export class OrbitClient {
         'content-type': 'application/json; charset=utf-8',
       },
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+      ...(signal ? { signal } : {}),
     });
     let envelope: unknown;
     try {
@@ -328,7 +361,7 @@ export class OrbitClient {
     options: InvokeOptions = {},
   ): Promise<T> {
     const context = this.context(options.context ?? 'connection', options.idempotencyKey);
-    const result = await this.rpc<T>(method, { context, ...params });
+    const result = await this.rpc<T>(method, { context, ...params }, options.signal);
     this.captureSession(result.data);
     return result.data;
   }
@@ -390,6 +423,39 @@ export class OrbitClient {
       }
       if (iteration + 1 < iterations) await delay(options.intervalMs ?? 1000, options.signal);
     }
+  }
+
+  rtosCapabilities(includeTrace = true, signal?: AbortSignal) {
+    return this.invoke('orbit.rtos.capabilities', { includeTrace }, { context: 'target', signal });
+  }
+
+  rtosSnapshot(options: { includeObjects?: boolean; includeTimers?: boolean; includeHeap?: boolean } = {}, signal?: AbortSignal) {
+    return this.invoke('orbit.rtos.snapshot', options, { context: 'target', signal });
+  }
+
+  traceRecordings(source: TraceSource = 'all', signal?: AbortSignal) {
+    return this.invoke<{ items: TraceRecordingHeader[]; nextCursor: null }>('orbit.trace.list', { source }, { signal });
+  }
+
+  traceStatus(recordId: string, includeSegments = false, signal?: AbortSignal) {
+    return this.invoke<TraceRecordingHeader & { segments?: Record<string, unknown>[]; segmentsTruncated?: boolean }>(
+      'orbit.trace.status', { recordId, includeSegments }, { signal });
+  }
+
+  startTrace(idempotencyKey: string, mode: TraceMode = 'continuous', signal?: AbortSignal) {
+    return this.invoke<TraceRecordingHeader>('orbit.trace.start', { mode }, { context: 'targetMutation', idempotencyKey, signal });
+  }
+
+  stopTrace(recordId: string, idempotencyKey: string, signal?: AbortSignal) {
+    return this.invoke<TraceRecordingHeader>('orbit.trace.stop', { recordId }, { context: 'targetMutation', idempotencyKey, signal });
+  }
+
+  traceEvents(window: TraceWindow & { offset?: number; limit?: number; category?: string; searchText?: string }, signal?: AbortSignal) {
+    return this.invoke<TraceEventsPage>('orbit.trace.events', { ...window }, { signal });
+  }
+
+  traceStatistics(window: TraceWindow & { maxBins?: number }, signal?: AbortSignal) {
+    return this.invoke('orbit.trace.statistics', { ...window }, { signal });
   }
 
   async *paginate<T = unknown>(

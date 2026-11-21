@@ -82,6 +82,45 @@ export type RpcContextKind = 'bootstrap' | 'connection' | 'connectionMutation' |
 export interface InvokeOptions {
     context?: RpcContextKind;
     idempotencyKey?: string;
+    signal?: AbortSignal;
+}
+export type TraceMode = 'continuous' | 'single-shot' | 'post-mortem';
+export type TraceSource = 'all' | 'session' | 'offline';
+export interface TraceWindow {
+    recordId: string;
+    unit: 'ns' | 'relative-ns' | 'absolute-ticks' | 'relative-ticks' | 'byte-offset';
+    start: string;
+    end: string;
+    bootGeneration?: number;
+    segmentId?: number;
+}
+export interface TraceRecordingHeader {
+    recordId: string;
+    source: Exclude<TraceSource, 'all'>;
+    mode?: TraceMode;
+    state: string;
+    integrity?: string;
+    committedRawBytes: number;
+    packetCount: number;
+    gapCount: number;
+    errorCode?: string;
+}
+export interface TraceEventsPage extends TraceWindow {
+    items: {
+        eventKey: string;
+        eventName: string;
+        eventId: string;
+        bootGeneration: number;
+        segmentId: number;
+        relTicks: string;
+        summary: string;
+    }[];
+    offset: number;
+    limit: number;
+    totalMatched: number;
+    totalKnownExact: boolean;
+    scanTruncated: boolean;
+    nextOffset: number | null;
 }
 export interface OrbitClientOptions {
     fetchImpl?: typeof fetch;
@@ -111,7 +150,7 @@ export declare class OrbitClient {
     session?: SessionSnapshot;
     constructor(endpoint: OrbitEndpoint, options?: OrbitClientOptions);
     get connectionId(): string | undefined;
-    rpc<T = unknown>(method: string, params: Record<string, unknown>): Promise<OperationResult<T>>;
+    rpc<T = unknown>(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<OperationResult<T>>;
     invoke<T = unknown>(method: string, params?: Record<string, unknown>, options?: InvokeOptions): Promise<T>;
     handshake(options: {
         client: {
@@ -128,6 +167,31 @@ export declare class OrbitClient {
         method: string;
         data: unknown;
     }>;
+    rtosCapabilities(includeTrace?: boolean, signal?: AbortSignal): Promise<unknown>;
+    rtosSnapshot(options?: {
+        includeObjects?: boolean;
+        includeTimers?: boolean;
+        includeHeap?: boolean;
+    }, signal?: AbortSignal): Promise<unknown>;
+    traceRecordings(source?: TraceSource, signal?: AbortSignal): Promise<{
+        items: TraceRecordingHeader[];
+        nextCursor: null;
+    }>;
+    traceStatus(recordId: string, includeSegments?: boolean, signal?: AbortSignal): Promise<TraceRecordingHeader & {
+        segments?: Record<string, unknown>[];
+        segmentsTruncated?: boolean;
+    }>;
+    startTrace(idempotencyKey: string, mode?: TraceMode, signal?: AbortSignal): Promise<TraceRecordingHeader>;
+    stopTrace(recordId: string, idempotencyKey: string, signal?: AbortSignal): Promise<TraceRecordingHeader>;
+    traceEvents(window: TraceWindow & {
+        offset?: number;
+        limit?: number;
+        category?: string;
+        searchText?: string;
+    }, signal?: AbortSignal): Promise<TraceEventsPage>;
+    traceStatistics(window: TraceWindow & {
+        maxBins?: number;
+    }, signal?: AbortSignal): Promise<unknown>;
     paginate<T = unknown>(method: string, params?: Record<string, unknown>, options?: InvokeOptions): AsyncGenerator<Record<string, unknown> & {
         items: T[];
         nextCursor?: string;

@@ -212,7 +212,7 @@ export class RpcDispatcher {
     this.methods.set(definition.name, definition as RpcMethodDefinition<unknown, unknown>);
   }
 
-  async dispatch(request: unknown, authorization: string | undefined): Promise<JsonRpcResponse> {
+  async dispatch(request: unknown, authorization: string | undefined, readSignal?: AbortSignal): Promise<JsonRpcResponse> {
     const envelope = jsonRpcRequestSchema.safeParse(request);
     if (!envelope.success) {
       return errorResponse(null, new AutomationError('InvalidJsonRpcRequest', 'invalid JSON-RPC 2.0 request', false));
@@ -276,7 +276,7 @@ export class RpcDispatcher {
       }
 
       // --- handler execution with timeout ---
-      return this.runHandler(definition, params, identity, lease, entry, id);
+      return this.runHandler(definition, params, identity, lease, entry, id, definition.mutation ? undefined : readSignal);
     } catch (error) {
       return errorResponse(id, error);
     }
@@ -420,8 +420,12 @@ export class RpcDispatcher {
     lease: ConnectionLease | undefined,
     entry: OperationEntry | undefined,
     id: string | number,
+    readSignal?: AbortSignal,
   ): Promise<JsonRpcResponse> {
+    if (readSignal?.aborted) return errorResponse(id, new AutomationError('TargetReadCancelled', 'RPC client disconnected', true));
     const controller = new AbortController();
+    const disconnect = () => controller.abort(readSignal?.reason);
+    readSignal?.addEventListener('abort', disconnect, { once: true });
     this.controllers.add(controller);
     const requestId = String(id);
     const call: RpcCallContext = {
@@ -489,6 +493,7 @@ export class RpcDispatcher {
     } catch (error) {
       return errorResponse(id, error);
     } finally {
+      readSignal?.removeEventListener('abort', disconnect);
       if (timer) clearTimeout(timer);
       if (!timedOutMutation) {
         controller.abort();

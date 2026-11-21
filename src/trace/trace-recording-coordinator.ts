@@ -769,6 +769,11 @@ export class TraceRecordingCoordinator {
     return arrivals?.getWindows() ?? [];
   }
 
+  public isActiveRecordingOwnedBy(recordId: string, session: TraceSessionHandle): boolean {
+    const current = this.activeRecording;
+    return !!current && current.recordId === recordId && current.session === session && this.isRecordingInProgress(current.state);
+  }
+
   public async inspectTarget(options: { includeEnumerate?: boolean; timeoutMs?: number } = {}): Promise<TraceTargetInspectResult> {
     const session = this.boundSession;
     if (!session || this.endedSessions.has(session)) {

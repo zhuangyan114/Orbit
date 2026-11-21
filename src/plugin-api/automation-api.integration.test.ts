@@ -97,6 +97,12 @@ import { SessionRegistry } from './session-registry';
 import { SessionService } from './session-service';
 import { BreakpointService } from './breakpoint-service';
 import { EventHub } from './event-hub';
+import { RtosTraceService } from './rtos-trace-service';
+
+const TRACE_METHODS = [
+  'orbit.rtos.capabilities', 'orbit.rtos.snapshot', 'orbit.trace.list', 'orbit.trace.status',
+  'orbit.trace.start', 'orbit.trace.stop', 'orbit.trace.events', 'orbit.trace.statistics',
+];
 
 const clientApi = require('../../Releases/clients/node/index.js') as {
   AmbiguousInstanceError: new (...args: unknown[]) => Error;
@@ -156,6 +162,7 @@ const CATALOG = [
   'orbit.record.list', 'orbit.record.get', 'orbit.record.clear', 'orbit.experiment.run',
   'orbit.rtt.status', 'orbit.rtt.start', 'orbit.rtt.stop', 'orbit.rtt.read', 'orbit.rttlog.read',
   'orbit.diagnostics.snapshot',
+  ...TRACE_METHODS,
 ];
 
 interface FakeBreakpoint {
@@ -188,6 +195,7 @@ interface WindowHandle {
   requested: FakeBreakpoint[];
   session?: { id: string; type: string; name: string; customRequest: (cmd: string, args?: unknown) => Promise<unknown> };
   controlCalls: unknown[];
+  trace: ReturnType<typeof makeTraceFixture>;
 }
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -237,6 +245,13 @@ function makeFakeSession(
     type: 'orbit',
     name,
     customRequest: async (cmd: string, args: any = {}) => {
+      if (cmd === 'orbitRtosSnapshot') {
+        const identity = { sessionId: 'snapshot-dap', sessionGeneration: 1, bootGeneration: 2,
+          operationGeneration: 1, elfSha256: 'fixture', layoutId: 'test-freertos' };
+        if (args.action === 'capabilities') return { ...identity, capabilities: { taskSnapshot: { available: true, evidence: 'source' } } };
+        if (args.action === 'refresh') return { ...identity, version: 1, consistency: 'halted-consistent',
+          startedAt: 1700000000000, completedAt: 1700000000001, tasks: [{ tcbAddress: 4096, state: 'ready' }] };
+      }
       if (cmd === 'orbitAutomationControl') {
         controlCalls.push({ generation: args.sessionGeneration, action: args.action });
         if (args.action === 'flash') {
@@ -344,6 +359,46 @@ function makeFakeSession(
   };
 }
 
+function makeTraceFixture(getSession: () => WindowHandle['session']) {
+  const counters = { committedRawBytes: 100, packetsDecoded: 3, gapCount: 0 };
+  const archive = { recordId: 'offline-accepted', source: 'offline', mode: 'continuous', state: 'completed',
+    counters, recordingDir: 'C:/private/trace-archives/accepted' };
+  type Capture = { recordId: string; mode: string; state: string; counters: typeof counters; recordingDir: string };
+  let capture: Capture | undefined;
+  let owner: WindowHandle['session'];
+  let cancelled = false;
+  const coordinator = {
+    get activeSession() { return getSession(); },
+    listRecordings: () => capture ? [capture] : [],
+    getSegments: async () => ({ ok: true, data: [{ bootGeneration: 2, segmentId: 8, minRelativeTicks: '0', maxRelativeTicks: '20' }] }),
+    startRecording: vi.fn(async ({ mode, recordId }: { mode: string; recordId: string }) => {
+      owner = getSession();
+      return capture = { mode, recordId, state: 'recording', counters, recordingDir: 'C:/private/trace-archives/capture' };
+    }),
+    isActiveRecordingOwnedBy: (recordId: string, session: unknown) => capture?.recordId === recordId && capture.state === 'recording' && owner === session,
+    stopRecording: vi.fn(async () => {
+      if (capture) capture = { ...capture, state: 'stopped' };
+      return capture;
+    }),
+    queryEvents: vi.fn(async (_: string, args: { offset: number; limit: number; filter: { searchText?: string }; maxScanPages: number }, options: { signal: AbortSignal }) => {
+      if (args.filter.searchText === 'slow') return new Promise(resolve => {
+        options.signal.addEventListener('abort', () => {
+          cancelled = true;
+          resolve({ ok: false, errorCode: 'QueryCancelled' });
+        }, { once: true });
+      });
+      const items = [0, 1, 2].slice(args.offset, args.offset + args.limit).map(index => ({
+        eventId: 7, eventKey: `b2:s8:p${index}@${index}`, eventName: 'ISR_ENTER', summary: 'IRQ 17',
+      }));
+      return { ok: true, data: { items, totalMatched: 3, totalKnownExact: true, scanTruncated: false, hasMore: args.offset + items.length < 3 } };
+    }),
+    queryAnalysis: vi.fn(async () => ({ ok: true, data: { windowDuration: '21', precision: 'exact', verifiable: true,
+      timeDomainJump: false, totals: { unknownDuration: '0' }, bins: [], contexts: [], markers: [], gapsInWindow: [],
+      contextsTruncated: false, markersTruncated: false } })),
+  };
+  return { coordinator, offline: [archive], get cancelled() { return cancelled; } };
+}
+
 async function createRoot(): Promise<string> {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'orbit-task15-'));
   cleanup.push(async () => {
@@ -445,6 +500,8 @@ async function startWindow(options: {
       events.publish('breakpoints.changed', { data: { breakpointCount: requested.length } });
     },
   });
+  const trace = makeTraceFixture(() => handle.session);
+  const rtosTraceService = new RtosTraceService(sessions, trace.coordinator as never, () => trace.offline as never);
   const server = new PluginApiServer(
     { globalStorageUri: { fsPath: globalStorage }, extension: { packageJSON: { version: '1.1.0' } } } as never,
     { execute: async () => ({ ok: true, data: 'halted' }) } as never,
@@ -453,6 +510,7 @@ async function startWindow(options: {
       sessionRegistry: sessions,
       sessionService,
       breakpointService,
+      rtosTraceService,
       eventHub: events,
     },
   );
@@ -468,6 +526,7 @@ async function startWindow(options: {
     events,
     requested,
     controlCalls,
+    trace,
   };
   return handle;
 }
@@ -519,6 +578,30 @@ describe('Automation API multi-window integration', () => {
       }
     };
 
+    const offline = await wrap('orbit.trace.list', () => client.invoke('orbit.trace.list', { source: 'offline' }));
+    expect(offline).toMatchObject({ items: [{ recordId: 'offline-accepted', source: 'offline' }], nextCursor: null });
+    expect(JSON.stringify(offline)).not.toContain('C:/private');
+    const archive = await wrap('orbit.trace.status', () => client.invoke('orbit.trace.status', { recordId: 'offline-accepted', includeSegments: true }));
+    expect(archive).toMatchObject({ segments: [{ bootGeneration: 2, segmentId: 8 }] });
+    const traceWindow = { recordId: 'offline-accepted', unit: 'relative-ticks', start: '0', end: '21', bootGeneration: 2, segmentId: 8 };
+    const tracePage = await wrap('orbit.trace.events', () => client.invoke('orbit.trace.events', { ...traceWindow, limit: 2 }));
+    expect(tracePage).toMatchObject({ items: [{ eventId: '7' }, { eventId: '7' }], nextOffset: 2, totalKnownExact: true });
+    await expect(client.invoke('orbit.trace.events', { ...traceWindow, offset: 2, limit: 2 })).resolves.toMatchObject({
+      items: [{ eventKey: 'b2:s8:p2@2' }], nextOffset: null,
+    });
+    expect(robotA.trace.coordinator.queryEvents.mock.calls[0][1].maxScanPages).toBe(2048);
+    await expect(client.invoke('orbit.trace.events', { ...traceWindow, limit: 201 })).rejects.toMatchObject({ data: { errorCode: 'InvalidParams' } });
+    await expect(client.invoke('orbit.trace.events', { ...traceWindow, end: '0' })).rejects.toMatchObject({ data: { errorCode: 'InvalidRequest' } });
+    await expect(client.invoke('orbit.trace.events', { ...traceWindow, segmentId: undefined })).rejects.toMatchObject({ data: { errorCode: 'InvalidRequest' } });
+    const stats = await wrap('orbit.trace.statistics', () => client.invoke('orbit.trace.statistics', traceWindow));
+    expect(stats).toMatchObject({ precision: 'exact', totals: { unknownDuration: '0' }, gapCount: 0 });
+    const queryAbort = new AbortController();
+    const pendingQuery = client.invoke('orbit.trace.events', { ...traceWindow, searchText: 'slow' }, { signal: queryAbort.signal }).catch(error => error);
+    await vi.waitFor(() => expect(robotA.trace.coordinator.queryEvents).toHaveBeenCalledTimes(3));
+    queryAbort.abort();
+    await expect(pendingQuery).resolves.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(robotA.trace.cancelled).toBe(true));
+
     await wrap('orbit.instance.describe', () => client.invoke('orbit.instance.describe', { includeEndpoint: true }, { context: 'bootstrap' }));
     await wrap('orbit.project.describe', () => client.invoke('orbit.project.describe', { includeLaunchConfigurations: true }, { context: 'bootstrap' }));
     await wrap('orbit.system.capabilities', () => client.invoke('orbit.system.capabilities', { includeUnavailable: true }, { context: 'bootstrap' }));
@@ -538,6 +621,32 @@ describe('Automation API multi-window integration', () => {
 
     const snapshot = await wrap('orbit.session.snapshot', () => client.refreshSession(sessionId)) as SessionSnapshotHandle;
     expect(snapshot.sessionId).toBe(sessionId);
+
+    const rtosCapabilities = await wrap('orbit.rtos.capabilities', () => client.invoke('orbit.rtos.capabilities', {}, { context: 'target' }));
+    expect(rtosCapabilities).toMatchObject({ capabilities: { taskSnapshot: { available: true } }, trace: { svdat: false, maxEventPage: 200 } });
+    const rtosSnapshot = await wrap('orbit.rtos.snapshot', () => client.invoke('orbit.rtos.snapshot', {}, { context: 'target' }));
+    expect(rtosSnapshot).toMatchObject({ startedAt: '1700000000000', sessionId: 'snapshot-dap', tasks: [{ tcbAddress: 4096 }] });
+    const readLease = new OrbitClient(chosen);
+    await readLease.handshake({ client: { name: 'read-only-trace-test' }, requestedScopes: ['read', 'record'] });
+    readLease.session = client.session;
+    try {
+      await expect(readLease.invoke('orbit.trace.start', {}, { context: 'targetMutation', idempotencyKey: 'missing-rtt-scope' }))
+        .rejects.toMatchObject({ data: { errorCode: 'Unauthorized' } });
+      expect(robotA.trace.coordinator.startRecording).not.toHaveBeenCalled();
+    } finally {
+      await readLease.close();
+    }
+    const traceStart = await wrap('orbit.trace.start', () => client.invoke('orbit.trace.start', {}, { context: 'targetMutation', idempotencyKey: 'trace-acceptance-start' })) as { recordId: string };
+    const repeated = await client.invoke('orbit.trace.start', {}, { context: 'targetMutation', idempotencyKey: 'trace-acceptance-start' });
+    expect(repeated).toEqual(traceStart);
+    expect(robotA.trace.coordinator.startRecording).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(traceStart)).not.toContain('C:/private');
+    await expect(client.invoke('orbit.trace.stop', { recordId: 'offline-accepted' }, { context: 'targetMutation', idempotencyKey: 'offline-stop' }))
+      .rejects.toMatchObject({ data: { errorCode: 'RecordingNotFound' } });
+    expect(robotA.trace.coordinator.stopRecording).not.toHaveBeenCalled();
+    const traceStop = await wrap('orbit.trace.stop', () => client.invoke('orbit.trace.stop', { recordId: traceStart.recordId },
+      { context: 'targetMutation', idempotencyKey: 'trace-acceptance-stop' }));
+    expect(traceStop).toMatchObject({ state: 'stopped', recordId: traceStart.recordId });
 
     const eventTypes: Array<{ type: string; eventId: string }> = [];
     const abort = new AbortController();
@@ -747,6 +856,7 @@ describe('Automation API multi-window integration', () => {
       { id: 'API-022', status: 'passed', methods: ['orbit.session.restart', 'orbit.target.pause'], generations: [{ sessionId, sessionGeneration: firstGeneration }, { sessionId, sessionGeneration: restarted.session.sessionGeneration }] },
       { id: 'API-023', status: 'passed', methods: ['orbit.instance.describe'] },
       { id: 'API-024', status: 'passed', methods: [...CATALOG] },
+      { id: 'API-025', status: 'passed', methods: [...TRACE_METHODS] },
     ];
 
     for (const method of CATALOG) expect(observedMethods.has(method), method).toBe(true);

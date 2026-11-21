@@ -359,3 +359,10 @@
 - STM32H723VGT6 与 RMLink 二号机 Wi-Fi 实测提交 `49,375 B`、`8,205` 包，目标、传输及主机丢包计数为 `0`。使用现有测试任务写入同一序号的变量与 SystemView Marker。暂停前后的时钟代次分别留出 `10` 和 `6` 个 Marker 检查，距采样边沿窗口中心的最大偏差为 `3.711 ms` 和 `2.560 ms`。部分测点超出采样窗口，映射算法拒绝精确联动。运行时 RTT 到达关联仍提示缓冲与采样延迟的上界未知。
 - 独立时钟样本覆盖 32 位回绕、递减计数、已知漂移与复位缺口。全量 Vitest 通过 `1,553` 项，`1` 项既有跳过。真实 VS Code 的 5.2 回归、类型检查与构建通过。
 - 证据位于 `out/rtos-stage5/acceptance-5.4`，包括 `h723-clock-proof.json`、`h723-shared-events-capture.json`、`codex-clock-proof.json` 和 `link-ui-final.log`。实板长稳与其他探针路径列入 6.2。
+
+### 5.5 Automation API 与 MCP
+
+- Automation API 增加 RTOS 能力和快照，以及 Trace 列表、状态、启停、分页事件与区间统计。MCP 和 Node/Python 客户端同步提供这组接口。离线查询只使用已经在当前实例打开的记录 ID，命令使用精确会话代次和 `record`、`rtt.control` 两个权限。
+- 真实 HTTP 集成检查覆盖身份、权限拒绝、同租约幂等、分页与读取取消。VS Code 1.134.0 在无调试会话时通过真实 Worker 读取 `68 B` 归档，对照两页不重叠事件和 8 个精确统计分箱，缺少令牌返回 `401`，关闭后返回 `RecordingNotFound`。
+- STM32H723VGT6 与 RMLink 二号机实测，REST API 读取暂停态 5 个任务，与当前低速 Trace fixture 的任务配置一致。同一连接重复同一个 Trace START 请求返回相同记录。告警和断开归档继续由原协调器处理。
+- 类型检查、构建、129 个文件共 `1,553` 项通过（`1` 项既有跳过）、67 方法的契约验证、25 个 API 验收用例、Node/Python SDK 与 12 项 MCP 回归通过。运行 `node scripts/rtos/verify-stage55-vscode.js` 可复验离线 API。报告位于 `out/rtos-stage5/acceptance-5.5/api-ui-324Js1/report.json`。

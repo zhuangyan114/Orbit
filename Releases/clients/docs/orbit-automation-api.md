@@ -119,6 +119,37 @@ client.handshake(client={"name": "quickstart"}, requested_scopes=["read"])
 
 Hardware mutation (reset, run, step, write, flash) is not part of a default quick start. See [hardware acceptance](orbit-automation-hardware-acceptance.md).
 
+## FreeRTOS and SystemView
+
+Use `orbit.rtos.capabilities` and `orbit.rtos.snapshot` with the active public session ID and generation. Check `consistency` and `reason` before using task details. The RTOS payload has its own snapshot identity. The RPC envelope carries the public session identity used by subsequent requests.
+
+Use `orbit.trace.list` to find a new capture or an archive already opened in the RTOS panel, then `orbit.trace.status` with `includeSegments: true` to find its time segments. Read-only Trace queries use the connection context, so offline queries work after closing the debug session. The API uses recording IDs. Open an archive from the RTOS panel to authorize reading its contents.
+
+`orbit.trace.events` and `orbit.trace.statistics` use a half-open `[start, end)` window with decimal strings for both limits. Supply both `bootGeneration` and `segmentId` for relative time. An event page holds up to 200 items. Continue with `nextOffset` and the same filter. `scanTruncated` and `totalKnownExact` describe scan coverage. Statistics return precision and gap information for the requested window. The Node client accepts an `AbortSignal` for both queries.
+
+```js
+const page = await client.traceRecordings('offline');
+const archive = page.items[0];
+const record = await client.traceStatus(archive.recordId, true);
+const segment = record.segments[0];
+const window = {
+  recordId: record.recordId,
+  unit: 'relative-ticks',
+  bootGeneration: segment.bootGeneration,
+  segmentId: segment.segmentId,
+  start: segment.minRelativeTicks,
+  end: String(BigInt(segment.maxRelativeTicks) + 1n),
+};
+const first = await client.traceEvents({ ...window, limit: 50 });
+const second = first.nextOffset === null ? undefined
+  : await client.traceEvents({ ...window, limit: 50, offset: first.nextOffset });
+const stats = await client.traceStatistics(window);
+```
+
+`orbit.trace.start` and `orbit.trace.stop` use target mutation context and require both `record` and `rtt.control`. Start and stop can write SystemView commands to the target RTT Down buffer. Use a distinct idempotency key for each operation and repeat a key only on the same authenticated connection. The returned capture state reports whether it started, completed or failed. An active capture is controlled only through the session that owns it. SystemView archives use the Orbit format. The capabilities response reports `svdat: false`.
+
+The MCP tools expose the same methods using `orbit_rtos_*` and `orbit_trace_*`. In Python, use `rtos_snapshot()`, `trace_recordings()`, `trace_status()`, `trace_events()` and `trace_statistics()` with the same field names on window objects.
+
 ## Migration from legacy `/rpc`
 
 One release cycle keeps `POST /rpc` with the old `ozone.*` method names. The compatibility adapter calls the new services, adds deprecation metadata, and still requires the bearer token. It does **not** grant handshake-free mutations, skip generation fences, or open a second owner.

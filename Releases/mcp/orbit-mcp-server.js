@@ -54,6 +54,14 @@ const TOOL_SPECS = {
   orbit_project_describe: { title: 'Describe the Orbit project', description: 'Returns the selected window project identity and workspace folders.' },
   orbit_expression_evaluate: { title: 'Evaluate an expression', description: 'Evaluates one debugger expression on the bound session.' },
   orbit_diagnostics_snapshot: { title: 'Diagnostics snapshot', description: 'Returns a redacted API/session diagnostics snapshot. Tokens are never included.' },
+  orbit_rtos_capabilities: { title: 'Read RTOS capabilities', description: 'Reports what Orbit can read on the selected debug session and lists Trace formats.' },
+  orbit_rtos_snapshot: { title: 'Read a FreeRTOS snapshot', description: 'Reads tasks and optional object, timer or heap details, with target consistency and availability.' },
+  orbit_trace_list: { title: 'List Trace recordings', description: 'Lists current-session recordings and archives already opened in the selected Orbit instance.' },
+  orbit_trace_status: { title: 'Describe a Trace recording', description: 'Gets a recording state and optionally lists its time segments.' },
+  orbit_trace_start: { title: 'Start a SystemView capture', description: 'Starts or reads the selected SystemView capture mode through the bound debug session. Requires record and rtt.control scopes.' },
+  orbit_trace_stop: { title: 'Stop a SystemView capture', description: 'Stops the named active capture through the bound debug session. Requires record and rtt.control scopes.' },
+  orbit_trace_events: { title: 'Read a page of Trace events', description: 'Queries committed events by a half-open time/byte window. Continue using nextOffset and inspect totalKnownExact.' },
+  orbit_trace_statistics: { title: 'Read Trace interval statistics', description: 'Queries bounded CPU, context and Marker statistics from committed trace data.' },
   orbit_status: { title: 'Get Orbit target status', description: 'Lists Orbit debug sessions after an explicit instance handshake.' },
   orbit_read_many: { title: 'Read target expressions', description: 'Reads one or more debugger expressions through orbit.expression.readMany.' },
   orbit_write_many: { title: 'Write target expressions', description: 'Writes debugger expressions through orbit.expression.writeMany.' },
@@ -254,6 +262,7 @@ function createOrbitMcpAdapter(options = {}) {
       return client.invoke(method, params, {
         context: invokeOptions.context,
         idempotencyKey: args.idempotencyKey,
+        ...(invokeOptions.signal ? { signal: invokeOptions.signal } : {}),
       });
     });
   }
@@ -364,6 +373,35 @@ function createOrbitMcpAdapter(options = {}) {
     async orbit_diagnostics_snapshot(args) {
       return invokeBound(args, 'orbit.diagnostics.snapshot', {}, { context: 'connection', scopes: ['read'] });
     },
+    async orbit_rtos_capabilities(args, signal) {
+      return invokeBound(args, 'orbit.rtos.capabilities', { includeTrace: args.includeTrace }, { context: 'target', scopes: ['read'], signal });
+    },
+    async orbit_rtos_snapshot(args, signal) {
+      return invokeBound(args, 'orbit.rtos.snapshot', { includeObjects: args.includeObjects, includeTimers: args.includeTimers, includeHeap: args.includeHeap },
+        { context: 'target', scopes: ['read'], signal });
+    },
+    async orbit_trace_list(args, signal) {
+      return invokeBound(args, 'orbit.trace.list', { source: args.source }, { context: 'connection', scopes: ['read'], signal });
+    },
+    async orbit_trace_status(args, signal) {
+      return invokeBound(args, 'orbit.trace.status', { recordId: args.recordId, includeSegments: args.includeSegments }, { context: 'connection', scopes: ['read'], signal });
+    },
+    async orbit_trace_start(args, signal) {
+      return invokeBound(args, 'orbit.trace.start', { mode: args.mode }, { context: 'targetMutation', scopes: ['record', 'rtt.control'], signal });
+    },
+    async orbit_trace_stop(args, signal) {
+      return invokeBound(args, 'orbit.trace.stop', { recordId: args.recordId }, { context: 'targetMutation', scopes: ['record', 'rtt.control'], signal });
+    },
+    async orbit_trace_events(args, signal) {
+      const { recordId, unit, start, end, bootGeneration, segmentId, offset, limit, category, searchText } = args;
+      return invokeBound(args, 'orbit.trace.events', { recordId, unit, start, end, bootGeneration, segmentId, offset, limit, category, searchText },
+        { context: 'connection', scopes: ['read'], signal });
+    },
+    async orbit_trace_statistics(args, signal) {
+      const { recordId, unit, start, end, bootGeneration, segmentId, maxBins } = args;
+      return invokeBound(args, 'orbit.trace.statistics', { recordId, unit, start, end, bootGeneration, segmentId, maxBins },
+        { context: 'connection', scopes: ['read'], signal });
+    },
     async orbit_status(args) {
       return handlers.orbit_session_list(args);
     },
@@ -412,11 +450,11 @@ function createOrbitMcpAdapter(options = {}) {
     },
   };
 
-  async function callTool(name, args = {}) {
+  async function callTool(name, args = {}, signal) {
     const handler = handlers[name];
     if (!handler) return fail({ errorCode: 'MethodNotFound', retryable: false, message: `unknown tool: ${name}` });
     try {
-      const data = await handler(args);
+      const data = await handler(args, signal);
       if (data && typeof data === 'object' && Array.isArray(data.content)) return data;
       return ok(data);
     } catch (error) {
@@ -447,6 +485,17 @@ const mutationFields = {
   idempotencyKey: z.string().min(1),
 };
 
+const traceId = z.string().min(1).max(160).regex(/^[A-Za-z0-9_.:-]+$/);
+const traceWindowFields = {
+  ...identityFields,
+  recordId: traceId,
+  start: z.string().regex(/^\d{1,30}$/),
+  end: z.string().regex(/^\d{1,30}$/),
+  unit: z.enum(['ns', 'relative-ns', 'absolute-ticks', 'relative-ticks', 'byte-offset']),
+  bootGeneration: z.number().int().min(0).max(0xFFFFFFFF).optional(),
+  segmentId: z.number().int().min(0).max(0xFFFFFFFF).optional(),
+};
+
 function createMcpServer(options = {}) {
   const adapter = createOrbitMcpAdapter(options);
   const server = new McpServer({
@@ -459,7 +508,7 @@ function createMcpServer(options = {}) {
       title: TOOL_SPECS[name].title,
       description: TOOL_SPECS[name].description,
       inputSchema,
-    }, async args => adapter.callTool(name, args || {}));
+    }, async (args, extra) => adapter.callTool(name, args || {}, extra?.signal));
   };
 
   register('orbit_instances', { projectId: z.string().optional() });
@@ -550,6 +599,16 @@ function createMcpServer(options = {}) {
     contextKind: z.enum(['watch', 'hover', 'repl', 'clipboard', 'variables']).optional(),
   });
   register('orbit_diagnostics_snapshot', identityFields);
+  register('orbit_rtos_capabilities', { ...sessionFields, includeTrace: z.boolean().optional() });
+  register('orbit_rtos_snapshot', { ...sessionFields, includeObjects: z.boolean().optional(), includeTimers: z.boolean().optional(), includeHeap: z.boolean().optional() });
+  register('orbit_trace_list', { ...identityFields, source: z.enum(['all', 'session', 'offline']).optional() });
+  register('orbit_trace_status', { ...identityFields, recordId: traceId, includeSegments: z.boolean().optional() });
+  register('orbit_trace_start', { ...mutationFields, mode: z.enum(['continuous', 'single-shot', 'post-mortem']).optional() });
+  register('orbit_trace_stop', { ...mutationFields, recordId: traceId });
+  register('orbit_trace_events', { ...traceWindowFields, offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+    category: z.enum(['all', 'task', 'isr', 'os-api', 'marker', 'terminal', 'system', 'anomalies']).optional(), searchText: z.string().max(256).optional() });
+  register('orbit_trace_statistics', { ...traceWindowFields, maxBins: z.number().int().min(1).max(256).optional() });
   register('orbit_status', identityFields);
   register('orbit_read_many', {
     ...sessionFields,

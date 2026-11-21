@@ -4778,6 +4778,696 @@
           "InternalError"
         ]
       }
+    },
+    {
+      "name": "orbit.rtos.capabilities",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/RtosCapabilitiesParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RtosCapabilitiesResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/NoActiveSession"
+        },
+        {
+          "$ref": "#/components/errors/SessionChanged"
+        },
+        {
+          "$ref": "#/components/errors/SessionTerminating"
+        },
+        {
+          "$ref": "#/components/errors/TargetBusy"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": true,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/RtosCapabilitiesParams",
+        "resultSchemaRef": "#/components/schemas/RtosCapabilitiesResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "NoActiveSession",
+          "SessionChanged",
+          "SessionTerminating",
+          "TargetBusy",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.rtos.snapshot",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/RtosSnapshotParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RtosSnapshotResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/NoActiveSession"
+        },
+        {
+          "$ref": "#/components/errors/SessionChanged"
+        },
+        {
+          "$ref": "#/components/errors/SessionTerminating"
+        },
+        {
+          "$ref": "#/components/errors/TargetBusy"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": true,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/RtosSnapshotParams",
+        "resultSchemaRef": "#/components/schemas/RtosSnapshotResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "NoActiveSession",
+          "SessionChanged",
+          "SessionTerminating",
+          "TargetBusy",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.trace.list",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/TraceListParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TraceListResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": false,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/TraceListParams",
+        "resultSchemaRef": "#/components/schemas/TraceListResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.trace.status",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/TraceStatusParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TraceStatusResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": false,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/TraceStatusParams",
+        "resultSchemaRef": "#/components/schemas/TraceStatusResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.trace.start",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/TraceStartParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TraceStartResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/NoActiveSession"
+        },
+        {
+          "$ref": "#/components/errors/SessionChanged"
+        },
+        {
+          "$ref": "#/components/errors/SessionTerminating"
+        },
+        {
+          "$ref": "#/components/errors/TargetBusy"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "record",
+          "rtt.control"
+        ],
+        "mutation": true,
+        "requiresIdempotency": true,
+        "targetBound": true,
+        "defaultTimeoutMs": 30000,
+        "paramsSchemaRef": "#/components/schemas/TraceStartParams",
+        "resultSchemaRef": "#/components/schemas/TraceStartResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "NoActiveSession",
+          "SessionChanged",
+          "SessionTerminating",
+          "TargetBusy",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.trace.stop",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/TraceStopParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TraceStopResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/NoActiveSession"
+        },
+        {
+          "$ref": "#/components/errors/SessionChanged"
+        },
+        {
+          "$ref": "#/components/errors/SessionTerminating"
+        },
+        {
+          "$ref": "#/components/errors/TargetBusy"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "record",
+          "rtt.control"
+        ],
+        "mutation": true,
+        "requiresIdempotency": true,
+        "targetBound": true,
+        "defaultTimeoutMs": 30000,
+        "paramsSchemaRef": "#/components/schemas/TraceStopParams",
+        "resultSchemaRef": "#/components/schemas/TraceStopResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "NoActiveSession",
+          "SessionChanged",
+          "SessionTerminating",
+          "TargetBusy",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.trace.events",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/TraceEventsParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TraceEventsResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": false,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/TraceEventsParams",
+        "resultSchemaRef": "#/components/schemas/TraceEventsResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
+    },
+    {
+      "name": "orbit.trace.statistics",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/TraceStatisticsParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TraceStatisticsResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/Unauthorized"
+        },
+        {
+          "$ref": "#/components/errors/ConnectionExpired"
+        },
+        {
+          "$ref": "#/components/errors/ProjectMismatch"
+        },
+        {
+          "$ref": "#/components/errors/InstanceMismatch"
+        },
+        {
+          "$ref": "#/components/errors/CapabilityUnavailable"
+        },
+        {
+          "$ref": "#/components/errors/InvalidRequest"
+        },
+        {
+          "$ref": "#/components/errors/RecordingNotFound"
+        },
+        {
+          "$ref": "#/components/errors/TargetReadCancelled"
+        },
+        {
+          "$ref": "#/components/errors/RateLimited"
+        },
+        {
+          "$ref": "#/components/errors/RequestTimeout"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "x-orbit-method": {
+        "bootstrap": false,
+        "requiredScopes": [
+          "read"
+        ],
+        "mutation": false,
+        "requiresIdempotency": false,
+        "targetBound": false,
+        "defaultTimeoutMs": 10000,
+        "paramsSchemaRef": "#/components/schemas/TraceStatisticsParams",
+        "resultSchemaRef": "#/components/schemas/TraceStatisticsResult",
+        "errorCodes": [
+          "Unauthorized",
+          "ConnectionExpired",
+          "ProjectMismatch",
+          "InstanceMismatch",
+          "CapabilityUnavailable",
+          "InvalidRequest",
+          "RecordingNotFound",
+          "TargetReadCancelled",
+          "RateLimited",
+          "RequestTimeout",
+          "InternalError"
+        ]
+      }
     }
   ],
   "components": {
@@ -10774,6 +11464,1116 @@
             "properties": {
               "data": {
                 "$ref": "#/components/schemas/DiagnosticsSnapshot"
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceRecordingHeader": {
+        "type": "object",
+        "properties": {
+          "recordId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9_.:-]+$"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "session",
+              "offline"
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "continuous",
+              "single-shot",
+              "post-mortem"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "integrity": {
+            "type": "string"
+          },
+          "committedRawBytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "packetCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "gapCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "errorCode": {
+            "type": "string"
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "bootGeneration": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "segmentId": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "minRelativeTicks": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,30}$"
+                },
+                "maxRelativeTicks": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,30}$"
+                },
+                "sysFreqHz": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "timeAnchorStatus": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "bootGeneration",
+                "segmentId",
+                "minRelativeTicks",
+                "maxRelativeTicks",
+                "timeAnchorStatus"
+              ]
+            },
+            "maxItems": 128
+          },
+          "segmentsTruncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recordId",
+          "source",
+          "state",
+          "committedRawBytes",
+          "packetCount",
+          "gapCount"
+        ]
+      },
+      "TraceEventItem": {
+        "type": "object",
+        "properties": {
+          "eventKey": {
+            "type": "string"
+          },
+          "eventName": {
+            "type": "string"
+          },
+          "eventId": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "deltaTicks": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "relTicks": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "absTicks": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "ns": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "bootGeneration": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "segmentId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "packetIndexInSegment": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "streamByteOffset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "contextKind": {
+            "type": "string"
+          },
+          "contextKey": {
+            "type": "string"
+          },
+          "irqId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "timeAnchorStatus": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "eventKey",
+          "eventName",
+          "eventId",
+          "deltaTicks",
+          "relTicks",
+          "bootGeneration",
+          "segmentId",
+          "packetIndexInSegment",
+          "streamByteOffset",
+          "contextKind",
+          "summary",
+          "timeAnchorStatus"
+        ]
+      },
+      "TraceDurationTotals": {
+        "type": "object",
+        "properties": {
+          "taskDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "isrDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "schedulerDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "idleDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "unknownDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "knownDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "activeDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "activeWindowPct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "activeKnownPct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unknownWindowPct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "taskDuration",
+          "isrDuration",
+          "schedulerDuration",
+          "idleDuration",
+          "unknownDuration",
+          "knownDuration",
+          "activeDuration",
+          "activeWindowPct",
+          "activeKnownPct",
+          "unknownWindowPct"
+        ]
+      },
+      "TraceStatisticsBin": {
+        "type": "object",
+        "properties": {
+          "taskDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "isrDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "schedulerDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "idleDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "unknownDuration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "binIndex": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "duration": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          }
+        },
+        "required": [
+          "taskDuration",
+          "isrDuration",
+          "schedulerDuration",
+          "idleDuration",
+          "unknownDuration",
+          "binIndex",
+          "start",
+          "end",
+          "duration"
+        ]
+      },
+      "RtosCapabilitiesParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/TargetRequestContext"
+          },
+          "includeTrace": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "RtosCapabilitiesResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "sessionId": {
+                    "type": "string"
+                  },
+                  "sessionGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bootGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "operationGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "elfSha256": {
+                    "type": "string"
+                  },
+                  "layoutId": {
+                    "type": "string"
+                  },
+                  "capabilities": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "object",
+                      "properties": {
+                        "available": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "evidence": {
+                          "type": "string",
+                          "enum": [
+                            "source",
+                            "offline",
+                            "hardware"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "available",
+                        "evidence"
+                      ]
+                    }
+                  },
+                  "trace": {
+                    "type": "object",
+                    "properties": {
+                      "modes": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "continuous",
+                            "single-shot",
+                            "post-mortem"
+                          ]
+                        },
+                        "maxItems": 3
+                      },
+                      "archiveFormat": {
+                        "const": "orbit",
+                        "type": "string"
+                      },
+                      "svdat": {
+                        "const": false,
+                        "type": "boolean"
+                      },
+                      "maxEventPage": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "maxBins": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "modes",
+                      "archiveFormat",
+                      "svdat",
+                      "maxEventPage",
+                      "maxBins"
+                    ]
+                  }
+                },
+                "required": [
+                  "sessionId",
+                  "sessionGeneration",
+                  "bootGeneration",
+                  "operationGeneration",
+                  "elfSha256",
+                  "layoutId",
+                  "capabilities"
+                ]
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "RtosSnapshotParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/TargetRequestContext"
+          },
+          "includeObjects": {
+            "type": "boolean",
+            "default": false
+          },
+          "includeTimers": {
+            "type": "boolean",
+            "default": false
+          },
+          "includeHeap": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "RtosSnapshotResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "sessionId": {
+                    "type": "string"
+                  },
+                  "sessionGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bootGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "operationGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "elfSha256": {
+                    "type": "string"
+                  },
+                  "layoutId": {
+                    "type": "string"
+                  },
+                  "version": {
+                    "type": "integer",
+                    "const": 1
+                  },
+                  "snapshotSequence": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "startedAt": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "completedAt": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "consistency": {
+                    "type": "string",
+                    "enum": [
+                      "halted-consistent",
+                      "live-best-effort",
+                      "partial",
+                      "stale",
+                      "unavailable"
+                    ]
+                  },
+                  "targetState": {
+                    "type": "string",
+                    "enum": [
+                      "Running",
+                      "Halted",
+                      "Unknown"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "errorCode": {
+                    "type": "string"
+                  },
+                  "tasks": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "tcbAddress": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "name": {
+                          "type": "object"
+                        },
+                        "priority": {
+                          "type": "object"
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "running",
+                            "ready",
+                            "blocked",
+                            "suspended",
+                            "termination",
+                            "unknown"
+                          ]
+                        }
+                      },
+                      "required": []
+                    }
+                  }
+                },
+                "required": [
+                  "version",
+                  "sessionId",
+                  "sessionGeneration",
+                  "bootGeneration",
+                  "consistency",
+                  "tasks"
+                ]
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceListParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/ConnectionContext"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "all",
+              "session",
+              "offline"
+            ],
+            "default": "all"
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "TraceListResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/TraceRecordingHeader"
+                    }
+                  },
+                  "nextCursor": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "items",
+                  "nextCursor"
+                ]
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceStatusParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/ConnectionContext"
+          },
+          "recordId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9_.:-]+$"
+          },
+          "includeSegments": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "context",
+          "recordId"
+        ]
+      },
+      "TraceStatusResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/TraceRecordingHeader"
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceStartParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/TargetMutationContext"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "continuous",
+              "single-shot",
+              "post-mortem"
+            ],
+            "default": "continuous"
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "TraceStartResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/TraceRecordingHeader"
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceStopParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/TargetMutationContext"
+          },
+          "recordId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9_.:-]+$"
+          }
+        },
+        "required": [
+          "context",
+          "recordId"
+        ]
+      },
+      "TraceStopResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/TraceRecordingHeader"
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceEventsParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/ConnectionContext"
+          },
+          "recordId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9_.:-]+$"
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "ns",
+              "relative-ns",
+              "absolute-ticks",
+              "relative-ticks",
+              "byte-offset"
+            ]
+          },
+          "bootGeneration": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "segmentId": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 100
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "all",
+              "task",
+              "isr",
+              "os-api",
+              "marker",
+              "terminal",
+              "system",
+              "anomalies"
+            ],
+            "default": "all"
+          },
+          "searchText": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "context",
+          "recordId",
+          "start",
+          "end",
+          "unit"
+        ]
+      },
+      "TraceEventsResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "recordId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160,
+                    "pattern": "^[A-Za-z0-9_.:-]+$"
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": [
+                      "ns",
+                      "relative-ns",
+                      "absolute-ticks",
+                      "relative-ticks",
+                      "byte-offset"
+                    ]
+                  },
+                  "start": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "end": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/TraceEventItem"
+                    },
+                    "maxItems": 200
+                  },
+                  "totalMatched": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "totalKnownExact": {
+                    "type": "boolean"
+                  },
+                  "scanTruncated": {
+                    "type": "boolean"
+                  },
+                  "nextOffset": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "recordId",
+                  "unit",
+                  "start",
+                  "end",
+                  "limit",
+                  "offset",
+                  "items",
+                  "totalMatched",
+                  "totalKnownExact",
+                  "scanTruncated",
+                  "nextOffset"
+                ]
+              }
+            },
+            "required": [
+              "data"
+            ]
+          }
+        ]
+      },
+      "TraceStatisticsParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/ConnectionContext"
+          },
+          "recordId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9_.:-]+$"
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^[0-9]{1,30}$"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "ns",
+              "relative-ns",
+              "absolute-ticks",
+              "relative-ticks",
+              "byte-offset"
+            ]
+          },
+          "bootGeneration": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "segmentId": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "maxBins": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256,
+            "default": 64
+          }
+        },
+        "required": [
+          "context",
+          "recordId",
+          "start",
+          "end",
+          "unit"
+        ]
+      },
+      "TraceStatisticsResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationResult"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "recordId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160,
+                    "pattern": "^[A-Za-z0-9_.:-]+$"
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": [
+                      "ns",
+                      "relative-ns",
+                      "absolute-ticks",
+                      "relative-ticks",
+                      "byte-offset"
+                    ]
+                  },
+                  "start": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "end": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "windowDuration": {
+                    "type": "string",
+                    "pattern": "^[0-9]{1,30}$"
+                  },
+                  "precision": {
+                    "type": "string",
+                    "enum": [
+                      "exact",
+                      "approx",
+                      "unavailable"
+                    ]
+                  },
+                  "approxReason": {
+                    "type": "string"
+                  },
+                  "verifiable": {
+                    "type": "boolean"
+                  },
+                  "verifiableReason": {
+                    "type": "string"
+                  },
+                  "timeDomainJump": {
+                    "type": "boolean"
+                  },
+                  "gapCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "totals": {
+                    "$ref": "#/components/schemas/TraceDurationTotals"
+                  },
+                  "bins": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/TraceStatisticsBin"
+                    },
+                    "maxItems": 256
+                  },
+                  "contexts": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "contextKey": {
+                          "type": "string"
+                        },
+                        "contextKind": {
+                          "type": "string"
+                        },
+                        "label": {
+                          "type": "string"
+                        },
+                        "invocationCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": []
+                    },
+                    "maxItems": 64
+                  },
+                  "contextsTruncated": {
+                    "type": "boolean"
+                  },
+                  "markers": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "markerId": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "label": {
+                          "type": "string"
+                        },
+                        "pointCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": []
+                    },
+                    "maxItems": 64
+                  },
+                  "markersTruncated": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "recordId",
+                  "unit",
+                  "start",
+                  "end",
+                  "windowDuration",
+                  "precision",
+                  "verifiable",
+                  "timeDomainJump",
+                  "gapCount",
+                  "totals",
+                  "bins",
+                  "contexts",
+                  "contextsTruncated",
+                  "markers",
+                  "markersTruncated"
+                ]
               }
             },
             "required": [

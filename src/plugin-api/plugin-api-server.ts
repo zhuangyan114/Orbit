@@ -26,6 +26,12 @@ import {
   TargetMutationContext,
 } from './protocol';
 import { buildMethodDefinition, RpcDispatcher } from './rpc-dispatcher';
+import type { z } from 'zod';
+import type { RtosTraceService } from './rtos-trace-service';
+import type {
+  rtosCapabilitiesParams, rtosSnapshotParams, traceEventsParams, traceListParams,
+  traceStartParams, traceStatisticsParams, traceStatusParams, traceStopParams,
+} from './schemas';
 import {
   BoundServerInfo,
   InstanceRegistry,
@@ -441,6 +447,7 @@ export interface PluginApiServerOptions {
   viewStateService?: ViewStateService;
   /** Unified automation recording service (plan Task 10). */
   recordingService?: RecordingService;
+  rtosTraceService?: RtosTraceService;
   /** RTT status/start/stop/read service (plan Task 11). */
   rttService?: RttService;
   /** Redacted diagnostics snapshot service (plan Task 11). */
@@ -1227,6 +1234,36 @@ export class PluginApiServer implements vscode.Disposable {
         data: await this.diagnostics.snapshot(params.sessionId),
       })),
     );
+    dispatcher.register(buildMethodDefinition('orbit.rtos.capabilities', async (params: z.infer<typeof rtosCapabilitiesParams>, call) => ({
+      data: await this.requireRtosTrace().capabilities(this.sessionRef(params.context), params.includeTrace, call.signal),
+    })));
+    dispatcher.register(buildMethodDefinition('orbit.rtos.snapshot', async (params: z.infer<typeof rtosSnapshotParams>, call) => {
+      const { context, ...options } = params;
+      return { data: await this.requireRtosTrace().snapshot(this.sessionRef(context), options, call.signal) };
+    }));
+    dispatcher.register(buildMethodDefinition('orbit.trace.list', async (params: z.infer<typeof traceListParams>) => ({
+      data: this.requireRtosTrace().list(params.source),
+    })));
+    dispatcher.register(buildMethodDefinition('orbit.trace.status', async (params: z.infer<typeof traceStatusParams>) => ({
+      data: await this.requireRtosTrace().describe(params.recordId, params.includeSegments),
+    })));
+    dispatcher.register(buildMethodDefinition('orbit.trace.start', async (params: z.infer<typeof traceStartParams>, call) => ({
+      data: await this.requireRtosTrace().start(this.sessionRef(params.context), params.mode, call.signal),
+    })));
+    dispatcher.register(buildMethodDefinition('orbit.trace.stop', async (params: z.infer<typeof traceStopParams>) => ({
+      data: await this.requireRtosTrace().stop(this.sessionRef(params.context), params.recordId),
+    })));
+    dispatcher.register(buildMethodDefinition('orbit.trace.events', async (params: z.infer<typeof traceEventsParams>, call) => ({
+      data: await this.requireRtosTrace().events(params, call.signal),
+    })));
+    dispatcher.register(buildMethodDefinition('orbit.trace.statistics', async (params: z.infer<typeof traceStatisticsParams>, call) => ({
+      data: await this.requireRtosTrace().statistics(params, call.signal),
+    })));
+  }
+
+  private requireRtosTrace(): RtosTraceService {
+    if (!this.options.rtosTraceService) throw new AutomationError('CapabilityUnavailable', 'RTOS and Trace are unavailable in this instance', false);
+    return this.options.rtosTraceService;
   }
 
   private sessionRef(context: TargetRequestContext): SessionRef {
@@ -1536,12 +1573,18 @@ export class PluginApiServer implements vscode.Disposable {
       }
       const method = this.requestMethod(request);
       const mutation = method ? (getMethodCatalogEntry(method)?.mutation ?? false) : false;
+      const readAbort = new AbortController();
+      const disconnect = () => readAbort.abort();
+      if (!mutation) {
+        res.once('close', disconnect);
+        if (res.destroyed) disconnect();
+      }
       let response;
       try {
         response = await this.runRequest(
           this.requestId(request),
           mutation,
-          () => this.dispatcher!.dispatch(request, req.headers.authorization),
+          () => this.dispatcher!.dispatch(request, req.headers.authorization, readAbort.signal),
         );
       } catch (error) {
         const automationError = error instanceof AutomationError
@@ -1552,7 +1595,10 @@ export class PluginApiServer implements vscode.Disposable {
           id: this.requestId(request) ?? null,
           error: automationError.toJsonRpcErrorObject(),
         };
+      } finally {
+        if (!mutation) res.off('close', disconnect);
       }
+      if (res.destroyed) return;
       if ('result' in response) this.touchConnection(request);
       this.writeJson(res, 200, response);
     } catch (err: any) {

@@ -223,7 +223,7 @@ class OrbitClient {
     get connectionId() {
         return this.connectionIdValue;
     }
-    async rpc(method, params) {
+    async rpc(method, params, signal) {
         const id = this.nextRequestId();
         const response = await this.fetchImpl(this.endpoint.rpcUrl, {
             method: 'POST',
@@ -232,6 +232,7 @@ class OrbitClient {
                 'content-type': 'application/json; charset=utf-8',
             },
             body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+            ...(signal ? { signal } : {}),
         });
         let envelope;
         try {
@@ -253,7 +254,7 @@ class OrbitClient {
     }
     async invoke(method, params = {}, options = {}) {
         const context = this.context(options.context ?? 'connection', options.idempotencyKey);
-        const result = await this.rpc(method, { context, ...params });
+        const result = await this.rpc(method, { context, ...params }, options.signal);
         this.captureSession(result.data);
         return result.data;
     }
@@ -308,6 +309,30 @@ class OrbitClient {
             if (iteration + 1 < iterations)
                 await delay(options.intervalMs ?? 1000, options.signal);
         }
+    }
+    rtosCapabilities(includeTrace = true, signal) {
+        return this.invoke('orbit.rtos.capabilities', { includeTrace }, { context: 'target', signal });
+    }
+    rtosSnapshot(options = {}, signal) {
+        return this.invoke('orbit.rtos.snapshot', options, { context: 'target', signal });
+    }
+    traceRecordings(source = 'all', signal) {
+        return this.invoke('orbit.trace.list', { source }, { signal });
+    }
+    traceStatus(recordId, includeSegments = false, signal) {
+        return this.invoke('orbit.trace.status', { recordId, includeSegments }, { signal });
+    }
+    startTrace(idempotencyKey, mode = 'continuous', signal) {
+        return this.invoke('orbit.trace.start', { mode }, { context: 'targetMutation', idempotencyKey, signal });
+    }
+    stopTrace(recordId, idempotencyKey, signal) {
+        return this.invoke('orbit.trace.stop', { recordId }, { context: 'targetMutation', idempotencyKey, signal });
+    }
+    traceEvents(window, signal) {
+        return this.invoke('orbit.trace.events', { ...window }, { signal });
+    }
+    traceStatistics(window, signal) {
+        return this.invoke('orbit.trace.statistics', { ...window }, { signal });
     }
     async *paginate(method, params = {}, options = {}) {
         let cursor = typeof params.cursor === 'string' ? params.cursor : undefined;

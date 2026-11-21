@@ -721,6 +721,34 @@ export const diagnosticsSnapshotParams = z
   })
   .strict();
 
+const traceIdSchema = z.string().min(1).max(160).regex(/^[A-Za-z0-9_.:-]+$/);
+const traceTimeSchema = z.string().regex(/^\d{1,30}$/);
+const windowParams = {
+  context: connectionContextSchema,
+  recordId: traceIdSchema,
+  start: traceTimeSchema,
+  end: traceTimeSchema,
+  unit: z.enum(['ns', 'relative-ns', 'absolute-ticks', 'relative-ticks', 'byte-offset']),
+  bootGeneration: z.number().int().min(0).max(0xFFFFFFFF).optional(),
+  segmentId: z.number().int().min(0).max(0xFFFFFFFF).optional(),
+};
+
+export const rtosCapabilitiesParams = z.object({ context: targetRequestContextSchema, includeTrace: z.boolean().default(true) }).strict();
+export const rtosSnapshotParams = z.object({ context: targetRequestContextSchema,
+  includeObjects: z.boolean().default(false), includeTimers: z.boolean().default(false), includeHeap: z.boolean().default(false) }).strict();
+export const traceListParams = z.object({ context: connectionContextSchema, source: z.enum(['all', 'session', 'offline']).default('all') }).strict();
+export const traceStatusParams = z.object({ context: connectionContextSchema, recordId: traceIdSchema, includeSegments: z.boolean().default(false) }).strict();
+export const traceStartParams = z.object({ context: targetMutationContextSchema,
+  mode: z.enum(['continuous', 'single-shot', 'post-mortem']).default('continuous') }).strict();
+export const traceStopParams = z.object({ context: targetMutationContextSchema, recordId: traceIdSchema }).strict();
+export const traceEventsParams = z.object({ ...windowParams,
+  offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+  limit: z.number().int().min(1).max(200).default(100),
+  category: z.enum(['all', 'task', 'isr', 'os-api', 'marker', 'terminal', 'system', 'anomalies']).default('all'),
+  searchText: z.string().max(256).optional(),
+}).strict();
+export const traceStatisticsParams = z.object({ ...windowParams, maxBins: z.number().int().min(1).max(256).default(64) }).strict();
+
 // --- Frozen method catalog (OpenRPC x-orbit-method metadata) ---
 
 export type AutomationMethodName = `orbit.${string}`;
@@ -800,6 +828,28 @@ const METHOD_ENTRIES: MethodCatalogEntry[] = [
   { name: 'orbit.rttlog.read', bootstrap: false, requiredScopes: ['read'], mutation: false, requiresIdempotency: false, targetBound: true, timeoutMs: 10000, paramsSchemaRef: '#/components/schemas/RttlogReadParams', resultSchemaRef: '#/components/schemas/RttlogReadResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'NoActiveSession', 'SessionStarting', 'SessionChanged', 'SessionTerminating', 'TargetDisconnected', 'CapabilityUnavailable', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: rttLogReadParams },
   { name: 'orbit.diagnostics.snapshot', bootstrap: false, requiredScopes: ['read'], mutation: false, requiresIdempotency: false, targetBound: false, timeoutMs: 5000, paramsSchemaRef: '#/components/schemas/DiagnosticsSnapshotParams', resultSchemaRef: '#/components/schemas/DiagnosticsSnapshotResult', errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch', 'InvalidRequest', 'RateLimited', 'RequestTimeout', 'InternalError'], paramsSchema: diagnosticsSnapshotParams },
 ];
+
+function rtosMethod(name: AutomationMethodName, schema: string, paramsSchema: z.ZodType<unknown>,
+  targetBound = false, mutation = false): MethodCatalogEntry {
+  return { name, paramsSchema, bootstrap: false, targetBound, mutation, requiresIdempotency: mutation,
+    requiredScopes: mutation ? ['record', 'rtt.control'] : ['read'], timeoutMs: mutation ? 30000 : 10000,
+    paramsSchemaRef: `#/components/schemas/${schema}Params`, resultSchemaRef: `#/components/schemas/${schema}Result`,
+    errorCodes: ['Unauthorized', 'ConnectionExpired', 'ProjectMismatch', 'InstanceMismatch',
+      ...(targetBound ? ['NoActiveSession', 'SessionChanged', 'SessionTerminating', 'TargetBusy'] : []),
+      'CapabilityUnavailable', 'InvalidRequest', 'RecordingNotFound', 'TargetReadCancelled', 'RateLimited', 'RequestTimeout', 'InternalError'],
+  };
+}
+
+METHOD_ENTRIES.push(
+  rtosMethod('orbit.rtos.capabilities', 'RtosCapabilities', rtosCapabilitiesParams, true),
+  rtosMethod('orbit.rtos.snapshot', 'RtosSnapshot', rtosSnapshotParams, true),
+  rtosMethod('orbit.trace.list', 'TraceList', traceListParams),
+  rtosMethod('orbit.trace.status', 'TraceStatus', traceStatusParams),
+  rtosMethod('orbit.trace.start', 'TraceStart', traceStartParams, true, true),
+  rtosMethod('orbit.trace.stop', 'TraceStop', traceStopParams, true, true),
+  rtosMethod('orbit.trace.events', 'TraceEvents', traceEventsParams),
+  rtosMethod('orbit.trace.statistics', 'TraceStatistics', traceStatisticsParams),
+);
 
 export const METHOD_CATALOG: ReadonlyMap<string, MethodCatalogEntry> = new Map(
   METHOD_ENTRIES.map(entry => [entry.name, entry]),

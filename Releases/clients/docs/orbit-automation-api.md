@@ -127,6 +127,8 @@ Use `orbit.trace.list` to find a new capture or an archive already opened in the
 
 `orbit.trace.events` and `orbit.trace.statistics` use a half-open `[start, end)` window with decimal strings for both limits. Supply both `bootGeneration` and `segmentId` for relative time. An event page holds up to 200 items. Continue with `nextOffset` and the same filter. `scanTruncated` and `totalKnownExact` describe scan coverage. Statistics return precision and gap information for the requested window. The Node client accepts an `AbortSignal` for both queries.
 
+During a live capture, segment metadata can advance as packets are decoded. Event and statistics queries see committed data. Use `committedRawBytes` as the end of a `byte-offset` query when paging the committed prefix during recording.
+
 ```js
 const page = await client.traceRecordings('offline');
 const archive = page.items[0];

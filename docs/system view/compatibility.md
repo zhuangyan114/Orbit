@@ -62,3 +62,13 @@ J-Link native、CMSIS-DAP WinUSB/HID、J-Link legacy 和其他 RMLink/XR 路径�
 | SEGGER `.SVDat` 导入 / 导出 | 不支持（保留例外） | 官方手册（`UM08027` V4.10b）对特定抓取场景允许裸流命名为 `.SVDat` 或 `.bin`，但本机 `Sample/*.SVDat` 带 `;` 文本元信息头，前者不证明 GUI 保存的带元数据归档可双向互通；`License_SystemView.txt` 包含 SFL/CUL 条款与第 `1(a)` 条限制描述，且本机 `SystemView.exe` V4.10b 打开 H723 `.bin` 在加载前即被 `"No Commercial-Use License"` 对话框阻断实测。Orbit 仅以 `.bin` 导出裸流，`.SVDat` 能力保持不可用，界面及接口均显式拒绝 `.SVDat` |
 
 详见 [阶段 5.3 归档与 SVDat 评估报告](stage5-archive-validation.md)。
+
+## 阶段 6 实板与安装复验（2026-11-21）
+
+| 环境 | 已验证能力 | 仍需验证 |
+| --- | --- | --- |
+| STM32H723VGT6、FreeRTOS 10.3.1、RMLink 二号机 Wi-Fi 0.3.4 | Continuous 配合变量采样和控制交错运行 30 分钟，目标与主机丢包计数为 0。共享标记实测覆盖暂停前后，当前 RTT 联动保留近似提示。 | 其他探针、固件组合或更高 Trace 负载的等效表现。 |
+| J-Link native、CMSIS-DAP WinUSB/HID | Windows 原生构建、mock、算法镜像检查与会话隔离回归通过。 | 当前版本的 RTOS 实板、吞吐和长稳。 |
+| Windows x64 VSIX 1.2.1，VS Code 1.134.0 | 正常安装并打开归档，离线游标与 API、CMSIS-DAP 自检和 `koffi` 加载通过。 | 完整首版实板矩阵。 |
+
+详见 [阶段 6 验收记录](stage6-acceptance.md)。

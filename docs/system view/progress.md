@@ -385,3 +385,8 @@
 - 核对实际包中的扩展、DAP、RTOS、Trace Worker、TIMELINE、Watch、原生 helper、H723 Flash Algorithm 与 Windows `koffi`。排除仓库根目录的历史仿真转录、阶段输出与录制档案。
 - 使用隔离 VS Code profile 安装候选包。正常模式加载安装目录里的扩展，打开 `68 B` 归档并验证 SHA-256。用同一安装目录执行 5.4 游标和 5.5 离线 API 脚本。已安装的 CMSIS-DAP helper 自检 `209/209`，Windows `koffi` 加载通过。
 - 候选包与证据见 `out/rtos-stage6/acceptance-6.4/`。发布状态为本地候选，首版完整硬件矩阵仍归 6.2 验收。
+
+### 6.2 RMLink 长稳与硬件矩阵
+
+- 同候选包的运行时文件在 H723 与 RMLink 二号机 Wi-Fi 实测 30 分钟，`189,395` 包和 `326,745` 个变量样本。目标、主机及传输丢包计数为 0，停止和离线重开校验通过。首次断连的原始记录也可恢复并分页查询。
+- 运行态 14 次 RTOS 快照中 13 次为 `partial`，暂停态 5 个任务与固件一致。J-Link native、CMSIS-DAP WinUSB/HID 真机矩阵保持待验。详见 [阶段 6 验收记录](stage6-acceptance.md)。

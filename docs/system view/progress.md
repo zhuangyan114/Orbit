@@ -378,3 +378,10 @@
 
 - [使用指南](quick-start.md) 说明 FreeRTOS 快照、SystemView 固件接入、通道探测、录制与回放、跨面板时间误差、故障排查和 API 权限。README 入口更新为当前 RTOS 能力。
 - 从空输出目录重建 10 个 fixture 固件、去除 DWARF 的变体和 5 份独立样本，7 项 fixture 测试通过。证据见 `out/rtos-stage6/acceptance-6.3/clean-fixtures/verification.json`。使用新 profile 的 5.4 与 5.5 脚本复走离线游标和 API 查询步骤。
+
+### 6.4 Windows x64 候选包
+
+- 在 `bab613f` 的源码与本次打包排除项上执行 `vsce package --target win32-x64`。`orbit-for-vscode-1.2.1-rtos-win32-x64.vsix` 有 163 项、6,576,593 B，SHA-256 为 `26a2c6daa385bc7fc019121527fe157b9cd3bfa200caa62449e78434f2be5471`。
+- 核对实际包中的扩展、DAP、RTOS、Trace Worker、TIMELINE、Watch、原生 helper、H723 Flash Algorithm 与 Windows `koffi`。排除仓库根目录的历史仿真转录、阶段输出与录制档案。
+- 使用隔离 VS Code profile 安装候选包。正常模式加载安装目录里的扩展，打开 `68 B` 归档并验证 SHA-256。用同一安装目录执行 5.4 游标和 5.5 离线 API 脚本。已安装的 CMSIS-DAP helper 自检 `209/209`，Windows `koffi` 加载通过。
+- 候选包与证据见 `out/rtos-stage6/acceptance-6.4/`。发布状态为本地候选，首版完整硬件矩阵仍归 6.2 验收。

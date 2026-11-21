@@ -8,6 +8,7 @@
 .vscode/**
 .vscode-test/**
 outputs/**
+transcript
 artifacts/**
 build/**
 tmp/**

@@ -120,8 +120,9 @@ async function main() {
   const installed = path.join(process.env.LOCALAPPDATA, 'Programs/Microsoft VS Code/Code.exe');
   const cached = path.join(root, '.vscode-test/vscode-win32-x64-archive-1.134.0/Code.exe');
   const executable = await fs.access(cached).then(() => cached).catch(() => installed);
+  const extensionPath = process.argv.find(arg => arg.startsWith('--extension='))?.slice('--extension='.length) || root;
   console.log(`Stage 5.4 report directory: ${output}`);
-  await runTests({ vscodeExecutablePath: executable, extensionDevelopmentPath: root, extensionTestsPath: __filename,
+  await runTests({ vscodeExecutablePath: executable, extensionDevelopmentPath: extensionPath, extensionTestsPath: __filename,
     launchArgs: [workspace, '--user-data-dir', path.join(output, 'profile'), '--extensions-dir', path.join(output, 'extensions'),
       '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes'] });
   console.log(await fs.readFile(path.join(output, 'report.json'), 'utf8'));

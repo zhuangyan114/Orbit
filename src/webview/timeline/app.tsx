@@ -120,6 +120,7 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
   };
   const cursorDragRef = useRef<'A' | 'B' | null>(null);
   const [rangeError, setRangeError] = useState(boot.tab.error ?? '');
+  const [clockLinkNotice, setClockLinkNotice] = useState<string>(boot.clockLinkNotice ?? '');
   const [sampleRateHz, setSampleRateHz] = useState<number>(boot.sampleRateHz ?? 0);
   const [averageSampleRateHz, setAverageSampleRateHz] = useState<number | null>(boot.averageSampleRateHz ?? null);
   const [debugSessions, setDebugSessions] = useState<TimelineDebugSession[]>(boot.debugSessions ?? []);
@@ -321,6 +322,20 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
       const msg = event.data;
       if (msg.tabId !== boot.tab.id || msg.recordId !== boot.tab.recordId) return;
       switch (msg.command) {
+        case 'clockLinkSelection': {
+          updateCursors(msg.cursors);
+          const cursor = Math.max(msg.cursors.A ?? -Infinity, msg.cursors.B ?? -Infinity);
+          if (!autoFollowRef.current && Number.isFinite(cursor) && historyBoundsRef.current) {
+            tEndRef.current = Math.min(historyBoundsRef.current.end, cursor + timePerDivRef.current * H_DIV / 4);
+            requestVisibleRange();
+          }
+          saveState();
+          setClockLinkNotice(msg.notice);
+          break;
+        }
+        case 'clockLinkNotice':
+          setClockLinkNotice(msg.notice);
+          break;
         case 'init': {
           setDebugSessions(msg.debugSessions ?? []);
           const eList: Entry[] = (msg.entries || []).map((e: TimelineEntryUpdate) => createTimelineEntry(e));
@@ -1054,8 +1069,11 @@ function TimelinePlot({ boot, kind, samplingEnabled, running }: { boot: any; kin
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, paddingLeft: 8, whiteSpace: 'nowrap' }}>
           <button style={iconBtnStyle} onClick={() => { saveState(); sendMessage({ command: 'saveCsv', scope: 'all' }); }}>保存全部 CSV</button>
           <button style={iconBtnStyle} disabled={cursorA === null || cursorB === null} onClick={() => { saveState(); sendMessage({ command: 'saveCsv', scope: 'selection' }); }}>保存 A/B 区间</button>
+          <button style={iconBtnStyle} disabled={cursorA === null && cursorB === null}
+            onClick={() => sendMessage({ command: 'clockLinkToTrace', cursors: cursorRef.current })}>定位到 RTOS Trace</button>
         </div>
         <div style={{ display: 'flex', alignItems: 'baseline', alignSelf: 'end', gap: 8, paddingLeft: PLOT_LEFT_MARGIN, minWidth: 0, position: 'relative', top: PLOT_TOP_MARGIN + EXPORT_ROW_PADDING - 3, zIndex: 1 }}>
+          {clockLinkNotice && <span role="status" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={clockLinkNotice}>{clockLinkNotice}</span>}
           <span title={kind === 'history' ? '平均采样率' : '实时采样率'} aria-label={kind === 'history' ? '平均采样率' : '实时采样率'} style={{ display: 'inline-flex', flexShrink: 0, gap: 0, color: 'var(--vscode-descriptionForeground, #aaa)', fontFamily: 'monospace', fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
             <span style={{ display: 'inline-block', minWidth: '4ch' }}>{kind === 'live' ? sampleRateHz.toFixed(0) : kind === 'history' ? averageSampleRateHz?.toFixed(0) ?? '—' : '—'}</span>
             <span>Hz</span>

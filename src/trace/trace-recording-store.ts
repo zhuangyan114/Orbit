@@ -296,6 +296,7 @@ export interface IngestBatchSummary {
   readonly markersEmitted: number;
   readonly markerPointsEmitted: number;
   readonly gapsRecorded: number;
+  readonly clockTail?: { readonly segmentId: number; readonly relativeTicks: string; readonly frequencyHz: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1305,10 @@ export class TraceRecordingStore {
       }
     }
 
+    const tail = decodeBatch.packets.at(-1);
+    const clockTail = tail?.sysFreqHz && tail.segmentReliability !== 'uncertain' && !decodeBatch.gaps.length
+      ? { segmentId: tail.segmentId, relativeTicks: tail.segmentRelativeTicks, frequencyHz: tail.sysFreqHz }
+      : undefined;
     this.sampleMemoryUsage();
     return {
       ok: true,
@@ -1312,6 +1317,7 @@ export class TraceRecordingStore {
         committedRawBytes: this.committed.rawBytes,
         packetsDecoded: decodeBatch.packets.length,
         slicesEmitted: reconBatch.executionSlices.length,
+        ...(clockTail ? { clockTail } : {}),
         activationsEmitted: reconBatch.contextActivations.length,
         readyWaitsEmitted: reconBatch.readyWaits.length,
         markersEmitted: reconBatch.markers.length,

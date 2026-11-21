@@ -59,6 +59,8 @@ export interface TraceTimelineViewProps {
   onChangeViewRange: (range: { start: string; end: string } | null) => void;
   onChangeCursorA: (cursor: SharedTraceCursor | null) => void;
   onChangeCursorB: (cursor: SharedTraceCursor | null) => void;
+  clockLinkNotice?: string;
+  onClockLink?: (command: 'traceClockLinkToTimeline' | 'traceClockAlign') => void;
   onUpdateSettings: (patch: Partial<RtosViewSettings>) => void;
   onInspectTarget: () => void;
   onStartRecording: (mode: TraceRecordingMode) => void;
@@ -1519,6 +1521,14 @@ export function TraceTimelineView(props: TraceTimelineViewProps) {
         >
           清除 A/B
         </button>
+        {props.onClockLink && <>
+          <button type="button" className="rtos-mini-btn" disabled={!cursorA && !cursorB}
+            onClick={() => props.onClockLink?.('traceClockLinkToTimeline')}>定位到变量 TIMELINE</button>
+          <button type="button" className="rtos-mini-btn" disabled={!cursorA}
+            title="在两个面板用 A 选中同一事件。若 B 也选中同一事件，可用第二对游标计算时间比例。"
+            onClick={() => props.onClockLink?.('traceClockAlign')}>手动对齐</button>
+        </>}
+        {props.clockLinkNotice && <span role="status" className="rtos-inline-warn">{props.clockLinkNotice}</span>}
 
         {activeViewport && (
           <span className="rtos-count">

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { isTimelineLinkClock, type TimelineLinkClock } from '../trace/clock-link-observations';
 import { OzoneBackend } from '../ozone-backend/commander';
 import { DataSamplingEntry, DataPoint, DataSampleSnapshot, WatchValue } from '../ozone-backend/types';
 import { trimTimelineHistory } from '../utils/timeline-history';
@@ -32,7 +33,7 @@ export class DataSamplingManager {
   private lastSampleTimestampMap = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   private sendTimer: NodeJS.Timeout | null = null;
-  private onSamples: ((snapshots: DataSampleSnapshot[]) => void) | null = null;
+  private onSamples: ((snapshots: DataSampleSnapshot[], clock?: TimelineLinkClock) => void) | null = null;
   private backend: OzoneBackend;
   private sampleIntervalMs = DEFAULT_SAMPLE_INTERVAL_MS;
   private sendIntervalMs = DEFAULT_SEND_INTERVAL_MS;
@@ -42,7 +43,6 @@ export class DataSamplingManager {
   private endedSessions = new WeakSet<vscode.DebugSession>();
   private remoteTransition: Promise<void> = Promise.resolve();
   private readonly disposables: vscode.Disposable[] = [];
-
   onExpressionsChanged: ((exprs: { expression: string; color: string }[]) => void) | null = null;
 
   constructor(backend: OzoneBackend) {
@@ -73,12 +73,13 @@ export class DataSamplingManager {
       if (event.session === this.remoteSession
         && event.session === vscode.debug.activeDebugSession
         && event.event === 'ozoneDataSamples') {
-        this.acceptRemoteSamples(event.body?.snapshots || []);
+        const clock = event.body?.clock;
+        this.acceptRemoteSamples(event.body?.snapshots || [], isTimelineLinkClock(clock) ? clock : undefined);
       }
     }));
   }
 
-  setOnSamples(cb: ((snapshots: DataSampleSnapshot[]) => void) | null) {
+  setOnSamples(cb: ((snapshots: DataSampleSnapshot[], clock?: TimelineLinkClock) => void) | null) {
     this.onSamples = cb;
   }
 
@@ -398,7 +399,7 @@ export class DataSamplingManager {
     return results;
   }
 
-  private acceptRemoteSamples(snapshots: DataSampleSnapshot[]) {
+  private acceptRemoteSamples(snapshots: DataSampleSnapshot[], clock?: TimelineLinkClock) {
     const accepted: DataSampleSnapshot[] = [];
     const entryByExpression = new Map(this.samplingEntries.map(entry => [entry.expression, entry]));
     for (const snapshot of snapshots) {
@@ -417,7 +418,7 @@ export class DataSamplingManager {
         data: snapshot.data,
       });
     }
-    if (accepted.length > 0 && this.onSamples) this.onSamples(accepted);
+    if (accepted.length > 0 && this.onSamples) this.onSamples(accepted, clock);
   }
 
   private flush() {

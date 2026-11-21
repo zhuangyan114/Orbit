@@ -212,6 +212,10 @@ export class TimelineRecordStore {
       globalHistoryCacheBytes: cacheBytes + indexPageBytes, indexNodes: [...this.counts] };
   }
   private origin: number | null = null;
+
+  getRawOriginTimestamp(): number | null {
+    return this.origin;
+  }
   private activeChannels = new Map<string, TimelineChannel>();
   private segments = new Map<number, number>();
   private hot: TimelineRow[] = [];

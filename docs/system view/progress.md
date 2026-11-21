@@ -351,3 +351,11 @@
 - 剩余事项：`.SVDat` 因本机官方工具受 `"No Commercial-Use License"` 对话框阻断实测且缺乏官方 GUI 带元数据归档双向核验，能力保持不可用；下一小部分为阶段 5.4（跨面板时钟域同步与变量 Timeline 对齐）与 5.5（公开 API / MCP）。
 - 独立复验：健康、坏索引、坏块与截断 journal 四份归档另存后均可离线重开，原始字节及可恢复前缀的 SHA-256 与样本一致。最终构建再次通过 5.3、5.2 的新 VS Code profile 验收。见 `out/rtos-stage5/acceptance-5.3/codex-io-probe-60n09M/report.json`、`codex-r2-final-ui-53-231101/vscode-ui-report.json`、`codex-r2-final-ui-52-231101/vscode-ui-report.json`。
 - 提交：实现 RTOS 阶段 5.3：完成录制归档与离线回放。
+
+### 5.4 跨面板时间映射
+
+- Trace Timeline 和变量 TIMELINE 可以传送 A/B 游标，保留两边的 Auto-Follow。实时关联只使用同一 DAP 会话和时钟代次内的观测。暂停、重启、采样源变化、Trace 缺口与时钟频率变化分别划分有效区间。每份记录的关联窗口有上限，缺少覆盖时可用已知事件手动对齐。
+- 在全新 VS Code 1.134.0 profile 中打开独立 SystemView 样本和变量 CSV。两对游标设定比例后，Trace 中点映射为变量 `22.5 ms`，反向恢复 `27000 ns` 和 `53000 ns`。两个面板的跟随设置分别保持开启与关闭。运行 `node scripts/rtos/verify-stage54-vscode.js` 可复验。
+- STM32H723VGT6 与 RMLink 二号机 Wi-Fi 实测提交 `49,375 B`、`8,205` 包，目标、传输及主机丢包计数为 `0`。使用现有测试任务写入同一序号的变量与 SystemView Marker。暂停前后的时钟代次分别留出 `10` 和 `6` 个 Marker 检查，距采样边沿窗口中心的最大偏差为 `3.711 ms` 和 `2.560 ms`。部分测点超出采样窗口，映射算法拒绝精确联动。运行时 RTT 到达关联仍提示缓冲与采样延迟的上界未知。
+- 独立时钟样本覆盖 32 位回绕、递减计数、已知漂移与复位缺口。全量 Vitest 通过 `1,553` 项，`1` 项既有跳过。真实 VS Code 的 5.2 回归、类型检查与构建通过。
+- 证据位于 `out/rtos-stage5/acceptance-5.4`，包括 `h723-clock-proof.json`、`h723-shared-events-capture.json`、`codex-clock-proof.json` 和 `link-ui-final.log`。实板长稳与其他探针路径列入 6.2。

@@ -18,6 +18,9 @@ import type { SymbolCatalog } from '../../symbols/symbol-catalog';
 import type { SymbolPickerPanel } from '../../debug-providers/symbol-picker-panel';
 import { prepareTimelineLiveSamples } from './timeline-live';
 import { pickTimelineColor } from './timeline-colors';
+import type { TimelineLinkClock } from '../../trace/clock-link-observations';
+import type { TimelineLinkView, TimelineLinkWindow } from '../../trace/clock-panel-link';
+import type { TimelineCursors } from './timeline-cursors';
 
 const STATE_KEY = 'ozoneTimelineState';
 const GROUPS_STATE_KEY = 'ozoneTimelineGroups';
@@ -39,9 +42,13 @@ interface RecordTab {
   pendingSession?: Omit<TimelineDebugSession, 'startMs'>;
   segmentExpressions?: Set<string>;
   timestampOffset?: number;
+  clockWindows?: TimelineLinkWindow[];
+  clockWindowOpen?: boolean;
+  clockLinkNotice?: string;
 }
 
 export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
+  onClockLink?: (view: TimelineLinkView) => void;
   private view: vscode.WebviewView | null = null;
   private tabs = new Map<string, RecordTab>();
   private activeId = 'timeline1';
@@ -100,7 +107,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     this.syncSampling();
     this.persistGroups();
     this.sampleManager.setRetainHistory(false);
-    this.sampleManager.setOnSamples(snapshots => this.sendSamples(snapshots));
+    this.sampleManager.setOnSamples((snapshots, clock) => this.sendSamples(snapshots, clock));
     context.subscriptions.push(
       vscode.debug.onDidStartDebugSession(session => { if (isOrbitDebugSessionType(session.type)) this.beginRecord(session); }),
       vscode.debug.onDidTerminateDebugSession(session => {
@@ -163,6 +170,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     for (const tab of this.debugTabs()) {
       if (tab.session !== session || (!tab.store && !tab.pendingSession)) {
         tab.session = session;
+        tab.clockWindowOpen = false;
         tab.pendingSession = { name: session?.name || '本地采样', startedAtUtc: startedAt };
         tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
         tab.sampleRate = new TimelineSampleRate();
@@ -176,6 +184,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     for (const tab of this.debugTabs()) {
       if (tab.session !== session) continue;
       tab.session = undefined;
+      tab.clockWindowOpen = false;
       tab.info.running = false;
       tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
       this.postMessage({ command: 'sampleRate', tabId: tab.info.id, recordId: tab.info.recordId,
@@ -284,6 +293,13 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
     switch (msg.command) {
+      case 'clockLinkToTrace': {
+        const view = this.getClockLinkView();
+        if (!view) break;
+        const valid = (value: unknown): value is number | null => value === null || (typeof value === 'number' && Number.isFinite(value));
+        if (valid(msg.cursors?.A) && valid(msg.cursors?.B)) this.onClockLink?.({ ...view, cursors: { A: msg.cursors.A, B: msg.cursors.B } });
+        break;
+      }
       case 'renderMetrics': {
         if (Date.now() - this.renderMetricsAt < 9000 || ![msg.frames, msg.slowFrames, msg.maxDrawMs].every(v => typeof v === 'number' && Number.isFinite(v) && v >= 0)) break;
         this.renderMetricsAt = Date.now();
@@ -402,6 +418,9 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     tab.pendingSession = { name: tab.session?.name || '本地采样', startedAtUtc: tab.session ? this.sessionStarts.get(tab.session)! : new Date().toISOString() };
     tab.segmentExpressions = new Set(tab.view.entries.map(entry => entry.expression));
     tab.timestampOffset = 0;
+    tab.clockWindows = undefined;
+    tab.clockWindowOpen = false;
+    tab.clockLinkNotice = undefined;
     if (tab.info.samplingEnabled) this.ensureStore(tab);
     this.activateTab(tab.info.id);
     this.persistGroups();
@@ -443,7 +462,7 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     this.activeId = id; const tab = this.tabs.get(id)!; tab.revision++;
     if (this.isDebugTab(tab)) { this.debugGroupId = id; this.persistGroups(); }
     this.postTabs();
-    this.postMessage({ command: 'activate', tab: tab.info, ...tab.view, debugSessions: tab.store?.meta.debugSessions ?? [],
+    this.postMessage({ command: 'activate', tab: tab.info, ...tab.view, clockLinkNotice: tab.clockLinkNotice, debugSessions: tab.store?.meta.debugSessions ?? [],
       historyBounds: tab.store?.bounds ?? null, sampleRateHz: tab.info.kind === 'live' ? tab.sampleRate?.getHz() ?? 0 : null, averageSampleRateHz: tab.store?.getAverageSampleRateHz() ?? null });
   }
   private postTabs() { this.postMessage({ command: 'tabs', tabs: [...this.tabs.values()].map(t => t.info), activeId: this.activeId }); }
@@ -477,7 +496,34 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
     this.finalizers.add(releasing);
     void releasing.finally(() => this.finalizers.delete(releasing)).catch(() => {});
   }
-  private sendSamples(snapshots: DataSampleSnapshot[]) {
+  getClockLinkView(): TimelineLinkView | undefined {
+    const tab = this.tabs.get(this.activeId);
+    const bounds = tab?.store?.bounds;
+    if (!tab || !bounds || !tab.info.recordId) return;
+    return { recordId: tab.info.recordId, bounds,
+      sessionStarts: tab.store?.meta.debugSessions?.map(session => session.startMs) ?? [],
+      windows: tab.clockWindows ?? [], cursors: { A: tab.view.cursorA_ms ?? null, B: tab.view.cursorB_ms ?? null } };
+  }
+
+  applyClockLink(recordId: string, cursors: TimelineCursors, notice: string): void {
+    const tab = this.tabs.get(this.activeId);
+    if (!tab || tab.info.recordId !== recordId) return;
+    tab.view = { ...tab.view, cursorA_ms: cursors.A, cursorB_ms: cursors.B };
+    tab.clockLinkNotice = notice;
+    if (tab.store) tab.store.view = tab.view;
+    if (this.view) this.view.show?.(false);
+    else void vscode.commands.executeCommand('ozoneTimeline.focus');
+    this.postMessage({ command: 'clockLinkSelection', tabId: tab.info.id, recordId, cursors, notice });
+  }
+
+  showClockLinkNotice(notice: string): void {
+    const tab = this.tabs.get(this.activeId);
+    if (!tab) return;
+    tab.clockLinkNotice = notice;
+    this.postMessage({ command: 'clockLinkNotice', tabId: tab.info.id, recordId: tab.info.recordId, notice });
+  }
+
+  private sendSamples(snapshots: DataSampleSnapshot[], clock?: TimelineLinkClock) {
     const active = vscode.debug.activeDebugSession;
     const session = active && isOrbitDebugSessionType(active.type) ? active : undefined;
     if (session && this.endedSessions.has(session)) return;
@@ -493,7 +539,8 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       if (!Number.isFinite(first)) continue;
       this.ensureStore(tab);
       const store = tab.store!;
-      const lastTime = store.bounds ? Date.parse(store.meta.timeOriginUtc) + store.bounds.end : undefined;
+      const rawOrigin = store.getRawOriginTimestamp();
+      const lastTime = store.bounds && rawOrigin !== null ? rawOrigin + store.bounds.end : undefined;
       if (tab.pendingSession) {
         tab.timestampOffset = lastTime === undefined ? 0 : Math.max(0, lastTime + 1 - first);
       } else if (lastTime !== undefined && first + (tab.timestampOffset ?? 0) < lastTime) {
@@ -511,6 +558,23 @@ export class TimelineWebviewProvider implements vscode.WebviewViewProvider {
       });
       const accepted = store.append(prepared);
       if (!accepted.length) continue;
+      const origin = store.getRawOriginTimestamp();
+      if (clock && origin !== null && session) {
+        const start = Math.min(...accepted.map(snapshot => snapshot.data[0].timestamp));
+        const end = Math.max(...accepted.map(snapshot => snapshot.data.at(-1)!.timestamp));
+        const shiftMs = origin - offset;
+        const windows = tab.clockWindows ??= [];
+        const previous = windows.at(-1);
+        if (tab.clockWindowOpen && previous?.key === clock.key && previous.shiftMs === shiftMs) {
+          windows[windows.length - 1] = { ...previous, end };
+        } else {
+          windows.push({ key: clock.key, shiftMs, start, end });
+          if (windows.length > 32) windows.shift();
+        }
+        tab.clockWindowOpen = true;
+      } else {
+        tab.clockWindowOpen = false;
+      }
       const markerAdded = !!tab.pendingSession;
       if (tab.pendingSession) {
         store.meta.debugSessions!.push({ ...tab.pendingSession, startMs: Math.min(...accepted.map(snapshot => snapshot.data[0].timestamp)) });

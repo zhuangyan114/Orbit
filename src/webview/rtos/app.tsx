@@ -6,10 +6,12 @@ import { ContextsView, type ContextsSubTab } from './contexts-view';
 import { ObjectsView } from './objects-view';
 import { TimersHeapView } from './timers-heap-view';
 import { TraceTimelineView, type SharedTraceCursor } from './trace-timeline-view';
+import type { TraceLinkSelection } from '../../trace/clock-panel-link';
 import {
   computeAxisDomain,
   computeTimelineJumpForEvent,
   resolveEventTimeStrForUnit,
+  segmentScopeKey,
   type TraceAnalysisResponse,
   type TraceAnalysisSourceKind,
   type TraceDiagnosticsResponse,
@@ -124,6 +126,8 @@ export function RtosApp() {
   const [traceViewRange, setTraceViewRange] = useState<{ start: string; end: string } | null>(null);
   const [cursorA, setCursorA] = useState<SharedTraceCursor | null>(null);
   const [cursorB, setCursorB] = useState<SharedTraceCursor | null>(null);
+  const [clockLinkMessage, setClockLinkMessage] = useState<{ recordId: string; notice: string } | null>(null);
+  const [clockLinkSelection, setClockLinkSelection] = useState<{ recordId: string; cursors: TraceLinkSelection } | null>(null);
   const [contextsRangeSource, setContextsRangeSource] = useState<TraceAnalysisSourceKind>('viewport');
   const [contextsSubTab, setContextsSubTab] = useState<ContextsSubTab>('contexts');
   const [focusedEvent, setFocusedEvent] = useState<TraceFocusedEventRef | null>(null);
@@ -157,6 +161,11 @@ export function RtosApp() {
     const onMessage = (event: MessageEvent) => {
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
+      if (msg.command === 'clockLinkSelection' || msg.command === 'clockLinkNotice') {
+        setClockLinkMessage({ recordId: msg.recordId, notice: msg.notice });
+        if (msg.command === 'clockLinkSelection') setClockLinkSelection({ recordId: msg.recordId, cursors: msg.cursors });
+        return;
+      }
       if (msg.command === 'state' && msg.state && typeof msg.state === 'object') {
         const next = msg.state as RtosPanelState;
         if (next.hostVersion < hostVersionRef.current) return;
@@ -309,6 +318,11 @@ export function RtosApp() {
             };
           } else if (action === 'trace.getState') {
             data = w.__orbitTraceTimelineTestApi?.getState?.() ?? null;
+          } else if (action === 'trace.clickClockLink') {
+            const label = payload.align ? '手动对齐' : '定位到变量 TIMELINE';
+            const button = Array.from(document.querySelectorAll('button')).find(el => el.textContent === label && !el.disabled);
+            button?.click();
+            data = { clicked: Boolean(button) };
           } else if (action === 'trace.exportCsvViewport') {
             data = { triggered: Boolean(w.__orbitTraceTimelineTestApi?.exportCsvViewport?.(payload.outputPath)) };
           } else if (action === 'trace.exportCsvSelection') {
@@ -558,6 +572,36 @@ export function RtosApp() {
       setTraceViewRange(pendingJump.viewRange);
     }
   }, [activeTraceRecordId, traceAxisDomain.scopeKey, traceAxisDomain.unit, traceAxisDomain.valid, traceAxisDomain.minStr, traceAxisDomain.displayMaxStr]);
+
+  useEffect(() => {
+    if (!clockLinkSelection || clockLinkSelection.recordId !== activeTraceRecordId) return;
+    const { A, B } = clockLinkSelection.cursors;
+    const point = A ?? B;
+    if (point?.bootGeneration === undefined || point.segmentId === undefined) return;
+    const scope = segmentScopeKey(point.bootGeneration, point.segmentId);
+    if (traceScopeKey !== scope || settings.traceTimeUnit !== point.unit || settings.activePage !== 'trace') {
+      pendingTimelineJumpRef.current = null;
+      setTraceScopeKey(scope);
+      updateSettings({ traceTimeUnit: point.unit, activePage: 'trace' });
+      return;
+    }
+    setClockLinkSelection(null);
+    setFocusedEvent(null);
+    setCursorA(A);
+    setCursorB(B);
+    if (!settings.traceAutoFollow && traceAxisDomain.valid) {
+      const min = BigInt(traceAxisDomain.minStr);
+      const max = BigInt(traceAxisDomain.displayMaxStr);
+      const left = BigInt((A ?? point).timeStr);
+      const right = BigInt((B ?? point).timeStr);
+      const low = left < right ? left : right;
+      const high = left < right ? right : left;
+      const padding = (max - min) / 10n + 1n;
+      setTraceViewRange({ start: (low - padding > min ? low - padding : min).toString(),
+        end: (high + padding < max ? high + padding : max).toString() });
+    }
+  }, [clockLinkSelection, activeTraceRecordId, settings.traceTimeUnit, settings.activePage, settings.traceAutoFollow,
+    traceScopeKey, traceAxisDomain, updateSettings]);
 
   useEffect(() => {
     if (!traceAxisDomain.valid) return;
@@ -979,6 +1023,8 @@ export function RtosApp() {
             onChangeViewRange={setTraceViewRange}
             onChangeCursorA={setCursorA}
             onChangeCursorB={setCursorB}
+            clockLinkNotice={clockLinkMessage?.recordId === activeTraceRecordId ? clockLinkMessage.notice : undefined}
+            onClockLink={command => vscodeApi.postMessage({ command, recordId: activeTraceRecordId, cursors: { A: cursorA, B: cursorB } })}
             onUpdateSettings={updateSettings}
             onInspectTarget={() => vscodeApi.postMessage({ command: 'traceInspectTarget' })}
             onStartRecording={mode => vscodeApi.postMessage({ command: 'traceStart', mode })}

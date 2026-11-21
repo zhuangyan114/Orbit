@@ -5,6 +5,7 @@ import { WatchWebviewProvider } from './debug-providers/watch-webview-provider';
 import { TimelineWebviewProvider } from './webview/timeline/timeline-provider';
 import { RtosWebviewProvider } from './webview/rtos/rtos-provider';
 import { TraceRecordingCoordinator } from './trace/trace-recording-coordinator';
+import { ClockPanelLink } from './trace/clock-panel-link';
 import { DataSamplingManager } from './debug-providers/data-sampling-manager';
 import { OzoneDebugConfigurationProvider } from './debug/ozone-debug-config';
 import { SvdBackgroundDownloader } from './debug/svd-background-downloader';
@@ -170,6 +171,34 @@ export async function activate(context: vscode.ExtensionContext) {
       traceCoordinator.bindSession(initialSession);
     }
     rtosProvider = new RtosWebviewProvider(context, traceCoordinator);
+    const rtos = rtosProvider;
+    const clockLink = new ClockPanelLink();
+    rtos.onClockLink = (command, trace, selection) => {
+      try {
+        const timeline = tl.getClockLinkView();
+        if (!timeline) throw new Error('请先在变量 TIMELINE 打开记录或采集变量。');
+        if (command === 'traceClockAlign') {
+          rtos.showClockLinkNotice(clockLink.align(trace, selection, timeline));
+        } else {
+          const result = clockLink.toTimeline(trace, selection, timeline);
+          rtos.showClockLinkNotice(result.notice);
+          tl.applyClockLink(timeline.recordId, result.cursors, result.notice);
+        }
+      } catch (error) {
+        rtos.showClockLinkNotice(String(error instanceof Error ? error.message : error));
+      }
+    };
+    tl.onClockLink = timeline => {
+      try {
+        const trace = rtos.getClockLinkView();
+        if (!trace) throw new Error('请先在 RTOS Trace Timeline 打开录制。');
+        const result = clockLink.toTrace(trace, timeline);
+        tl.showClockLinkNotice(result.notice);
+        rtos.applyClockLink(trace.record.recordId, result.cursors, result.notice);
+      } catch (error) {
+        tl.showClockLinkNotice(String(error instanceof Error ? error.message : error));
+      }
+    };
 
     // Bounded automation event ring and the exact DebugSession registry with
     // the instance-level generation fence (plan Task 3). The ring pulls its
@@ -583,7 +612,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     if (activeWatchSession) startWatchPolling();
     if (context.extensionMode === vscode.ExtensionMode.Test) {
-      return { rtosProvider, traceCoordinator, extensionContext: context };
+      return { rtosProvider, traceCoordinator, timelineProvider, extensionContext: context };
     }
   } catch (e: any) {
     console.error('[Orbit] activate FAILED:', e.message);

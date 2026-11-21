@@ -268,6 +268,9 @@ export class DapSession extends EventEmitter {
   private targetRunning = false;
   private timelineClockPausedAtMs: number | null = null;
   private timelineClockPausedTotalMs = 0;
+  private dataSamplingSource: 'host' | 'probe' | 'rmlink' | 'none' = 'none';
+  private dataSamplingClockEpoch = 0;
+  private dataSamplingClockBoundaryPending = false;
   private controlInProgress = false;
   private readCancelEpoch = 0;
   private readonly rtosSessionId = crypto.randomUUID();
@@ -931,10 +934,25 @@ export class DapSession extends EventEmitter {
     if (running && this.timelineClockPausedAtMs !== null) {
       this.timelineClockPausedTotalMs += Math.max(0, now - this.timelineClockPausedAtMs);
       this.timelineClockPausedAtMs = null;
+      this.dataSamplingClockEpoch++;
+      this.dataSamplingClockBoundaryPending = true;
     } else if (!running && this.timelineClockPausedAtMs === null) {
       this.timelineClockPausedAtMs = now;
+      this.dataSamplingClockEpoch++;
+      this.dataSamplingClockBoundaryPending = true;
     }
     this.targetRunning = running;
+  }
+
+  private getTimelineLinkClock() {
+    const source = this.dataSamplingSource;
+    if (source === 'none') return undefined;
+    const measuredProbeRoundTripMs = source === 'probe' ? this.probeSampler?.getClockSnapshot().measuredMinRttMs : null;
+    return {
+      source,
+      key: [this.rtosSessionId, this.rtosSessionGeneration, this.rtosBootGeneration, source, this.dataSamplingClockEpoch].join(':'),
+      ...(measuredProbeRoundTripMs == null ? {} : { measuredProbeRoundTripMs }),
+    };
   }
 
   private timelineNowMs(now = this.nowMs()): number {
@@ -4801,9 +4819,13 @@ export class DapSession extends EventEmitter {
             if (kindCheck.value === 'text') {
               if (batch.bytes.length > 0) this.emitRttBytes(Buffer.from(batch.bytes));
             } else {
+              const clock = this.targetRunning && !this.controlInProgress && !batch.backlogLikely
+                && !batch.congested && !batch.overrun ? this.getTimelineLinkClock() : undefined;
+              const arrivalMs = this.nowMs();
               this.sendEvent('orbitRttData', {
                 consumerId: consumerCheck.value,
                 ...serializeBatch(batch),
+                ...(clock ? { traceArrival: { clock, axisMs: clock.source === 'rmlink' ? arrivalMs : this.timelineNowMs(arrivalMs) } } : {}),
               });
             }
           },
@@ -6418,6 +6440,9 @@ export class DapSession extends EventEmitter {
     if (probeIntervalMs !== null) this.dataSamplingIntervalMs = probeIntervalMs;
     this.rttCoordinator?.onXrSamplingStateChanged();
     const source = this.backend.supportsProbeSubscriptions ? 'rmlink' : probeIntervalMs !== null ? 'probe' : 'host';
+    this.dataSamplingSource = source;
+    this.dataSamplingClockEpoch++;
+    this.dataSamplingClockBoundaryPending = false;
 
     const now = this.nowMs();
     this.dataSamplingNextSampleMs = now;
@@ -6438,7 +6463,7 @@ export class DapSession extends EventEmitter {
           Math.max(200,Math.round(this.dataSamplingIntervalMs*1000)),sample=>{
           if(generation!==this.probeSamplingGeneration || !this.dataSamplingActive || !this.targetRunning || !sample.values)return;
           const probeMs=Number(sample.timestampUs)/1000;
-          offset??=this.nowMs()-probeMs;
+          offset ??= this.nowMs() - probeMs;
           // The probe keeps sampling time independently of host delivery and
           // pause notifications. Subtracting later host pauses can move an
           // in-flight pre-pause batch backwards. Keep its real elapsed time.
@@ -6635,9 +6660,13 @@ export class DapSession extends EventEmitter {
       this.dataSamplingCounts.samplesSent += snapshots[snapshots.length - 1].data.length;
     }
     if (snapshots.length > 0) {
+      // One delivery can contain samples queued on both sides of a control pause.
+      const clock = this.dataSamplingClockBoundaryPending ? undefined : this.getTimelineLinkClock();
+      this.dataSamplingClockBoundaryPending = false;
       this.sendEvent('ozoneDataSamples', {
         snapshots,
         intervalMs: this.dataSamplingIntervalMs,
+        ...(clock ? { clock } : {}),
       });
       const now = this.nowMs();
       if (now - this.dataSamplingSummaryAt >= 1000) {
@@ -6668,6 +6697,7 @@ export class DapSession extends EventEmitter {
       this.dataSamplingSendTimer = null;
     }
     this.flushDataSampling();
+    this.dataSamplingSource = 'none';
     this.dataSamplingEntries = [];
     this.dataSamplingSpecs = [];
     this.dataSamplingPending.clear();

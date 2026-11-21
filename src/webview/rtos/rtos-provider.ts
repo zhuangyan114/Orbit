@@ -44,6 +44,7 @@ import {
 } from './trace-dto';
 import type { TraceEventCategoryFilter, TraceTerminalLevelFilter } from '../../trace/trace-events';
 import type { TraceCsvExportRequest, TraceCsvExportSource } from '../../trace/trace-csv-export';
+import { readTraceLinkSelection, type TraceLinkSelection, type TraceLinkView } from '../../trace/clock-panel-link';
 import type {
   TraceAnalysisResponse,
   TraceAnalysisSourceKind,
@@ -60,6 +61,7 @@ import type {
 } from './trace-timeline-state';
 
 export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
+  onClockLink?: (command: 'traceClockLinkToTimeline' | 'traceClockAlign', trace: TraceLinkView, selection: TraceLinkSelection) => void;
   private view: vscode.WebviewView | null = null;
   private viewDisposables: vscode.Disposable[] = [];
   private readonly disposables: vscode.Disposable[] = [];
@@ -753,6 +755,13 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
       case 'traceInspectTarget':
         await this.probeTraceTarget(this.sessionGeneration);
         break;
+      case 'traceClockLinkToTimeline':
+      case 'traceClockAlign': {
+        const trace = this.getClockLinkView();
+        const selection = readTraceLinkSelection(msg.cursors);
+        if (trace && trace.record.recordId === msg.recordId && selection) this.onClockLink?.(msg.command, trace, selection);
+        break;
+      }
       case 'traceStart':
         await this.handleTraceStart(msg.mode);
         break;
@@ -874,6 +883,24 @@ export class RtosWebviewProvider implements vscode.WebviewViewProvider, vscode.D
     } catch {
       // Ignore postMessage errors when webview is closing.
     }
+  }
+
+  getClockLinkView(): TraceLinkView | undefined {
+    const recordId = this.selectedTraceRecordId;
+    const record = recordId ? this.traceRecords.get(recordId) : undefined;
+    if (!record) return;
+    return { record, arrivals: record.source !== 'offline' ? this.traceCoordinator?.getClockWindows(record.recordId) ?? [] : [] };
+  }
+
+  applyClockLink(recordId: string, cursors: TraceLinkSelection, notice: string): void {
+    if (recordId !== this.selectedTraceRecordId) return;
+    if (this.view) this.view.show?.(false);
+    else void vscode.commands.executeCommand('ozoneRtos.focus');
+    this.postMessage({ command: 'clockLinkSelection', recordId, cursors, notice });
+  }
+
+  showClockLinkNotice(notice: string): void {
+    this.postMessage({ command: 'clockLinkNotice', recordId: this.selectedTraceRecordId, notice });
   }
 
   private getHtml(webview: vscode.Webview): string {

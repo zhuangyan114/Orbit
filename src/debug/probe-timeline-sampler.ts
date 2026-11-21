@@ -53,6 +53,10 @@ export class ProbeTimelineSampler {
     return this.running;
   }
 
+  getClockSnapshot() {
+    return this.clock.snapshot();
+  }
+
   /**
    * Asks the probe to sample `specs` every `intervalMs`. Returns the interval
    * the probe uses (it may lengthen one it cannot keep), or null when the
@@ -119,6 +123,7 @@ export class ProbeTimelineSampler {
       this.schedule(POLL_MS);
       return;
     }
+    const requestStartedAt = host.nowMs();
     let result: OzoneCommandResult;
     try {
       result = await host.execute({ cmd: 'readProbeSampling' });
@@ -126,6 +131,7 @@ export class ProbeTimelineSampler {
       host.endTargetRead();
     }
     const receivedAt = host.nowMs();
+    const rttMs = Math.max(0, receivedAt - requestStartedAt);
     if (generation !== this.generation) return;
     if (!result.ok) {
       if (result.errorCode === 'RequestCancelled') {
@@ -141,7 +147,7 @@ export class ProbeTimelineSampler {
     host.counts.readsCompleted++;
     const batch = result.data as ProbeSampleBatch;
     const probeNowMs = batch.probeNowUs / 1000;
-    const offsetMs = this.clock.update(receivedAt - batch.probeNowAgeUs / 1000, probeNowMs);
+    const offsetMs = this.clock.update(receivedAt - batch.probeNowAgeUs / 1000, probeNowMs, rttMs);
     if (!host.isTargetRunning()) {
       // Frames sampled while the core is stopped do not advance the Timeline.
       this.held = [];

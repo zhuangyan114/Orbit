@@ -38,6 +38,7 @@ import type {
 import type { TraceStorageResult } from './trace-recording-store';
 import { TraceWorkerClient } from './trace-worker-client';
 import { log } from '../utils/logger';
+import { isTimelineLinkClock, TraceClockArrivals, type TraceClockArrival } from './clock-link-observations';
 
 export type TraceRecordingMode = 'continuous' | 'single-shot' | 'post-mortem';
 
@@ -541,6 +542,7 @@ interface ActiveRecordingContext {
   stopPromise?: Promise<TraceRecordingStatus>;
   tailDrainNotify?: () => void;
   streamObserver?: SystemViewStreamDecoder;
+  clockArrivals?: TraceClockArrivals;
   sawTraceStartAndInit: boolean;
   sawAttributedPostStartSync: boolean;
   sawTraceStop: boolean;
@@ -584,6 +586,7 @@ export class TraceRecordingCoordinator {
   private activeRecording: ActiveRecordingContext | null = null;
   private activeReservationId = 0;
   private readonly completedRecords = new Map<string, TraceRecordingStatus>();
+  private readonly completedClockArrivals = new Map<string, TraceClockArrivals>();
   private recordSeq = 0;
   private reservationSeq = 0;
   private runGenSeq = 0;
@@ -713,6 +716,9 @@ export class TraceRecordingCoordinator {
         committedRdOff: typeof payload.committedRdOff === 'number' ? payload.committedRdOff : undefined,
         overrun: payload.overrun === true,
         congested: payload.congested === true,
+        arrival: isTimelineLinkClock(payload.traceArrival?.clock) && Number.isFinite(payload.traceArrival.axisMs)
+          ? { clock: payload.traceArrival.clock, axisMs: payload.traceArrival.axisMs }
+          : undefined,
       });
       rec.tailDrainNotify?.();
       return;
@@ -755,6 +761,12 @@ export class TraceRecordingCoordinator {
       out.push(this.snapshotStatus(this.activeRecording));
     }
     return out;
+  }
+
+  public getClockWindows(recordId: string) {
+    const arrivals = this.activeRecording?.recordId === recordId
+      ? this.activeRecording.clockArrivals : this.completedClockArrivals.get(recordId);
+    return arrivals?.getWindows() ?? [];
   }
 
   public async inspectTarget(options: { includeEnumerate?: boolean; timeoutMs?: number } = {}): Promise<TraceTargetInspectResult> {
@@ -1013,6 +1025,7 @@ export class TraceRecordingCoordinator {
         paused: true,
       });
       rec.userPaused = true;
+      rec.clockArrivals?.breakWindow();
       rec.state = 'paused';
       rec.stateReason = 'Host receiving paused (target recording unaffected)';
       this.emitStatus(rec);
@@ -1255,7 +1268,9 @@ export class TraceRecordingCoordinator {
   }
 
   public async closeRecording(recordId: string): Promise<TraceStorageResult<{ closed: boolean; alreadyClosed: boolean }>> {
-    return this.ensureWorker().closeRecording(recordId);
+    const result = await this.ensureWorker().closeRecording(recordId);
+    if (result.ok) this.completedClockArrivals.delete(recordId);
+    return result;
   }
 
   public async dispose(): Promise<void> {
@@ -2414,6 +2429,7 @@ export class TraceRecordingCoordinator {
       committedRdOff?: number;
       overrun: boolean;
       congested: boolean;
+      arrival?: Pick<TraceClockArrival, 'clock' | 'axisMs'>;
     },
   ): void {
     let payloadBytes = batch.bytes;
@@ -2487,6 +2503,7 @@ export class TraceRecordingCoordinator {
         }
         const worker = this.ensureWorker();
         if (batch.overrun) {
+          rec.clockArrivals?.breakWindow();
           await worker.markGap({
             recordId: rec.recordId,
             sessionId: rec.identity.sessionId,
@@ -2546,6 +2563,13 @@ export class TraceRecordingCoordinator {
         rec.packetsDecoded += ingestRes.data.packetsDecoded;
         rec.sliceCount += ingestRes.data.slicesEmitted;
         rec.gapCount += ingestRes.data.gapsRecorded;
+        if (batch.arrival && ingestRes.data.clockTail && !batch.overrun && !batch.congested
+          && !ingestRes.data.gapsRecorded && !rec.hostBackpressured && !rec.userPaused) {
+          rec.clockArrivals ??= new TraceClockArrivals();
+          rec.clockArrivals.observe({ ...batch.arrival, ...ingestRes.data.clockTail, bootGeneration: rec.identity.bootGeneration });
+        } else if (batchBytes && (ingestRes.data.gapsRecorded || !batch.arrival)) {
+          rec.clockArrivals?.breakWindow();
+        }
         this.emitStatusThrottled(rec);
         if (rec.hostBackpressured && rec.pendingHostQueueBytes <= 128 * 1024) {
           await this.applyHostBackpressure(rec, false);
@@ -2581,6 +2605,7 @@ export class TraceRecordingCoordinator {
     const runGen = rec.runGeneration;
     rec.ingestChain = rec.ingestChain.then(async () => {
       if (rec.runGeneration !== runGen || !rec.workerCreated || rec.workerFinished) return;
+      rec.clockArrivals?.breakWindow();
       const res = await this.ensureWorker().markGap({
         recordId: rec.recordId,
         sessionId: rec.identity.sessionId,
@@ -2620,6 +2645,7 @@ export class TraceRecordingCoordinator {
     const runGen = rec.runGeneration;
     rec.ingestChain = rec.ingestChain.then(async () => {
       if (rec.runGeneration !== runGen || !rec.workerCreated || rec.workerFinished) return;
+      rec.clockArrivals?.breakWindow();
       const res = await this.ensureWorker().markGap({
         recordId: rec.recordId,
         sessionId: rec.identity.sessionId,
@@ -3512,10 +3538,12 @@ export class TraceRecordingCoordinator {
     }
     const snap = this.snapshotStatus(rec);
     this.completedRecords.set(rec.recordId, snap);
+    if (rec.clockArrivals) this.completedClockArrivals.set(rec.recordId, rec.clockArrivals);
     if (this.completedRecords.size > 32) {
       const oldest = this.completedRecords.keys().next().value;
       if (oldest !== undefined) {
         this.completedRecords.delete(oldest);
+        this.completedClockArrivals.delete(oldest);
       }
     }
     if (this.activeRecording === rec) {

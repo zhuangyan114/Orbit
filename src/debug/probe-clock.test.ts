@@ -36,4 +36,27 @@ describe('ProbeClock', () => {
     expect(feed(clock, 1000, 7, () => 3)).toBeNull();
     expect(clock.update(1070 + 1000 + 3, 1070)).toBe(1003);
   });
+
+  it('keeps clock offset estimates separate from measured round-trip RTT', () => {
+    const clock = new ProbeClock();
+    // Probe clock ahead of host by 5000 ms (negative offset estimates) with no explicit RTT passed
+    for (let i = 0; i < 8; i++) {
+      clock.update(1000 + i * 10, 6000 + i * 10);
+    }
+    const noRttSnap = clock.snapshot();
+    expect(noRttSnap.warmedUp).toBe(true);
+    expect(noRttSnap.minOffsetEstimateMs).toBe(-5000);
+    expect(noRttSnap.offsetSpreadMs).toBe(0);
+    expect(noRttSnap.measuredMinRttMs).toBeNull();
+    expect(noRttSnap.measuredLastRttMs).toBeNull();
+
+    // When explicit RTT pairing windows are supplied, measuredMinRttMs tracks RTT independently of offset
+    clock.update(1085, 6080, 4.5);
+    clock.update(1092, 6090, 2.0);
+    const withRttSnap = clock.snapshot();
+    expect(withRttSnap.minOffsetEstimateMs).toBe(-5000);
+    expect(withRttSnap.offsetSpreadMs).toBe(5);
+    expect(withRttSnap.measuredMinRttMs).toBe(2.0);
+    expect(withRttSnap.measuredLastRttMs).toBe(2.0);
+  });
 });

@@ -366,3 +366,10 @@
 - 真实 HTTP 集成检查覆盖身份、权限拒绝、同租约幂等、分页与读取取消。VS Code 1.134.0 在无调试会话时通过真实 Worker 读取 `68 B` 归档，对照两页不重叠事件和 8 个精确统计分箱，缺少令牌返回 `401`，关闭后返回 `RecordingNotFound`。
 - STM32H723VGT6 与 RMLink 二号机实测，REST API 读取暂停态 5 个任务，与当前低速 Trace fixture 的任务配置一致。同一连接重复同一个 Trace START 请求返回相同记录。告警和断开归档继续由原协调器处理。
 - 类型检查、构建、129 个文件共 `1,553` 项通过（`1` 项既有跳过）、67 方法的契约验证、25 个 API 验收用例、Node/Python SDK 与 12 项 MCP 回归通过。运行 `node scripts/rtos/verify-stage55-vscode.js` 可复验离线 API。报告位于 `out/rtos-stage5/acceptance-5.5/api-ui-324Js1/report.json`。
+
+### 6.1 调试与会话回归
+
+- 在 `a3c8042` 验证标准 DAP、控制与断点、Watch、TIMELINE、RTT、Viewer、Trace 归档及会话切换。129 个 Vitest 文件共 `1,553` 项通过，`1` 项既有跳过。类型检查、扩展构建、双窗口 Automation API、Node/Python SDK 和 MCP 检查通过。
+- Windows x64 构建两种原生 helper 和四种 Flash Algorithm。CMSIS-DAP mock、算法镜像检查、XR 传输及 J-Link mock 通过，包括分步和断点恢复、RTT 多通道、断开与缺少可选 DLL 入口的分支。
+- 使用独立 VS Code 1.134.0 profile 重跑阶段 2、4.5、5.1、5.2、5.3，均退出 `0`。5.4 和 5.5 分别在对应真实 UI 脚本通过。既有 H723 启动项在 VS Code 1.146.0 开发宿主启动、探测并录制成功。原生 mock 和真实探针的证据分别记录，安装包复验见 6.4。
+- 报告位于 `out/rtos-stage6/acceptance-6.1/`，原生构建及 mock 日志位于 `out/rtos-stage5/acceptance-5.4/stage61-native-*.log`。

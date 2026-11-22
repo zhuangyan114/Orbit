@@ -2,6 +2,12 @@
 
 按版本从新到旧排列。
 
+## 1.2.2 — 2026-11-22
+
+- **Watch 写入升级为不停机直写（Live Write）**：运行中修改 Watch 变量时不再临时暂停（halt）与恢复目标芯片，避免打断实时控制中断、PWM 输出或触发看门狗，同时继续保持控制写屏障与 CMSIS-DAP RAM 地址安全校验。
+- **CMSIS-DAP 原生 8/16/32-bit MEM-AP CSW 写入**：将 CMSIS-DAP helper 的子字及非对齐写入由 32-bit Read-Modify-Write 迁移为原生 8-bit/16-bit/32-bit MEM-AP CSW 宽度传输，消除运行态写入 `uint8_t`/`uint16_t` 等变量时与 CPU 修改同字相邻字节的竞态。
+- **新增 RTOS 诊断面板与 SEGGER SystemView Trace 支持**：支持 FreeRTOS 任务链表/栈水位/队列锁/软件定时器与堆快照视图，支持经统一 RTT 通道接入 SystemView 实时与缓冲录制、泳道时间线、CPU 负载与上下文统计、事件列表、录制归档离线回放、Timeline 跨面板时间联动以及快照/Trace 自动化接口。
+
 ## 1.2.1 — 2026-11-15
 
 - **正式版打包与商店发布更新**：将版本正式升至 `1.2.1`（衔接并替换先前的 `1.2.0` 商店预发布版），改为无平台限制的通用 `.vsix` 安装包以支持 VS Code 扩展商店网页端直接上传，并在打包配置中排除 `Releases/` 下的发布压缩包与安装包。

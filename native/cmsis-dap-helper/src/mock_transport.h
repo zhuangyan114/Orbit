@@ -182,6 +182,10 @@ struct MockInjection {
   uint32_t transferCount = 0;   // DAP_Transfer commands seen
   uint32_t blockReadCount = 0;  // DAP_TransferBlock read commands seen
   uint32_t blockWriteCount = 0; // DAP_TransferBlock write commands seen
+  uint32_t drwReadCount = 0;    // AP DRW read accesses executed
+  uint32_t drw8WriteCount = 0;  // AP DRW 8-bit write accesses executed
+  uint32_t drw16WriteCount = 0; // AP DRW 16-bit write accesses executed
+  uint32_t drw32WriteCount = 0; // AP DRW 32-bit write accesses executed
   uint32_t flashAlgorithmCount = 0;
   uint32_t flashEraseCount = 0;
   uint32_t flashProgramCount = 0;
@@ -307,7 +311,7 @@ class MockCmsisDapTransport : public CmsisDapTransport {
   const std::vector<uint8_t>& lastBlockRequest() const { return lastBlockRequest_; }
   const std::vector<uint8_t>& commandHistory() const { return commandHistory_; }
 
-  // ADIv5/MEM-AP CSW shape validation (Size=bits[2:0] 32-bit, AddrInc=bits[5:4]
+  // ADIv5/MEM-AP CSW shape validation (Size=bits[2:0] 8/16/32-bit, AddrInc=bits[5:4]
   // single; DeviceEn is bit6 and is not part of this check). Exposed publicly
   // so the helper self-test can assert the exact accepted/rejected encodings
   // independently of a target session.
@@ -352,8 +356,9 @@ class MockCmsisDapTransport : public CmsisDapTransport {
   TransferOutcome accessAp(uint8_t regAddr, bool rnw, uint32_t value);
   uint32_t readMemWord(uint32_t address);
   void writeMemWord(uint32_t address, uint32_t value);
+  void writeMemSubword(uint32_t address, uint32_t width, uint32_t drwValue);
   void setSticky(uint32_t bit) { state_.dpCtrlStat |= bit; }
-  static uint32_t autoIncrementTar(uint32_t tar);
+  static uint32_t autoIncrementTar(uint32_t tar, uint32_t step = 4);
   void runPreparedFlashAlgorithm();
   void runPreparedRamStub();
 

@@ -50,9 +50,9 @@ constexpr uint32_t kApCswDbgswEnable = 1u << 31;
 constexpr uint32_t kApCswAhbDefault =
     kApCswAhbHprot1 | kApCswAhbMasterDebug | kApCswDbgswEnable;
 
-// MEM-AP CSW value for 32-bit single auto-increment transfers, encoded per
-// the ADIv5/MEM-AP definition and OpenOCD's AHB debug defaults:
-//   - Size    bits[2:0]   = 0b010 (32-bit)     -> 0x02
+// MEM-AP CSW values for 8/16/32-bit single auto-increment transfers, encoded
+// per the ADIv5/MEM-AP definition and OpenOCD's AHB debug defaults:
+//   - Size    bits[2:0]   = 0b000 (8-bit), 0b001 (16-bit), 0b010 (32-bit)
 //   - AddrInc bits[5:4]   = 0b01  (single)     -> 0x10
 //   - DeviceEn bit6       = 0: the verified target keeps DeviceEn asserted on
 //     its own (the CSW read-back shows bit6=1), so this implementation does
@@ -70,8 +70,10 @@ constexpr uint32_t kApCswAhbDefault =
 //   - 0x13: Size bits[2:0] = 0b011. Whether 64-bit accesses are supported is
 //     a per-MEM-AP capability; the verified target does not accept this
 //     encoding, so it must not be used here.
-// The mock's cswShapeOk enforces this exact Size/AddrInc shape and rejects
-// every other encoding (including 0x95, 0x02000095 and 0x13).
+// The mock's cswShapeOk enforces this exact Size (8/16/32-bit) / AddrInc shape
+// and rejects every other encoding (including 0x95, 0x02000095 and 0x13).
+constexpr uint32_t kApCsw8Auto = kApCswAhbDefault | 0x10u;
+constexpr uint32_t kApCsw16Auto = kApCswAhbDefault | 0x11u;
 constexpr uint32_t kApCsw32Auto = kApCswAhbDefault | 0x12u;
 
 // Number of DP-AP chunks in one memory region (0x400 = 1 KiB boundary).
@@ -154,8 +156,10 @@ class CmsisDapTarget {
   // Capacity accounts for both negotiated protocol and transport payload limits.
   size_t maxScatteredReadsPerPacket() const;
 
-  // Writes a byte-oriented range. Partial words are read-modify-written while
-  // the target is halted, then all writes use the bounded block-write path.
+  // Writes a byte-oriented range using native MEM-AP CSW transfer widths:
+  // 8-bit (Size=0) and 16-bit (Size=1) for unaligned head/tail bytes and
+  // 32-bit (Size=2) block writes for the aligned body, avoiding 32-bit RMW
+  // races when writing live target RAM.
   Result writeMemory(uint32_t address, const std::vector<uint8_t>& bytes,
                      DapTransferDiagnostics& diag,
                      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
@@ -204,6 +208,13 @@ class CmsisDapTarget {
   Result writeMemoryWordSingle(uint32_t address, uint32_t value,
                                DapTransferDiagnostics& diag,
                                std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
+
+  // Single 8-bit (sizeCode=0) or 16-bit (sizeCode=1) MEM-AP DRW write with
+  // lane-shifted value and bounded WAIT/FAULT retry. Never retries once the
+  // DRW write completion state is unknown.
+  Result writeMemorySubwordSingle(uint32_t address, uint8_t sizeCode, uint32_t drwValue,
+                                  DapTransferDiagnostics& diag,
+                                  std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
 
   CmsisDapProtocol* protocol_;
   uint16_t packetSize_;

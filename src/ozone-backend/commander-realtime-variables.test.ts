@@ -845,13 +845,15 @@ describe('OzoneBackend realtime variables', () => {
     expect(direct).toMatchObject({ ok: true, data: expect.objectContaining({ value: 0x11223344 }) });
   });
 
-  it('writes a floating-point child value using its declared type', async () => {
+  it('writes a floating-point child value live without halting or resuming a running target', async () => {
     const backend = new OzoneBackend();
     const internal = backend as any;
     const writes: Array<{ address: number; bytes: number[] }> = [];
+    let stateChecks = 0;
+    let ensureHaltedCount = 0;
     let runCount = 0;
-    internal.targetIsHalted = async () => false;
-    internal.ensureHalted = async () => true;
+    internal.targetIsHalted = async () => { stateChecks++; return false; };
+    internal.ensureHalted = async () => { ensureHaltedCount++; return true; };
     internal.targetWriteMemory = async (address: number, bytes: Uint8Array) => {
       writes.push({ address, bytes: Array.from(bytes) });
       return true;
@@ -868,7 +870,9 @@ describe('OzoneBackend realtime variables', () => {
 
     expect(result.ok).toBe(true);
     expect(writes).toEqual([{ address: 0x20001020, bytes: [0, 0, 128, 63] }]);
-    expect(runCount).toBe(1);
+    expect(stateChecks).toBe(0);
+    expect(ensureHaltedCount).toBe(0);
+    expect(runCount).toBe(0);
   });
 
   it('does not halt or resume an already stopped target and adds no fixed delay', async () => {
@@ -899,12 +903,13 @@ describe('OzoneBackend realtime variables', () => {
     }
   });
 
-  it('resumes a running target when a Watch memory write fails', async () => {
+  it('returns failure without halting or resuming when a live Watch memory write fails or throws', async () => {
     const backend = new OzoneBackend();
     const internal = backend as any;
+    let ensureHaltedCount = 0;
     let runCount = 0;
     internal.targetIsHalted = async () => false;
-    internal.ensureHalted = async () => true;
+    internal.ensureHalted = async () => { ensureHaltedCount++; return true; };
     internal.targetWriteMemory = async () => false;
     internal.targetRun = async () => { runCount++; return true; };
 
@@ -912,8 +917,22 @@ describe('OzoneBackend realtime variables', () => {
       cmd: 'setWatchValue', expression: 'plain', value: 2, address: 0x20001024, typeName: 'float',
     });
 
-    expect(result.ok).toBe(false);
-    expect(runCount).toBe(1);
+    expect(result).toMatchObject({ ok: false, error: 'write failed' });
+    expect(ensureHaltedCount).toBe(0);
+    expect(runCount).toBe(0);
+
+    internal.targetWriteMemory = async () => { throw new Error('SWD write fault'); };
+    const thrown = await backend.execute({
+      cmd: 'setWatchValue', expression: 'plain', value: 2, address: 0x20001024, typeName: 'float',
+    });
+
+    expect(thrown).toMatchObject({
+      ok: false,
+      error: 'write failed: SWD write fault',
+      errorCode: 'MemoryWriteFailed',
+    });
+    expect(ensureHaltedCount).toBe(0);
+    expect(runCount).toBe(0);
   });
 
   it('evaluates a scalar through a nested pointer member chain', async () => {

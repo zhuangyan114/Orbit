@@ -52,6 +52,9 @@ function fixture(writeOutcome: 'success' | 'failure' | 'throw' = 'success', resu
   session.on('send', message => messages.push(message));
   return {
     internal, messages, queryState, writeStarted, writeFinished,
+    targetIsHalted: target.targetIsHalted,
+    ensureHalted: target.ensureHalted,
+    targetRun: target.targetRun,
     get state() { return state; },
     halt() { state = TargetState.Halted; },
     write() {
@@ -71,15 +74,18 @@ afterEach(() => {
 
 describe('DapSession run-state polling across Watch writes', () => {
   it.each(['success', 'failure', 'throw'] as const)(
-    'keeps the UI and Timeline running after a temporary write halt (%s)', async outcome => {
+    'keeps the target, UI, and Timeline running across a live Watch write (%s)', async outcome => {
       vi.useFakeTimers();
       const f = fixture(outcome);
       f.internal.startPolling();
       const write = f.write();
       await f.writeStarted.promise;
-      expect(f.state).toBe(TargetState.Halted);
+      expect(f.state).toBe(TargetState.Running);
+      expect(f.targetIsHalted).not.toHaveBeenCalled();
+      expect(f.ensureHalted).not.toHaveBeenCalled();
+      expect(f.targetRun).not.toHaveBeenCalled();
 
-      // Place the 200 ms run poll inside the real backend's halt/write/run path.
+      // Place the 200 ms run poll inside the live write barrier.
       await vi.advanceTimersByTimeAsync(200);
       f.writeFinished.resolve();
       await write;
@@ -202,21 +208,20 @@ describe('DapSession run-state polling across Watch writes', () => {
     expect(f.queryState).toHaveBeenCalledOnce();
   });
 
-  it('reports the real halt when the write cannot restore execution', async () => {
+  it('reports a real halt that occurs during a live write on the next run poll', async () => {
     vi.useFakeTimers();
-    const f = fixture('success', false);
+    const f = fixture('success');
     f.internal.startPolling();
     const write = f.write();
     await f.writeStarted.promise;
+    f.halt();
     await vi.advanceTimersByTimeAsync(200);
     expect(f.messages.filter(message => message.event === 'stopped')).toEqual([]);
     f.writeFinished.resolve();
     await write;
     await vi.advanceTimersByTimeAsync(200);
 
-    expect(f.messages.find(message => message.request_seq === 1)?.body).toMatchObject({
-      ok: false, errorCode: 'TargetResumeFailed',
-    });
+    expect(f.messages.find(message => message.request_seq === 1)?.body).toMatchObject({ ok: true });
     expect(f.state).toBe(TargetState.Halted);
     expect(f.internal.targetRunning).toBe(false);
     expect(f.messages.filter(message => message.event === 'stopped')).toHaveLength(1);

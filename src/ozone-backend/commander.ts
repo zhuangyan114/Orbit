@@ -4982,37 +4982,15 @@ case 'readVariableRuntime':
       }
     }
 
-    log.eval('doSetWatchValue: using control write path');
-    const wasRunning = !(await this.targetIsHalted());
-    if (wasRunning) {
-      const halted = await this.ensureHalted();
-      if (!halted) return { ok: false, error: 'halt failed' };
-    }
-
+    log.eval('doSetWatchValue: using live control write path');
     let ok = false;
-    let resumed = true;
     let writeError: unknown;
     try {
       ok = await this.targetWriteMemory(writeAddress, buf);
     } catch (error) {
       writeError = error;
-    } finally {
-      if (wasRunning) {
-        try {
-          resumed = await this.targetRun();
-        } catch {
-          resumed = false;
-        }
-      }
     }
 
-    if (!resumed) {
-      return {
-        ok: false,
-        error: ok ? 'write succeeded but target could not be resumed' : 'write failed and target could not be resumed',
-        errorCode: 'TargetResumeFailed',
-      };
-    }
     if (writeError) {
       const message = writeError instanceof Error ? writeError.message : String(writeError);
       return { ok: false, error: `write failed: ${message}`, errorCode: 'MemoryWriteFailed' };

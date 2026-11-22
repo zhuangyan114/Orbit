@@ -658,6 +658,91 @@ Result CmsisDapTarget::writeMemoryBlock(uint32_t address, const std::vector<uint
   return Result::success();
 }
 
+Result CmsisDapTarget::writeMemorySubwordSingle(uint32_t address, uint8_t sizeCode,
+                                                uint32_t drwValue, DapTransferDiagnostics& diag,
+                                                std::chrono::milliseconds timeout) {
+  if (sizeCode > 1u) {
+    return Result::error(ErrorCodes::kDapInvalidRequest,
+                         "writeMemorySubwordSingle supports only 8-bit (0) and 16-bit (1) sizes");
+  }
+  const uint32_t width = 1u << sizeCode;
+  if ((address & (width - 1u)) != 0) {
+    return Result::error(ErrorCodes::kDapInvalidRequest,
+                         "writeMemorySubwordSingle requires natural alignment for width " +
+                             std::to_string(width));
+  }
+  const uint32_t csw = sizeCode == 0 ? kApCsw8Auto : kApCsw16Auto;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto remainingTimeout = [&]() -> std::chrono::milliseconds {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return std::chrono::milliseconds(0);
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+  };
+
+  ++diag.chunks;
+  uint32_t attempt = 0;
+  for (;;) {
+    const std::chrono::milliseconds attemptTimeout = remainingTimeout();
+    if (attemptTimeout.count() <= 0) {
+      return Result::error(ErrorCodes::kWriteTimeout,
+                           "writeMemory subword deadline exceeded at 0x" +
+                               std::to_string(address));
+    }
+    std::vector<DapTransferItem> items(4);
+    items[0].ap = false;
+    items[0].rnw = false;
+    items[0].addr = static_cast<uint8_t>((kDpRegSelect >> 2) & 0x03);
+    items[0].value = 0;
+    items[1].ap = true;
+    items[1].rnw = false;
+    items[1].addr = static_cast<uint8_t>((kApRegCsw >> 2) & 0x03);
+    items[1].value = csw;
+    items[2].ap = true;
+    items[2].rnw = false;
+    items[2].addr = static_cast<uint8_t>((kApRegTar >> 2) & 0x03);
+    items[2].value = address;
+    items[3].ap = true;
+    items[3].rnw = false;
+    items[3].addr = static_cast<uint8_t>((kApRegDrw >> 2) & 0x03);
+    items[3].value = drwValue;
+
+    uint8_t completed = 0;
+    ++diag.packets;
+    const Result transfer = protocol_->dapTransfer(0, items, attemptTimeout, &completed);
+    if (transfer.ok) return transfer;
+    if (transfer.errorCode != ErrorCodes::kDapAckWait &&
+        transfer.errorCode != ErrorCodes::kDapAckFault) {
+      return transfer;
+    }
+    if (completed >= items.size()) {
+      return Result::error(
+          ErrorCodes::kOutcomeUnknown,
+          "writeMemory subword completion is unknown at 0x" + std::to_string(address) + ": " +
+              transfer.message + "; completed=" + std::to_string(completed) + "/" +
+              std::to_string(items.size()) + " (not retried)");
+    }
+    if (transfer.errorCode == ErrorCodes::kDapAckFault) {
+      ++diag.faultClears;
+      const std::chrono::milliseconds clearTimeout = remainingTimeout();
+      if (clearTimeout.count() <= 0) {
+        return Result::error(ErrorCodes::kWriteTimeout,
+                             "writeMemory subword deadline exceeded before FAULT clear");
+      }
+      const Result clearResult = clearStickyErrors(diag, clearTimeout);
+      if (!clearResult.ok) return clearResult;
+    }
+    if (++attempt > kMaxTransferRetries) {
+      return Result::error(transfer.errorCode,
+                           "writeMemory subword at 0x" + std::to_string(address) +
+                               " failed after " + std::to_string(attempt) + " attempts: " +
+                               transfer.message);
+    }
+    ++diag.waitRetries;
+  }
+}
+
 Result CmsisDapTarget::writeMemory(uint32_t address, const std::vector<uint8_t>& bytes,
                                    DapTransferDiagnostics& diag,
                                    std::chrono::milliseconds timeout) {
@@ -679,35 +764,85 @@ Result CmsisDapTarget::writeMemory(uint32_t address, const std::vector<uint8_t>&
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
   };
 
-  const uint32_t firstWord = address & ~3u;
-  const uint32_t lastWord = static_cast<uint32_t>((end - 1) / 4);
-  const uint32_t wordCount = lastWord - firstWord / 4 + 1;
-  std::vector<uint32_t> words(wordCount, 0);
-  const bool partial = (address & 3u) != 0 || (end & 3u) != 0;
-  if (partial) {
-    const std::chrono::milliseconds readTimeout = remainingTimeout();
-    if (readTimeout.count() <= 0) {
+  size_t offset = 0;
+  auto currentAddress = [&]() -> uint32_t {
+    return static_cast<uint32_t>(static_cast<uint64_t>(address) + offset);
+  };
+
+  auto writeByteAtOffset = [&]() -> Result {
+    const std::chrono::milliseconds stepTimeout = remainingTimeout();
+    if (stepTimeout.count() <= 0) {
       return Result::error(ErrorCodes::kWriteTimeout,
-                           "writeMemory deadline exceeded before RMW pre-read");
+                           "writeMemory deadline exceeded before 8-bit write");
     }
-    const Result readResult = readMemoryBlock(firstWord, wordCount, words, diag, readTimeout);
-    if (!readResult.ok) return readResult;
+    const uint32_t pos = currentAddress();
+    const uint32_t laneShift = (pos & 3u) * 8u;
+    const uint32_t drwValue = static_cast<uint32_t>(bytes[offset]) << laneShift;
+    const Result res = writeMemorySubwordSingle(pos, 0, drwValue, diag, stepTimeout);
+    if (!res.ok) return res;
+    ++offset;
+    return Result::success();
+  };
+
+  auto writeHalfwordAtOffset = [&]() -> Result {
+    const std::chrono::milliseconds stepTimeout = remainingTimeout();
+    if (stepTimeout.count() <= 0) {
+      return Result::error(ErrorCodes::kWriteTimeout,
+                           "writeMemory deadline exceeded before 16-bit write");
+    }
+    const uint32_t pos = currentAddress();
+    const uint32_t halfword = static_cast<uint32_t>(bytes[offset]) |
+                              (static_cast<uint32_t>(bytes[offset + 1]) << 8u);
+    const uint32_t laneShift = (pos & 2u) * 8u;
+    const uint32_t drwValue = halfword << laneShift;
+    const Result res = writeMemorySubwordSingle(pos, 1, drwValue, diag, stepTimeout);
+    if (!res.ok) return res;
+    offset += 2;
+    return Result::success();
+  };
+
+  // 1. Leading unaligned bytes to reach a 4-byte boundary.
+  if (offset < bytes.size() && (currentAddress() & 1u) != 0) {
+    const Result res = writeByteAtOffset();
+    if (!res.ok) return res;
+  }
+  if (bytes.size() - offset >= 2 && (currentAddress() & 3u) == 2u) {
+    const Result res = writeHalfwordAtOffset();
+    if (!res.ok) return res;
   }
 
-  for (size_t index = 0; index < bytes.size(); ++index) {
-    const uint64_t byteAddress = static_cast<uint64_t>(address) + index;
-    const size_t wordIndex = static_cast<size_t>((byteAddress - firstWord) / 4);
-    const uint32_t shift = static_cast<uint32_t>(((byteAddress - firstWord) & 3u) * 8u);
-    words[wordIndex] = (words[wordIndex] & ~(0xFFu << shift)) |
-                       (static_cast<uint32_t>(bytes[index]) << shift);
+  // 2. Aligned 32-bit body via bounded DAP_TransferBlock writes.
+  const size_t remainingWords = (bytes.size() - offset) / 4;
+  if (remainingWords > 0) {
+    const std::chrono::milliseconds blockTimeout = remainingTimeout();
+    if (blockTimeout.count() <= 0) {
+      return Result::error(ErrorCodes::kWriteTimeout,
+                           "writeMemory deadline exceeded before 32-bit block write");
+    }
+    const uint32_t blockAddress = currentAddress();
+    std::vector<uint32_t> words(remainingWords);
+    for (size_t i = 0; i < remainingWords; ++i) {
+      const size_t base = offset + i * 4;
+      words[i] = static_cast<uint32_t>(bytes[base]) |
+                 (static_cast<uint32_t>(bytes[base + 1]) << 8u) |
+                 (static_cast<uint32_t>(bytes[base + 2]) << 16u) |
+                 (static_cast<uint32_t>(bytes[base + 3]) << 24u);
+    }
+    const Result blockResult = writeMemoryBlock(blockAddress, words, diag, blockTimeout);
+    if (!blockResult.ok) return blockResult;
+    offset += remainingWords * 4;
   }
-  const std::chrono::milliseconds writeTimeout = remainingTimeout();
-  if (writeTimeout.count() <= 0) {
-    return Result::error(ErrorCodes::kWriteTimeout,
-                         "writeMemory deadline exceeded before block write");
+
+  // 3. Trailing subword bytes (0..3 bytes remaining at an aligned address).
+  if (bytes.size() - offset >= 2) {
+    const Result res = writeHalfwordAtOffset();
+    if (!res.ok) return res;
   }
-  const Result writeResult = writeMemoryBlock(firstWord, words, diag, writeTimeout);
-  if (!writeResult.ok) return writeResult;
+  if (offset < bytes.size()) {
+    const Result res = writeByteAtOffset();
+    if (!res.ok) return res;
+  }
+
   return Result::success();
 }
 

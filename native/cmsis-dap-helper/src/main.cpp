@@ -4204,13 +4204,104 @@ int runSelfTest() {
            "dap03-block-write-reuses-contiguous-tar");
 
     const std::vector<uint8_t> writeBytes = {0x11, 0x22, 0x33, 0x44, 0x55};
+    const uint32_t drwReadsBefore = mock.injection().drwReadCount;
+    const uint32_t drw8Before = mock.injection().drw8WriteCount;
+    const uint32_t drw16Before = mock.injection().drw16WriteCount;
+    const uint32_t drw32Before = mock.injection().drw32WriteCount;
     diag = DapTransferDiagnostics{};
     const Result writeUnaligned = target.writeMemory(0x20000201, writeBytes, diag);
     expect(writeUnaligned.ok, "dap06-byte-write-unaligned");
+    expect(mock.injection().drwReadCount == drwReadsBefore &&
+               mock.injection().drw8WriteCount == drw8Before + 1 &&
+               mock.injection().drw16WriteCount == drw16Before + 2 &&
+               mock.injection().drw32WriteCount == drw32Before,
+           "dap06-byte-write-native-csw-no-rmw");
     std::vector<uint8_t> readBack;
     diag = DapTransferDiagnostics{};
-    const Result readWritten = target.readMemory(0x20000201, 5, readBack, diag);
-    expect(readWritten.ok && readBack == writeBytes, "dap06-byte-write-readback");
+    const Result readWritten = target.readMemory(0x20000200, 8, readBack, diag);
+    expect(readWritten.ok && readBack.size() == 8 &&
+               readBack[0] == 0x00 &&
+               readBack[1] == 0x11 && readBack[2] == 0x22 && readBack[3] == 0x33 &&
+               readBack[4] == 0x44 && readBack[5] == 0x55 &&
+               readBack[6] == 0x00 && readBack[7] == 0xA5,
+           "dap06-byte-write-readback");
+
+    // Single-byte writes across all 4 lanes and single-halfword writes across
+    // both lanes must leave neighboring bytes untouched and issue zero DRW reads.
+    const std::vector<uint32_t> sentinelWords = {0x11223344u, 0x55667788u, 0x99AABBCCu, 0xDDEEFF00u};
+    expect(target.writeMemoryBlock(0x20000240, sentinelWords, diag).ok,
+           "dap06-subword-sentinel-init");
+    const uint32_t readsBeforeSubword = mock.injection().drwReadCount;
+    expect(target.writeMemory(0x20000240, {0xAA}, diag).ok &&
+               target.writeMemory(0x20000245, {0xBB}, diag).ok &&
+               target.writeMemory(0x2000024A, {0xCC}, diag).ok &&
+               target.writeMemory(0x2000024F, {0xDD}, diag).ok,
+           "dap06-subword-8bit-all-lanes");
+    expect(mock.injection().drwReadCount == readsBeforeSubword,
+           "dap06-subword-8bit-no-rmw");
+    std::vector<uint8_t> laneCheck;
+    expect(target.readMemory(0x20000240, 16, laneCheck, diag).ok &&
+               laneCheck == std::vector<uint8_t>({
+                   0xAA, 0x33, 0x22, 0x11,
+                   0x88, 0xBB, 0x66, 0x55,
+                   0xCC, 0xBB, 0xCC, 0x99,
+                   0x00, 0xFF, 0xEE, 0xDD}),
+           "dap06-subword-8bit-neighbors-intact");
+
+    const uint32_t readsBeforeHalf = mock.injection().drwReadCount;
+    const uint32_t drw16BeforeHalf = mock.injection().drw16WriteCount;
+    expect(target.writeMemory(0x20000240, {0x12, 0x34}, diag).ok &&
+               target.writeMemory(0x20000246, {0x56, 0x78}, diag).ok,
+           "dap06-subword-16bit-both-lanes");
+    expect(mock.injection().drwReadCount == readsBeforeHalf &&
+               mock.injection().drw16WriteCount == drw16BeforeHalf + 2,
+           "dap06-subword-16bit-no-rmw");
+    expect(target.readMemory(0x20000240, 8, laneCheck, diag).ok &&
+               laneCheck == std::vector<uint8_t>({0x12, 0x34, 0x22, 0x11, 0x88, 0xBB, 0x56, 0x78}),
+           "dap06-subword-16bit-neighbors-intact");
+
+    // Mixed unaligned head (8+16) + 32-bit block body + tail (16+8) across a 1 KiB boundary.
+    const std::vector<uint8_t> mixedPayload = {
+        0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA};
+    const uint32_t readsBeforeMixed = mock.injection().drwReadCount;
+    const uint32_t drw8BeforeMixed = mock.injection().drw8WriteCount;
+    const uint32_t drw16BeforeMixed = mock.injection().drw16WriteCount;
+    const uint32_t drw32BeforeMixed = mock.injection().drw32WriteCount;
+    expect(target.writeMemory(0x200003FD, mixedPayload, diag).ok,
+           "dap06-mixed-write-1kib-boundary");
+    expect(mock.injection().drwReadCount == readsBeforeMixed &&
+               mock.injection().drw8WriteCount == drw8BeforeMixed + 2 &&
+               mock.injection().drw16WriteCount == drw16BeforeMixed + 2 &&
+               mock.injection().drw32WriteCount == drw32BeforeMixed + 1,
+           "dap06-mixed-write-uses-8-16-32-no-rmw");
+    expect(target.readMemory(0x200003FC, 12, laneCheck, diag).ok &&
+               laneCheck[0] == mockByteAt(0x200003FC) &&
+               std::vector<uint8_t>(laneCheck.begin() + 1, laneCheck.begin() + 11) == mixedPayload &&
+               laneCheck[11] == mockByteAt(0x20000407),
+           "dap06-mixed-write-1kib-readback");
+
+    // Verify TAR auto-increment by (1 << size) and unaligned 16-bit FAULT in the mock oracle.
+    expect(target.writeAp(kApRegCsw, kApCsw8Auto, diag).ok &&
+               target.writeAp(kApRegTar, 0x200003FFu, diag).ok &&
+               target.writeAp(kApRegDrw, 0x7Eu << 24u, diag).ok,
+           "dap06-mock-tar-inc-8bit-write");
+    uint32_t tarAfter8 = 0;
+    expect(target.readAp(kApRegTar, tarAfter8, diag).ok && tarAfter8 == 0x20000000u,
+           "dap06-mock-tar-inc-8bit-wraps-1kib");
+    expect(target.writeAp(kApRegCsw, kApCsw16Auto, diag).ok &&
+               target.writeAp(kApRegTar, 0x20000262u, diag).ok &&
+               target.writeAp(kApRegDrw, 0xBEEFu << 16u, diag).ok,
+           "dap06-mock-tar-inc-16bit-write");
+    uint32_t tarAfter16 = 0;
+    expect(target.readAp(kApRegTar, tarAfter16, diag).ok && tarAfter16 == 0x20000264u,
+           "dap06-mock-tar-inc-16bit-advances-2");
+    expect(target.writeAp(kApRegCsw, kApCsw16Auto, diag).ok &&
+               target.writeAp(kApRegTar, 0x20000261u, diag).ok,
+           "dap06-mock-unaligned-16bit-setup");
+    const Result badHalf = target.writeAp(kApRegDrw, 0x1234u, diag);
+    expect(!badHalf.ok && badHalf.errorCode == ErrorCodes::kDapAckFault &&
+               target.clearStickyErrors(diag).ok,
+           "dap06-mock-unaligned-16bit-faults");
   }
 
   {
@@ -5000,25 +5091,30 @@ int runSelfTest() {
   }
 
   // --- MEM-AP CSW encoding: strict Size/AddrInc shape checks. The ADIv5 CSW
-  // layout is Size=bits[2:0] (32-bit = 0b010; DeviceEn is bit6, outside the
-  // Size field) and AddrInc=bits[5:4] (single = 0b01). 0x95 and 0x02000095
-  // both carry the reserved Size encoding 0b101 in bits[2:0], which the
-  // verified STM32F407 AHB-AP reads back as 0b001 (16-bit accesses with stale
-  // upper halves); both must be rejected. 0x13 carries Size=0b011, which the
-  // verified target does not support, and must also be rejected.
+  // layout is Size=bits[2:0] (8-bit = 0b000, 16-bit = 0b001, 32-bit = 0b010;
+  // DeviceEn is bit6, outside the Size field) and AddrInc=bits[5:4] (single =
+  // 0b01). 0x95 and 0x02000095 both carry the reserved Size encoding 0b101 in
+  // bits[2:0], which the verified STM32F407 AHB-AP reads back as 0b001 (16-bit
+  // accesses with stale upper halves); both must be rejected. 0x13 carries
+  // Size=0b011, which the verified target does not support, and must also be
+  // rejected.
   {
+    expect(MockCmsisDapTransport::cswShapeOk(kApCsw8Auto),
+           "dap03-csw-8bit-single-accepted");
+    expect(MockCmsisDapTransport::cswShapeOk(kApCsw16Auto),
+           "dap03-csw-16bit-single-accepted");
     expect(MockCmsisDapTransport::cswShapeOk(kApCsw32Auto),
            "dap03-csw-32bit-single-accepted");
+    expect(MockCmsisDapTransport::cswShapeOk(0x10u),
+           "dap03-csw-explicit-0x10-accepted");  // Size bits[2:0] = 0b000
+    expect(MockCmsisDapTransport::cswShapeOk(0x11u),
+           "dap03-csw-explicit-0x11-accepted");  // Size bits[2:0] = 0b001
     expect(MockCmsisDapTransport::cswShapeOk(0x12u),
-           "dap03-csw-explicit-0x12-accepted");
+           "dap03-csw-explicit-0x12-accepted");  // Size bits[2:0] = 0b010
     expect(!MockCmsisDapTransport::cswShapeOk(0x95u),
            "dap03-csw-0x95-rejected");
     expect(!MockCmsisDapTransport::cswShapeOk(0x02000095u),
            "dap03-csw-0x02000095-rejected");
-    expect(!MockCmsisDapTransport::cswShapeOk(0x10u),
-           "dap03-csw-size-8-rejected");      // Size bits[2:0] = 0b000
-    expect(!MockCmsisDapTransport::cswShapeOk(0x11u),
-           "dap03-csw-size-16-rejected");     // Size bits[2:0] = 0b001
     expect(!MockCmsisDapTransport::cswShapeOk(0x13u),
            "dap03-csw-size-64-rejected");     // Size bits[2:0] = 0b011
     expect(!MockCmsisDapTransport::cswShapeOk(0x14u),

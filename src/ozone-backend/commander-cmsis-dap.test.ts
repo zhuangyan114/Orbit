@@ -686,6 +686,48 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     expect(writeMemory).toHaveBeenCalledTimes(1);
   });
 
+  it('writes CMSIS-DAP Watch scalars live while running without calling getState, halt, or run', async () => {
+    const getState = vi.fn(async () => ({
+      ok: true, message: 'state', targetState: 'Running' as const, elapsedMs: 1,
+      data: { state: 'Running' },
+    }));
+    const halt = vi.fn(async () => ({
+      ok: true, message: 'halted', targetState: 'Halted' as const, elapsedMs: 1,
+    }));
+    const run = vi.fn(async () => ({
+      ok: true, message: 'running', targetState: 'Running' as const, elapsedMs: 1,
+    }));
+    const writeMemory = vi.fn(async (address: number, bytes: Uint8Array) => ({
+      ok: true,
+      message: 'memory written',
+      targetState: 'Running' as const,
+      elapsedMs: 1,
+      data: { address, bytesWritten: bytes.length },
+    }));
+    const owner = cmsisOwner({ getState, halt, run, writeMemory, flashTarget: STM32F407VET6 });
+    const backend = new OzoneBackend(undefined, owner);
+
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'flag', value: 0x5A,
+      address: 0x20000001, typeName: 'uint8_t',
+    })).resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'half', value: 0x1234,
+      address: 0x20000002, typeName: 'uint16_t',
+    })).resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({
+      cmd: 'setWatchValue', expression: 'gain', value: 1,
+      address: 0x20000004, typeName: 'float',
+    })).resolves.toMatchObject({ ok: true });
+
+    expect(writeMemory).toHaveBeenNthCalledWith(1, 0x20000001, Uint8Array.from([0x5A]));
+    expect(writeMemory).toHaveBeenNthCalledWith(2, 0x20000002, Uint8Array.from([0x34, 0x12]));
+    expect(writeMemory).toHaveBeenNthCalledWith(3, 0x20000004, Uint8Array.from([0, 0, 128, 63]));
+    expect(getState).not.toHaveBeenCalled();
+    expect(halt).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it('stops a cancelled Locals scan after the current CMSIS-DAP memory read', async () => {
     const controller = new AbortController();
     const owner = cmsisOwner({

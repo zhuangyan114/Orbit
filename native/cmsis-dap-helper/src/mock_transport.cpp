@@ -445,15 +445,15 @@ std::vector<uint8_t> MockCmsisDapTransport::dapDisconnectResponse(const std::str
   return {kMockCmdDisconnect, 0x00};
 }
 
-uint32_t MockCmsisDapTransport::autoIncrementTar(uint32_t tar) {
+uint32_t MockCmsisDapTransport::autoIncrementTar(uint32_t tar, uint32_t step) {
   // MEM-AP TAR auto-increment wraps the low 10 bits at the 1 KiB boundary.
-  return (tar & ~0x3FFu) | ((tar + 4) & 0x3FFu);
+  return (tar & ~0x3FFu) | ((tar + step) & 0x3FFu);
 }
 
 bool MockCmsisDapTransport::cswShapeOk(uint32_t csw) {
   // ADIv5/MEM-AP CSW shape required for DRW accesses:
-  //   - Size   bits[2:0]  == 0b010 (32-bit). Every other Size encoding is
-  //     rejected: 0b000 (8-bit), 0b001 (16-bit), 0b011 (64-bit, not
+  //   - Size   bits[2:0]  in {0b000 (8-bit), 0b001 (16-bit), 0b010 (32-bit)}.
+  //     Unsupported Size encodings are rejected: 0b011 (64-bit, not
   //     supported by the verified target), 0b100 (128-bit) and the reserved
   //     values 0b101/0b110/0b111. DeviceEn is bit6, outside this check; the
   //     verified target keeps it asserted on its own.
@@ -464,7 +464,7 @@ bool MockCmsisDapTransport::cswShapeOk(uint32_t csw) {
   // Size=0b011 which the verified target does not support. Rejecting them at
   // the mock keeps a wrong-size CSW from silently producing halfword-lane
   // reads with stale upper halves.
-  if ((csw & 0x07u) != 0x02u) return false;
+  if ((csw & 0x07u) > 0x02u) return false;
   if ((csw & 0x30u) != 0x10u) return false;
   return true;
 }
@@ -728,6 +728,30 @@ void MockCmsisDapTransport::writeMemWord(uint32_t address, uint32_t value) {
       static_cast<uint8_t>((value >> 16) & 0xFF), static_cast<uint8_t>((value >> 24) & 0xFF)};
   for (int index = 0; index < 4; ++index) {
     base[index] = isFlash ? static_cast<uint8_t>(base[index] & bytes[index]) : bytes[index];
+  }
+}
+
+void MockCmsisDapTransport::writeMemSubword(uint32_t address, uint32_t width, uint32_t drwValue) {
+  if (width != 1u && width != 2u) return;
+  uint8_t* base = nullptr;
+  bool isFlash = false;
+  const uint64_t end = static_cast<uint64_t>(address) + width;
+  const uint64_t ramEnd = static_cast<uint64_t>(state_.profile.ramBase) + state_.profile.ramSize;
+  const uint64_t flashEnd =
+      static_cast<uint64_t>(state_.profile.flashBase) + state_.profile.flashSize;
+  if (address >= state_.profile.ramBase && end <= ramEnd) {
+    base = state_.ram.data() + (address - state_.profile.ramBase);
+  } else if (address >= state_.profile.flashBase && end <= flashEnd) {
+    base = state_.flash.data() + (address - state_.profile.flashBase);
+    isFlash = true;
+  } else {
+    return;  // writes to unmapped memory are dropped
+  }
+  const uint32_t laneShift = (width == 1u) ? ((address & 3u) * 8u) : ((address & 2u) * 8u);
+  const uint32_t laneValue = drwValue >> laneShift;
+  for (uint32_t index = 0; index < width; ++index) {
+    const uint8_t byte = static_cast<uint8_t>((laneValue >> (index * 8u)) & 0xFFu);
+    base[index] = isFlash ? static_cast<uint8_t>(base[index] & byte) : byte;
   }
 }
 
@@ -998,12 +1022,14 @@ MockCmsisDapTransport::TransferOutcome MockCmsisDapTransport::accessAp(uint8_t r
         capture = state_.apTar;
         break;
       case kApDrw: {
-        if ((state_.apTar & 3u) != 0 || !cswShapeOk(state_.apCsw)) {
+        if ((state_.apCsw & 0x07u) != 0x02u || (state_.apTar & 3u) != 0 ||
+            !cswShapeOk(state_.apCsw)) {
           setSticky(kStickyErr);
           return {kMockAckFault, 0, false};
         }
+        ++injection_.drwReadCount;
         capture = readMemWord(state_.apTar);
-        state_.apTar = autoIncrementTar(state_.apTar);
+        state_.apTar = autoIncrementTar(state_.apTar, 4u);
         break;
       }
       default:
@@ -1023,12 +1049,25 @@ MockCmsisDapTransport::TransferOutcome MockCmsisDapTransport::accessAp(uint8_t r
       state_.apTar = value;
       break;
     case kApDrw: {
-      if ((state_.apTar & 3u) != 0 || !cswShapeOk(state_.apCsw)) {
+      if (!cswShapeOk(state_.apCsw)) {
         setSticky(kStickyErr);
         return {kMockAckFault, 0, false};
       }
-      writeMemWord(state_.apTar, value);
-      state_.apTar = autoIncrementTar(state_.apTar);
+      const uint32_t sizeCode = state_.apCsw & 0x07u;
+      const uint32_t width = 1u << sizeCode;
+      if ((state_.apTar & (width - 1u)) != 0) {
+        setSticky(kStickyErr);
+        return {kMockAckFault, 0, false};
+      }
+      if (width == 4u) {
+        ++injection_.drw32WriteCount;
+        writeMemWord(state_.apTar, value);
+      } else {
+        if (width == 2u) ++injection_.drw16WriteCount;
+        else ++injection_.drw8WriteCount;
+        writeMemSubword(state_.apTar, width, value);
+      }
+      state_.apTar = autoIncrementTar(state_.apTar, width);
       break;
     }
     default:

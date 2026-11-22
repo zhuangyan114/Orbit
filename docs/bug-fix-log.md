@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### 改进：Watch 写入切换为不停机直写，CMSIS-DAP 改用原生 8/16/32-bit MEM-AP CSW 写入
+
+- **日期**: 2026-11-22
+- **问题描述**: 运行中通过 Watch 修改变量时，`OzoneBackend.doSetWatchValue` 会先 halt 目标芯片、写入内存后再恢复运行；在实时控制/调参场景下会短暂打断固件执行。同时 CMSIS-DAP helper 对非 4 字节对齐或小于 4 字节的写入原实现为 32-bit Read-Modify-Write，若在运行态直写存在与 CPU 修改同字内相邻字节的竞态风险。
+- **根因分析**: `doSetWatchValue` 无条件检查运行状态并执行 `ensureHalted()` / `targetRun()`，未利用 Cortex-M MEM-AP 与 J-Link `JLINK_WriteMem` 的不停机写能力；`CmsisDapTarget::writeMemory` 原先将所有子字与非对齐写入回退为 `readMemoryBlock` + `writeMemoryBlock` 的 32-bit RMW，且 `MockCmsisDapTransport::cswShapeOk` 仅放行 32-bit CSW。
+- **修改方案**: `doSetWatchValue` 改为不停机直写，移除 `targetIsHalted()`/`ensureHalted()`/`targetRun()` 流程，继续保留 `writeWatchValueCore` 控制锁与写屏障、`NativeScheduler` 的 `control` 优先级以及 CMSIS-DAP RAM 地址范围校验。CMSIS-DAP helper 新增 `kApCsw8Auto`/`kApCsw16Auto` 与 `writeMemorySubwordSingle`，`CmsisDapTarget::writeMemory` 按自然对齐拆分为 8-bit（lane shift `(addr & 3) * 8`）、16-bit（lane shift `(addr & 2) * 8`）与 32-bit block 写入，彻底消除子字 RMW。同步更新 `MockCmsisDapTransport`（放行 CSW Size `0b000`/`0b001`、实现按 lane 子字写、对齐 FAULT 校验与 `autoIncrementTar` 按 `1 << size` 步进）及对应 C++/Vitest 回归测试。
+- **涉及文件**: `src/ozone-backend/commander.ts:4985` - `doSetWatchValue`；`native/cmsis-dap-helper/src/cmsis_dap_target.h:53,159,210`、`native/cmsis-dap-helper/src/cmsis_dap_target.cpp:661` - `writeMemorySubwordSingle` / `writeMemory`；`native/cmsis-dap-helper/src/mock_transport.h:184,314,358`、`native/cmsis-dap-helper/src/mock_transport.cpp:448,734,1025` - `cswShapeOk` / `autoIncrementTar` / `writeMemSubword` / `accessAp`；测试 `native/cmsis-dap-helper/src/main.cpp:4206,5093`、`src/ozone-backend/commander-realtime-variables.test.ts:848`、`src/ozone-backend/commander-cmsis-dap.test.ts:688`、`src/debug/dap-session-run-poll.test.ts:73`。
+- **验证结果**: 自动化与构建层：全量 Vitest 129 文件、1554 项通过（1 项跳过），`npm run typecheck`、`npm run build`、`npm run build:native`、`orbit-cmsis-dap-helper.exe --selftest`（209 项 0 失败）、`npm run test:cmsis-dap:mock`、`npm run test:cmsis-dap:algorithm`、`npm run test:cpp-channel:mock` 及 `git diff --check` 全部通过。用户验收：用户于 2026-11-22 明确确认手动验收符合预期；本次 agent 未另行执行硬件操作，未据此推断覆盖全部探针/芯片型号或长稳场景。
+
 ### Bug：RMLink 数据流结束后重新勾选 Timeline 仍显示 0 Hz
 
 - **日期**：2026-11-14。

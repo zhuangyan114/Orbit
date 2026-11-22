@@ -105,7 +105,7 @@ export function TimersHeapView({
                 </span>
               </div>
             )}
-            <div className="rtos-muted">{heap.note}</div>
+            {heap.note && <div className="rtos-muted">{heap.note}</div>}
           </>
         )}
       </section>
@@ -113,7 +113,9 @@ export function TimersHeapView({
       {/* Software Timers 表格区 */}
       <div className="rtos-table-pane">
         <div className="rtos-coverage-bar">
-          <span>{timers ? timers.coverageNote : '尚未读取 Software Timers 快照。'}</span>
+          {(!timers || timers.coverageNote) && (
+            <span>{timers ? timers.coverageNote : '尚未读取 Software Timers 快照。'}</span>
+          )}
           {timers && (
             <span className="rtos-mono">
               {timers.tickCount?.available ? `Tick=${timers.tickCount.value} · ` : ''}

@@ -114,10 +114,10 @@ export class RMLinkTargetChannel implements SessionTargetOwner {
     return this.writeMemoryWithPriority(address, bytes, 'control');
   }
   private async writeMemoryWithPriority(address:number,bytes:Uint8Array,priority:'control'|'background'):Promise<CppJLinkResult<{address:number;bytesWritten:number}>> {
-    if (!Number.isInteger(address) || address < 0 || (address % 4) !== 0
-      || bytes.length === 0 || (bytes.length % 4) !== 0 || bytes.length > 4096
+    if (!Number.isInteger(address) || address < 0
+      || bytes.length === 0 || bytes.length > 4096
       || address + bytes.length > 0x100000000) {
-      return this.failure('RMLink write_memory requires 4-byte aligned uint32 address and non-zero 4-byte aligned length <= 4096', 'UnsupportedCapability');
+      return this.failure('RMLink write_memory requires uint32 address and non-zero length <= 4096', 'InvalidRequest');
     }
     const r=await this.control<{bytes_written:number}>('write_memory',{address,data:Buffer.from(bytes).toString('hex')},{priority});
     return r.ok && r.data?{...r,data:{address,bytesWritten:r.data.bytes_written}}:this.failure(r.message,r.errorCode);

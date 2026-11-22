@@ -331,7 +331,7 @@ export async function readTimerSnapshot(
     activeCurrentCount: timers.filter(t => t.listState === 'active-current').length,
     activeOverflowCount: timers.filter(t => t.listState === 'active-overflow').length,
     globalStoppedCount: timers.filter(t => t.listState === 'stopped-global').length,
-    coverageNote: `已扫描 xActiveTimerList1/2（当前/溢出活动定时器）与 ${layout.timerGlobals.length} 个全局定时器句柄；未引用且处于停止态的动态定时器不进入内核列表，不会伪造全量列表。`,
+    coverageNote: '',
     timers,
   };
 }
@@ -429,7 +429,7 @@ export async function readHeapOverview(
 
   let usableBytes: Field<number>;
   let usedBytes: Field<number>;
-  let note = '已核对 heap_4 元数据（不基于块链表猜测碎片率或内存泄漏）。';
+  let note = '';
 
   if (pxEndVal <= ucStart || pxEndVal > ucEnd) {
     const reason = `pxEnd=0x${pxEndVal.toString(16)} outside ucHeap [0x${ucStart.toString(16)}, 0x${ucEnd.toString(16)})`;

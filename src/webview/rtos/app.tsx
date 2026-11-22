@@ -27,7 +27,6 @@ import {
 import {
   DEFAULT_RTOS_VIEW_SETTINGS,
   INITIAL_TRACE_PANEL_STATE,
-  describeConsistency,
   describeDiagnosticIssue,
   filterAndSortTasks,
   formatDurationMs,
@@ -828,7 +827,6 @@ export function RtosApp() {
     [selectedTask, objectsSummary],
   );
 
-  const consistencyMeta = snapshot ? describeConsistency(snapshot.consistency) : null;
   const diagnosticError = useMemo(() => {
     if (panel.capabilitiesError) return describeDiagnosticIssue(panel.capabilitiesError);
     if (snapshot && snapshot.consistency === 'unavailable' && snapshot.reason) {
@@ -862,18 +860,6 @@ export function RtosApp() {
             {panel.session.phase === 'terminating' && `已断开 · ${panel.session.sessionName || 'Orbit'}`}
             {panel.session.phase === 'connected' && `FreeRTOS${panel.session.device ? ` · ${panel.session.device}` : ''}`}
           </span>
-
-          {panel.session.phase === 'connected' && (
-            <span className={`rtos-pill rtos-pill-target-${(panel.session.targetState || 'Unknown').toLowerCase()}`}>
-              {panel.session.targetState === 'Halted' ? '已暂停' : panel.session.targetState === 'Running' ? '运行中' : '状态未知'}
-            </span>
-          )}
-
-          {consistencyMeta && (
-            <span className={`rtos-pill rtos-pill-consistency rtos-tone-${consistencyMeta.tone}`} title={consistencyMeta.detail}>
-              {consistencyMeta.label}
-            </span>
-          )}
         </div>
 
         <nav className="rtos-subtabs" role="tablist" aria-label="RTOS 子视图">
@@ -1184,14 +1170,21 @@ export function RtosApp() {
 
               {/* 任务表 */}
               <div className="rtos-table-scroll">
-                <table className="rtos-table">
+                <table className="rtos-table rtos-tasks-table">
+                  <colgroup>
+                    <col className="rtos-col-state" />
+                    <col className="rtos-col-name" />
+                    <col className="rtos-col-tcb" />
+                    <col className="rtos-col-prio" />
+                    <col className="rtos-col-stack" />
+                    <col className="rtos-col-cpu" />
+                  </colgroup>
                   <thead>
                     <tr>
                       <SortHeader label="状态" sortKey="state" settings={settings} onSort={toggleSort} />
                       <SortHeader label="任务名" sortKey="name" settings={settings} onSort={toggleSort} />
                       <SortHeader label="TCB" sortKey="address" settings={settings} onSort={toggleSort} />
                       <SortHeader label="优先级" sortKey="priority" settings={settings} onSort={toggleSort} />
-                      <th>所属列表与证据</th>
                       <SortHeader label="栈水位 / 容量" sortKey="stack" settings={settings} onSort={toggleSort} />
                       <SortHeader label="CPU% / 计数" sortKey="cpu" settings={settings} onSort={toggleSort} />
                     </tr>
@@ -1199,7 +1192,7 @@ export function RtosApp() {
                   <tbody>
                     {displayedTasks.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="rtos-table-empty">
+                        <td colSpan={6} className="rtos-table-empty">
                           {tasks.length === 0
                             ? (panel.loading.refresh ? '正在读取任务快照…' : '当前快照未包含任务（或点击“刷新”采集）')
                             : '没有符合筛选条件的任务'}
@@ -1235,7 +1228,7 @@ export function RtosApp() {
                           </td>
                           <td>
                             <div className="rtos-task-name">
-                              <span title={task.name.available ? task.name.value : task.name.reason}>
+                              <span className="rtos-task-name-text" title={task.name.available ? task.name.value : task.name.reason}>
                                 {task.name.available ? task.name.value : '(名称不可用)'}
                               </span>
                               <span className="rtos-task-id">
@@ -1243,24 +1236,13 @@ export function RtosApp() {
                               </span>
                             </div>
                           </td>
-                          <td className="rtos-mono">{formatHex32(task.tcbAddress)}</td>
-                          <td className="rtos-mono">{prioText}</td>
-                          <td>
-                            <div className="rtos-list-cell">
-                              <span>{task.lists.length ? task.lists.join(', ') : '—'}</span>
-                              <span
-                                className={`rtos-evidence rtos-evidence-${task.listEvidence}`}
-                                title={task.listEvidence === 'traversed' ? '经链表节点双向校验遍历获得' : '列表变化期间经重新读取 TCB owner/container 单独校验'}
-                              >
-                                {task.listEvidence === 'traversed' ? '遍历' : 'TCB校验'}
-                              </span>
-                            </div>
-                          </td>
+                          <td className="rtos-mono rtos-cell-ellipsis">{formatHex32(task.tcbAddress)}</td>
+                          <td className="rtos-mono rtos-cell-ellipsis" title={prioText}>{prioText}</td>
                           <td>
                             <div className="rtos-stack-cell">
                               {task.stack.capacityBytes.available ? (
                                 <>
-                                  <span className="rtos-mono" title={task.stack.watermarkBytes.available ? task.stack.watermarkBytes.source : task.stack.watermarkBytes.reason}>
+                                  <span className="rtos-mono rtos-stack-text" title={task.stack.watermarkBytes.available ? task.stack.watermarkBytes.source : task.stack.watermarkBytes.reason}>
                                     {used !== undefined
                                       ? `${used} / ${task.stack.capacityBytes.value} B`
                                       : `未扫 / ${task.stack.capacityBytes.value} B`}
@@ -1298,14 +1280,14 @@ export function RtosApp() {
                           <td>
                             <div className="rtos-cpu-cell">
                               <span
-                                className="rtos-mono"
+                                className="rtos-mono rtos-cpu-pct"
                                 title={task.runtime.percent.available
                                   ? `${task.runtime.percent.source}${task.runtime.readWindowMs?.available ? `；窗口 ${task.runtime.readWindowMs.value} ms` : ''}`
                                   : task.runtime.percent.reason}
                               >
                                 {task.runtime.percent.available ? `${task.runtime.percent.value.toFixed(2)}%` : '—'}
                               </span>
-                              <span className="rtos-muted rtos-mono" title={task.runtime.counter.available ? task.runtime.counter.source : task.runtime.counter.reason}>
+                              <span className="rtos-muted rtos-mono rtos-cpu-cnt" title={task.runtime.counter.available ? task.runtime.counter.source : task.runtime.counter.reason}>
                                 {task.runtime.counter.available ? task.runtime.counter.value : '无计数'}
                               </span>
                             </div>
@@ -1489,7 +1471,6 @@ const STYLES = `
 .rtos-toolbar { display:flex; flex-wrap:nowrap; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; min-height:36px; border-bottom:1px solid var(--vscode-panel-border, var(--vscode-sideBar-border)); background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); flex-shrink:0; overflow-x:auto; scrollbar-width:none; }
 .rtos-toolbar-group { display:flex; flex-wrap:nowrap; align-items:center; gap:6px; flex-shrink:0; }
 .rtos-pill { display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:10px; font-size:11px; border:1px solid var(--vscode-panel-border, transparent); background:var(--vscode-badge-background); color:var(--vscode-badge-foreground); white-space:nowrap; }
-.rtos-pill-consistency { min-width:96px; justify-content:center; }
 .rtos-dot { width:7px; height:7px; border-radius:50%; background:var(--vscode-descriptionForeground); }
 .rtos-dot-connected { background:var(--vscode-charts-green, #4ec9b0); }
 .rtos-dot-starting { background:var(--vscode-charts-yellow, #cca700); }
@@ -1503,8 +1484,8 @@ const STYLES = `
 .rtos-subtab.active { color:var(--vscode-foreground); border-bottom-color:var(--vscode-focusBorder, #007fd4); font-weight:600; }
 .rtos-subtab:hover { color:var(--vscode-foreground); background:var(--vscode-list-hoverBackground); }
 .rtos-btn { border:1px solid var(--vscode-button-border, transparent); border-radius:3px; padding:3px 9px; background:var(--vscode-button-background); color:var(--vscode-button-foreground); cursor:pointer; white-space:nowrap; }
-.rtos-btn-action { min-width:50px; text-align:center; }
-.rtos-btn-scan { min-width:82px; text-align:center; }
+.rtos-btn-action { box-sizing:border-box; width:54px; min-width:54px; text-align:center; }
+.rtos-btn-scan { box-sizing:border-box; width:88px; min-width:88px; text-align:center; }
 .rtos-btn:hover:not(:disabled) { background:var(--vscode-button-hoverBackground); }
 .rtos-btn:disabled { opacity:.45; cursor:default; }
 .rtos-btn-secondary { background:var(--vscode-button-secondaryBackground); color:var(--vscode-button-secondaryForeground); }
@@ -1533,6 +1514,15 @@ const STYLES = `
 .rtos-count { margin-left:auto; color:var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; flex-shrink:0; font-variant-numeric:tabular-nums; }
 .rtos-table-scroll { flex:1; min-height:0; overflow:auto; }
 .rtos-table { width:100%; border-collapse:collapse; table-layout:auto; font-size:12px; font-variant-numeric:tabular-nums; }
+.rtos-tasks-table { table-layout:fixed; min-width:940px; }
+.rtos-tasks-table th, .rtos-tasks-table td { box-sizing:border-box; }
+.rtos-col-state { width:112px; }
+.rtos-col-name { width:auto; }
+.rtos-col-tcb { width:116px; }
+.rtos-col-prio { width:88px; }
+.rtos-col-stack { width:auto; }
+.rtos-col-cpu { width:auto; }
+.rtos-cell-ellipsis { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .rtos-table th { position:sticky; top:0; z-index:1; text-align:left; font-weight:600; padding:5px 8px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); border-bottom:1px solid var(--vscode-panel-border); white-space:nowrap; }
 .rtos-sort-btn { border:0; background:transparent; color:inherit; font:inherit; font-weight:600; cursor:pointer; padding:0; }
 .rtos-table td { padding:4px 8px; border-bottom:1px solid var(--vscode-panel-border); vertical-align:middle; }
@@ -1543,21 +1533,27 @@ const STYLES = `
 .rtos-mono { font-family:var(--vscode-editor-font-family, monospace); font-variant-numeric:tabular-nums; }
 .rtos-muted { color:var(--vscode-descriptionForeground); }
 .rtos-state-badge { display:inline-block; min-width:84px; text-align:center; padding:1px 6px; border-radius:3px; font-size:11px; font-weight:600; white-space:nowrap; border:1px solid var(--vscode-panel-border); }
+.rtos-tasks-table .rtos-state-badge { box-sizing:border-box; width:92px; min-width:92px; }
 .rtos-state-running { border-color:var(--vscode-charts-green, #4ec9b0); color:var(--vscode-charts-green, #4ec9b0); }
 .rtos-state-ready { border-color:var(--vscode-charts-blue, #3794ff); }
 .rtos-state-blocked { border-color:var(--vscode-charts-yellow, #cca700); }
 .rtos-state-suspended, .rtos-state-termination, .rtos-state-unknown { opacity:.8; }
 .rtos-row.selected .rtos-state-badge { color:inherit; border-color:currentColor; }
 .rtos-task-name { display:flex; align-items:center; gap:6px; min-width:110px; }
-.rtos-task-id { font-size:11px; color:var(--vscode-descriptionForeground); }
+.rtos-tasks-table .rtos-task-name { min-width:0; }
+.rtos-task-name-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.rtos-task-id { font-size:11px; color:var(--vscode-descriptionForeground); flex-shrink:0; white-space:nowrap; }
 .rtos-row.selected .rtos-task-id, .rtos-row.selected .rtos-muted { color:inherit; opacity:.85; }
-.rtos-list-cell, .rtos-stack-cell, .rtos-cpu-cell { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+.rtos-list-cell, .rtos-stack-cell, .rtos-cpu-cell { display:flex; align-items:center; gap:6px; white-space:nowrap; min-width:0; }
 .rtos-evidence { font-size:10px; min-width:48px; text-align:center; padding:0 5px; border-radius:3px; border:1px solid var(--vscode-panel-border); }
 .rtos-evidence-validated-tcb { border-color:var(--vscode-charts-yellow, #cca700); }
-.rtos-bar { display:inline-block; width:48px; height:6px; border-radius:3px; background:var(--vscode-progressBar-background, rgba(127,127,127,.25)); background:color-mix(in srgb, var(--vscode-foreground) 15%, transparent); overflow:hidden; }
+.rtos-stack-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.rtos-cpu-pct { display:inline-block; width:56px; text-align:right; flex-shrink:0; }
+.rtos-cpu-cnt { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.rtos-bar { display:inline-block; width:48px; height:6px; border-radius:3px; background:var(--vscode-progressBar-background, rgba(127,127,127,.25)); background:color-mix(in srgb, var(--vscode-foreground) 15%, transparent); overflow:hidden; flex-shrink:0; }
 .rtos-bar-fill { display:block; height:100%; background:var(--vscode-charts-blue, #3794ff); }
 .rtos-bar-fill.warn { background:var(--vscode-charts-red, #f48771); }
-.rtos-mini-btn { border:1px solid var(--vscode-panel-border); border-radius:3px; padding:1px 6px; background:transparent; color:inherit; cursor:pointer; font-size:11px; white-space:nowrap; }
+.rtos-mini-btn { border:1px solid var(--vscode-panel-border); border-radius:3px; padding:1px 6px; background:transparent; color:inherit; cursor:pointer; font-size:11px; white-space:nowrap; flex-shrink:0; }
 .rtos-mini-btn:hover:not(:disabled) { background:var(--vscode-list-hoverBackground); }
 .rtos-mini-btn:disabled { opacity:.45; cursor:default; }
 .rtos-detail-pane { width:310px; max-width:42%; border-left:1px solid var(--vscode-panel-border); padding:10px; overflow:auto; display:flex; flex-direction:column; gap:10px; background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; }
@@ -1617,8 +1613,8 @@ const STYLES = `
 .trace-hover-detail { color:var(--vscode-foreground); line-height:1.35; }
 .contexts-warn-bar { display:flex; flex-direction:column; gap:2px; padding:4px 10px; border-bottom:1px solid var(--vscode-panel-border); background:color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 8%, transparent); font-size:11px; flex-shrink:0; max-height:76px; overflow:auto; }
 .contexts-cpuload-card { display:flex; flex-direction:column; gap:4px; padding:6px 10px; border-bottom:1px solid var(--vscode-panel-border); background:var(--vscode-sideBar-background, var(--vscode-panel-background)); flex-shrink:0; }
-.contexts-cpuload-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; font-size:11px; }
-.contexts-legend { display:inline-flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.contexts-cpuload-header { display:flex; flex-wrap:nowrap; align-items:center; justify-content:space-between; gap:10px; height:18px; min-height:18px; line-height:18px; font-size:11px; overflow:hidden; }
+.contexts-legend { display:inline-flex; flex-wrap:nowrap; align-items:center; gap:8px; flex-shrink:0; white-space:nowrap; }
 .contexts-dot-lbl { display:inline-flex; align-items:center; gap:4px; color:var(--vscode-descriptionForeground); }
 .contexts-swatch { display:inline-block; width:9px; height:9px; border-radius:2px; }
 .contexts-swatch.sw-task { background:#3794FF; }
@@ -1626,7 +1622,7 @@ const STYLES = `
 .contexts-swatch.sw-sched { background:#C586C0; }
 .contexts-swatch.sw-idle { background:rgba(148,163,184,0.45); }
 .contexts-swatch.sw-unknown { background:rgba(204,167,0,0.45); }
-.contexts-bin-hover { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:65%; }
+.contexts-bin-hover { flex:1 1 0; min-width:0; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-variant-numeric:tabular-nums; }
 .contexts-canvas-wrap { width:100%; height:112px; overflow:hidden; }
 .contexts-cpuload-canvas { display:block; cursor:pointer; }
 .contexts-kind-isr { border-color:var(--vscode-charts-red, #f48771); color:var(--vscode-charts-red, #f48771); }

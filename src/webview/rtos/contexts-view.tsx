@@ -581,6 +581,19 @@ export function ContextsView(props: ContextsViewProps) {
     return analysis.bins[hoveredBinIdx];
   }, [hoveredBinIdx, analysis]);
 
+  const hoveredBinText = useMemo(() => {
+    if (!hoveredBin) return '悬停分箱查看各层耗时；点击分箱定位到 Trace Timeline';
+    return [
+      `箱#${hoveredBin.binIndex} [${formatTraceTimestamp(hoveredBin.start, activeUnit)}..${formatTraceTimestamp(hoveredBin.end, activeUnit)})`,
+      `Active=${formatPct(hoveredBin.activeWindowPct)}${BigInt(hoveredBin.unknownDuration) > 0n ? ` (可信=${formatPct(hoveredBin.activeKnownPct)})` : ''}`,
+      `ISR=${formatPct(hoveredBin.isrWindowPct)}`,
+      `Idle=${formatPct(hoveredBin.idleWindowPct)}`,
+      `Unknown=${formatPct(hoveredBin.unknownWindowPct)}`,
+      ...(hoveredBin.dominantContext ? [`主上下文=${hoveredBin.dominantContext.label ?? hoveredBin.dominantContext.contextKey}`] : []),
+      ...(hoveredBin.hasGap ? [`缺口:${hoveredBin.gapKinds.join(',')}`] : []),
+    ].join(' · ') + ' (点击定位 Trace)';
+  }, [hoveredBin, activeUnit]);
+
   // Expose deterministic test API for Stage 5.1 verification
   useEffect(() => {
     (window as any).__orbitRtosContextsTestApi = {
@@ -802,20 +815,8 @@ export function ContextsView(props: ContextsViewProps) {
             <span className="contexts-dot-lbl"><i className="contexts-swatch sw-idle" />Idle</span>
             <span className="contexts-dot-lbl"><i className="contexts-swatch sw-unknown" />Unknown/缺口</span>
           </span>
-          <span className="rtos-mono rtos-muted contexts-bin-hover">
-            {hoveredBin ? (
-              <>
-                箱#{hoveredBin.binIndex} [{formatTraceTimestamp(hoveredBin.start, activeUnit)}..{formatTraceTimestamp(hoveredBin.end, activeUnit)})
-                {' · '}Active={formatPct(hoveredBin.activeWindowPct)}
-                {BigInt(hoveredBin.unknownDuration) > 0n ? ` (可信=${formatPct(hoveredBin.activeKnownPct)})` : ''}
-                {' · '}ISR={formatPct(hoveredBin.isrWindowPct)}
-                {' · '}Idle={formatPct(hoveredBin.idleWindowPct)}
-                {' · '}Unknown={formatPct(hoveredBin.unknownWindowPct)}
-                {hoveredBin.dominantContext ? ` · 主上下文=${hoveredBin.dominantContext.label ?? hoveredBin.dominantContext.contextKey}` : ''}
-                {hoveredBin.hasGap ? ` · 缺口:${hoveredBin.gapKinds.join(',')}` : ''}
-                {' (点击定位 Trace)'}
-              </>
-            ) : '悬停分箱查看各层耗时；点击分箱定位到 Trace Timeline'}
+          <span className="rtos-mono rtos-muted contexts-bin-hover" title={hoveredBinText}>
+            {hoveredBinText}
           </span>
         </div>
         <div className="contexts-canvas-wrap" ref={chartWrapRef}>

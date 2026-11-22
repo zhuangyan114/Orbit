@@ -89,13 +89,6 @@ export function ObjectsView({
   return (
     <div className="rtos-workspace">
       <div className="rtos-table-pane">
-        <div className="rtos-coverage-bar">
-          <span>{summary.coverageNote}</span>
-          <span className="rtos-mono">
-            Registry {summary.registryCount}{summary.registryCapacity ? `/${summary.registryCapacity}` : ''} · Global {summary.globalCount} · WaitList {summary.listDiscoveredCount}
-          </span>
-        </div>
-
         {summary.waitCycles.length > 0 && (
           <div className="rtos-cycle-banner" role="alert">
             {summary.waitCycles.map((cycle, idx) => (

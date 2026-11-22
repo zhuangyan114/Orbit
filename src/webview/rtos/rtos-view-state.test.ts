@@ -311,6 +311,8 @@ describe('RTOS view state helpers', () => {
     expect(appSrc).toContain('.rtos-filter-bar { display:flex; flex-wrap:nowrap;');
     expect(appSrc).toContain('.rtos-coverage-bar { display:flex; flex-wrap:nowrap;');
     expect(appSrc).toContain('.rtos-diagnostics { border-top:1px solid var(--vscode-panel-border); padding:8px 10px; font-size:11px; background:var(--vscode-editorWidget-background, var(--vscode-panel-background)); height:88px;');
+    expect(appSrc).toContain('.rtos-tasks-table { table-layout:fixed;');
+    expect(appSrc).toContain('.contexts-cpuload-header { display:flex; flex-wrap:nowrap;');
   });
 
   it('renders lifecycle status labels accurately in ObjectsView without marking freed or unconfirmed objects as valid', () => {

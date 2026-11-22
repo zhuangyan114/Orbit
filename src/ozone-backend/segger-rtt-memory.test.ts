@@ -261,8 +261,8 @@ describe('SeggerRttMemoryEngine', () => {
         }
         if (cmd === 'write_memory') {
           const bytes = Buffer.from(args.data, 'hex');
-          // Mirror D:\STM32\RMLink\host\rmlink_connector\target.py word-alignment rule
-          if ((args.address % 4) !== 0 || bytes.length === 0 || (bytes.length % 4) !== 0 || bytes.length > 4096) {
+          // Mirror D:\STM32\RMLink\host\rmlink_connector\target.py 8/16/32-bit MEM-AP write range rule
+          if (args.address < 0 || bytes.length === 0 || bytes.length > 4096 || args.address + bytes.length > 0x100000000) {
             throw Object.assign(new Error('InvalidRequest: Error: invalid_request'), {
               httpStatus: 400,
               errorCode: 'InvalidRequest',
@@ -312,10 +312,14 @@ describe('SeggerRttMemoryEngine', () => {
     expect(sim.ram[0x503]).toBe(0xd3);
     expect(sim.readU32(cb + 24 + 2 * 24 + 12)).toBe(2);
 
-    // Non-RTT arbitrary unaligned writeMemory is rejected safely before sending write_memory RPC
+    // Non-RTT subword/unaligned writeMemory forwards directly to RMLink write_memory (8/16/32-bit MEM-AP CSW)
     const unalignedDirect = await channel.writeMemory(sim.base + 0x501, new Uint8Array([1, 2]));
-    expect(unalignedDirect.ok).toBe(false);
-    expect(unalignedDirect.errorCode).toBe('UnsupportedCapability');
+    expect(unalignedDirect.ok).toBe(true);
+    expect(unalignedDirect.data?.bytesWritten).toBe(2);
+    expect(sim.ram[0x500]).toBe(0x5a);
+    expect(sim.ram[0x501]).toBe(1);
+    expect(sim.ram[0x502]).toBe(2);
+    expect(sim.ram[0x503]).toBe(0xd3);
   });
 
   it('enforces real RMLink 4-byte alignment via safe edge RMW (11-byte payload, unaligned start, wrap-around, Mode 1 trim, neighbor preservation, and geometry rejection)', async () => {

@@ -2,6 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { applyNormalizedDapLaunchConfig, normalizeDapLaunchConfig } from './dap-launch-config';
 
 describe('DAP launch probe configuration', () => {
+  it.each(['auto', 'native', 'openocd'])('round-trips flashBackend %s', flashBackend => {
+    const config = {};
+    applyNormalizedDapLaunchConfig(config, normalizeDapLaunchConfig({ flashBackend }));
+    expect(config).toHaveProperty('flashBackend', flashBackend);
+  });
+
+  it('rejects unsupported flash backend selections', () => {
+    expect(() => normalizeDapLaunchConfig({ flashBackend: 'manual' })).toThrow('flashBackend');
+  });
   it('selects the public RMLink owner explicitly without automatic flash',()=>{
     expect(normalizeDapLaunchConfig({rmlinkDeviceId:'50787D15A924'})).toMatchObject({
       rmlinkDeviceId:'50787d15a924',probe:'rmlink',flashBeforeDebug:false,runToEntryPoint:'main',

@@ -120,7 +120,7 @@ J-Link、DAPLink 和 RMLink 烧录后默认停在 `main`。可在 `launch.json` 
 Orbit 主要由个人维护，手头开发板和探针有限，目前仅覆盖了常用型号与常见场景：
 
 - **仅支持 Windows x64**：暂不提供 macOS / Linux 版本。
-- **CMSIS-DAP / RMLink 烧录范围有限**：目前内置支持 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 和 `STM32F103C8T6`（其中 F103C8 尚未在实板上完整验证）。如果只是调试板上已有固件，可设置 `"flashBeforeDebug": false`。各型号支持详情见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
+- **CMSIS-DAP / RMLink 烧录**默认优先使用已登记型号的快速算法。更多 STM32 型号可根据 `device` 用内置 OpenOCD 烧录片内 Flash，`"flashBackend": "openocd"` 可显式选用。只调试板上已有固件时设置 `"flashBeforeDebug": false`。支持范围见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 - **复杂表达式与局部变量**：表达式类型和地址依赖 ELF/DWARF 调试信息，局部变量只在暂停且对应栈帧有效时可读取；高频采样建议优先使用全局变量或简单成员表达式。
 - **采样与日志带宽共享**：展开大量 Watch 变量或高负载 RTT 输出会占用探针带宽；高速采样期间 RTT 文本轮询会自动暂停，采样结束后恢复。
 - **RTOS 视图**：查看 FreeRTOS 任务、同步对象和运行快照。固件接入 SystemView 后可录制任务与中断轨迹，查看事件、终端和区间统计，并保存为离线归档。运行态快照和跨面板时间关联显示各自的可靠性。[接入与使用指南](docs/system%20view/quick-start.md)
@@ -153,16 +153,19 @@ Orbit 还有不少要打磨的地方。我手里的开发板十分有限，所�
 
 ```powershell
 npm install
+npm run build:openocd
 npm run build
 npm run build:native
 npm run typecheck
 npm test
 ```
 
-启动扩展开发窗口可执行 `npm run dev`。源码位于 `src/` 和 `native/`，请勿直接修改生成的 `dist/` 文件。
+启动扩展开发窗口可执行 `npm run dev`。源码位于 `src/` 和 `native/`，请勿直接修改生成的 `dist/` 文件。`npm run build:openocd` 会校验并解压 `resources/openocd/` 中固定的 OpenOCD Windows 运行时到 `out/openocd/`。
 
 </details>
 
 ## 许可证
 
-[MIT](https://github.com/zhuangyan114/Orbit/blob/master/LICENSE)。SEGGER 软件包等外部依赖仍遵循各自的许可。
+- Orbit 扩展本身采用 [MIT](https://github.com/zhuangyan114/Orbit/blob/master/LICENSE) 许可证。
+- 自 `1.2.3` 起，随 Orbit 分发的内置 OpenOCD Windows 运行时（`resources/openocd/` 与 `out/openocd/`）为未经修改的上游 OpenOCD `0.12.0+dev-g6fbe9e7` 二进制及附带动态库，遵循 **GNU GPL-2.0-or-later**（以及 `libjaylink` `GPL-2.0-or-later`、`libftdi1` `LGPL-2.1-only`、`libusb-1.0` `LGPL-2.1-or-later`、`hidapi`、`libgcc` 等各自开源许可）。Orbit 仅在独立烧录阶段通过命令行子进程按需调用 `openocd.exe`，未链接或合入任何 GPL 代码。对应许可证文本、上游固定源码提交及三年有效书面源码要约见 [OpenOCD 运行时说明](https://github.com/zhuangyan114/Orbit/blob/master/resources/openocd/README.md)、[OpenOCD COPYING](https://github.com/zhuangyan114/Orbit/blob/master/resources/openocd/COPYING) 与 [第三方开源声明](https://github.com/zhuangyan114/Orbit/blob/master/THIRD_PARTY_NOTICES.md)。
+- SEGGER J-Link 软件包、RMLink 连接服务等外部依赖仍遵循各自的许可协议。

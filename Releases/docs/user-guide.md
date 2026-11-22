@@ -1,6 +1,6 @@
 # Orbit 用户手册
 
-> 适用版本：1.2.1
+> 适用版本：1.2.3
 
 ## 目录
 
@@ -18,6 +18,7 @@
 - [12. MCP 与 Plugin API](#12-mcp-与-plugin-api)
 - [13. 常见问题](#13-常见问题)
 - [14. 已知限制](#14-已知限制)
+- [15. 开源许可与第三方组件](#15-开源许可与第三方组件)
 
 ## 1. 安装与环境要求
 
@@ -37,7 +38,7 @@ Releases 中也会附带独立的 MCP server 和配置 Skill，配合 AI 进行�
 | --- | --- |
 | 操作系统 | 目前仅支持 Windows x64（扩展自带原生 helper 可执行文件）。 |
 | VS Code | 需要 VS Code 1.90.0 及以上版本。 |
-| 目标芯片 | 面向 STM32 与 ARM Cortex-M。J-Link 支持其自带器件库中的所有芯片；CMSIS-DAP / RMLink 烧录目前内置 F103C8、F407VE/IG 和 H723VG 等常见型号。 |
+| 目标芯片 | 面向 STM32 与 ARM Cortex-M。J-Link 支持其自带器件库中的所有芯片；CMSIS-DAP / RMLink 烧录优先使用内置 F103C8、F407VE/IG、H723VG 快速算法，其余受支持的 STM32 F1/F4/H72x/G0/G4 型号由随扩展提供的 OpenOCD 烧录。 |
 | 调试探针 | 支持 SEGGER J-Link（需安装 SEGGER 软件包提供 `JLink_x64.dll`）、CMSIS-DAP / DAPLink（HID v1、WinUSB v2 与 TCP 网络探针）以及 RMLink 连接服务。WinUSB 详细测试见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。 |
 | 固件文件 | 需要带 DWARF 调试信息的 `.elf` 或 `.axf` 文件。 |
 | 外部视图 | RTOS Views、Memory View 和 Peripheral Viewer 由对应外部扩展提供，Orbit 负责向它们提供内存、寄存器和符号数据。 |
@@ -58,12 +59,13 @@ Orbit 通过以下工具解析 ELF 符号、源码行号与变量类型：
 
 ```powershell
 npm install
+npm run build:openocd
 npm run build
 npm run build:native
 npm run typecheck
 ```
 
-构建产物位于 `dist/` 和 `out/native/win32-x64/`。普通用户直接安装 VSIX 即可，不需要配置 CMake 或 C++ 编译器。
+构建产物位于 `dist/`、`out/openocd/` 和 `out/native/win32-x64/`。普通用户直接安装 VSIX 即可，不需要配置 CMake 或 C++ 编译器。
 
 ## 2. 调试探针与烧录
 
@@ -120,7 +122,7 @@ Orbit 通过 `orbit-jlink-helper.exe`（或备选的 `koffi` 通道）加载 `JL
 
 #### 内置 Flash 烧录支持
 
-CMSIS-DAP（以及 RMLink）开启 `flashBeforeDebug: true` 时，会通过当前探针直接运行内置 Flash 算法完成擦除、编程和校验，不需要安装 J-Link 软件。目前内置支持的芯片如下：
+CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优先使用内置快速算法，其他受支持的型号由随 Orbit 提供的 OpenOCD 烧录。
 
 | `device` 名称 / 别名 | 容量与算法说明 | 实板状态 |
 | --- | --- | --- |
@@ -130,7 +132,9 @@ CMSIS-DAP（以及 RMLink）开启 `flashBeforeDebug: true` 时，会通过当�
 | `STM32H723VGT6` / `STM32H723VG` | 1 MiB Flash，自研 H7 算法 | 已在 HID v1 与 J-Link 上验证通过 |
 
 说明：
-- 未在内置列表中的型号会在擦除前直接报错退出，避免误刷。如需为其他芯片烧录，可通过 `cmsisDapFlashAlgorithmPath` 提供自己的算法文件，或暂时设置 `"flashBeforeDebug": false`（自行用其他工具下载固件后再调试）。
+- `flashBackend` 默认等同于 `"auto"`。`"native"` 仅使用已登记型号的算法，`"openocd"` 则为已支持的型号显式选择内置 OpenOCD。只填写型号即可，Orbit 会自动选择脚本。
+- OpenOCD 路径目前覆盖部分 STM32 F103、F4、H723/H725、G0 和 G4 型号的 SWD 片内 Flash 烧录。未匹配型号、外置 Flash 或超出探测到的 Flash 容量会在擦除前报错。RMLink 未登记型号在此路径下使用通用 CMSIS-DAP 调试，增强采样仍要求已登记型号。
+- 只调试板上已有固件时设置 `"flashBeforeDebug": false`。
 - `STM32F407IG` 的芯片 ID（`0x413`）为 F405/407/415/417 系列共用，算法工作区使用 `0x20000000` 起的普通 SRAM（暂不支持固件段直接落在 CCM RAM 中）。
 - `STM32F103C8` 按标准 64 KiB 容量校验，暂不支持非官方扩容型号或 128 KiB 的 CB 型号。
 - 用 **J-Link** 调试 `STM32H723` 时请注意：部分旧版 J-Link 器件库（例如 V9.56）只识别 `"STM32H723VG"`，不识别 `"STM32H723VGT6"`，写错会导致 J-Link 弹窗卡住。
@@ -194,7 +198,8 @@ CMSIS-DAP（以及 RMLink）开启 `flashBeforeDebug: true` 时，会通过当�
 
 | 属性 | 类型 / 可选值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `device` | string | `"STM32F407VG"` | 目标芯片型号。J-Link 需使用 J-Link 软件识别的型号名；CMSIS-DAP / RMLink 用于匹配内置算法和校验芯片。 |
+| `device` | string | `"STM32F407VG"` | 目标芯片型号。J-Link 使用 SEGGER 器件名，CMSIS-DAP 和 RMLink 用它自动选烧录配置。 |
+| `flashBackend` | string | `"auto"` | `auto` 优先选快速算法，`native` 只选快速算法，`openocd` 选用内置通用烧录。 |
 | `deviceName` | string | 跟随 `device` | 供外部 MCU Debug Views 使用的别名，通常不用单独填写。 |
 | `probe` | `auto` / `jlink` / `cmsis-dap` / `rmlink` | `"auto"` | 调试探针类型。 |
 | `rmlinkDeviceId` | string（12 位十六进制） | `""` | 指定 RMLink 设备 ID；`probe: "rmlink"` 且仅一台设备在线时可省略。 |
@@ -449,7 +454,7 @@ control（控制） > watch（变量刷新） > timeline（波形采样） > bac
 
 ### Q2：调试能连上，但启动自动烧录失败
 - 使用 J-Link 时，连接走 `JLink_x64.dll` 而烧录默认调用 `JLink.exe`，请检查 `orbit.jlinkPath` 是否正确。
-- 使用 CMSIS-DAP / RMLink 时，请确认芯片型号在内置支持列表中（或已配置 `cmsisDapFlashAlgorithmPath`）。如果芯片里已经有固件只想直接调试，在 `launch.json` 加上 `"flashBeforeDebug": false` 即可。
+- 使用 CMSIS-DAP / RMLink 时，请确认 `device` 与芯片型号一致。如果芯片里已经有固件，只想直接调试，在 `launch.json` 加上 `"flashBeforeDebug": false` 即可。
 
 ### Q3：提示找不到 ELF/AXF 文件
 Orbit 默认只自动扫描 `build/Debug`、`build/Release` 和 `build` 目录。如果固件在其他位置（比如 Keil `MDK-ARM/Objects/`），请在 `launch.json` 中手动填写 `"program"` 字段。
@@ -481,9 +486,15 @@ J-Link Legacy 引擎当前固定使用 SWD；需要使用 JTAG 请确认 `orbit.
 ## 14. 已知限制
 
 - **平台限制**：目前仅支持 Windows x64，暂不支持 macOS 与 Linux。
-- **烧录芯片支持范围**：J-Link 烧录取决于已安装的 SEGGER 软件包；CMSIS-DAP 与 RMLink 内置烧录支持 `STM32F407VET6`、`STM32F407IG`、`STM32H723VGT6` 和 `STM32F103C8T6`（F103C8 待完整实板验证）。其他芯片可使用自定义 `cmsisDapFlashAlgorithmPath` 或设为 `flashBeforeDebug: false`。
+- **烧录芯片支持范围**。J-Link 的覆盖取决于 SEGGER 器件库。CMSIS-DAP 和 RMLink 优先使用已登记型号的快速算法，其余受支持的 STM32 可由内置 OpenOCD 烧录。
 - **硬件断点数量**：J-Link 最多使用 6 个硬件断点槽位；CMSIS-DAP 根据芯片 FPB 比较器数量动态判断，槽位用满后新增断点会提示失败。
 - **单步与接口限制**：J-Link Legacy 模式不支持源码级单步（`stepInto`/`stepOver`/`stepOut`）与 JTAG 接口，建议保持默认的原生 helper 模式。
 - **采样频率**：`orbit.timelineSampleIntervalMs`（默认 `0.2 ms`）是期望周期而非硬实时保证，实际采样率取决于探针通信速率、通道数、指针深度和并发 Watch/RTT 负载。
 - **RTOS Views**：外部 RTOS Views 扩展的集成目前存在已知问题，暂不建议用于正式调试。
 - **部分 DAP 高级特性未支持**：当前暂不支持条件断点（Conditional Breakpoint）、数据断点（Watchpoint）、Logpoint、反向单步（Step Back）以及反汇编视图（Disassemble）。
+
+## 15. 开源许可与第三方组件
+
+- **Orbit 扩展主体**：采用 [MIT License](../../LICENSE) 开源。
+- **随扩展分发的 OpenOCD Windows 运行时**：`out/openocd/` 源自未经修改的上游 OpenOCD `0.12.0+dev-g6fbe9e7` 构建（固定提交 `6fbe9e772476ce55c634cb0e8cd14244588ee9e2`），Orbit 仅在独立的烧录阶段通过子进程按需调用，不与 GPL 代码链接。OpenOCD 及其脚本遵循 **GNU GPL-2.0-or-later**，附带的 `libjaylink`、`libftdi1`、`libusb-1.0`、`hidapi` 等动态库遵循各自的开源协议（GPL-2.0-or-later / LGPL-2.1 / BSD / MIT 等），且均不提供任何明示或默示担保。
+- **完整许可文本与源码获取要约**：请查阅扩展目录下的 [resources/openocd/README.md](../../resources/openocd/README.md)、[resources/openocd/COPYING](../../resources/openocd/COPYING)、[resources/openocd/LICENSES/preferred/GPL-2.0](../../resources/openocd/LICENSES/preferred/GPL-2.0) 及 [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md)（含 GPL v2 第 3(b) 条三年有效书面源码要约）。

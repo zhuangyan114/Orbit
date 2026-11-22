@@ -41,6 +41,9 @@ tsconfig.json
 vitest.config.ts
 *.log
 *.cpuprofile
+resources/openocd/*.tar.gz
+out/openocd-acceptance/**
+out/f407ig-flash-compare/**
 docs/debug-rtos.md
 docs/rtos-debug-guide.md
 docs/test-rtos-fix.md

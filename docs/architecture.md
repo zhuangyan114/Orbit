@@ -90,6 +90,7 @@ flowchart TD
 - XR-DAP 探针端采样是默认关闭的可选功能，与 TCP 传输独立。只有 launch 配置显式设置 `cmsisDapXrSampling: true` 且实际 owner 为 CMSIS-DAP 时，`dataSamplingStart` 才创建 `ProbeTimelineSampler`（`src/debug/probe-timeline-sampler.ts`）：经 commander `startProbeSampling` → `CmsisDapTargetChannel` → helper `xrSamplingStart` 让探针定时采样，再以 timeline 优先级轮询 `xrSamplingRead`，用 `ProbeClock` 换算探针时钟；不支持或读取失败时退回主机采样。普通会话直接走原有 `readFastDataSampling`，不查询 XR INFO、不发送 XR 命令。
 - XR 已启用且正在采样期间，helper 在 `dispatch()` 入口按 `xrSamplingRoute()` 处理请求：标量读取和运行态 DHCSR 查询改用厂商 READ，其余请求先停止采样、执行后恢复；`open`/`connect`/`disconnect`/`close`/`shutdown` 结束采样。未开启 XR 时，helper 拒绝 XR RPC，也不按设备序列号自动发送 XR 停止命令。自动 RTT 文本轮询只在 XR 采样活动期间暂停。详见 [XR-DAP 隔离边界](xr-dap-isolation.md)。
 - Flash、DAP、Watch、Timeline、RTT、RTOS View、Memory View 和 Peripheral Viewer 都复用当前 owner。
+- **独立 OpenOCD 烧录阶段（`src/ozone-backend/openocd-flasher.ts`）**：对于未纳入原生快速算法的受支持 STM32 型号（或显式设置 `flashBackend: "openocd"`），`DapSession` 仅在**尚未认领调试 owner 之前**（或重启固件变更时先完整断开调试 owner 之后）启动随扩展打包的 `out/openocd/bin/openocd.exe` 独立子进程完成擦除、烧录和校验；RMLink 探针先通过 `RMLinkProbeHandoff` 暂停连接服务自动重连并在子进程退出后恢复。Orbit 必须等待 `openocd.exe` 进程完全退出（`close`）后才建立单一调试 owner；OpenOCD 不得作为调试 owner 或 GDB server 接入正常调试控制路径。
 - owner loss、session termination 或 replacement 会取消排队工作、阻止旧 generation 发布，并在退出前释放 helper。
 
 ## 访问调度

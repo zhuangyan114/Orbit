@@ -8,8 +8,11 @@ import { OzoneBackend } from '../ozone-backend/commander';
 import {
   DataPoint, FastDataSamplePlanItem, FastDataSampleSpec, MemoryBlock,
   DebugProbe, OzoneCommandResult, StackFrame, TargetState, Variable, WatchValue,
+  DebugSessionConfig,
 } from '../ozone-backend/types';
-import { parseElf32LoadSegments, resolveFlashTarget } from '../ozone-backend/cmsis-dap-flasher';
+import { listFlashTargets, parseElf32LoadSegments, resolveFlashTarget } from '../ozone-backend/cmsis-dap-flasher';
+import type { FlashTargetDefinition } from '../ozone-backend/cmsis-dap-flasher';
+import { flashWithOpenOcd, resolveOpenOcdTarget, RMLinkProbeHandoff } from '../ozone-backend/openocd-flasher';
 import type { SymbolCatalog } from '../symbols/symbol-catalog';
 import { RtosSnapshotService } from '../rtos/snapshot-service';
 import { RtosError } from '../rtos/model';
@@ -378,6 +381,12 @@ export class DapSession extends EventEmitter {
   private terminationPromise: Promise<void> | null = null;
   private disposePromise: Promise<void> | null = null;
   private flashAbortController: AbortController | null = null;
+  private openOcdTarget?: { script: string; nativeTarget?: FlashTargetDefinition };
+  private openOcdTask?: Promise<OzoneCommandResult>;
+  private openOcdConnection?: Promise<OzoneCommandResult>;
+  private rmlinkHandoff?: RMLinkProbeHandoff;
+  private rmlinkDirectDebug = false;
+  private sessionConnectConfig?: DebugSessionConfig;
 
   constructor(backend: OzoneBackend) {
     super();
@@ -465,10 +474,12 @@ export class DapSession extends EventEmitter {
         output: `Target connection lost (${reason}). Ending debug session and cleaning up the selected target owner.\n`,
       });
       try {
+        await this.openOcdConnection?.catch(() => {});
         await this.backend.dispose(false);
       } catch (error) {
         log.dap(`session-cleanup error=${error instanceof Error ? error.message : String(error)}`);
       }
+      await this.releaseOpenOcdProbe();
       this.phase = 'terminated';
       this.sendEvent('terminated', { reason });
       log.dap(`session-cleanup completed reason=${reason} elapsedMs=${Date.now() - started}`);
@@ -498,10 +509,12 @@ export class DapSession extends EventEmitter {
       (this.backend as any).cancelFlash?.('launch failed');
       log.dap(`launch-cleanup reason=${reason} ownerDispose=forced`);
       try {
+        await this.openOcdConnection?.catch(() => {});
         await this.backend.dispose(false);
       } catch (error) {
         log.dap(`launch-cleanup error=${error instanceof Error ? error.message : String(error)}`);
       }
+      await this.releaseOpenOcdProbe();
       this.backend.configureNativeSteps(false);
       this.controlInProgress = false;
       this.phase = 'idle';
@@ -2175,6 +2188,62 @@ export class DapSession extends EventEmitter {
     this.sendEvent('output', { category: 'console', output: `${message}\n` });
   }
 
+  private async releaseOpenOcdProbe(): Promise<void> {
+    await this.openOcdTask;
+    try {
+      await this.rmlinkHandoff?.release();
+    } catch (error) {
+      log.dll('[cmsis-dap] [rmlink] 探针交回连接服务失败 ' + String(error));
+    }
+  }
+
+  private connectAfterFlash(config: DebugSessionConfig): Promise<OzoneCommandResult> {
+    const pending = this.backend.execute({ cmd: 'connect', config });
+    if (!this.openOcdTarget && !this.rmlinkDirectDebug) return pending;
+    const tracked = pending.finally(() => {
+      if (this.openOcdConnection === tracked) this.openOcdConnection = undefined;
+    });
+    this.openOcdConnection = tracked;
+    return tracked;
+  }
+
+  private runOpenOcdStage(config: DebugSessionConfig, elfPath?: string): Promise<OzoneCommandResult> {
+    const controller = new AbortController();
+    this.flashAbortController = controller;
+    const task = this.withFlashProgress('固件烧录', async (): Promise<OzoneCommandResult> => {
+      let result: OzoneCommandResult;
+      try {
+        controller.signal.throwIfAborted();
+        await this.rmlinkHandoff?.acquire();
+        controller.signal.throwIfAborted();
+        const target = this.openOcdTarget;
+        result = elfPath && target
+          ? await flashWithOpenOcd({ ...config, ...this.rmlinkHandoff?.debugConfig }, elfPath, target.script,
+            target.nativeTarget, controller.signal, message => this.sendFlashProgress(message))
+          : { ok: true, data: null };
+      } catch (error) {
+        result = { ok: false, errorCode: controller.signal.aborted ? 'RequestCancelled' : 'ProbeHandoffFailed',
+          error: error instanceof Error ? error.message : String(error) };
+      }
+      if (!result.ok || !this.rmlinkDirectDebug || controller.signal.aborted) {
+        try {
+          await this.rmlinkHandoff?.release();
+        } catch (error) {
+          const detail = '探针交回连接服务失败：' + String(error);
+          log.dll('[cmsis-dap] [rmlink] ' + detail);
+          return { ok: false, errorCode: result.ok ? 'ProbeHandoffFailed' : result.errorCode,
+            error: result.ok ? detail : result.error + '。' + detail };
+        }
+      }
+      return result;
+    }).finally(() => {
+      if (this.flashAbortController === controller) this.flashAbortController = null;
+      if (this.openOcdTask === task) this.openOcdTask = undefined;
+    });
+    this.openOcdTask = task;
+    return task;
+  }
+
   private async handleLaunch(msg: DebugProtocolMessage) {
     try {
       const args = msg.arguments || {};
@@ -2278,6 +2347,52 @@ export class DapSession extends EventEmitter {
         log.dap('flash skipped reason=flashBeforeDebug=false');
         this.sendEvent('output', { category: 'console', output: 'Flash skipped: flashBeforeDebug=false\n' });
       }
+      const deviceName = String(device).trim().toUpperCase();
+      const existingTarget = resolvedProbe === 'jlink' ? undefined : listFlashTargets().find(target =>
+        target.name === deviceName || target.aliases.includes(deviceName));
+      const flashBackend = targetConfig.flashBackend ?? 'auto';
+      const useOpenOcd = flashEnabled && (flashBackend === 'openocd'
+        || (resolvedProbe !== 'jlink' && flashBackend === 'auto' && !existingTarget && !targetConfig.cmsisDapFlashAlgorithmPath));
+      const openOcdScript = resolvedProbe === 'jlink' ? undefined : resolveOpenOcdTarget(deviceName);
+      if (useOpenOcd && !openOcdScript) {
+        this.phase = 'idle';
+        this.sendResponse(msg, undefined, false, resolvedProbe === 'jlink'
+          ? 'OpenOCD 烧录需要选择 DAPLink 或 RMLink 探针'
+          : '暂未找到 ' + device + ' 的片内 Flash 烧录配置');
+        return;
+      }
+      this.openOcdTarget = useOpenOcd && openOcdScript ? { script: openOcdScript, nativeTarget: existingTarget } : undefined;
+      this.rmlinkDirectDebug = resolvedProbe === 'rmlink' && !existingTarget && !!openOcdScript
+        && (useOpenOcd || (!flashEnabled && flashBackend !== 'native'));
+      if (resolvedProbe === 'rmlink' && (useOpenOcd || this.rmlinkDirectDebug)) {
+        this.rmlinkHandoff = await RMLinkProbeHandoff.prepare(targetConfig.rmlinkDeviceId);
+        if (this.isSessionTerminating()) return;
+      }
+      const connectConfig: DebugSessionConfig = {
+        rmlinkDeviceId: this.rmlinkHandoff?.deviceId ?? targetConfig.rmlinkDeviceId,
+        device,
+        interface: interface_,
+        speedKHz,
+        probe: resolvedProbe,
+        cmsisDapTransport: targetConfig.cmsisDapTransport,
+        cmsisDapSerial: targetConfig.cmsisDapSerial,
+        cmsisDapVid: targetConfig.cmsisDapVid,
+        cmsisDapPid: targetConfig.cmsisDapPid,
+        cmsisDapPath: targetConfig.cmsisDapPath,
+        cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
+        cmsisDapXrSampling: this.xrSamplingEnabled,
+        flashBeforeDebug: targetConfig.flashBeforeDebug,
+        nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
+          ? args.nativeDebugEngineMode
+          : 'auto',
+        nativeDebugEngineEnabled: args.nativeDebugEngineEnabled !== false,
+      };
+      if (this.rmlinkDirectDebug) {
+        Object.assign(connectConfig, this.rmlinkHandoff!.debugConfig, {
+          probe: 'cmsis-dap', rmlinkDeviceId: undefined, cmsisDapVid: undefined, cmsisDapPid: undefined, cmsisDapXrSampling: false,
+        });
+      }
+      this.sessionConnectConfig = connectConfig;
       if (this.pRtLogEnabled) {
         const tokenLoad = this.pRtLogDecoder.loadTokenDatabase(elfPath);
         const output = tokenLoad.ok
@@ -2286,7 +2401,21 @@ export class DapSession extends EventEmitter {
         this.sendEvent('output', { category: tokenLoad.ok ? 'console' : 'stderr', output });
       }
 
-      if (elfPath && this._flashEnabled && resolvedProbe === 'jlink') {
+      if (this.openOcdTarget || this.rmlinkDirectDebug) {
+        if (this.openOcdTarget) this.sendFlashProgress('正在烧录 ' + elfPath);
+        const result = await this.runOpenOcdStage(connectConfig, this.openOcdTarget ? elfPath : undefined);
+        if (this.isSessionTerminating()) return;
+        if (!result.ok) {
+          this.phase = 'idle';
+          await this.releaseOpenOcdProbe();
+          this.sendCommandFailure(msg, result, 'FlashFailed');
+          return;
+        }
+        if (this.openOcdTarget) {
+          this.rememberFlashedFirmware(elfPath);
+          this.sendFlashProgress('固件烧录及校验完成');
+        }
+      } else if (elfPath && this._flashEnabled && resolvedProbe === 'jlink') {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath}...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
@@ -2315,29 +2444,11 @@ export class DapSession extends EventEmitter {
 
       this.phase = 'connecting';
       this.probeWatchGeneration++;this.probeWatchKey='';this.probeWatchStop=null;
-      const connectResult = await this.backend.execute({
-        cmd: 'connect', config: {
-          rmlinkDeviceId: targetConfig.rmlinkDeviceId,
-          device,
-          interface: interface_,
-          speedKHz,
-          probe: resolvedProbe,
-          cmsisDapTransport: targetConfig.cmsisDapTransport,
-          cmsisDapSerial: targetConfig.cmsisDapSerial,
-          cmsisDapVid: targetConfig.cmsisDapVid,
-          cmsisDapPid: targetConfig.cmsisDapPid,
-          cmsisDapPath: targetConfig.cmsisDapPath,
-          cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
-          cmsisDapXrSampling: this.xrSamplingEnabled,
-          flashBeforeDebug: targetConfig.flashBeforeDebug,
-          nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
-            ? args.nativeDebugEngineMode
-            : 'auto',
-          nativeDebugEngineEnabled: args.nativeDebugEngineEnabled !== false,
-        },
-      });
+      const connectResult = await this.connectAfterFlash(connectConfig);
+      if (this.isSessionTerminating()) return;
       if (!connectResult.ok) {
         this.phase = 'idle';
+        await this.releaseOpenOcdProbe();
         this.sendEvent('output', { category: 'stderr', output: `Connect failed: ${connectResult.error}\n` });
         this.sendResponse(msg, undefined, false, connectResult.error);
         return;
@@ -2354,12 +2465,12 @@ export class DapSession extends EventEmitter {
       this.rttOwnerKind = ownerKind;
       this.rttTransportKind = connectedDevice?.transport
         || (typeof connectResult.diagnostics?.transport === 'string' ? connectResult.diagnostics.transport : '')
-        || (resolvedProbe === 'rmlink' ? 'rmlink-service' : '');
+        || (connectConfig.probe === 'rmlink' ? 'rmlink-service' : '');
       let debugPath = ownerKind === 'jlink-native'
         ? 'J-Link / native C++ helper'
         : ownerKind === 'jlink-legacy' ? 'J-Link / legacy koffi' : '未知路径';
       if (ownerKind === 'cmsis-dap') {
-        debugPath = resolvedProbe === 'rmlink'
+        debugPath = connectConfig.probe === 'rmlink'
           ? 'RMLink'
           : connectedDevice?.transport === 'winusb'
           ? 'CMSIS-DAP v2 / WinUSB'
@@ -2380,7 +2491,7 @@ export class DapSession extends EventEmitter {
       this.sendEvent('output', { category: 'console', output: `${singleLineSummary}\n` });
       log.dap(`${ownerKind === 'cmsis-dap' ? '[cmsis-dap] ' : ''}${singleLineSummary}`);
 
-      if (elfPath && this._flashEnabled && resolvedProbe !== 'jlink') {
+      if (elfPath && this._flashEnabled && resolvedProbe !== 'jlink' && !this.openOcdTarget) {
         this.sendEvent('output', { category: 'console', output: `Flashing ${elfPath} through the connected CMSIS-DAP owner...\n` });
         const flashAbortController = new AbortController();
         this.flashAbortController = flashAbortController;
@@ -2517,6 +2628,7 @@ export class DapSession extends EventEmitter {
         if (this.targetConnectionEstablished) {
           await this.cleanupFailedLaunch('LaunchException');
         } else {
+          await this.releaseOpenOcdProbe();
           this.phase = 'idle';
         }
         this.sendResponse(msg, undefined, false, err.message);
@@ -2551,6 +2663,7 @@ export class DapSession extends EventEmitter {
     try {
       this.forgetAllBreakpoints();
       try {
+        await this.openOcdConnection?.catch(() => {});
         await this.backend.execute({ cmd: 'disconnect' });
         await this.backend.dispose(true);
       } catch (error) {
@@ -2559,6 +2672,7 @@ export class DapSession extends EventEmitter {
         // and keeps the physical probe claimed for the next debug session.
         log.dap(`disconnect-cleanup error=${error instanceof Error ? error.message : String(error)}`);
       }
+      await this.releaseOpenOcdProbe();
       this.backend.configureNativeSteps(false);
       this.setTargetRunning(true);
       this.sendResponse(msg);
@@ -3461,6 +3575,32 @@ export class DapSession extends EventEmitter {
               category: 'console',
               output: `Restart: firmware unchanged, skipping flash (${this._elfPath})\n`,
             });
+          } else if (this.openOcdTarget && this.sessionConnectConfig) {
+            this.stopDataSampling();
+            this.stopConnectionMonitor();
+            this.targetConnectionEstablished = false;
+            const connectConfig = this.sessionConnectConfig;
+            const disconnected = await this.backend.execute({ cmd: 'disconnect' });
+            if (this.isSessionTerminating()) return;
+            const flashed = disconnected.ok ? await this.runOpenOcdStage(connectConfig, this._elfPath) : disconnected;
+            if (this.isSessionTerminating()) return;
+            if (!flashed.ok) {
+              this._lastFlashedFirmware = undefined;
+              this.sendCommandFailure(msg, flashed, 'FlashFailed');
+              await this.terminateForConnectionLoss(flashed.errorCode || 'FlashFailed');
+              return;
+            }
+            this.rememberFlashedFirmware(this._elfPath, currentFirmware);
+            this.sendFlashProgress('固件烧录及校验完成');
+            const reconnected = await this.connectAfterFlash(connectConfig);
+            if (this.isSessionTerminating()) return;
+            if (!reconnected.ok) {
+              this.sendCommandFailure(msg, reconnected, 'TargetConnectFailed');
+              await this.terminateForConnectionLoss(reconnected.errorCode || 'TargetConnectFailed');
+              return;
+            }
+            this.targetConnectionEstablished = true;
+            this.startConnectionMonitor();
           } else {
             if (this._probe === 'cmsis-dap') {
               const haltResult = await this.backend.execute({ cmd: 'halt' });
@@ -6802,6 +6942,7 @@ export class DapSession extends EventEmitter {
       this.flashAbortController?.abort('DAP session disposed');
       (this.backend as any).cancelFlash?.('DAP session disposed');
       try {
+        await this.openOcdConnection?.catch(() => {});
         await this.backend.dispose(false);
       } catch (error) {
         // The adapter exit path awaits this promise. A rejection here would be
@@ -6809,6 +6950,7 @@ export class DapSession extends EventEmitter {
         // a stranded adapter process, so disposal never propagates.
         log.dap(`session-dispose error=${error instanceof Error ? error.message : String(error)}`);
       }
+      await this.releaseOpenOcdProbe();
       this.phase = 'terminated';
       this.rtosSnapshots?.dispose();
     })();

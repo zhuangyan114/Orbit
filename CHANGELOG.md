@@ -2,6 +2,12 @@
 
 按版本从新到旧排列。
 
+## 1.2.3 — 2026-11-22
+
+- DAPLink 和 RMLink 可按 `device` 自动选择烧录配置。已登记芯片默认走现有快速路径，`flashBackend: "openocd"` 可切换到随 Orbit 提供的 OpenOCD。烧录校验后由 Orbit 接管探针，进入调试。
+- 部分 STM32 F1、F4、H72x、G0 和 G4 型号可通过内置 OpenOCD 扩展片内 Flash 烧录。RMLink 未登记型号通过标准 CMSIS-DAP 调试。
+- 随扩展分发未经修改的上游 OpenOCD `0.12.0+dev-g6fbe9e7` Windows 运行时（独立子进程调用，不与 MIT 主体代码链接），并补充完整的 GPL-2.0-or-later / LGPL-2.1 开源许可声明、`THIRD_PARTY_NOTICES.md` 及三年有效书面源码要约。
+
 ## 1.2.2 — 2026-11-22
 
 - **Watch 写入升级为不停机直写（Live Write）**：运行中修改 Watch 变量时不再临时暂停（halt）与恢复目标芯片，避免打断实时控制中断、PWM 输出或触发看门狗，同时继续保持控制写屏障与 CMSIS-DAP RAM 地址安全校验。

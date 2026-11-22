@@ -2,7 +2,7 @@
   "name": "orbit-for-vscode",
   "displayName": "Orbit STM32 Debugger",
   "description": "Modern STM32 and ARM Cortex-M debugging frontend for J-Link and CMSIS-DAP with AI integration",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "publisher": "orbit-debug",
   "license": "MIT",
   "repository": {
@@ -297,6 +297,17 @@
                 "type": "boolean",
                 "description": "启动前通过所选探针烧录并校验 ELF。重启时 ELF 未变化则跳过烧录并直接运行；变化后重新烧录并停在 runToEntryPoint。",
                 "default": true
+              },
+              "flashBackend": {
+                "type": "string",
+                "enum": ["auto", "native", "openocd"],
+                "enumDescriptions": [
+                  "已登记型号优先使用原生快速烧录，其余受支持型号根据 device 自动选择烧录配置。",
+                  "使用 Orbit 或 RMLink 的内置烧录算法。",
+                  "使用随 Orbit 安装的 OpenOCD，通过 device 自动选择配置。适用于 DAPLink 与 RMLink。"
+                ],
+                "default": "auto",
+                "description": "为 DAPLink 和 RMLink 选择烧录方式。"
               },
               "runToEntryPoint": {
                 "oneOf": [
@@ -635,7 +646,8 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run build",
+    "vscode:prepublish": "npm run build:openocd && npm run build",
+    "build:openocd": "node scripts/stage-openocd.js",
     "build": "node esbuild.config.js && npm run build:automation-client",
     "build:automation-client": "tsc -p clients/node/tsconfig.json",
     "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",

@@ -16,6 +16,7 @@
 ## Build and Test
 
 - `npm install` installs the locked dependencies (`package-lock.json` is committed).
+- `npm run build:openocd` verifies the pinned OpenOCD archive SHA-256 and extracts the Windows runtime into `out/openocd/`.
 - `npm run build` bundles `dist/{extension,debugadapter,webview,timeline,watch}.js`.
 - `npm run typecheck` runs `tsc --noEmit`; `npm test` runs Vitest.
 - `npm run build:native` builds `out/native/win32-x64/orbit-jlink-helper.exe`.
@@ -68,7 +69,7 @@
 - Stopped-state `variables` requests for Local and Registers may wait for the control/read handoff (bounded at 1200 ms) instead of returning an immediate empty list. On session termination or an unavailable target read, return a safe empty/error result and never issue a new native read.
 - Runtime Watch/Timeline sampling is allowed to read while the target is running through the explicit realtime path; avoid an extra target-state query in that forced path because it serializes the owner and can block Timeline. Ordinary stopped-state DAP Watch refreshes must still respect target state and return cached/running values when reads are deferred.
 - Keep `initialize.supportsReadMemoryRequest`, base64 byte-oriented `readMemory`/`writeMemory`, and valid DAP `memoryReference` behavior for MemoryView and Peripheral Viewer. Preserve `deviceName`, `svdFile`, and `svdPath` launch aliases.
-- Preserve `probe`, `cmsisDapTransport`, `cmsisDapSerial`, `cmsisDapVid`, `cmsisDapPid`, `cmsisDapPath`, `cmsisDapFlashAlgorithmPath`, `flashBeforeDebug`, and `runToEntryPoint`. `flashBeforeDebug: true` must use the already-selected owner; `false` must not erase, program, verify, or issue Flash-only resets.
+- Preserve `probe`, `cmsisDapTransport`, `cmsisDapSerial`, `cmsisDapVid`, `cmsisDapPid`, `cmsisDapPath`, `cmsisDapFlashAlgorithmPath`, `flashBackend`, `flashBeforeDebug`, and `runToEntryPoint`. Native CMSIS-DAP/RMLink Flash uses the selected owner. OpenOCD runs only as a standalone programmer before claiming the debug owner or after releasing it for a changed-image Restart. Wait for the programmer to exit before connecting the debug owner. `flashBeforeDebug: false` must not erase, program, verify, or issue Flash-only resets.
 - A native source-level `stepInto` must scan/enter calls within the current source-line bounds, rather than regressing to repeated instruction-only UI clicks.
 - A native `stepOut` source hint may improve displayed location but must not replace the trusted native PC. The first subsequent source-level step must advance visibly beyond that hint, not consume a visual empty step.
 - Preserve user breakpoint ownership and temporary-breakpoint cleanup/restoration across step, step-out, continue-at-current-PC, timeout, and error paths. Trusted native stop PC/state must not be overwritten by stale legacy state.

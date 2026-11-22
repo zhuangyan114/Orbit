@@ -62,6 +62,7 @@ describe('DapSession native executor lifecycle', () => {
       type: 'request', seq: 2, command: 'launch',
       arguments: {
         probe: 'cmsis-dap',
+        device: 'STM32F407VET6',
         program: 'firmware.elf',
         flashBeforeDebug: true,
         rttLogEnabled: false,

@@ -2,6 +2,7 @@ import {
   CmsisDapTransport,
   DebugProbePreference,
 } from '../ozone-backend/types';
+import type { FlashBackendPreference } from '../ozone-backend/openocd-flasher';
 
 export interface NormalizedDapLaunchConfig {
   rmlinkDeviceId?: string;
@@ -13,6 +14,7 @@ export interface NormalizedDapLaunchConfig {
   cmsisDapPath?: string;
   cmsisDapFlashAlgorithmPath?: string;
   cmsisDapXrSampling?: boolean;
+  flashBackend?: FlashBackendPreference;
   flashBeforeDebug: boolean;
   runToEntryPoint?: string | false;
 }
@@ -21,13 +23,14 @@ export class DapLaunchConfigError extends Error {
   readonly errorCode = 'InvalidConfiguration' as const;
 
   constructor(
-    readonly field: 'probe' | 'cmsisDapTransport' | 'rmlinkDeviceId' | 'cmsisDapXrSampling',
+    readonly field: 'probe' | 'cmsisDapTransport' | 'rmlinkDeviceId' | 'cmsisDapXrSampling' | 'flashBackend',
     value: unknown,
   ) {
     const received = typeof value === 'string' ? `"${value}"` : String(value);
     const allowed = field === 'rmlinkDeviceId' ? 'a 12-digit RMLink device ID' : field === 'probe'
       ? 'auto, jlink, cmsis-dap, or rmlink'
-      : 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp';
+      : field === 'flashBackend' ? 'auto, native, or openocd'
+        : 'auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp';
     super(field === 'cmsisDapXrSampling'
       ? `InvalidConfiguration: ${field} must be a boolean; received ${received}`
       : `InvalidConfiguration: ${field} must be one of ${allowed}; received ${received}`);
@@ -69,6 +72,12 @@ export function normalizeDapLaunchConfig(input: unknown): NormalizedDapLaunchCon
     if(args.probe!=='rmlink' && args.flashBeforeDebug===undefined)config.flashBeforeDebug=false;
   }
   if (typeof args.cmsisDapXrSampling === 'boolean') config.cmsisDapXrSampling = args.cmsisDapXrSampling;
+  if (args.flashBackend !== undefined) {
+    if (args.flashBackend !== 'auto' && args.flashBackend !== 'native' && args.flashBackend !== 'openocd') {
+      throw new DapLaunchConfigError('flashBackend', args.flashBackend);
+    }
+    config.flashBackend = args.flashBackend;
+  }
 
   const entry = typeof args.runToEntryPoint === 'string' ? args.runToEntryPoint.trim() : '';
   config.runToEntryPoint = args.runToEntryPoint === false ? false : entry || 'main';
@@ -93,6 +102,7 @@ export function applyNormalizedDapLaunchConfig(
   config.cmsisDapPath = targetConfig.cmsisDapPath;
   config.cmsisDapFlashAlgorithmPath = targetConfig.cmsisDapFlashAlgorithmPath;
   config.cmsisDapXrSampling = targetConfig.cmsisDapXrSampling;
+  if (targetConfig.flashBackend !== undefined) config.flashBackend = targetConfig.flashBackend;
   config.flashBeforeDebug = targetConfig.flashBeforeDebug;
   if (targetConfig.runToEntryPoint === undefined) delete config.runToEntryPoint;
   else config.runToEntryPoint = targetConfig.runToEntryPoint;

@@ -4,6 +4,12 @@ import * as path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import { DapSession, DebugProtocolMessage } from './dap-session';
 import { OzoneBackend } from '../ozone-backend/commander';
+import { flashWithOpenOcd, RMLinkProbeHandoff } from '../ozone-backend/openocd-flasher';
+
+vi.mock('../ozone-backend/openocd-flasher', async importOriginal => ({
+  ...await importOriginal<typeof import('../ozone-backend/openocd-flasher')>(),
+  flashWithOpenOcd: vi.fn(),
+}));
 
 const probes = ['jlink', 'cmsis-dap', 'rmlink'] as const;
 
@@ -21,13 +27,14 @@ function fixture(probe: typeof probes[number], entry?: string | false, flashBefo
     if (command.cmd === 'setBreakpoint') return { ok: true, data: { id: 2, address: 0x08000400 } };
     return { ok: true, data: { message: 'verified' } };
   });
-  const session = new DapSession({ execute, configureNativeSteps: () => {} } as unknown as OzoneBackend);
+  const session = new DapSession({ execute, configureNativeSteps: () => {}, dispose: vi.fn() } as unknown as OzoneBackend);
   const messages: DebugProtocolMessage[] = [];
   session.on('send', message => messages.push(message));
-  const launch = (selectedProbe: string = probe) => (session as any).handleLaunch({
+  const launch = (selectedProbe: string = probe, extra: Record<string, unknown> = {}) => (session as any).handleLaunch({
     type: 'request', seq: 1, command: 'launch', arguments: {
-      probe: selectedProbe, program, flashBeforeDebug, rttLogEnabled: false,
+      probe: selectedProbe, program, device: 'STM32H723VG', flashBeforeDebug, rttLogEnabled: false,
       ...(entry === undefined ? {} : { runToEntryPoint: entry }),
+      ...extra,
     },
   });
   const restart = () => (session as any).handleRestart({ type: 'request', seq: 2, command: 'restart', arguments: {} });
@@ -41,6 +48,71 @@ function fixture(probe: typeof probes[number], entry?: string | false, flashBefo
 }
 
 describe('shared startup and restart policy', () => {
+  it.each(['auto', 'native'])('prefers the registered fast path with flashBackend=%s', async flashBackend => {
+    const f = fixture('cmsis-dap');
+    try {
+      await f.launch('cmsis-dap', { flashBackend });
+      expect(f.execute.mock.calls.map(([command]) => command.cmd).slice(0, 2)).toEqual(['connect', 'flash']);
+      expect(f.messages.find(m => m.request_seq === 1)).toMatchObject({ success: true });
+    } finally { f.clean(); }
+  });
+
+  it.each([
+    { device: 'STM32H723VG', flashBackend: 'openocd' },
+    { device: 'STM32F401CCU6' },
+  ])('burns before connecting and relinquishes the current owner on changed restart for %j', async selection => {
+    const f = fixture('cmsis-dap');
+    const flash = vi.mocked(flashWithOpenOcd);
+    flash.mockReset().mockResolvedValue({ ok: true, data: null });
+    try {
+      await f.launch('cmsis-dap', selection);
+      expect(flash.mock.invocationCallOrder[0]).toBeLessThan(f.execute.mock.invocationCallOrder[0]!);
+      expect(f.execute.mock.calls.map(([command]) => command.cmd)).not.toContain('flash');
+      (f.session as any).rememberBreakpoint('main.c:42', 2, 0x08000400);
+      await f.restart();
+      expect(flash).toHaveBeenCalledTimes(1);
+      fs.writeFileSync(f.program, 'firmware-v2');
+      f.execute.mockClear();
+      await f.restart();
+      expect(f.execute.mock.calls.map(([command]) => command.cmd).slice(1, 3)).toEqual(['disconnect', 'connect']);
+      expect(flash.mock.invocationCallOrder[1]).toBeGreaterThan(f.execute.mock.invocationCallOrder[1]!);
+      expect(flash.mock.invocationCallOrder[1]).toBeLessThan(f.execute.mock.invocationCallOrder[2]!);
+      expect(f.execute).toHaveBeenCalledWith(expect.objectContaining({ cmd: 'setBreakpoint', file: 'main.c', line: 42 }));
+    } finally { f.clean(); }
+  });
+
+  it('releases RMLink before programming and restores the enhanced connection even on flash failure', async () => {
+    const f = fixture('rmlink');
+    const acquire = vi.fn();
+    const release = vi.fn();
+    const handoff = vi.spyOn(RMLinkProbeHandoff, 'prepare').mockResolvedValue({
+      acquire, release, deviceId: 'b81f3fc30470',
+      debugConfig: { cmsisDapTransport: 'tcp', cmsisDapPath: '127.0.0.1' },
+    } as unknown as RMLinkProbeHandoff);
+    const flash = vi.mocked(flashWithOpenOcd);
+    flash.mockReset().mockResolvedValue({ ok: false, errorCode: 'OutcomeUnknown', error: 'flash outcome unknown' });
+    try {
+      await f.launch('rmlink', { flashBackend: 'openocd' });
+      expect(acquire.mock.invocationCallOrder[0]).toBeLessThan(flash.mock.invocationCallOrder[0]!);
+      expect(release.mock.invocationCallOrder[0]).toBeGreaterThan(flash.mock.invocationCallOrder[0]!);
+      expect(f.execute.mock.calls.map(([command]) => command.cmd)).not.toContain('connect');
+      expect(f.execute.mock.calls.map(([command]) => command.cmd)).not.toContain('flash');
+      expect(f.messages.find(m => m.request_seq === 1)).toMatchObject({ success: false });
+    } finally { handoff.mockRestore(); f.clean(); }
+  });
+
+  it('skips explicit OpenOCD when flashBeforeDebug is false', async () => {
+    const f = fixture('cmsis-dap', 'main', false);
+    const flash = vi.mocked(flashWithOpenOcd);
+    flash.mockClear();
+    try {
+      await f.launch('cmsis-dap', { flashBackend: 'openocd' });
+      expect(flash).not.toHaveBeenCalled();
+      expect(f.execute.mock.calls.map(([command]) => command.cmd)).not.toContain('flash');
+      expect(f.messages.find(m => m.request_seq === 1)).toMatchObject({ success: true });
+    } finally { f.clean(); }
+  });
+
   it.each(probes)('%s launches at main and restarts unchanged firmware directly', async probe => {
     const f = fixture(probe);
     try {

@@ -117,7 +117,7 @@ mock 必须独立维护协议 oracle；不得只用 production 常量和同一�
 | DAP_Connect 成功就是调试连接成功 | 仍需 DPIDR、CTRL/STAT 和 DP/AP ACK |
 | mock 内存读成功就是硬件通过 | 还需真实目标和完整时序证据 |
 | DAPLink 每个芯片都要重写传输层 | 通信和 Cortex-M 层复用，Flash/SVD/内存参数按型号或家族适配 |
-| OpenOCD 可以直接当生产后端 | 按 AGENTS.md 仅作为资料参考，不得添加为正常调试控制路径或用它绕过 owner |
+| OpenOCD 可以直接当调试后端 | OpenOCD 只用于独立烧录阶段。探针完全释放后才能启动烧录，烧录进程退出后由 Orbit 接管调试。 |
 | `.data` 的 p_vaddr 就是烧录地址 | p_vaddr 是运行地址，p_paddr 通常是 Flash LMA |
 | waitForHalt 超时只能修超时 | 先区分入口、Flash busy、fault、返回地址和 BKPT 失败 |
 | 读取一个变量成功就是 Watch 通过 | 还需 owner 路由、运行态采样、调度公平和 session fence |

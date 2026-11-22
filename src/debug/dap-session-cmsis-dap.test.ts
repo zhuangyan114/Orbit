@@ -291,7 +291,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
 
       await (session as any).handleLaunch({
         type: 'request', seq: 20, command: 'launch', arguments: {
-          probe: 'cmsis-dap', program: 'firmware.elf', flashBeforeDebug: true,
+          probe: 'cmsis-dap', device: 'STM32F407VET6', program: 'firmware.elf', flashBeforeDebug: true,
           rttLogEnabled: false,
         },
       });
@@ -2106,7 +2106,7 @@ describe('DapSession CMSIS-DAP control routing', () => {
 
       await (session as any).handleLaunch({
         type: 'request', seq: 20, command: 'launch', arguments: {
-          probe: 'cmsis-dap', program: elfPath, flashBeforeDebug: true, rttLogEnabled: false,
+          probe: 'cmsis-dap', device: 'STM32F407VET6', program: elfPath, flashBeforeDebug: true, rttLogEnabled: false,
         },
       });
       (session as any).stopConnectionMonitor();

@@ -1,6 +1,6 @@
 ---
 name: Orbit-Config-skill
-description: Configure and verify an STM32 firmware workspace for Orbit for VS Code. Use when Codex must inspect or edit CMake and ARM toolchain settings, .vscode/launch.json, J-Link or CMSIS-DAP/DAPLink probe settings, target ownership, MCU Debug Views integration, RTT, P-RTLog, FreeRTOS RTOS Views full-panel firmware hooks, or the local MCP setup. Do not use for generic embedded debugging, firmware algorithm/PID changes, or changes to Orbit debug implementation.
+description: Configure and verify an STM32 firmware workspace for Orbit for VS Code. Use when Codex must inspect or edit CMake and ARM toolchain settings, .vscode/launch.json, J-Link / CMSIS-DAP / DAPLink / RMLink probe and flashBackend settings, target ownership, MCU Debug Views integration, RTT, P-RTLog, built-in Orbit RTOS panel (FreeRTOS snapshot & SystemView Trace) firmware hooks, or the local MCP setup. Do not use for generic embedded debugging, firmware algorithm/PID changes, or changes to Orbit debug implementation.
 ---
 
 # Orbit Workspace Configuration
@@ -10,9 +10,9 @@ description: Configure and verify an STM32 firmware workspace for Orbit for VS C
 Use this skill when the user asks to configure or validate an STM32 firmware workspace for Orbit — The Debugger for What's Next, including:
 
 - `.vscode/launch.json`, `.vscode/settings.json`, CMake, ARM GCC, ELF/AXF, or SVD setup;
-- J-Link `JLink_x64.dll`/`JLink.exe`, CMSIS-DAP/DAPLink HID/WinUSB, either native helper, Legacy `koffi`, or owner-selection options;
-- Watch, Timeline, RTT, P-RTLog, RTOS Views（默认全面板：Tasks + runtime/CPU% + Queue/Mutex/Sem）, Memory View, or Peripheral Viewer integration;
-- FreeRTOS `FreeRTOSConfig.h` / `freertos.c` USER CODE debug hooks for those views;
+- J-Link `JLink_x64.dll`/`JLink.exe`, CMSIS-DAP/DAPLink (HID/WinUSB/TCP), RMLink (`probe: "rmlink"`), `flashBackend`（`auto` / `native` / `openocd`）, either native helper, Legacy `koffi`, or owner-selection options;
+- Watch（支持运行中不停机直写）、Timeline（含 XR-DAP / RMLink 板端采样）、RTT、P-RTLog、Orbit 内置 RTOS 面板（FreeRTOS 全面板快照：Tasks + 栈水位 + runtime/CPU% + Queue/Mutex/Sem + Timers/Heap，及可选 SEGGER SystemView Trace），以及 Memory View / Peripheral Viewer 集成;
+- FreeRTOS `FreeRTOSConfig.h` / `freertos.c` USER CODE 调试钩子与 `rtosSnapshotPort` 配置;
 - the local Orbit Plugin API or MCP server setup;
 - a source-grounded audit of an existing Orbit debug configuration.
 
@@ -27,7 +27,7 @@ Do not use this skill for:
 
 ## Goal
 
-让当前 STM32 firmware workspace 默认只保留一个精简、可复现的 `Orbit Debug` launch：标准 DAP 字段加一次真实芯片型号，其余使用 Orbit 的自动探针、ELF、SVD、SWD/4000 kHz 和 Native 默认值。只有用户明确要求固定 probe、禁用 Flash、指定 ELF/SVD/RTOS/RTT 或需要多个快捷入口时才增加对应字段或配置。工程实际使用 FreeRTOS 时，**默认一次配齐 RTOS Views 全面板**（workspace tracker + launch `rtos` + 固件 trace/stack/runtime-stat/queue registry），不要只配 launch 然后把固件缺口留给用户。
+让当前 STM32 firmware workspace 默认只保留一个精简、可复现的 `Orbit Debug` launch：标准 DAP 字段加一次真实芯片型号，其余使用 Orbit 的自动探针、ELF、SVD、SWD/4000 kHz、自动 `flashBackend` 和 Native 默认值。只有用户明确要求固定 probe（如 `cmsis-dap` / `jlink` / `rmlink`）、禁用 Flash、显式选择 `flashBackend`、指定 ELF/SVD/RTOS/RTT 或需要多个快捷入口时才增加对应字段或配置。工程实际使用 FreeRTOS 时，**默认一次配齐 Orbit 内置 RTOS 面板所需的全面板固件钩子**（launch `rtos` + 可选 `rtosSnapshotPort` + 固件 trace/stack/runtime-stat/queue registry），不要只配 launch 然后把固件缺口留给用户。
 
 具体 JSON、CMake、RTOS、RTT、P-RTLog 和 MCP 示例必须先阅读 `references/configuration-details.md`。完整配置项、默认值、范围和功能说明以仓库内 `Releases/docs/user-guide.md` 与当前 `package.json` 为准。
 
@@ -46,7 +46,7 @@ Do not use this skill for:
 
 省略 `probe` 等价于 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。省略 `interface`、`speedKHz`、`nativeDebugEngineMode` 分别使用 `SWD`、`4000`、`auto`。`deviceName` 自动跟随 `device`。保留非 Orbit 配置和用户额外命名的配置，不为了瘦身删除用户已有的显式变体。
 
-只有用户明确要求强制 DAPLink 时才写 `"probe": "cmsis-dap"`；强制 J-Link 时写 `"probe": "jlink"`。只有用户明确要求绑定某一只 DAPLink probe 时才加入 `cmsisDapVid`、`cmsisDapPid`、`cmsisDapSerial` 或 `cmsisDapPath`。PnP/HID 枚举发现的 VID/PID/Serial 只是诊断信息，不能自动写入 launch，也不能因为当前只连接一只设备就固定它。
+只有用户明确要求强制 DAPLink 时才写 `"probe": "cmsis-dap"`；强制 J-Link 时写 `"probe": "jlink"`；使用 RMLink 连接服务时写 `"probe": "rmlink"`（仅一台已配对在线设备时可省略 `rmlinkDeviceId`，多台设备时才填写 12 位 `rmlinkDeviceId`）。只有用户明确要求绑定某一只 DAPLink probe 时才加入 `cmsisDapVid`、`cmsisDapPid`、`cmsisDapSerial` 或 `cmsisDapPath`。PnP/HID 枚举发现的 VID/PID/Serial 只是诊断信息，不能自动写入 launch，也不能因为当前只连接一只设备就固定它。
 
 ## One-pass workflow
 
@@ -100,22 +100,21 @@ CMSIS-DAP owner 规则：
 - 默认省略 `cmsisDapSerial`、`cmsisDapVid`、`cmsisDapPid` 和 `cmsisDapPath`。只有用户明确要求固定具体 probe 时才加入；
 - 不从 Windows 枚举、当前连接设备、验收 fixture 或示例值推断绑定。尤其不得默认写入 `C251`、`F001`、`LU_2022_8888`；
 - 当前 CMSIS-DAP 调试接口为 SWD。不要把 J-Link 的 `nativeDebugEngineMode` 当成 CMSIS-DAP transport 开关；
-- `flashBeforeDebug: true` 使用当前 CMSIS-DAP owner 和匹配目标的 Flash Algorithm；`false` 不得触发 erase/program/verify 或 Flash-only reset；
+- `flashBeforeDebug: true` 对已登记型号使用当前 CMSIS-DAP / RMLink owner 的原生快速算法，对其余受支持 STM32 型号由内置 OpenOCD 在认领调试 owner 前完成独立烧录校验（`flashBackend` 默认 `"auto"`，可选 `"native"` / `"openocd"`）；`false` 不得触发 erase/program/verify 或 Flash-only reset；
 - owner loss 结束当前 session。Watch、Timeline、RTT 和 Viewer 失败不得创建 J-Link 或 extension-host bypass。
 
-### 5. Configure external MCU Debug Views
+### 5. Configure external MCU Debug Views and built-in RTOS panel
 
-工程使用 FreeRTOS 时，**默认一次配齐全面板**，不要只写 launch/`trackDebuggers` 然后把固件缺口写成“已知限制”。全面板 = Tasks（含栈/任务 ID）+ runtime/CPU% + Queue/Mutex/Sem。精确宏、DWT 时基和 registry 对象写法见 `references/configuration-details.md` 的 RTOS Views 节。
+Orbit 自 `1.2.2` 起内置了原生底部 **RTOS** 诊断面板（`ozoneRtos`），**不再依赖或向工作区写入 `mcu-debug.rtos-views.trackDebuggers` 与 `orbit.rtosViewsAutoRefresh`**。工程使用 FreeRTOS 时，**默认一次配齐内置 RTOS 面板所需的全面板固件钩子**（Tasks + 栈水位 + runtime/CPU% + Queue/Mutex/Sem + Timers/Heap），不要只写 launch 然后把固件缺口写成“已知限制”。精确宏、DWT 时基、`rtosSnapshotPort` 和 registry 对象写法见 `references/configuration-details.md` 的内置 RTOS 面板节。
 
-补齐这些 workspace arrays（扩展未安装也先写入，并在报告里提示安装 `mcu-debug.rtos-views`、`mcu-debug.debug-tracker-vscode`、`mcu-debug.memory-view`）：
+仅补齐 Memory View 与 debug-tracker 所需的 workspace arrays（扩展未安装也先写入，并在报告里提示按需安装 `mcu-debug.memory-view`、`mcu-debug.debug-tracker-vscode`）：
 
 - `memory-view.trackDebuggers`；
-- `mcu-debug.rtos-views.trackDebuggers`；
 - `mcu-debug.debug-tracker-vscode.trackDebuggers`。
 
-数组中加入字符串 `"orbit"`，并为旧配置保留 `"ozone"`；去重并保留其他 debugger 类型。执行 `Orbit: Enable MCU Debug Views Integration` 后按提示 Reload Window。Orbit 提供 DAP memory、`memoryReference`、RTOS capability 和 SVD metadata，但不把外部视图的 UI 或 kernel/SVD parser 复制进本 skill。
+数组中加入字符串 `"orbit"`，并为旧配置保留 `"ozone"`；去重并保留其他 debugger 类型。执行 `Orbit: Enable MCU Debug Views Integration` 后按提示 Reload Window。Orbit 提供 DAP memory、`memoryReference`、RTOS capability 和 SVD metadata，但不把外部视图的 UI 或 SVD parser 复制进本 skill。
 
-`rtos` / `orbit.defaultRtos` 只有在 firmware 实际使用对应 RTOS 时才填写，例如 `FreeRTOS`。不要把启动成功当作 RTOS Views 已在硬件上验证。
+`rtos` / `orbit.defaultRtos` 只有在 firmware 实际使用对应 RTOS 时才填写，例如 `FreeRTOS`（不要写 `CMSIS-RTOS`）。需要启用精确栈高水位扫描与 CPU% 估算口径时，按实际核对的 port 与计时器频率在 `launch.json` 补充 `rtosSnapshotPort`。不要把启动成功当作硬件已验证。
 
 #### FreeRTOS 全面板（默认应用）
 
@@ -128,19 +127,17 @@ CMSIS-DAP owner 规则：
 
 用户明确说只要 launch、不要改固件时，才跳过上述固件补丁并在报告中列出缺口。
 
-FreeRTOS 兼容性验收补充：
+FreeRTOS 与 SystemView 补充：
 
-- FreeRTOS 10.x 配合 CMSIS-RTOS v1 wrapper 时，launch 使用 `"rtos": "FreeRTOS"`；`CMSIS-RTOS` 是 API wrapper 名称，不是 RTOS Views 的识别值。
-- J-Link 和 CMSIS-DAP HID 都可以承载同一套 RTOS View DAP 合同。`probe: "cmsis-dap"` 必须由唯一 CMSIS-DAP helper owner 服务，不能创建 J-Link、Legacy 或第二个 target owner；J-Link 路径同样只能保留一个活动 owner。
-- 最低 DAP 合同包括 `initialize.supportsRTOS` / `rtosName`、`rtosInfo`、`evaluate`、可展开的 `variables` / `variablesReference`、有效 `memoryReference` 以及 byte-oriented `readMemory`。RTOS View 失败时要保留 `errorCode`、`targetState`、`elapsedMs` 和 `diagnostics`。
-- RTOS 链表和 runtime counter 必须来自同一停止态快照；Continue、Halt、Step、Reset、Disconnect 或 session replacement 时取消排队的 RTOS refresh，旧 generation 的结果不得发布。RTOS refresh 只能作为 background/低优先级读取，不能阻塞控制操作或禁用 Watch、Timeline、RTT、变量树和 Memory View。
-- 遇到 `Unable to collect full RTOS information` 或 `No RTOS detected` 时，先确认目标已停止、ELF 与实际固件一致，再终止旧 session、Reload Window 并创建新 session；外部 RTOS Views 会缓存当前 session 的检测失败。瞬态 `Busy` / `TargetReadUnavailable` 应允许重试，符号缺失等永久错误才应报告为配置问题。
-- `vet6_led` 的 `RTT_BENCH_ENABLE=ON` fixture 会额外创建 `rttBench`，并注册同名 `rtosViewQueue` / `rtosViewMutex` / `rtosViewSemaphore`。全面板默认对象与该 fixture 同名时不要重复创建。该 fixture 的 4 任务快照不是所有工程的固定期望；未开 bench 时任务数以工程实际线程 + IDLE 为准。
+- FreeRTOS 10.x 配合 CMSIS-RTOS v1 wrapper 时，launch 使用 `"rtos": "FreeRTOS"`；保留完整 DWARF（`-g`/`-g3`，禁止对调试 ELF 执行 `strip`），否则内置 RTOS 面板会报 `DwarfUnavailable`。
+- J-Link、CMSIS-DAP 与 RMLink 均可复用同一活动调试会话为内置 RTOS 面板提供快照与 SystemView RTT 访问，不会创建第二个 target owner；RTOS 刷新与 RTT 均为低优先级后台工作，不会阻塞调试控制。
+- 如用户需要 SystemView Trace 泳道与事件分析，提示按 `Releases/docs/RTOS诊断功能使用教程.md` 接入 SEGGER SystemView（提供独立 `SysView` RTT 通道，Continuous 模式不要在启动时主动调用 `SEGGER_SYSVIEW_Start()`）。
+- `vet6_led` 的 `RTT_BENCH_ENABLE=ON` fixture 会额外创建 `rttBench`，并注册同名 `rtosViewQueue` / `rtosViewMutex` / `rtosViewSemaphore`。全面板默认对象与该 fixture 同名时不要重复创建。
 
 ### 6. Configure RTT and P-RTLog
 
-- RTT 默认 `rttLogEnabled: true`，up-buffer 默认 `0`，默认 poll interval `500 ms`，每轮默认读取 `64 bytes`，输出默认到 `terminal`。
-- J-Link RTT 使用 DLL API；CMSIS-DAP RTT 使用目标内存 control block/ring buffer，必要时配置 `rttControlBlockAddress`。两者都必须复用当前 owner。
+- RTT 默认 `rttLogEnabled: true`，up-buffer 默认 `0`，默认 poll interval `50 ms`，每轮默认读取 `4096 bytes`，输出默认到 `terminal`。
+- J-Link RTT 使用 DLL API；CMSIS-DAP 与 RMLink RTT 使用目标内存 control block/ring buffer，必要时配置 `rttControlBlockAddress`。所有探针均复用当前 owner，且普通文本日志通道（如通道 0 `Terminal`）可与 SystemView 通道（`SysView`）共存。
 - `rttLogTarget` 只能使用 `terminal`、`debugConsole` 或 `both`。
 - `pRtLogEnabled` 默认 `false`；仅在当前 firmware 使用 tokenized P-RTLog 或用户明确要求时打开。
 - P-RTLog 解码使用当前 ELF/AXF 的 `.pw_tokenizer.entries`；`pRtLogRoot` 是当前源码读取的配置/诊断值，不要描述成 token 搜索目录，除非源码已改变并重新核对。

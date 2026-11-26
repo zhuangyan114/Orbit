@@ -112,6 +112,10 @@ python -m unittest clients/python/test_orbit_client.py
 | `poll_snapshots([{method, params, context}], interval=, iterations=)` | 轮询只读快照 |
 | `events(event_types=, last_event_id=)` | SSE 迭代器；多类型在本地过滤 |
 | `close()` | `orbit.connection.close`，清 `connection_id` / `session` |
+| `rtos_capabilities(include_trace=True)` / `rtos_snapshot(...)` | 读取活动会话的 RTOS 能力与 FreeRTOS 快照 |
+| `trace_recordings(source="all")` / `trace_status(record_id, include_segments=False)` | 列出当前录制或已打开的离线归档，并查询状态/时间段 |
+| `start_trace(idempotency_key, mode="continuous")` / `stop_trace(record_id, idempotency_key)` | 启停 SystemView 录制（需 `record` + `rtt.control`） |
+| `trace_events(window)` / `trace_statistics(window)` | 按半开区间 `[start, end)` 分页读取事件或查询区间统计 |
 | `decode_base64(s)` | 校验后解 memory/RTT 的 Base64 |
 
 `invoke` 的 `context`（客户端填 identity / generation / idempotencyKey，不要自己塞 `context` 对象）：
@@ -165,14 +169,14 @@ Handshake 只给 `requestedScopes ∩ orbit.automation.allowedScopes`。token �
 
 | scope | 典型方法 |
 |---|---|
-| `read` | list/snapshot/runtime/evaluate/read/memory.read/record.get/rtt.read/diagnostics |
+| `read` | list/snapshot/runtime/evaluate/read/memory.read/record.get/rtt.read/rtos.\*/trace.list\|status\|events\|statistics/diagnostics |
 | `session.control` | session.start/stop/restart，target.pause/continue/reset/step\* |
 | `breakpoints.write` | breakpoints.add/update/remove/replace |
 | `variables.write` | expression.writeMany |
 | `memory.write` | memory.write |
 | `view.write` | watch.add/replace/remove，timeline.replace/start/stop |
-| `record` | record.start/stop/clear |
-| `rtt.control` | rtt.start/stop |
+| `record` | record.start/stop/clear，trace.start/stop（需同时授权 `rtt.control`） |
+| `rtt.control` | rtt.start/stop，trace.start/stop（需同时授权 `record`） |
 | `flash` | target.flash（另需工作区授权；未授权不要请求） |
 
 `orbit.experiment.run` 的实际 scope 是步骤并集（读/写/录）。

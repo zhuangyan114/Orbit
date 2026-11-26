@@ -1,6 +1,6 @@
 # Orbit RTOS 诊断功能详细介绍与使用教程
 
-> 适用版本：Orbit for VS Code `1.2.1` 及以上  
+> 适用版本：Orbit for VS Code `1.2.2` 及以上  
 > 适用范围：ARM Cortex-M（单核）FreeRTOS 内核快照诊断与 SEGGER SystemView Trace 全链路分析
 
 Orbit 内置了原生 **RTOS 诊断面板**（位于 VS Code 底部面板区，视图名 **RTOS**，视图 ID：`ozoneRtos`），直接复用当前活动调试会话的芯片接入通道，无需安装第三方 `mcu-debug.rtos-views` 扩展，也无需启动外部 Ozone 或 SystemView 桌面软件，即可在 VS Code 内完成**内核对象快照**、**实时/离线任务与中断泳道分析**、**上下文 CPU 负载与延迟统计**、**百万级事件检索**以及**与变量 TIMELINE 波形的跨面板时间联动**。
@@ -122,7 +122,7 @@ Orbit RTOS 诊断系统在底部 **RTOS** 面板中分为三个顶层子视图�
       "program": "${workspaceFolder}/build/app.elf",
       "device": "STM32H723VG",
       "interface": "SWD",
-      "speed": 4000,
+      "speedKHz": 4000,
       "rtos": "FreeRTOS",
       "flashBeforeDebug": true,
       "runToEntryPoint": "main",

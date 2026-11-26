@@ -16,13 +16,14 @@
 | `orbit.defaultProgram` | path | `""` | 默认 ELF/AXF；空值时扫描 `build/Debug`、`build/Release`、`build`。|
 | `orbit.defaultSvdFile` | path | `""` | 外部 Peripheral Viewer 使用的 SVD 默认路径。|
 | `orbit.svdAutoDownload` | boolean | `true` | 本地没有匹配项时按需下载并缓存对应 STM32 系列的一个 Keil DFP，只提取当前芯片 SVD。|
-| `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称；例如实际使用 FreeRTOS 时写 `FreeRTOS`。|
-| `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次 stack trace 后是否请求外部 RTOS Views focus/refresh。|
+| `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称（例如 `FreeRTOS`），用于 Orbit 内置 RTOS 面板及标准 DAP `rtosInfo`。|
+| `orbit.logging.enabled` | boolean | `true` | 是否记录 Orbit 内部诊断日志（`outputs/Log/`）。|
+| `orbit.logging.clearOnStart` | boolean | `true` | 扩展或调试会话启动时是否清空旧日志。|
 | `orbit.rttLogEnabled` | boolean | `true` | 是否读取 SEGGER RTT。|
 | `orbit.rttBufferIndex` | number | `0`, `0..15` | RTT up-buffer index。|
 | `orbit.rttPollIntervalMs` | number, ms | `50`, `10..5000` | RTT poll interval。|
 | `orbit.rttReadSize` | number, bytes/poll | `4096`, `64..65536` | 每轮 RTT 最大读取字节数。|
-| `orbit.rttControlBlockAddress` | string | `""` | RTT control block address；J-Link 可自动检测，CMSIS-DAP 可从 ELF 符号定位或使用显式地址。|
+| `orbit.rttControlBlockAddress` | string | `""` | RTT control block address；J-Link 可自动检测，CMSIS-DAP / RMLink 可从 ELF 符号定位或使用显式地址。|
 | `orbit.rttStripAnsi` | boolean | `true` | 仅去除写入 Debug Console 的 ANSI 控制序列。|
 | `orbit.rttLogTarget` | `terminal` / `debugConsole` / `both` | `terminal` | RTT 输出位置。|
 | `orbit.pRtLogEnabled` | boolean | `false` | 是否把 RTT bytes 解码为 P-RTLog tokenized frames。|
@@ -32,15 +33,18 @@
 | `orbit.watchPollIntervalMs` | number, ms | `500`, `100..10000` | Watch Webview 可见时的刷新计时基准。|
 | `orbit.timelineSampleIntervalMs` | number, ms | `0.2`, `0.1..10000` | Timeline target sampling 目标间隔。|
 | `orbit.timelineSendIntervalMs` | number, ms | `16`, `1..10000` | Timeline 向 Webview 发送更新的间隔。|
+| `orbit.flashBeforeDebug` | boolean | `true` | 启动调试前默认是否烧录固件。|
+| `orbit.recentSessions` | number | `10`, `0..50` | 保留的最近调试会话数量。|
+| `orbit.automation.enabled` | boolean | `false` | 是否开启本机 `127.0.0.1` Automation API v1。|
+| `orbit.automation.allowedScopes` | string[] | `["read"]` | 自动化接口允许授予的最高权限范围（`read` / `session.control` / `breakpoints.write` / `view.write` / `record` / `rtt.control` / `variables.write` / `memory.write` / `flash`）。|
 
-`orbit.flashBeforeDebug` 默认 `true`。launch 层可覆盖它：J-Link 使用 Commander 烧录，CMSIS-DAP 使用当前 helper owner 的 Flash Algorithm；`false` 跳过所有 Flash 操作。
+`orbit.flashBeforeDebug` 默认 `true`。launch 层可覆盖它：J-Link 使用 Commander 烧录，CMSIS-DAP / RMLink 按 `flashBackend`（默认 `auto`）优先使用原生快速算法或随扩展提供的 OpenOCD 独立烧录；`false` 跳过所有 Flash 操作。
 
-External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目标 workspace 中加入：
+External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目标 workspace 中加入（Orbit 已内置原生 RTOS 面板，不再写入 `mcu-debug.rtos-views.trackDebuggers`）：
 
 ```json
 {
   "memory-view.trackDebuggers": ["orbit", "ozone"],
-  "mcu-debug.rtos-views.trackDebuggers": ["orbit", "ozone"],
   "mcu-debug.debug-tracker-vscode.trackDebuggers": ["orbit", "ozone"]
 }
 ```
@@ -98,9 +102,13 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | `svdPath` | path | 跟随 `svdFile` | SVD 兼容字段；未填写时可从工作区、本机 Pack、缓存或按需下载解析。|
 | `interface` | `SWD` / `JTAG` | `SWD` | 调试接口；当前 CMSIS-DAP 与 RMLink 路径使用 SWD。|
 | `speedKHz` | number, kHz | `4000` | target interface speed。|
-| `flashBeforeDebug` | boolean | `true` | 使用当前 owner 烧录/校验；Restart 时 ELF 未变化跳过烧录并复位直接运行，变化后重烧并停在 `runToEntryPoint`；`false` 明确跳过。|
+| `flashBeforeDebug` | boolean | `true` | 使用所选探针烧录/校验；Restart 时 ELF 未变化跳过烧录并复位直接运行，变化后重烧并停在 `runToEntryPoint`；`false` 明确跳过。|
+| `flashBackend` | `auto` / `native` / `openocd` | `auto` | 为 DAPLink 与 RMLink 选择烧录方式：`auto` 优先原生快速算法，其余受支持 STM32 用内置 OpenOCD；`native` 仅用内置算法；`openocd` 显式使用内置 OpenOCD。|
 | `runToEntryPoint` | string / `false` | `main` | J-Link、CMSIS-DAP 和 RMLink 烧录后停靠符号（Restart 仅程序变化后停靠）；`false` 禁用。|
-| `rtos` | string | `""` | 传给 RTOS Views 的 RTOS 名称。|
+| `rtos` | string | `""` | 目标 RTOS 名称（如 `FreeRTOS`），用于 Orbit 内置 RTOS 面板及标准 DAP `rtosInfo`。|
+| `rtosSnapshotPort` | object | 未配置 | FreeRTOS 栈水位与运行统计端口口径（`source`、`stackGrowth`、`stackFillByte`、`runtime`）；缺省时相关列保持不可用。|
+| `loggingEnabled` | boolean | `true` | 是否启用 Orbit 内部诊断日志。|
+| `clearLogsOnStart` | boolean | `true` | 启动会话时是否清空旧诊断日志。|
 | `rttLogEnabled` | boolean | `true` | 是否轮询 RTT。|
 | `rttBufferIndex` | number | `0` | RTT up-buffer index；运行时限制为 `0..15`。|
 | `rttPollIntervalMs` | number, ms | `50` | RTT poll interval；schema 限制 `10..5000`。|
@@ -112,9 +120,6 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | `pRtLogRoot` | path | `""` | 当前为 decoder 诊断配置，不是 token 搜索目录。|
 | `nativeDebugEngineEnabled` | boolean | `true` | Native helper 开关。|
 | `nativeDebugEngineMode` | enum | `auto` | `legacy`、`native` 或 `auto`。|
-| `nativeDebugEngineStepInto` | boolean | `true` | Native step into 开关。|
-| `nativeDebugEngineStepOver` | boolean | `true` | Native step over 开关。|
-| `nativeDebugEngineStepOut` | boolean | `true` | Native step out 开关。|
 
 源码还支持 `elfPath` 作为 `program` 的兼容别名。`probe`、`interface`、`device`、`speedKHz`、`flashBeforeDebug`、`rtos` 和所有 RTT/P-RTLog/owner 字段最终由 DAP session 使用。
 
@@ -154,7 +159,7 @@ set(CMAKE_SIZE "${ARM_TOOLCHAIN_BIN_DIR}/arm-none-eabi-size.exe")
 
 CMSIS-DAP owner 负责协议 framing、SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm 和内存型 RTT。它不回退到 J-Link/Legacy，也不允许 Watch、Timeline、RTT 或 Viewer 创建第二个 target owner。
 
-默认 `flashBeforeDebug: true` 要求目标型号和 Flash Algorithm 匹配，并由同一 owner 完成 erase/program/verify；`false` 不得发出 Flash 操作。使用自定义 `cmsisDapFlashAlgorithmPath` 时，必须确认来源、许可、目标范围、RAM 布局和 ABI。
+默认 `flashBeforeDebug: true` 按 `flashBackend`（默认 `auto`）处理：已登记型号使用原生快速 Flash Algorithm，其余受支持 STM32（部分 F1/F4/H72x/G0/G4）在建立调试 owner 前通过随扩展提供的 OpenOCD 子进程完成独立烧录与校验（OpenOCD 进程完全退出后再建立调试 owner）；`false` 不得发出 Flash 操作。使用自定义 `cmsisDapFlashAlgorithmPath` 时，必须确认来源、许可、目标范围、RAM 布局和 ABI。
 
 ## Native / Legacy owner
 
@@ -162,38 +167,44 @@ Native helper 路径为 source checkout 的 `out/native/win32-x64/orbit-jlink-he
 
 Native scheduler 的优先级是 `control > watch > timeline > background`。step、continue、halt、reset、breakpoint、Flash 和 write 属于 control work；RTT/RTOS refresh 属于 background。不要通过第二个 owner 绕过调度。
 
-## RTOS Views
+## 内置 RTOS 面板与 FreeRTOS 全面板
 
-Orbit 通过 DAP capability 和外部 extension tracker 对接 RTOS Views；Orbit 本身不解析 RTOS kernel。需要三层同时正确，**配置 skill 默认一次做完**，不要只配 launch：
+Orbit 自 `1.2.2` 起在底部面板区原生内置 **RTOS** 视图（`ozoneRtos`），直接从 ELF DWARF 类型图推导 FreeRTOS 结构偏移并通过当前活动会话探针读取，**不再依赖外部 `mcu-debug.rtos-views` 扩展，也不再写入 `mcu-debug.rtos-views.trackDebuggers` 或 `orbit.rtosViewsAutoRefresh`**。
 
-1. tracker arrays 含 `"orbit"`（兼容时同时保留 `"ozone"`），且对应的 MCU Debug extensions 已安装或已在报告中提示安装；
-2. launch 的 MCU、active ELF、SVD、`rtos` 一致；
-3. firmware USER CODE 具备 Tasks + runtime/CPU% + Queue/Mutex/Sem 全面板所需的 symbols、trace、runtime-stat 和 queue registry。
+要一次配齐内置 RTOS 面板的全面板能力（Tasks + 栈水位 + runtime/CPU% + Queue/Mutex/Sem + Timers/Heap），**配置 skill 默认一次做完**：
 
-`orbit.rtosViewsAutoRefresh` 默认 `false`；设为 `true` 时，源码会在外部 tracker 报告首次 stack trace 后尝试 focus/refresh RTOS Views。
+1. launch 的 MCU（`device`，用于 RAM 范围校验）、active ELF（带完整 `-g`/`-g3` DWARF，禁止 `strip`）、SVD、`rtos`（以及核对后的 `rtosSnapshotPort`）一致；
+2. firmware USER CODE 具备 Tasks + 栈边界 + runtime/CPU% + Queue/Mutex/Sem 全面板所需的宏、DWT 时基和 queue registry；
+3. 如用户还需要 SEGGER SystemView Trace 泳道与事件分析，按 `Releases/docs/RTOS诊断功能使用教程.md` 接入 SystemView 并配置独立 `SysView` RTT 通道。
 
 ### FreeRTOS / CMSIS-RTOS v1
 
 FreeRTOS 10.x 使用 CMSIS-RTOS v1 wrapper 时，launch 示例为：
 
-```json
+```jsonc
 {
   "type": "orbit",
   "request": "launch",
   "name": "Orbit: FreeRTOS STM32F407",
   "program": "${workspaceFolder}/build/Debug/firmware.elf",
   "device": "STM32F407VE",
-  "rtos": "FreeRTOS"
+  "rtos": "FreeRTOS",
+  "rtosSnapshotPort": {
+    "source": "GCC/ARM_CM4F",
+    "stackGrowth": "down",
+    "stackFillByte": 165,
+    "runtime": {
+      "source": "DWT_CYCCNT",
+      "frequencyHz": 656250,
+      "countsDuringSleep": false
+    }
+  }
 }
 ```
 
-`rtos` 必须写 `FreeRTOS`，不要写 `CMSIS-RTOS`。后者是 API wrapper，不是外部 RTOS Views 的识别名称。J-Link 和 CMSIS-DAP HID 均可使用此配置；CMSIS-DAP 会话必须保持唯一 CMSIS-DAP helper owner，不能与 J-Link/Legacy owner 并存。
+`rtos` 必须写 `FreeRTOS`，不要写 `CMSIS-RTOS`。`rtosSnapshotPort.runtime.frequencyHz` 必须填写真实计数器有效频率（例如使用 `DWT->CYCCNT >> 8` 时应为 `SystemCoreClock / 256`）。J-Link、CMSIS-DAP 与 RMLink 均可复用唯一活动调试会话提供快照与 SystemView RTT 读取，不能并存第二个 target owner。
 
-外部 RTOS Views 通过以下 DAP 请求展开信息：`initialize` 的 `supportsRTOS` / `rtosName`、`rtosInfo`、`evaluate`、`variables`、`stackTrace` 和 `readMemory`。变量树必须返回可继续请求的 `variablesReference` 与有效 `memoryReference`；`readMemory` 使用 byte-oriented 数据。FreeRTOS 链表、TCB 和 runtime counter 应在停止态取得一致快照，运行态刷新只能走受控 background 读取。
-
-固件侧至少要从同一个 active ELF 中确认 FreeRTOS 内核符号，例如 `uxCurrentNumberOfTasks`、`pxReadyTasksLists`、`xDelayedTaskList1` 和 `pxCurrentTCB`（多数为 `static`，靠 DWARF 解析，因此保持 Debug `-g`）。名称列若显示 `0x0800...`，通常是 registry 字符串指针尚未被外部视图解引用，不代表对象读取失败。
-
-`Unable to collect full RTOS information` / `No RTOS detected` 可能是停止态读取被控制操作取消、目标仍在运行或旧 session 缓存了失败结果。确认目标停止后，结束旧调试会话、Reload Window、重新启动 launch，再刷新 RTOS Views；`Busy`、`TargetReadUnavailable` 等瞬态错误应重试，符号缺失才作为永久配置错误报告。
+固件侧至少要从同一个 active ELF 中确认 FreeRTOS 内核符号，例如 `uxCurrentNumberOfTasks`、`pxReadyTasksLists`、`xDelayedTaskList1` 和 `pxCurrentTCB`（多数为 `static`，靠 DWARF 解析，因此保持 Debug `-g`）。运行中读取遇链表变动会标明 `partial`，需要精确核对或死锁确认时请暂停目标后刷新以获取 `halted-consistent`。
 
 ### CubeMX 全面板默认补丁
 
@@ -275,7 +286,7 @@ frame 的前 4 bytes 是 little-endian token。decoder 从 active ELF 的 `.pw_t
 
 ## MCP and Plugin API
 
-MCP server：`Releases/mcp/orbit-mcp-server.js`，stdio 进程；它通过 Node automation client 读取 `ORBIT_AUTOMATION_REGISTRY`（Windows 默认 `%LOCALAPPDATA%\Orbit\automation\registries.json`），握手后调用 `POST /v1/rpc`。多个相同 `projectId` 实例必须指定 `instanceId`。当前 tools：`orbit_instances`、`orbit_handshake`、session/control/breakpoint/memory tools，以及 `orbit_status`、`orbit_read_many`、`orbit_write_many`、`orbit_record`、`orbit_experiment_run`。`tools/list` 对全可选工具也发出 `required: []`，避免 opencode 把缺失字段序列化成 `required: null` 后被严格中转拒绝。
+MCP server：`Releases/mcp/orbit-mcp-server.js`，stdio 进程；它通过 Node automation client 读取 `ORBIT_AUTOMATION_REGISTRY`（Windows 默认 `%LOCALAPPDATA%\Orbit\automation\registries.json`），握手后调用 `POST /v1/rpc`。多个相同 `projectId` 实例必须指定 `instanceId`。当前 tools：`orbit_instances`、`orbit_handshake`、`orbit_project_describe`、session/control/breakpoint/memory/expression/diagnostics tools、RTOS/Trace tools（`orbit_rtos_capabilities`、`orbit_rtos_snapshot`、`orbit_trace_list`、`orbit_trace_status`、`orbit_trace_start`、`orbit_trace_stop`、`orbit_trace_events`、`orbit_trace_statistics`），以及 `orbit_status`、`orbit_read_many`、`orbit_write_many`、`orbit_record`、`orbit_experiment_run`。`tools/list` 对全可选工具也发出 `required: []`，避免 opencode 把缺失字段序列化成 `required: null` 后被严格中转拒绝。
 
 如果活动 `orbit` DAP session（或旧 `ozone` 别名）存在，runtime reads/writes/status 通过该 DAP session 路由；DAP 请求失败应返回错误，不回退到另一个 Extension Host target owner。
 

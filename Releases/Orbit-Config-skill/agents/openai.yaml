@@ -1,4 +1,4 @@
 interface:
   display_name: "Orbit Workspace Config"
-  short_description: "Configure four Orbit J-Link/DAPLink launches."
-  default_prompt: "Use $Orbit-Config-skill to configure or audit this STM32 workspace. Always generate the four standard J-Link/DAPLink flash and no-flash launches, leave DAPLink unbound unless I explicitly request a probe selector, and when the firmware uses FreeRTOS apply the full RTOS Views panel by default (trace/stack/runtime-stat USER CODE, DWT timer, and queue registry objects) unless I say not to change firmware."
+  short_description: "Configure and verify an STM32 workspace for Orbit."
+  default_prompt: "Use $Orbit-Config-skill to configure or audit this STM32 workspace for Orbit (J-Link, CMSIS-DAP/DAPLink, or RMLink). Keep a minimal Orbit Debug launch unless I ask for extra probe/flashBackend variants, leave DAPLink unbound unless I explicitly request a probe selector, and when the firmware uses FreeRTOS apply the built-in RTOS panel hooks by default (trace/stack/runtime-stat USER CODE, DWT timer, queue registry objects, and rtosSnapshotPort) unless I say not to change firmware."

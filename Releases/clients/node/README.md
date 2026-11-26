@@ -118,7 +118,7 @@ node cli.js read cnt --instance <id>
 
 命令集与上表相同（无 `refresh`/`quit`）。`step`/`breakpoints`/`record` 用 `--action`；`read` 位置参数进 `expressions`；`start` 可带 configurationId。
 
-库入口是 `index.js` / `index.d.ts`（`require("./index")`）。
+库入口是 `index.js` / `index.d.ts`（`require("./index")`），除基础 RPC 封装外还提供 RTOS 与 SystemView Trace 便捷方法：`rtosCapabilities`、`rtosSnapshot`、`traceRecordings`、`traceStatus`、`startTrace`、`stopTrace`、`traceEvents`、`traceStatistics`（查询支持 `AbortSignal`）。
 
 ## 租约
 

@@ -1,6 +1,6 @@
 ---
 name: orbit-mcp-control
-description: Use Orbit MCP to inspect and control an STM32/J-Link or CMSIS-DAP target through the Orbit for VS Code plugin. Use when an agent needs to discover VS Code instances, handshake, start or control a visible debug session, read or write expressions, access memory, manage breakpoints, record synchronized waveform data, run generic experiments, or standardize tuning workflows such as PID, cascaded PID, motor, chassis, gimbal, or other embedded control loops.
+description: Use Orbit MCP to inspect and control an STM32 target over J-Link, CMSIS-DAP/DAPLink, or RMLink through the Orbit for VS Code plugin. Use when an agent needs to discover VS Code instances, handshake, start or control a visible debug session, read or write expressions, access memory, manage breakpoints, inspect FreeRTOS snapshots or SEGGER SystemView traces, record synchronized waveform data, run generic experiments, or standardize tuning workflows such as PID, cascaded PID, motor, chassis, gimbal, or other embedded control loops.
 ---
 
 # Orbit MCP Control
@@ -19,7 +19,7 @@ The VS Code Orbit debug session owns the single physical target. MCP never selec
     "orbit": {
       "command": "node",
       "args": [
-        "C:\\Users\\22690\\Desktop\\AI\\Orbit\\Releases\\mcp\\orbit-mcp-server.js"
+        "<path-to-orbit>\\Releases\\mcp\\orbit-mcp-server.js"
       ]
     }
   }
@@ -42,11 +42,15 @@ v1 tools:
 
 - `orbit_instances`: list live instances; never returns tokens.
 - `orbit_handshake`: validate project/instance and requested scopes.
+- `orbit_project_describe`: return project identity and workspace folders.
 - `orbit_session_list` / `orbit_session_snapshot` / `orbit_session_start` / `orbit_session_stop`
 - `orbit_target_pause` / `orbit_target_continue` / `orbit_target_reset` / `orbit_target_step`
 - `orbit_breakpoints_list` / `orbit_breakpoints_add`
 - `orbit_memory_read` / `orbit_memory_write`
 - `orbit_record_get` / `orbit_expression_evaluate` / `orbit_diagnostics_snapshot`
+- `orbit_rtos_capabilities` / `orbit_rtos_snapshot`: inspect FreeRTOS capabilities and task/object/timer/heap snapshots (`read` scope; check `consistency` and `reason`).
+- `orbit_trace_list` / `orbit_trace_status` / `orbit_trace_events` / `orbit_trace_statistics`: inspect active SystemView recordings or offline archives already opened in the RTOS panel (`read` scope, half-open `[start, end)` decimal-string windows, up to 200 events per page via `nextOffset`).
+- `orbit_trace_start` / `orbit_trace_stop`: start or stop a SystemView capture on the active session (requires both `record` and `rtt.control` scopes plus `idempotencyKey`).
 - `orbit_status` → `orbit.session.list`
 - `orbit_read_many` → `orbit.expression.readMany`
 - `orbit_write_many` → `orbit.expression.writeMany`

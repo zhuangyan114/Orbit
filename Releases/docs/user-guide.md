@@ -11,7 +11,7 @@
 - [5. Timeline 波形采样](#5-timeline-波形采样)
 - [6. RTT 日志](#6-rtt-日志)
 - [7. P-RTLog 二进制日志](#7-p-rtlog-二进制日志)
-- [8. RTOS Views](#8-rtos-views)
+- [8. RTOS 诊断与 SystemView Trace](#8-rtos-诊断与-systemview-trace)
 - [9. Memory View](#9-memory-view)
 - [10. Peripheral Viewer](#10-peripheral-viewer)
 - [11. 调试通道与调度机制](#11-调试通道与调度机制)
@@ -41,7 +41,7 @@ Releases 中也会附带独立的 MCP server 和配置 Skill，配合 AI 进行�
 | 目标芯片 | 面向 STM32 与 ARM Cortex-M。J-Link 支持其自带器件库中的所有芯片；CMSIS-DAP / RMLink 烧录优先使用内置 F103C8、F407VE/IG、H723VG 快速算法，其余受支持的 STM32 F1/F4/H72x/G0/G4 型号由随扩展提供的 OpenOCD 烧录。 |
 | 调试探针 | 支持 SEGGER J-Link（需安装 SEGGER 软件包提供 `JLink_x64.dll`）、CMSIS-DAP / DAPLink（HID v1、WinUSB v2 与 TCP 网络探针）以及 RMLink 连接服务。WinUSB 详细测试见 [WinUSB 报告](../../docs/cmsis-dap-v2-winusb-report.md)。 |
 | 固件文件 | 需要带 DWARF 调试信息的 `.elf` 或 `.axf` 文件。 |
-| 外部视图 | RTOS Views、Memory View 和 Peripheral Viewer 由对应外部扩展提供，Orbit 负责向它们提供内存、寄存器和符号数据。 |
+| 外部视图 | Memory View 和 Peripheral Viewer 由对应外部扩展提供，Orbit 负责向它们提供内存、寄存器和符号数据；FreeRTOS 诊断与 SystemView Trace 已由 Orbit 原生内置。 |
 
 ### 1.3 GNU Arm 符号工具链
 
@@ -215,7 +215,10 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
 | `speedKHz` | number（kHz） | `4000` | SWD / JTAG 通信时钟频率。 |
 | `flashBeforeDebug` | boolean | `true` | 启动前是否烧录固件。点击“重启”时若固件未变化则自动跳过烧录直接复位运行，固件变化后重烧并停在入口；设为 `false` 则始终跳过烧录。 |
 | `runToEntryPoint` | string / `false` | `"main"` | J-Link、CMSIS-DAP 和 RMLink 烧录后自动停靠的函数名（重启时仅固件变化后停靠）；设为 `false` 禁用。 |
-| `rtos` | string | `""` | 传给外部 RTOS Views 的系统名称（如 `"FreeRTOS"`，兼容别名 `defaultRtos`）。 |
+| `rtos` | string | `""` | 目标 RTOS 名称（如 `"FreeRTOS"`），用于 Orbit 内置 RTOS 面板及标准 DAP `rtosInfo`（兼容别名 `defaultRtos`）。 |
+| `rtosSnapshotPort` | object | 未配置 | FreeRTOS 栈高水位扫描与 CPU% 运行统计端口参数（`source`、`stackGrowth`、`stackFillByte`、`runtime`），缺省时相关列保持不可用。 |
+| `loggingEnabled` | boolean | `true` | 是否启用 Orbit 内部诊断日志（`step`、`eval`、`dll`、`dap`）。 |
+| `clearLogsOnStart` | boolean | `true` | 启动会话时是否清空旧的内部诊断日志。 |
 | `rttLogEnabled` | boolean | `true` | 是否开启 SEGGER RTT 日志读取。 |
 | `rttBufferIndex` | number（`0..15`） | `0` | RTT 上行缓冲区编号。 |
 | `rttPollIntervalMs` | number（`10..5000` ms） | `50` | RTT 轮询间隔。 |
@@ -252,8 +255,7 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
 | `orbit.defaultProgram` | path | `""` | 默认固件路径，留空自动扫描 `build/` 目录。 |
 | `orbit.defaultSvdFile` | path | `""` | 默认 SVD 文件路径。 |
 | `orbit.svdAutoDownload` | boolean | `true` | 本地缺少 SVD 时先正常启动调试，并在后台按芯片系列下载缓存 Keil DFP 中的对应 SVD。 |
-| `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称（如 `"FreeRTOS"`）。 |
-| `orbit.rtosViewsAutoRefresh` | boolean | `false` | 首次命中断点获取栈帧后自动刷新外部 RTOS Views（开启会略微增加调试通信开销）。 |
+| `orbit.defaultRtos` | string | `""` | 默认 RTOS 名称（如 `"FreeRTOS"`），用于内置 RTOS 面板与标准 DAP `rtosInfo`。 |
 | `orbit.logging.enabled` | boolean | `true` | 是否记录 Orbit 内部诊断日志（输出到 `outputs/Log/`）。 |
 | `orbit.logging.clearOnStart` | boolean | `true` | 每次启动时是否清空旧的内部诊断日志。 |
 | `orbit.rttLogEnabled` | boolean | `true` | 默认启用 RTT。 |
@@ -284,7 +286,7 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
   - 点击箭头或双击变量名可展开结构体、数组或指针，勾选或取消勾选后点击「添加」一次性应用增删；点击「关闭」、`Esc` 或切换窗口会取消本次修改。
 - **多分组管理**：顶部提供 `watch1`、`watch2` 等分组标签，支持新建分组（自动复用最小空缺编号）、点击切换、双击重命名（支持中文）、拖动调整标签顺序以及点击 `×` 删除分组（至少保留一个）。
 - **数值实时查看与高亮**：支持展开结构体、数组和指针查看子成员；数值发生变化时会自动高亮提示（持续 500 ms）。
-- **直接修改变量值**：点击叶子数值可以直接修改并写入 MCU 内存，支持十进制、科学计数法和 `0x...` 十六进制格式（复合结构节点不能整体直接写入）。
+- **运行中不停机直写（Live Write）**：点击叶子数值可以直接修改并写入 MCU 内存，支持十进制、科学计数法和 `0x...` 十六进制格式（复合结构节点不能整体直接写入）。目标运行中改参无需临时暂停（halt）和恢复芯片，避免打断 PWM、实时控制中断或触发看门狗；CMSIS-DAP 采用原生 8/16/32-bit MEM-AP CSW 写入消除子字写竞态，同时保留控制写屏障与 RAM 地址边界安全校验。
 - **一键发送到 Timeline**：点击 Watch 行上的图表图标，可直接把该数值变量添加到 Timeline 采样。
 
 ### 4.2 状态与调度机制
@@ -353,7 +355,7 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
 | `rttStripAnsi` | `true` | 写入 Debug Console 前去除颜色控制码。 |
 | `rttLogTarget` | `"terminal"` | 显示目标：`terminal`、`debugConsole` 或 `both`。 |
 
-注：在高速 Timeline 采样期间，后台 RTT 轮询可能会自动暂停以让出探针带宽，采样停止后自动恢复。
+注：统一 RTT 通道支持普通文本日志（如通道 0 `Terminal`）与 SystemView 二进制流（独立 `SysView` 通道）共存。在高速 Timeline 采样期间，后台 RTT 文本轮询会自动暂停以让出探针带宽，采样停止后自动恢复。
 
 ## 7. P-RTLog 二进制日志
 
@@ -374,13 +376,21 @@ P-RTLog 是运行在 RTT 之上的二进制令牌化日志格式（基于 `pw_to
 
 请确保 ELF 文件在链接时保留了 `.pw_tokenizer.entries` 段；若遇到未识别的 token，日志中会直接输出原始 token ID 方便核对固件版本。
 
-## 8. RTOS Views
+## 8. RTOS 诊断与 SystemView Trace
 
-> **提示**：目前 Orbit 与外部 RTOS Views 扩展的兼容性仍有已知问题，暂不建议在关键任务分析中依赖该视图。
+Orbit 在 VS Code 底部面板区原生内置了 **RTOS** 诊断视图（视图 ID：`ozoneRtos`），直接复用当前活动调试会话的探针连接（支持 J-Link、CMSIS-DAP/DAPLink 与 RMLink），**不再需要安装外部 `mcu-debug.rtos-views` 扩展**（自 `1.2.2` 起已移除旧的 `mcu-debug.rtos-views.trackDebuggers` 注入和 `orbit.rtosViewsAutoRefresh` 设置）。
 
-RTOS Views 由外部扩展（`mcu-debug.rtos-views`、`mcu-debug.debug-tracker-vscode`）提供。Orbit 在激活时会自动尝试将 `"orbit"`（以及兼容旧配置 `"ozone"`）写入它们的 `trackDebuggers` 设置中；也可以在命令面板运行 `Orbit: Enable MCU Debug Views Integration` 后重载窗口。
+RTOS 面板分为三个顶层视图：
 
-如果固件使用了 RTOS，可在 `launch.json` 中加上对应的名称（例如 `"rtos": "FreeRTOS"`，请写 `"FreeRTOS"` 而不是 `"CMSIS-RTOS"`）。需要首次暂停时自动触发视图刷新，可将工作区设置 `orbit.rtosViewsAutoRefresh` 设为 `true`。
+1. **Tasks & Objects（FreeRTOS 内核快照）**：仅需带完整 DWARF 调试信息的 FreeRTOS ELF，无需修改业务代码。从真实 DWARF 类型图自动推导结构体偏移，展示：
+   - **任务**：状态、优先级（含互斥锁优先级继承标注）、列表发现证据、按需栈高水位扫描（超 85% 高亮）与双帧差分 CPU%；
+   - **队列与锁**：从 `xQueueRegistry`、ELF 全局句柄和阻塞任务等待链发现 Queue / Mutex / Recursive Mutex / Semaphore，支持持有者、递归层级与**候选死锁等待环**检测；
+   - **定时器与堆**：Software Timers 列表及 `heap_4` 容量、当前剩余、历史最低剩余与分配/释放统计。
+   - 面板顶部会标明快照一致性等级（`halted-consistent`、`live-best-effort`、`partial`、`stale`）；配置 `launch.json` 中的 `rtosSnapshotPort` 可显式提供栈增长方向、填充字节与运行时间计数器频率。
+2. **Trace Timeline（SEGGER SystemView 泳道）**：固件接入 SEGGER SystemView 并提供独立 `SysView` RTT 通道后，支持 **Continuous（流式）**、**Single-Shot（单次）** 和 **Post-Mortem（回卷）** 三种录制模式、任务/中断分层泳道、A/B 游标以及与**变量 TIMELINE 跨面板时间联动**（支持实时同会话联动及离线单点 A / 双点 A+B 手动对齐）。
+3. **Contexts & Events（统计、事件流与归档）**：提供 CPU Load 分箱图（点击分箱直接下钻到泳道）、任务/ISR 独占与包含耗时及 Ready 延迟统计、自定义 Markers、百万级分页事件与 FreeRTOS API 参数解码、Trace 终端；支持将录制保存为 **`orbit-trace-v1` 归档目录**离线回放，并支持导出 **`.bin` 原始流**和 **39 列 `.csv`**（不支持 `.SVDat`）。
+
+固件接入步骤、`FreeRTOSConfig.h` 宏对照、`rtosSnapshotPort` 写法、SystemView 配置与故障排查请查看完整的 [RTOS 诊断功能使用教程](RTOS诊断功能使用教程.md)。
 
 ## 9. Memory View
 
@@ -444,7 +454,8 @@ control（控制） > watch（变量刷新） > timeline（波形采样） > bac
 
 仓库中提供了开箱即用的 stdio MCP 适配器 `Releases/mcp/orbit-mcp-server.js`（以及兼容旧名的 `ozone-mcp-server.js`），使 Claude Code、Codex、OpenCode、Cursor 等支持 MCP 的 AI 客户端可以直接连接并控制 Orbit：
 
-- **主要工具**：`orbit_instances`、`orbit_handshake`、`orbit_session_*`、`orbit_target_*`、`orbit_breakpoints_*`、`orbit_memory_*`、`orbit_expression_evaluate`、`orbit_diagnostics_snapshot`，以及便捷组合工具 `orbit_status`、`orbit_read_many`、`orbit_write_many`、`orbit_record`、`orbit_experiment_run`。
+- **主要工具**：`orbit_instances`、`orbit_handshake`、`orbit_project_describe`、`orbit_session_*`、`orbit_target_*`、`orbit_breakpoints_*`、`orbit_memory_*`、`orbit_expression_evaluate`、`orbit_diagnostics_snapshot`，RTOS 与 SystemView Trace 工具 `orbit_rtos_capabilities`、`orbit_rtos_snapshot`、`orbit_trace_list`、`orbit_trace_status`、`orbit_trace_start`、`orbit_trace_stop`、`orbit_trace_events`、`orbit_trace_statistics`，以及便捷组合工具 `orbit_status`、`orbit_read_many`、`orbit_write_many`、`orbit_record`、`orbit_experiment_run`。
+- **RTOS / Trace 权限**：查询 RTOS 能力/快照以及读取当前录制或已在 RTOS 面板打开的离线归档只需 `read` 权限；通过 `orbit_trace_start` / `orbit_trace_stop` 启停目标录制需要同时授予 `record` 与 `rtt.control`。
 - **录波与实验限制**：单次 `orbit_record` 最多支持 64 个通道，采样间隔 `5..10000 ms`（默认 `10 ms`），单份缓存最多保留 `50000` 帧；`orbit_experiment_run` 单次最多编排 64 步（支持 `read` / `write` / `wait` / `record`），支持通过 `min` / `max` 配置写入安全边界。
 
 ## 13. 常见问题
@@ -483,6 +494,11 @@ J-Link Legacy 引擎当前固定使用 SWD；需要使用 JTAG 请确认 `orbit.
 2. 修改变量或控制调试器前，确认已在 `orbit.automation.allowedScopes` 中添加了对应权限；
 3. 确保目标变量存在于当前 ELF 符号表中（局部变量仅在停在对应作用域时可访问）。
 
+### Q10：RTOS 面板提示 `DwarfUnavailable` / `RtosNotDetected` 或探测不到 `SysView` 通道
+1. 确认编译选项开启 `-g`/`-g3` 且 `program` 指向未经 `strip` 的 ELF，并已在 `launch.json` 填写准确 `device`；
+2. 栈水位和 CPU% 不可用时，检查 `FreeRTOSConfig.h` 宏与 `launch.json` 中的 `rtosSnapshotPort` 配置；
+3. 探测 SystemView 通道前，需先从 `main` 入口断点继续运行让固件执行完 `SEGGER_SYSVIEW_Conf()`，且 Continuous 模式不要在固件启动时主动调用 `SEGGER_SYSVIEW_Start()`。完整排查见 [RTOS 诊断功能使用教程](RTOS诊断功能使用教程.md#11-常见错误码与问题排查速查表)。
+
 ## 14. 已知限制
 
 - **平台限制**：目前仅支持 Windows x64，暂不支持 macOS 与 Linux。
@@ -490,7 +506,7 @@ J-Link Legacy 引擎当前固定使用 SWD；需要使用 JTAG 请确认 `orbit.
 - **硬件断点数量**：J-Link 最多使用 6 个硬件断点槽位；CMSIS-DAP 根据芯片 FPB 比较器数量动态判断，槽位用满后新增断点会提示失败。
 - **单步与接口限制**：J-Link Legacy 模式不支持源码级单步（`stepInto`/`stepOver`/`stepOut`）与 JTAG 接口，建议保持默认的原生 helper 模式。
 - **采样频率**：`orbit.timelineSampleIntervalMs`（默认 `0.2 ms`）是期望周期而非硬实时保证，实际采样率取决于探针通信速率、通道数、指针深度和并发 Watch/RTT 负载。
-- **RTOS Views**：外部 RTOS Views 扩展的集成目前存在已知问题，暂不建议用于正式调试。
+- **内置 RTOS 诊断范围**：目前面向单核 ARM Cortex-M FreeRTOS；SystemView 归档与导出采用 `orbit-trace-v1` 目录、`.bin` 与 `.csv`，暂不支持 `.SVDat` 导入导出。
 - **部分 DAP 高级特性未支持**：当前暂不支持条件断点（Conditional Breakpoint）、数据断点（Watchpoint）、Logpoint、反向单步（Step Back）以及反汇编视图（Disassemble）。
 
 ## 15. 开源许可与第三方组件

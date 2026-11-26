@@ -6,8 +6,8 @@
 
 <p align="center">
   在 VS Code 里调试 STM32 / ARM Cortex-M，支持 J-Link、DAPLink 和 RMLink。<br>
-  直接读 MCU 变量画波形，不用写串口发送代码；参数可以在 Watch 里改。<br>
-  断点、单步、RTT 日志也在这里，AI 可以通过 MCP 操作调试器。
+  直接读 MCU 变量画波形，运行中在 Watch 不停机改参，无需写串口通信代码。<br>
+  断点、单步、RTT 日志、内置 FreeRTOS 与 SystemView 诊断都在这里，AI 也可通过 MCP 操作调试器。
 </p>
 
 <p align="center">
@@ -16,6 +16,7 @@
   <a href="https://github.com/zhuangyan114/Orbit/blob/master/README.md#开始使用">快速开始</a> ·
   <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md">从零搭环境</a> ·
   <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md">用户手册</a> ·
+  <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/RTOS诊断功能使用教程.md">RTOS 诊断教程</a> ·
   <a href="https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md#12-mcp-与-plugin-api">MCP 接入</a> ·
   <a href="https://github.com/zhuangyan114/Orbit/issues">反馈问题</a>
 </p>
@@ -39,27 +40,35 @@
 
 ### Watch 变量读写
 
-- 查看变量和表达式，展开结构体、数组与指针，数值变化高亮。
-- **直接修改可写变量，无需重新编译烧录或实现串口调参命令。**
+- 查看变量和表达式，展开结构体、数组与指针，支持多分组管理与数值变化高亮。
+- **支持运行中不停机直写（Live Write）**：直接修改可写变量而无需暂停 MCU，避免打断实时控制中断、PWM 输出或触发看门狗；CMSIS-DAP 采用原生 8/16/32-bit MEM-AP CSW 写入，消除子字变量与 CPU 并发修改的竞态。
 
 ### 源码调试与固件烧录
 
 - 支持断点、单步、暂停、继续、复位和调用堆栈。
 - **自动查找 ELF/AXF**，通常只需在 `launch.json` 中指定芯片型号。
-- 启动前可烧录并校验固件；烧录支持取决于芯片与探针链路。
+- 启动前可自动烧录并校验固件：J-Link 覆盖 SEGGER 器件库；DAPLink 与 RMLink 优先使用已登记型号的快速烧录算法，其余常见 STM32 F1 / F4 / H72x / G0 / G4 型号由随扩展提供的 OpenOCD 按 `device` 自动烧录，无需单独安装配置 OpenOCD。
 
 ### RTT 彩色日志
 
 - 在 `Orbit RTT Log` 终端显示日志，保留 ANSI 颜色，也可输出到 Debug Console。
-- 支持 P-RTLog 二进制日志解码，读取 ELF 中的 token 信息。
+- 支持 P-RTLog 二进制日志解码，读取 ELF 中的 token 信息；统一 RTT 通道可与 SystemView 二进制流共存。
 
 [![Orbit RTT 日志：真实终端中的彩色日志输出](https://raw.githubusercontent.com/zhuangyan114/Orbit/master/resources/orbit-rtt-promo.png)](https://github.com/zhuangyan114/Orbit/blob/master/resources/orbit-rtt-promo.png)
 
 日志需要固件接入 RTT；P-RTLog 解码需要匹配的固件和 ELF 信息。接法和配置见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 
+### RTOS 诊断与 SystemView Trace
+
+- **内置底部 RTOS 面板**：直接复用当前活动调试连接（支持 J-Link、DAPLink 与 RMLink），无需安装第三方 `mcu-debug.rtos-views` 扩展。
+- **FreeRTOS 内核快照（Tasks & Objects）**：从 ELF DWARF 信息自动推导内核结构偏移，查看任务状态、优先级（含互斥锁优先级继承）、按需栈高水位、CPU 占比、队列/互斥锁/信号量、候选死锁等待环、软件定时器及 `heap_4` 堆概览。
+- **SEGGER SystemView 全链路分析**：固件接入 SystemView 后，支持 Continuous / Single-Shot / Post-Mortem 三种录制模式、任务与中断泳道时间线、CPU 负载分箱图（点击下钻）与上下文/Ready 延迟统计、Markers、百万级事件列表与 FreeRTOS API 参数解码、Trace 终端、与变量 TIMELINE 跨面板时间联动，以及 `orbit-trace-v1` 离线归档回放和 `.bin` / 39 列 `.csv` 导出。
+
+接入步骤与排查流程见 [RTOS 诊断功能使用教程](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/RTOS诊断功能使用教程.md)。
+
 ### MCP 与 AI 自动调试
 
-- 提供 Python、Node.js 和 MCP 接口，支持变量读写、波形记录、断点管理和调试控制。
+- 提供 Python、Node.js 和 MCP 接口，支持变量读写、波形记录、断点管理、调试控制以及 RTOS 快照与 SystemView Trace 查询/录制。
 - **AI 可通过 MCP 实际操作调试器，自动执行已配置、已授权的调试流程。**
 - 脚本和 AI 复用当前调试连接，不另开连接抢占探针。
 
@@ -89,7 +98,7 @@
 
 1. 在 VS Code 扩展页搜索 **Orbit STM32 Debugger**，选择扩展 ID 为 `orbit-debug.orbit-for-vscode` 的插件安装，也可以直接打开[插件市场页面](https://marketplace.visualstudio.com/items?itemName=orbit-debug.orbit-for-vscode)。需要离线安装时，从 [Releases](https://github.com/zhuangyan114/Orbit/releases) 下载 VSIX，再执行 `Extensions: Install from VSIX...`。安装后重新加载窗口。
 2. 打开固件工程文件夹，编译得到 ELF/AXF，连接开发板和探针。
-3. 在“运行和调试”中点击 **“创建一个 launch.json 文件”**，选择 **Orbit (J-Link / CMSIS-DAP)**。Orbit 会生成最小配置，只需填写 `device` 芯片型号，ELF/AXF 文件会自动查找。已有 `launch.json` 时，也可通过“添加配置”选择 **Orbit: 最小调试配置**。下面用 STM32F407IG 举例：
+3. 在“运行和调试”中点击 **“创建一个 launch.json 文件”**，选择 **Orbit (J-Link / CMSIS-DAP / RMLink)**。Orbit 会生成最小配置，只需填写 `device` 芯片型号，ELF/AXF 文件会自动查找。已有 `launch.json` 时，也可通过“添加配置”选择 **Orbit: 最小调试配置**。下面用 STM32F407IG 举例：
 
 ```jsonc
 {
@@ -123,15 +132,15 @@ Orbit 主要由个人维护，手头开发板和探针有限，目前仅覆盖�
 - **CMSIS-DAP / RMLink 烧录**默认优先使用已登记型号的快速算法。更多 STM32 型号可根据 `device` 用内置 OpenOCD 烧录片内 Flash，`"flashBackend": "openocd"` 可显式选用。只调试板上已有固件时设置 `"flashBeforeDebug": false`。支持范围见[用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md)。
 - **复杂表达式与局部变量**：表达式类型和地址依赖 ELF/DWARF 调试信息，局部变量只在暂停且对应栈帧有效时可读取；高频采样建议优先使用全局变量或简单成员表达式。
 - **采样与日志带宽共享**：展开大量 Watch 变量或高负载 RTT 输出会占用探针带宽；高速采样期间 RTT 文本轮询会自动暂停，采样结束后恢复。
-- **RTOS 视图**：查看 FreeRTOS 任务、同步对象和运行快照。固件接入 SystemView 后可录制任务与中断轨迹，查看事件、终端和区间统计，并保存为离线归档。运行态快照和跨面板时间关联显示各自的可靠性。[接入与使用指南](docs/system%20view/quick-start.md)
+- **RTOS 诊断范围**：内置 RTOS 面板目前面向单核 ARM Cortex-M FreeRTOS；运行态快照和跨面板时间联动会标明各自的可靠性边界；Trace 离线归档采用 `orbit-trace-v1` 目录、`.bin` 和 `.csv`，暂不支持 `.SVDat` 导入导出。详见 [RTOS 诊断功能使用教程](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/RTOS诊断功能使用教程.md)。
 
 遇到问题欢迎提 [Issue](https://github.com/zhuangyan114/Orbit/issues)。反馈时请尽量附上芯片型号、探针类型、Orbit 版本、`launch.json`、复现步骤和 `outputs/Log/` 下的相关日志（注意删掉个人路径等敏感信息），方便快速定位。
 
 ## 欢迎加入
 
-Orbit 还有不少要打磨的地方。我手里的开发板十分有限，所以CMSIS-DAP链路目前支持芯片较少。
+Orbit 还有不少要打磨的地方。手头开发板有限，CMSIS-DAP 内置快速烧录算法目前只覆盖了部分常用型号（其余常见 STM32 已支持通过内置 OpenOCD 自动烧录）。
 
-如果你想适配新的 CMSIS-DAP 芯片，从[新芯片适配指南](https://github.com/zhuangyan114/Orbit/blob/master/.agent/skills/cmsis-dap-add-target/SKILL.md)开始。
+如果你想为更多芯片适配 CMSIS-DAP 原生快速烧录算法，从[新芯片适配指南](https://github.com/zhuangyan114/Orbit/blob/master/.agent/skills/cmsis-dap-add-target/SKILL.md)开始。
 
 
 ## 文档和开发
@@ -139,7 +148,8 @@ Orbit 还有不少要打磨的地方。我手里的开发板十分有限，所�
 | 想做什么 | 去哪里看 |
 | --- | --- |
 | 从 Keil 等环境转到 VS Code | [全套工具链教程](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/全套工具链教程.md) |
-| 查 Watch、TIMELINE、RTT 和配置 | [用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md) |
+| 查 Watch、TIMELINE、RTT、烧录和配置 | [用户手册](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/user-guide.md) |
+| 用 FreeRTOS 快照与 SystemView Trace | [RTOS 诊断功能使用教程](https://github.com/zhuangyan114/Orbit/blob/master/Releases/docs/RTOS诊断功能使用教程.md) |
 | 接 Python / Node.js / MCP | [Automation API](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-api.md) |
 | 看实现结构 | [架构说明](https://github.com/zhuangyan114/Orbit/blob/master/docs/architecture.md) |
 | 看测试到了哪一步 | [自动化与硬件验收](https://github.com/zhuangyan114/Orbit/blob/master/docs/api/orbit-automation-hardware-acceptance.md) |

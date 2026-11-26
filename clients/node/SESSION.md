@@ -46,8 +46,6 @@ orbit-automation-session quit
 
 默认 scopes（`connect` 时可用 `--scopes` 覆盖）：
 
-默认 scopes（可用 `--scopes` 覆盖）：
-
 ```
 read, session.control, breakpoints.write, variables.write, record
 ```
@@ -120,7 +118,7 @@ orbit-automation read cnt --instance <id>
 orbit-automation breakpoints add --params '{"source":{"path":"src/main.c"},"line":42}' --instance <id>
 ```
 
-命令集与上表相同（无 `refresh`/`quit`）。`step`/`breakpoints`/`record` 用 `--action`；`read` 位置参数进 `expressions`；`start` 可带 configurationId。
+命令集与上表相同（无 `refresh`/`quit`）。`step`/`breakpoints`/`record` 用 `--action`；`read` 位置参数进 `expressions`；`start` 可带 configurationId。库入口（`clients/node/dist/index.js`）另外提供 `rtosCapabilities`、`rtosSnapshot`、`traceRecordings`、`traceStatus`、`startTrace`、`stopTrace`、`traceEvents`、`traceStatistics` 等 RTOS / SystemView 便捷方法。
 
 ## 租约
 

@@ -4,7 +4,7 @@
 
 ```mermaid
 flowchart TD
-    VSCode["VS Code 调试 UI\nWatch / Timeline / 外部 Viewer"]
+    VSCode["VS Code 调试 UI\nWatch / Timeline / RTOS / 外部 Viewer"]
     MCP["MCP / Node / Python client"]
 
     subgraph Host["VS Code Extension Host"]
@@ -14,6 +14,7 @@ flowchart TD
         Registry["InstanceRegistry + SessionRegistry"]
         Watch["Watch provider / webview"]
         Timeline["DataSamplingManager / Timeline"]
+        RtosUi["RTOS 面板 (ozoneRtos)\nFreeRTOS 快照 + SystemView Trace Worker"]
     end
 
     subgraph Adapter["DAP Adapter Process"]
@@ -42,7 +43,7 @@ flowchart TD
     RMProbe["RMLink probe\nUSB / Wi-Fi / SWD"]
     ProbeDiscovery["short-lived probe discovery\nJ-Link first"]
     Target["STM32 / ARM Cortex-M\nFirmware + ELF/DWARF"]
-    ExternalViews["Memory View / Peripheral Viewer / RTOS Views"]
+    ExternalViews["Memory View / Peripheral Viewer"]
 
     VSCode --> Entry
     VSCode --> Ext
@@ -50,8 +51,10 @@ flowchart TD
     Registry --> Router
     Ext --> Watch
     Ext --> Timeline
+    Ext --> RtosUi
     Watch -->|"customRequest"| Session
     Timeline -->|"customRequest / events"| Session
+    RtosUi -->|"customRequest / RTT Trace"| Session
     Router -->|"active session only"| Session
     Entry --> Session --> Backend --> Selector
     Backend --> Symbols
@@ -73,7 +76,7 @@ flowchart TD
 
 | 边界 | 入口 | 职责 |
 |---|---|---|
-| Extension Host | `src/extension.ts` | Watch/Timeline UI、Automation API v1（默认关闭）、活动 session identity/generation、DAP custom request 路由 |
+| Extension Host | `src/extension.ts` | Watch/Timeline/RTOS UI、SystemView Trace Worker、Automation API v1（默认关闭）、活动 session identity/generation、DAP custom request 路由 |
 | DAP Adapter | `src/debugadapter.ts`、`src/debug/dap-session.ts` | DAP 协议、目标控制、变量/内存、RTT、采样、停止/终止事件；不导入 `vscode` |
 | J-Link helper | `native/jlink-helper/src/main.cpp` | 在独立进程加载 `JLink_x64.dll`，提供 J-Link 控制、内存、断点、源码步进和 RTT |
 | CMSIS-DAP helper | `native/cmsis-dap-helper/src/main.cpp` | 枚举 HID/WinUSB/TCP、CMSIS-DAP framing、SWD/DP/AP、Cortex-M 控制、内存、FPB、Flash Algorithm 和内存型 RTT |
@@ -89,7 +92,7 @@ flowchart TD
 - `probe: "rmlink"`（或指定 `rmlinkDeviceId`）创建 `RMLinkTargetChannel` owner，不会与 J-Link 或 CMSIS-DAP helper 并存。Timeline 优先使用板端 `memory_series` 订阅并支持断线指数退避自动重连；不进入 XR-DAP 或主机轮询重复采样。
 - XR-DAP 探针端采样是默认关闭的可选功能，与 TCP 传输独立。只有 launch 配置显式设置 `cmsisDapXrSampling: true` 且实际 owner 为 CMSIS-DAP 时，`dataSamplingStart` 才创建 `ProbeTimelineSampler`（`src/debug/probe-timeline-sampler.ts`）：经 commander `startProbeSampling` → `CmsisDapTargetChannel` → helper `xrSamplingStart` 让探针定时采样，再以 timeline 优先级轮询 `xrSamplingRead`，用 `ProbeClock` 换算探针时钟；不支持或读取失败时退回主机采样。普通会话直接走原有 `readFastDataSampling`，不查询 XR INFO、不发送 XR 命令。
 - XR 已启用且正在采样期间，helper 在 `dispatch()` 入口按 `xrSamplingRoute()` 处理请求：标量读取和运行态 DHCSR 查询改用厂商 READ，其余请求先停止采样、执行后恢复；`open`/`connect`/`disconnect`/`close`/`shutdown` 结束采样。未开启 XR 时，helper 拒绝 XR RPC，也不按设备序列号自动发送 XR 停止命令。自动 RTT 文本轮询只在 XR 采样活动期间暂停。详见 [XR-DAP 隔离边界](xr-dap-isolation.md)。
-- Flash、DAP、Watch、Timeline、RTT、RTOS View、Memory View 和 Peripheral Viewer 都复用当前 owner。
+- Flash、DAP、Watch、Timeline、RTT、内置 RTOS 面板、Memory View 和 Peripheral Viewer 都复用当前 owner。
 - **独立 OpenOCD 烧录阶段（`src/ozone-backend/openocd-flasher.ts`）**：对于未纳入原生快速算法的受支持 STM32 型号（或显式设置 `flashBackend: "openocd"`），`DapSession` 仅在**尚未认领调试 owner 之前**（或重启固件变更时先完整断开调试 owner 之后）启动随扩展打包的 `out/openocd/bin/openocd.exe` 独立子进程完成擦除、烧录和校验；RMLink 探针先通过 `RMLinkProbeHandoff` 暂停连接服务自动重连并在子进程退出后恢复。Orbit 必须等待 `openocd.exe` 进程完全退出（`close`）后才建立单一调试 owner；OpenOCD 不得作为调试 owner 或 GDB server 接入正常调试控制路径。
 - owner loss、session termination 或 replacement 会取消排队工作、阻止旧 generation 发布，并在退出前释放 helper。
 

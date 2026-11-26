@@ -159,7 +159,7 @@ async function main() {
   try {
     const initialize = await client.request('initialize', { clientID: 'orbit-dap06-watch-types-hw', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true }); check('initialize', responseOk(initialize), { response: initialize.message });
     const launchIndex = evidence.trace.length - 1;
-    const launchConfig = { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe, flashBeforeDebug, nativeDebugEngineEnabled: true, nativeDebugEngineMode: isJLink ? 'native' : 'auto', loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false };
+    const launchConfig = { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe, flashBeforeDebug, loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false };
     if (!isJLink) Object.assign(launchConfig, { cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid, cmsisDapSerial: serial });
     const launch = await client.request('launch', launchConfig, 30000);
     check(flashBeforeDebug ? 'authorized extended-type fixture programmed' : 'extended-type fixture connected without Flash', responseOk(launch), { response: launch.message, launchConfig }); if (!responseOk(launch)) throw new Error(`launch failed: ${launch.message.message}`);

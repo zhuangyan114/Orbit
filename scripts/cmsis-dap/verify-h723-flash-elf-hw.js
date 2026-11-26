@@ -209,8 +209,6 @@ async function main() {
       cmsisDapVid: vid,
       cmsisDapPid: pid,
       flashBeforeDebug: true,
-      nativeDebugEngineEnabled: true,
-      nativeDebugEngineMode: 'auto',
       loggingEnabled: true,
       clearLogsOnStart: true,
       rttLogEnabled: false,

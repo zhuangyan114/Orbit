@@ -266,7 +266,6 @@ async function main() {
       device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz,
       probe: 'cmsis-dap', cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid,
       cmsisDapSerial: serial, flashBeforeDebug: false,
-      nativeDebugEngineEnabled: true, nativeDebugEngineMode: 'auto',
       loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false,
     }, 30000);
     launched = responseOk(launch);

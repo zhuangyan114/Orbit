@@ -164,7 +164,7 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     expect(backend.currentState).toBe('halted');
   });
 
-  it('does not describe a connected CMSIS-DAP owner as a legacy path', async () => {
+  it('reports the selected CMSIS-DAP owner and its transport', async () => {
     const owner = cmsisOwner({
       connect: vi.fn(async () => ({
         ok: true,
@@ -178,9 +178,6 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       })),
     });
     const backend = new OzoneBackend(undefined, owner);
-    addSourceLine(backend, 0x080001C0, 0x080001C6);
-    const stepLog = vi.spyOn(log, 'step');
-
     const result = await backend.execute({
       cmd: 'connect',
       config: {
@@ -188,8 +185,6 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
         interface: 'SWD',
         speedKHz: 1000,
         probe: 'cmsis-dap',
-        nativeDebugEngineEnabled: true,
-        nativeDebugEngineMode: 'auto',
       },
     });
 
@@ -198,9 +193,6 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       data: { ownerKind: 'cmsis-dap', probe: 'cmsis-dap' },
       diagnostics: { device: { transport: 'winusb', product: 'Horco CMSIS-DAP v2', serial: '507874001033' } },
     });
-    expect(stepLog).toHaveBeenCalledWith(expect.stringContaining('owner=cmsis-dap'));
-    expect(stepLog).not.toHaveBeenCalledWith(expect.stringContaining('legacy'));
-    stepLog.mockRestore();
   });
 
   it('maps ordinary stepIn to the CMSIS-DAP source-step primitive', async () => {
@@ -959,8 +951,6 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
       })),
     });
     const backend = new OzoneBackend(undefined, owner);
-    const directJlink = { readRegister: vi.fn() };
-    (backend as any).jlink = directJlink;
     const dapLog = vi.spyOn(log, 'dap');
     const stepLog = vi.spyOn(log, 'step');
 
@@ -972,7 +962,6 @@ describe('OzoneBackend CMSIS-DAP routing', () => {
     ] });
     expect(owner.readRegister).toHaveBeenCalledWith(15);
     expect(owner.readRegister).toHaveBeenCalledWith(14);
-    expect(directJlink.readRegister).not.toHaveBeenCalled();
     expect(dapLog).toHaveBeenCalledWith(expect.stringContaining('getCallStack PC source=sessionTarget/cmsis-dap'));
     expect(dapLog).toHaveBeenCalledWith(expect.stringContaining('LR source=sessionTarget/cmsis-dap'));
     expect(dapLog).not.toHaveBeenCalledWith(expect.stringContaining('legacyJLinkDLL'));

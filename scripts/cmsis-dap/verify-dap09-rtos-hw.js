@@ -515,8 +515,6 @@ async function main() {
       flashBeforeDebug: false,
       runToEntryPoint: 'osKernelStart',
       rtos: 'FreeRTOS',
-      nativeDebugEngineEnabled: true,
-      nativeDebugEngineMode: 'auto',
       loggingEnabled: true,
       clearLogsOnStart: true,
       rttLogEnabled: true,

@@ -34,7 +34,7 @@ function fixture(ending:'eof'|'error'='eof') {
   };
   const owner=new RMLinkTargetChannel(client as unknown as RMLinkClient);
   const forbidden=()=>{throw new Error('second owner');};
-  const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+  const selector=new SessionTargetSelector(forbidden,forbidden,()=>owner);
   const backend=new OzoneBackend();(backend as any).sessionTarget=selector;
   return {client,owner,selector,backend,end,opens:()=>opens};
 }

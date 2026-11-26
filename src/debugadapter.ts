@@ -3,7 +3,7 @@ import { DapSession, DebugProtocolMessage } from './debug/dap-session';
 import { createAdapterExit } from './debug/adapter-exit';
 import { DapFrameDecoder } from './debug/dap-framing';
 import { ExperimentalCppJLinkChannel } from './ozone-backend/cpp-jlink-channel';
-import { CmsisDapTargetChannel, LegacyJLinkTargetChannel, SessionTargetSelector } from './ozone-backend/session-target-channel';
+import { CmsisDapTargetChannel, SessionTargetSelector } from './ozone-backend/session-target-channel';
 import { log } from './utils/logger';
 
 try {
@@ -14,7 +14,6 @@ try {
         else log.dap(message);
       },
     }),
-    () => new LegacyJLinkTargetChannel(),
     () => new CmsisDapTargetChannel({
       onDiagnostic: message => log.dll(message),
     }),

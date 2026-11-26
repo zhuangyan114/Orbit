@@ -3,16 +3,18 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { OzoneBackend } from './commander';
-import { JLinkDLL } from './jlink-dll';
+import { SessionTargetOwner } from './session-target-channel';
 import { NativeStepExecutor } from './cpp-jlink-channel';
 
-function legacyJLink(pc: number, lr = 0x08002001): JLinkDLL {
+function jlinkOwner(pc: number, lr = 0x08002001) {
   return {
-    breakpointSlots: Array(6).fill(null),
-    isHalted: vi.fn(() => true),
-    readRegister: vi.fn((index: number) => index === 15 ? pc : index === 14 ? lr : 0),
-    disconnect: vi.fn(),
-  } as unknown as JLinkDLL;
+    kind: 'jlink-native',
+    getState: vi.fn(async () => ({ ok: true, data: { state: 'Halted' } })),
+    readRegister: vi.fn(async (index: number) => ({
+      ok: true,
+      data: { value: index === 15 ? pc : index === 14 ? lr : 0 },
+    })),
+  };
 }
 
 describe('OzoneBackend native stop routing', () => {
@@ -51,8 +53,7 @@ describe('OzoneBackend native stop routing', () => {
       stepOverSourceLine: vi.fn(),
       stepOut: vi.fn(),
     } as unknown as NativeStepExecutor;
-    const backend = new OzoneBackend(executor);
-    (backend as any).jlink = legacyJLink(pcBefore);
+    const backend = new OzoneBackend(executor, jlinkOwner(pcBefore) as unknown as SessionTargetOwner);
     (backend as any).symbols = [{ name: 'caller', address: 0x08000100, size: 0x100, type: 'T' }];
     (backend as any).lineEntries = [
       { address: pcBefore, file: 'main.c', line: 7 },
@@ -111,8 +112,7 @@ describe('OzoneBackend native stop routing', () => {
         stepOverSourceLine: command === 'stepOver' ? sourceStep : vi.fn(),
         stepOut: vi.fn(),
       } as unknown as NativeStepExecutor;
-      const backend = new OzoneBackend(executor);
-      (backend as any).jlink = legacyJLink(pcBefore);
+      const backend = new OzoneBackend(executor, jlinkOwner(pcBefore) as unknown as SessionTargetOwner);
       (backend as any).symbols = [{ name: 'caller', address: pcBefore, size: 0x40, type: 'T' }];
       (backend as any).lineEntries = [
         { address: pcBefore, file: sourceFile, line: 1 },
@@ -345,8 +345,7 @@ describe('OzoneBackend native stop routing', () => {
       stepOverSourceLine: sourceStep,
       stepOut: vi.fn(),
     } as unknown as NativeStepExecutor;
-    const backend = new OzoneBackend(executor);
-    (backend as any).jlink = legacyJLink(calleePc);
+    const backend = new OzoneBackend(executor, jlinkOwner(calleePc) as unknown as SessionTargetOwner);
     (backend as any).symbols = [
       { name: 'caller', address: callerStart, size: 0x100, type: 'T' },
       { name: 'calcSum', address: calleePc, size: 0x20, type: 't' },
@@ -457,9 +456,8 @@ describe('OzoneBackend native stop routing', () => {
       stepIntoInstruction: vi.fn(),
       stepOut: vi.fn(),
     } as unknown as NativeStepExecutor;
-    const backend = new OzoneBackend(executor);
-    const legacy = legacyJLink(pcBefore);
-    (backend as any).jlink = legacy;
+    const target = jlinkOwner(pcBefore);
+    const backend = new OzoneBackend(executor, target as unknown as SessionTargetOwner);
     (backend as any).symbols = [{ name: 'caller', address: 0x08000100, size: 0x100, type: 'T' }];
     (backend as any).lineEntries = [
       { address: pcBefore, file: 'main.c', line: 7 },
@@ -476,7 +474,7 @@ describe('OzoneBackend native stop routing', () => {
       maxInstructionSteps: 128,
       breakpoints: {},
     });
-    vi.mocked(legacy.readRegister).mockClear();
+    vi.mocked(target.readRegister).mockClear();
 
     const stack = await backend.execute({ cmd: 'getCallStack' });
     if (!stack.ok) throw new Error(stack.error);
@@ -486,23 +484,7 @@ describe('OzoneBackend native stop routing', () => {
     if (!pc.ok) throw new Error(pc.error);
     expect((pc.data as { value: number }).value).toBe(pcAfter);
     expect(executor.readRegister).toHaveBeenCalledWith(15);
-    expect(legacy.readRegister).not.toHaveBeenCalled();
-  });
-
-  it('keeps legacy JLinkDLL as the register and stack source without native', async () => {
-    const legacyPc = 0x08001000;
-    const backend = new OzoneBackend();
-    const legacy = legacyJLink(legacyPc);
-    (backend as any).jlink = legacy;
-
-    const stack = await backend.execute({ cmd: 'getCallStack' });
-    if (!stack.ok) throw new Error(stack.error);
-    expect((stack.data as Array<{ address: number }>)[0].address).toBe(legacyPc);
-
-    const pc = await backend.execute({ cmd: 'readRegister', name: 'PC' });
-    if (!pc.ok) throw new Error(pc.error);
-    expect((pc.data as { value: number }).value).toBe(legacyPc);
-    expect(legacy.readRegister).toHaveBeenCalled();
+    expect(target.readRegister).not.toHaveBeenCalled();
   });
 
   it('uses an adjusted first-frame source hint when stepOut returns into the call line mapping', async () => {
@@ -542,8 +524,7 @@ describe('OzoneBackend native stop routing', () => {
         };
       }),
     } as unknown as NativeStepExecutor;
-    const backend = new OzoneBackend(executor);
-    (backend as any).jlink = legacyJLink(calleePc);
+    const backend = new OzoneBackend(executor, jlinkOwner(calleePc) as unknown as SessionTargetOwner);
     (backend as any).symbols = [
       { name: 'caller', address: 0x08001100, size: 0x100, type: 'T' },
       { name: 'callee', address: calleePc, size: 0x100, type: 'T' },
@@ -607,8 +588,7 @@ describe('OzoneBackend native stop routing', () => {
         },
       })),
     } as unknown as NativeStepExecutor;
-    const backend = new OzoneBackend(executor);
-    (backend as any).jlink = legacyJLink(helperPc);
+    const backend = new OzoneBackend(executor, jlinkOwner(helperPc) as unknown as SessionTargetOwner);
     (backend as any).symbols = [
       { name: '__aeabi_dmul', address: helperPc, size: helperEnd - helperPc, type: 'W' },
       { name: 'caller', address: returnAddress, size: 0x100, type: 'T' },
@@ -680,8 +660,7 @@ describe('OzoneBackend native stop routing', () => {
           };
         }),
       } as unknown as NativeStepExecutor;
-      const backend = new OzoneBackend(executor);
-      (backend as any).jlink = legacyJLink(calleePc);
+      const backend = new OzoneBackend(executor, jlinkOwner(calleePc) as unknown as SessionTargetOwner);
       (backend as any).symbols = [
         { name: 'caller', address: 0x08001100, size: 0x100, type: 'T' },
         { name: 'callee', address: calleePc, size: 0x100, type: 'T' },
@@ -781,9 +760,8 @@ describe('OzoneBackend native stop routing', () => {
 
 describe('OzoneBackend getCallStack cancellation', () => {
   it('aborts a cancelled getCallStack before touching registers', async () => {
-    const legacy = legacyJLink(0x08000480, 0x08000400);
-    const backend = new OzoneBackend(undefined as unknown as NativeStepExecutor);
-    (backend as any).jlink = legacy;
+    const target = jlinkOwner(0x08000480, 0x08000400);
+    const backend = new OzoneBackend(undefined, target as unknown as SessionTargetOwner);
 
     const controller = new AbortController();
     controller.abort();
@@ -792,19 +770,18 @@ describe('OzoneBackend getCallStack cancellation', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error('expected ok result');
     expect(result.data).toEqual([]);
-    expect(legacy.readRegister).not.toHaveBeenCalled();
+    expect(target.readRegister).not.toHaveBeenCalled();
   });
 
   it('aborts a getCallStack cancelled between the PC and LR reads', async () => {
-    const legacy = legacyJLink(0x08000480, 0x08000400);
-    const backend = new OzoneBackend(undefined as unknown as NativeStepExecutor);
-    (backend as any).jlink = legacy;
+    const target = jlinkOwner(0x08000480, 0x08000400);
+    const backend = new OzoneBackend(undefined, target as unknown as SessionTargetOwner);
 
     // Abort right after the PC read: the LR read must never be issued.
     const controller = new AbortController();
-    (legacy.readRegister as any).mockImplementation((index: number) => {
+    target.readRegister.mockImplementation(async (index: number) => {
       if (index === 15) controller.abort();
-      return index === 15 ? 0x08000480 : 0x08000400;
+      return { ok: true, data: { value: index === 15 ? 0x08000480 : 0x08000400 } };
     });
 
     const result = await backend.execute({ cmd: 'getCallStack', signal: controller.signal });
@@ -812,7 +789,7 @@ describe('OzoneBackend getCallStack cancellation', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error('expected ok result');
     expect(result.data).toEqual([]);
-    const registerIndexes = (legacy.readRegister as any).mock.calls.map((call: number[]) => call[0]);
+    const registerIndexes = target.readRegister.mock.calls.map(([index]) => index);
     expect(registerIndexes).toEqual([15]); // PC only, no LR (R14) read
   });
 });

@@ -11,7 +11,6 @@ import { cancelActiveFlashes, flashElf } from './flasher';
 import { CmsisDapFlashOptions, findRamRegion } from './cmsis-dap-flasher';
 import type { CmsisDapRttMemoryRange } from './cmsis-dap-helper-channel';
 import { RttCapabilities, rttCapability, unavailableRttCapabilities } from './rtt-contract';
-import { JLinkDLL } from './jlink-dll';
 import { SessionTargetOwner, SessionTargetSelector } from './session-target-channel';
 import { readElfSymbols, SymbolInfo, findSymbol, preloadLineMappings, preloadAddressMappings, parseDwarfTypeInfo, DwarfInfo, DwarfTypeInfo, DwarfField, OBJDUMP_EXE, LineMappingByFile, resolveMappedStatementAddress, buildSymbolCatalog } from './jlink-symbols';
 import { execFile } from 'child_process';
@@ -91,7 +90,6 @@ function hasSourceStepPc(
 }
 
 export class OzoneBackend {
-  private jlink: JLinkDLL = new JLinkDLL();
   private state: TargetState = TargetState.Disconnected;
   private symbols: SymbolInfo[] = [];
   private elfPath = '';
@@ -218,48 +216,50 @@ export class OzoneBackend {
         ? this.sessionTarget.ownerKind !== 'none'
         : true;
     }
-    return this.jlink.connected
-      && this.state !== TargetState.Disconnected
-      && this.state !== TargetState.Error;
+    return false;
+  }
+
+  private targetUnavailable(): CppJLinkResult<never> {
+    return {
+      ok: false,
+      errorCode: 'TargetOwnerUnavailable',
+      message: 'No target owner is connected',
+      targetState: 'Disconnected',
+      elapsedMs: 0,
+    };
   }
 
   private async targetHalt(): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.halt();
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.halt();
     return result.ok;
   }
 
   private async targetHaltResult(): Promise<CppJLinkResult> {
     if (this.sessionTarget) return this.sessionTarget.halt();
-    const ok = this.jlink.halt();
-    return {
-      ok,
-      message: ok ? 'J-Link target halted' : 'J-Link halt failed',
-      targetState: ok ? 'Halted' : 'Error',
-      elapsedMs: 0,
-    };
+    return this.targetUnavailable();
   }
 
   private async targetRun(): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.run();
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.run();
     return result.ok;
   }
 
   private async targetReset(): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.reset();
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.reset();
     return result.ok;
   }
 
   private async targetIsHalted(): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.isHalted();
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.getState();
     return result.ok && result.data?.state === 'Halted';
   }
 
   private async targetReadRegister(index: number, signal?: AbortSignal): Promise<number | null> {
-    if (!this.sessionTarget) return this.jlink.readRegister(index);
+    if (!this.sessionTarget) return null;
     const result = signal
       ? await this.sessionTarget.readRegister(index, { signal })
       : await this.sessionTarget.readRegister(index);
@@ -267,7 +267,7 @@ export class OzoneBackend {
   }
 
   private targetRegisterSource(): string {
-    if (!this.sessionTarget) return 'legacyJLinkDLL';
+    if (!this.sessionTarget) return 'sessionTarget/none';
     const ownerKind = 'ownerKind' in this.sessionTarget
       ? this.sessionTarget.ownerKind
       : this.sessionTarget.kind;
@@ -296,35 +296,17 @@ export class OzoneBackend {
     if (this.sessionTarget) {
       return this.sessionTarget.readMemory(address, size, signal ? { priority, signal } : { priority });
     }
-    const started = Date.now();
-    const bytes = this.jlink.readMemory(address, size);
-    if (bytes) {
-      return {
-        ok: true,
-        message: 'J-Link memory read',
-        targetState: 'Unknown',
-        elapsedMs: Date.now() - started,
-        data: { bytes },
-      };
-    }
-    return {
-      ok: false,
-      message: `J-Link failed to read ${size} bytes at 0x${address.toString(16)}`,
-      errorCode: 'MemoryReadFailed',
-      targetState: 'Unknown',
-      elapsedMs: Date.now() - started,
-      diagnostics: { ownerKind: 'jlink-legacy', operation: 'readMemory', phase: 'targetRead' },
-    };
+    return this.targetUnavailable();
   }
 
   private async targetWriteMemory(address: number, bytes: Uint8Array): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.writeMemoryBytes(address, bytes);
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.writeMemory(address, bytes);
     return result.ok && result.data?.bytesWritten === bytes.length;
   }
 
   private async targetSetBreakpoint(address: number, preferredSlot?: number): Promise<number | null> {
-    if (!this.sessionTarget) return this.jlink.setBreakpoint(address, preferredSlot);
+    if (!this.sessionTarget) return null;
     const result = await this.sessionTarget.setBreakpoint(address, preferredSlot);
     if (!result.ok || !result.data) return null;
     this.sessionBreakpointSlots[result.data.id] = address;
@@ -332,17 +314,14 @@ export class OzoneBackend {
   }
 
   private async targetClearBreakpoint(id: number): Promise<boolean> {
-    if (!this.sessionTarget) return this.jlink.clearBreakpoint(id);
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.clearBreakpoint(id);
     if (result.ok && id >= 0 && id < this.sessionBreakpointSlots.length) this.sessionBreakpointSlots[id] = null;
     return result.ok;
   }
 
   private async targetClearAllBreakpoints(): Promise<boolean> {
-    if (!this.sessionTarget) {
-      this.jlink.clearAllBreakpoints();
-      return true;
-    }
+    if (!this.sessionTarget) return false;
     const result = await this.sessionTarget.clearAllBreakpoints();
     if (result.ok) this.sessionBreakpointSlots.fill(null);
     return result.ok;
@@ -353,25 +332,7 @@ export class OzoneBackend {
     ramRanges?: readonly CmsisDapRttMemoryRange[],
     memoryBacked?: boolean,
   ): Promise<CppJLinkResult<any>> {
-    if (!this.sessionTarget) {
-      const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
-        ? this.jlink.getRttApiAvailability()
-        : null;
-      if (rttApis && !rttApis.control) {
-        return {
-          ok: false,
-          message: 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control',
-          errorCode: 'UnsupportedCapability',
-          targetState: 'Error',
-          elapsedMs: 0,
-          diagnostics: { ownerKind: 'jlink-legacy', capability: 'startRtt', dllRttApis: rttApis },
-        };
-      }
-      const ok = this.jlink.startRtt(controlBlockAddress);
-      return ok
-        ? { ok: true, message: 'RTT started', targetState: 'Unknown', elapsedMs: 0, data: {} }
-        : { ok: false, message: 'legacy RTT start failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
-    }
+    if (!this.sessionTarget) return this.targetUnavailable();
     const startOptions = (ramRanges || memoryBacked !== undefined)
       ? {
         ...(ramRanges ? { ramRanges } : {}),
@@ -382,10 +343,7 @@ export class OzoneBackend {
   }
 
   private async targetStopRtt(): Promise<CppJLinkResult<any>> {
-    if (!this.sessionTarget) {
-      this.jlink.stopRtt();
-      return { ok: true, message: 'RTT stopped', targetState: 'Unknown', elapsedMs: 0, data: {} };
-    }
+    if (!this.sessionTarget) return this.targetUnavailable();
     return this.sessionTarget.stopRtt();
   }
 
@@ -394,26 +352,7 @@ export class OzoneBackend {
     size: number,
     signal?: AbortSignal,
   ): Promise<CppJLinkResult<{ bytes: Uint8Array }>> {
-    if (!this.sessionTarget) {
-      const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
-        ? this.jlink.getRttApiAvailability()
-        : null;
-      if (rttApis && (!rttApis.control || !rttApis.read)) {
-        const missing = !rttApis.control ? 'JLINK_RTTERMINAL_Control' : 'JLINK_RTTERMINAL_Read';
-        return {
-          ok: false,
-          message: `Legacy J-Link DLL does not export ${missing}`,
-          errorCode: 'UnsupportedCapability',
-          targetState: 'Error',
-          elapsedMs: 0,
-          diagnostics: { ownerKind: 'jlink-legacy', capability: 'readRtt', dllRttApis: rttApis },
-        };
-      }
-      const bytes = this.jlink.readRtt(bufferIndex, size);
-      return bytes
-        ? { ok: true, message: 'RTT read', targetState: 'Unknown', elapsedMs: 0, data: { bytes } }
-        : { ok: false, message: 'legacy RTT read failed', errorCode: 'JLinkCallFailed', targetState: 'Error', elapsedMs: 0 };
-    }
+    if (!this.sessionTarget) return this.targetUnavailable();
     return this.sessionTarget.readRtt(bufferIndex, size, { priority: 'background', signal });
   }
 
@@ -437,28 +376,7 @@ export class OzoneBackend {
         ),
       };
     }
-    if (!this.jlink.connected) {
-      return unavailableRttCapabilities('none', 'No target owner is connected');
-    }
-    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
-      ? this.jlink.getRttApiAvailability()
-      : null;
-    const startAvailable = !rttApis || rttApis.control;
-    const readAvailable = !rttApis || (rttApis.control && rttApis.read);
-    const readReason = rttApis && !rttApis.control
-      ? 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'
-      : 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Read';
-    return {
-      ownerKind: 'jlink-legacy',
-      rttStart: rttCapability(startAvailable, 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'),
-      rttEnumerate: rttCapability(false, 'Legacy koffi J-Link owner does not support multi-channel RTT enumeration'),
-      rttUpRead: rttCapability(readAvailable, readReason),
-      rttDownWrite: rttCapability(false, 'Legacy koffi J-Link owner does not support RTT down-buffer writes'),
-      details: {
-        channel: 'koffi',
-        ...(rttApis ? { dllRttApis: rttApis } : {}),
-      },
-    };
+    return unavailableRttCapabilities('none', 'No target owner is connected');
   }
 
   configureNativeSteps(enabled = true): void {
@@ -491,13 +409,13 @@ export class OzoneBackend {
         case 'disconnect':
           return this.doDisconnect();
         case 'halt':
-          this.clearNativeStopInfo('legacy halt requested');
+          this.clearNativeStopInfo('halt requested');
           if (this.isCmsisDapOwner()) return this.ownerControlResult(await this.sessionTarget!.halt(), 'Halted', 'halt');
           return (await this.targetHalt())
             ? (this.state = TargetState.Halted, { ok: true, data: 'Halted' })
             : { ok: false, error: 'Halt failed' };
         case 'run':
-          this.clearNativeStopInfo('legacy run requested');
+          this.clearNativeStopInfo('run requested');
           if (this.isCmsisDapOwner()) return this.ownerControlResult(await this.sessionTarget!.run(), 'Running', 'run');
           return (await this.targetRun())
             ? (this.state = TargetState.Running, { ok: true, data: 'Running' })
@@ -565,9 +483,7 @@ export class OzoneBackend {
             log.dap(`getTargetState source=sessionTarget state=${result}`);
             return { ok: true, data: result };
           }
-          const halted = this.jlink.isHalted();
-          log.dap(`getTargetState source=legacyJLinkDLL halted=${halted}`);
-          return { ok: true, data: halted ? TargetState.Halted : this.state };
+          return this.sessionOwnerFailure(this.targetUnavailable(), 'TargetOwnerUnavailable');
         }
         case 'flash':
           return await this.doFlash(command.elfPath, command.device, command.interface, command.speedKHz,
@@ -931,49 +847,11 @@ case 'readVariableRuntime':
     if (this.state === TargetState.Connected) {
       return { ok: true, data: { state: TargetState.Connected } };
     }
-    if (requestedProbe !== 'jlink' && !this.sessionTarget) {
-      return {
-        ok: false,
-        errorCode: 'OwnerUnavailable',
-        error: 'OwnerUnavailable: CMSIS-DAP target owner requires a SessionTargetSelector; J-Link fallback is disabled.',
-      };
-    }
-    const nativeMode = config.nativeDebugEngineMode === 'native'
-      ? 'native'
-      : config.nativeDebugEngineMode === 'auto'
-        ? config.nativeDebugEngineEnabled === true ? 'auto' : 'legacy'
-        : config.nativeDebugEngineMode === undefined && config.nativeDebugEngineEnabled === true
-          ? 'auto'
-          : 'legacy';
-    let connectionDiagnostics: Record<string, unknown> | undefined;
-    if (this.sessionTarget) {
-      const connected = this.sessionTarget instanceof SessionTargetSelector
-        ? await this.sessionTarget.connect(config, nativeMode)
-        : await this.sessionTarget.connect(config);
-      if (!connected.ok) {
-        return {
-          ok: false,
-          errorCode: connected.errorCode,
-          error: `${connected.errorCode ? `${connected.errorCode}: ` : ''}${connected.message}`,
-        };
-      }
-      connectionDiagnostics = connected.data?.diagnostics;
-    } else {
-      if (!this.jlink.open()) return { ok: false, error: 'Failed to load JLink DLL' };
-      if (!this.jlink.connect(config.device, config.speedKHz)) {
-        this.jlink.close();
-        return { ok: false, error: `Failed to connect to ${config.device}` };
-      }
-    }
+    if (!this.sessionTarget) return this.sessionOwnerFailure(this.targetUnavailable(), 'TargetOwnerUnavailable');
+    const connected = await this.sessionTarget.connect(config);
+    if (!connected.ok) return this.sessionOwnerFailure(connected, 'NativeInitializationFailed');
 
     this.configureNativeSteps();
-    if (config.nativeDebugEngineEnabled && !this.nativeStepExecutor?.usingNative) {
-      if (this.isCmsisDapOwner()) {
-        log.step('Native J-Link source-step executor unavailable owner=cmsis-dap; instruction steps remain on sessionTarget/cmsis-dap');
-      } else {
-        log.step('Native step paths requested but no connected exclusive native executor is available; using legacy paths');
-      }
-    }
     if (this.isCmsisDapOwner()) {
       const haltResult = await this.targetHaltResult();
       if (!haltResult.ok) {
@@ -1000,11 +878,9 @@ case 'readVariableRuntime':
       data: {
         state: TargetState.Connected,
         probe: this.selectedProbe() || requestedProbe,
-        ownerKind: this.sessionTarget
-          ? 'ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind
-          : 'jlink-legacy',
+        ownerKind: 'ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind,
       },
-      ...(connectionDiagnostics ? { diagnostics: connectionDiagnostics } : {}),
+      ...(connected.data?.diagnostics ? { diagnostics: connected.data.diagnostics } : {}),
     };
   }
 
@@ -1013,7 +889,7 @@ case 'readVariableRuntime':
       return { ok: true, data: { probe: config.probe, policy: 'explicit' } };
     }
     if (!(this.sessionTarget instanceof SessionTargetSelector)) {
-      return { ok: true, data: { probe: 'jlink', policy: 'legacy-default' } };
+      return { ok: true, data: { probe: 'jlink', policy: 'jlink-default' } };
     }
     const result = await this.sessionTarget.resolveProbe(config);
     if (!result.ok || !result.data) {
@@ -1037,10 +913,10 @@ case 'readVariableRuntime':
         ? this.sessionTarget.ownerKind
         : this.sessionTarget.kind;
       if (ownerKind === 'cmsis-dap') return this.sessionTarget.supportsSubscriptions ? 'rmlink' : 'cmsis-dap';
-      if (ownerKind === 'jlink-native' || ownerKind === 'jlink-legacy') return 'jlink';
+      if (ownerKind === 'jlink-native') return 'jlink';
       return null;
     }
-    return this.state === TargetState.Connected || this.jlink.connected ? 'jlink' : null;
+    return null;
   }
 
   private isCmsisDapOwner(): boolean {
@@ -1117,9 +993,9 @@ case 'readVariableRuntime':
   }
 
   private async doJLinkRunToEntryPoint(symbol: string, reset: boolean): Promise<OzoneCommandResult> {
-    const ownerKind = this.sessionTarget
-      ? ('ownerKind' in this.sessionTarget ? this.sessionTarget.ownerKind : this.sessionTarget.kind)
-      : 'jlink-legacy';
+    const target = this.sessionTarget;
+    if (!target) return this.sessionOwnerFailure(this.targetUnavailable(), 'TargetOwnerUnavailable');
+    const ownerKind = 'ownerKind' in target ? target.ownerKind : target.kind;
     const fail = (errorCode: string, message: string): OzoneCommandResult => ({
       ok: false, errorCode, error: `${errorCode}: ${message}`,
       targetState: this.state === TargetState.Halted ? 'Halted' : 'Unknown',
@@ -1127,14 +1003,8 @@ case 'readVariableRuntime':
     });
     this.clearNativeStopInfo('J-Link startup stop requested');
     const control = async (operation: 'reset' | 'halt' | 'run'): Promise<OzoneCommandResult> => {
-      if (this.sessionTarget) {
-        const result = await this.sessionTarget[operation]();
-        if (!result.ok) return this.sessionOwnerFailure(result, 'TargetControlFailed');
-      } else {
-        const ok = operation === 'reset' ? await this.targetReset()
-          : operation === 'run' ? await this.targetRun() : await this.targetHalt();
-        if (!ok) return fail('TargetControlFailed', `startup ${operation} failed`);
-      }
+      const result = await target[operation]();
+      if (!result.ok) return this.sessionOwnerFailure(result, 'TargetControlFailed');
       this.state = operation === 'run' ? TargetState.Running : TargetState.Halted;
       return { ok: true, data: operation };
     };
@@ -1156,18 +1026,15 @@ case 'readVariableRuntime':
     // Reuse a user breakpoint at the entry; only remove a slot we allocated.
     const existingSlot = this.currentBreakpointSlots().findIndex(address => address != null && (address & ~1) === entryAddress);
     let slot: number | null = existingSlot >= 0 ? existingSlot : null;
-    if (slot === null && this.sessionTarget) {
-      const reserved = await this.sessionTarget.setBreakpoint(entryAddress);
+    if (slot === null) {
+      const reserved = await target.setBreakpoint(entryAddress);
       if (!reserved.ok) return this.sessionOwnerFailure(reserved, 'BreakpointResourceExhausted');
       if (!reserved.data || !Number.isInteger(reserved.data.id) || reserved.data.id < 0 || reserved.data.id >= 6) {
         return fail('MalformedResponse', 'entry breakpoint returned an invalid slot');
       }
       slot = reserved.data.id;
       this.sessionBreakpointSlots[slot] = entryAddress;
-    } else if (slot === null) {
-      slot = await this.targetSetBreakpoint(entryAddress);
     }
-    if (slot === null) return fail('BreakpointResourceExhausted', 'no hardware breakpoint slot is available for the entry');
     let result: OzoneCommandResult = fail('StartupEntryNotReached', `timed out waiting for ${symbol}`);
     let targetMayBeRunning = true;
     try {
@@ -1177,35 +1044,24 @@ case 'readVariableRuntime':
       } else {
         const deadline = Date.now() + 5000;
         while (Date.now() < deadline) {
-          let halted: boolean;
-          if (this.sessionTarget) {
-            const stateResult = await this.sessionTarget.getState();
-            if (!stateResult.ok) {
-              result = this.sessionOwnerFailure(stateResult, 'TargetStateReadFailed');
-              break;
-            }
-            halted = stateResult.data?.state === 'Halted';
-          } else {
-            halted = await this.targetIsHalted();
+          const stateResult = await target.getState();
+          if (!stateResult.ok) {
+            result = this.sessionOwnerFailure(stateResult, 'TargetStateReadFailed');
+            break;
           }
-          if (halted) {
+          if (stateResult.data?.state === 'Halted') {
             const syncResult = await control('halt');
             if (!syncResult.ok) {
               result = syncResult;
               break;
             }
             targetMayBeRunning = false;
-            let pc: number | null;
-            if (this.sessionTarget) {
-              const read = await this.sessionTarget.readRegister(REG_INDEXES.PC);
-              if (!read.ok) {
-                result = this.sessionOwnerFailure(read, 'RegisterReadFailed');
-                break;
-              }
-              pc = read.data?.value ?? null;
-            } else {
-              pc = await this.targetReadRegister(REG_INDEXES.PC);
+            const read = await target.readRegister(REG_INDEXES.PC);
+            if (!read.ok) {
+              result = this.sessionOwnerFailure(read, 'RegisterReadFailed');
+              break;
             }
+            const pc = read.data?.value ?? null;
             result = pc !== null && (pc & ~1) === entryAddress
               ? { ok: true, data: { symbol, entryAddress, pc: pc & ~1, state: TargetState.Halted, cleanupOk: true } }
               : fail('StartupEntryNotReached', `stopped at ${pc === null ? 'unknown PC' : `0x${pc.toString(16)}`} before ${symbol}`);
@@ -1221,12 +1077,10 @@ case 'readVariableRuntime':
         const recovery = await control('halt');
         if (!recovery.ok && (result.ok || result.errorCode !== 'NativeOwnerLost')) result = recovery;
       }
-      if (existingSlot < 0 && this.sessionTarget) {
-        const cleanup = await this.sessionTarget.clearBreakpoint(slot);
+      if (existingSlot < 0) {
+        const cleanup = await target.clearBreakpoint(slot);
         if (cleanup.ok) this.sessionBreakpointSlots[slot] = null;
         else if (result.ok) result = this.sessionOwnerFailure(cleanup, 'BreakpointCleanupFailed');
-      } else if (existingSlot < 0 && !(await this.targetClearBreakpoint(slot)) && result.ok) {
-        result = fail('BreakpointCleanupFailed', 'could not remove the temporary entry breakpoint');
       }
     }
     return result;
@@ -1313,8 +1167,6 @@ case 'readVariableRuntime':
         this.state = TargetState.Error;
         return { ok: false, error: `${disconnected.errorCode || 'DisconnectFailed'}: ${disconnected.message}` };
       }
-    } else {
-      this.jlink.disconnect();
     }
     this.state = TargetState.Disconnected;
     this.sessionGeneration++;
@@ -1788,7 +1640,7 @@ case 'readVariableRuntime':
         maxInstructionSteps: 32,
       }));
     }
-    this.clearNativeStopInfo('stepInto using legacy path');
+    this.clearNativeStopInfo('stepInto using adapter step');
     return this.doStepIntoLegacy();
   }
 
@@ -1822,7 +1674,7 @@ case 'readVariableRuntime':
     if (this.nativeStepsEnabled.stepInto && this.nativeStepExecutor?.usingNative) {
       return this.executeNativeStep('stepInto', () => this.nativeStepExecutor!.stepIntoInstruction());
     }
-    this.clearNativeStopInfo('instruction step using legacy path');
+    this.clearNativeStopInfo('instruction step using adapter step');
     return this.doSingleStep();
   }
 
@@ -2101,7 +1953,7 @@ case 'readVariableRuntime':
         breakpoints: this.snapshotBreakpoints(),
       }));
     }
-    this.clearNativeStopInfo('stepOut using legacy path');
+    this.clearNativeStopInfo('stepOut using adapter step');
     return this.doStepOutLegacy();
   }
 
@@ -2135,7 +1987,7 @@ case 'readVariableRuntime':
 
   private async doStepOver(): Promise<OzoneCommandResult> {
     if (!this.nativeStepsEnabled.stepOver || !this.nativeStepExecutor?.usingNative) {
-      this.clearNativeStopInfo('stepOver using legacy path');
+      this.clearNativeStopInfo('stepOver using adapter step');
       return this.doStepOverLegacy();
     }
 
@@ -2230,7 +2082,7 @@ case 'readVariableRuntime':
   }
 
   private currentBreakpointSlots(): readonly (number | null)[] {
-    return this.sessionTarget ? this.sessionBreakpointSlots : this.jlink.breakpointSlots;
+    return this.sessionBreakpointSlots;
   }
 
   private async executeNativeStep(
@@ -2802,7 +2654,7 @@ case 'readVariableRuntime':
   private async doSingleStep(): Promise<OzoneCommandResult> {
     for (let retry = 0; retry < 5; retry++) {
       const tStep = Date.now();
-      const stepOk = this.sessionTarget ? (await this.sessionTarget.step()).ok : this.jlink.step();
+      const stepOk = (await this.sessionTarget?.step())?.ok === true;
       log.step(`doSingleStep: retry=${retry} step()=${stepOk} t=${Date.now()-tStep}ms`);
       this.stepProfileMark('run', tStep, `singleStep retry=${retry} ok=${stepOk}`);
       if (stepOk) {
@@ -4899,15 +4751,7 @@ case 'readVariableRuntime':
         }
         return { ok: true, data: `Wrote ${data.length} byte(s)` };
       }
-      const ok = this.jlink.writeMemoryBytes(address, bytes);
-      return ok
-        ? { ok: true, data: `Wrote ${data.length} byte(s)` }
-        : {
-          ok: false,
-          errorCode: 'MemoryWriteFailed',
-          error: 'MemoryWriteFailed: live memory write failed',
-          targetState: this.state,
-        };
+      return this.sessionOwnerFailure(this.targetUnavailable(), 'TargetOwnerUnavailable');
     }
 
     const wasRunning = !(await this.targetIsHalted());
@@ -5007,7 +4851,6 @@ case 'readVariableRuntime':
   async dispose(graceful = false): Promise<void> {
     this.clearNativeStopInfo('backend dispose');
     cancelActiveFlashes('backend disposed');
-    if (this.sessionTarget) await this.sessionTarget.dispose(graceful);
-    else this.jlink.disconnect();
+    await this.sessionTarget?.dispose(graceful);
   }
 }

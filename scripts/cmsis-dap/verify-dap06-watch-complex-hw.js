@@ -164,7 +164,7 @@ async function main() {
   try {
     const initialize = await client.request('initialize', { clientID: 'orbit-dap06-watch-complex-hw', adapterID: 'orbit', pathFormat: 'path', linesStartAt1: true, columnsStartAt1: true }); check('initialize', responseOk(initialize), { response: initialize.message });
     const launchIndex = evidence.trace.length - 1;
-    const launch = await client.request('launch', { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe: 'cmsis-dap', cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid, cmsisDapSerial: serial, flashBeforeDebug: true, nativeDebugEngineEnabled: true, nativeDebugEngineMode: 'auto', loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false }, 30000);
+    const launch = await client.request('launch', { program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe: 'cmsis-dap', cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid, cmsisDapSerial: serial, flashBeforeDebug: true, loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false }, 30000);
     check('launch programs the authorized complex fixture', responseOk(launch), { response: launch.message }); if (!responseOk(launch)) throw new Error(`launch failed: ${launch.message.message}`);
     const configurationDone = await client.request('configurationDone'); const entry = await client.waitEvent('stopped', launchIndex, 15000); check('initial entry stop', responseOk(configurationDone) && entry.message.body?.reason === 'entry', { response: configurationDone.message, event: entry.message });
 

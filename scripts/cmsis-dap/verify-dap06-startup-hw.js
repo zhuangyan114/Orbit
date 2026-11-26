@@ -181,7 +181,6 @@ function launchArguments(flashBeforeDebug) {
     device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz,
     probe: 'cmsis-dap', cmsisDapTransport: 'hid', cmsisDapVid: vid, cmsisDapPid: pid,
     cmsisDapSerial: serial, flashBeforeDebug, runToEntryPoint: 'main',
-    nativeDebugEngineEnabled: true, nativeDebugEngineMode: 'auto',
     loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled: false,
   };
 }

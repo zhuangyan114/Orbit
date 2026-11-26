@@ -241,7 +241,7 @@ export interface InstanceDescription {
 }
 
 /** OpenRPC OwnerKind. */
-export type OwnerKind = 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
+export type OwnerKind = 'jlink-native' | 'cmsis-dap';
 
 /** OpenRPC Capability. */
 export interface Capability {

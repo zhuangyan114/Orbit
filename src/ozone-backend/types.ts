@@ -27,10 +27,9 @@ export interface DebugSessionConfig extends DebugProbeLaunchConfig {
   device: string;
   interface: 'SWD' | 'JTAG';
   speedKHz: number;
+  dllPath?: string;
   jdebugScript?: string;
   rtos?: string;
-  nativeDebugEngineMode?: 'legacy' | 'native' | 'auto';
-  nativeDebugEngineEnabled?: boolean;
 }
 
 export enum TargetState {

@@ -86,7 +86,7 @@ describe('RMLink public-service owner',()=>{
   it('routes probe=rmlink to one service owner without requiring USB selectors or a device ID',async()=>{
     const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
     const forbidden=()=>{throw new Error('competing probe');};
-    const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+    const selector=new SessionTargetSelector(forbidden,forbidden,()=>owner);
     expect(await selector.connect({probe:'rmlink',device:'STM32F103C8',interface:'SWD',speedKHz:4000}))
       .toMatchObject({ok:true,data:{diagnostics:{transport:'rmlink-service',deviceId:'50787d15a924'}}});
     expect(model.opened).toBe(1);expect(model.calls).toEqual(['connect']);
@@ -101,7 +101,7 @@ describe('RMLink public-service owner',()=>{
     expect((await owner.connect({probe:'rmlink',device:'STM32F103C8',speedKHz:4000})).errorCode).toBe('DeviceNotFound');
     model.target=async()=>{throw Object.assign(new Error('busy'),{errorCode:'TargetBusy',httpStatus:409});};
     const forbidden=()=>{throw new Error('competing probe');};
-    const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+    const selector=new SessionTargetSelector(forbidden,forbidden,()=>owner);
     expect(await selector.connect({probe:'rmlink',rmlinkDeviceId:'50787d15a924',device:'STM32F103C8',speedKHz:4000}))
       .toMatchObject({ok:false,errorCode:'TargetBusy',message:expect.stringContaining('未执行烧录')});
     expect(selector.ownerKind).toBe('none');expect(model.opened).toBe(1);
@@ -118,7 +118,7 @@ describe('RMLink public-service owner',()=>{
   it('selects exactly one service owner and never constructs a competing probe',async()=>{
     const model=new ClientModel(),owner=new RMLinkTargetChannel(model as unknown as RMLinkClient);
     const forbidden=()=>{throw new Error('competing probe');};
-    const selector=new SessionTargetSelector(forbidden,forbidden,forbidden,()=>owner);
+    const selector=new SessionTargetSelector(forbidden,forbidden,()=>owner);
     expect((await selector.connect({device:'STM32F103C8',speedKHz:4000,rmlinkDeviceId:'50787d15a924'})).ok).toBe(true);
     expect((await selector.readMemory(0x20000000,4)).data?.bytes).toEqual(Buffer.from('78563412','hex'));
     expect(model.opened).toBe(1);await selector.dispose();expect(model.closed).toBe(1);

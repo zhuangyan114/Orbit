@@ -179,7 +179,7 @@ export class DiagnosticsService {
   }
 
   private toOwnerKind(kind: string | undefined, fallback: OwnerKind | undefined): OwnerKind | undefined {
-    if (kind === 'jlink-native' || kind === 'jlink-legacy' || kind === 'cmsis-dap') return kind;
+    if (kind === 'jlink-native' || kind === 'cmsis-dap') return kind;
     return fallback;
   }
 }

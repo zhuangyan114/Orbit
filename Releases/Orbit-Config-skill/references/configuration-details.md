@@ -28,8 +28,6 @@
 | `orbit.rttLogTarget` | `terminal` / `debugConsole` / `both` | `terminal` | RTT 输出位置。|
 | `orbit.pRtLogEnabled` | boolean | `false` | 是否把 RTT bytes 解码为 P-RTLog tokenized frames。|
 | `orbit.pRtLogRoot` | path | `""` | P-RTLog root 配置/诊断值；当前 decoder 不从该目录搜索 token。|
-| `orbit.nativeDebugEngine.enabled` | boolean | `true` | Native helper 总开关。|
-| `orbit.nativeDebugEngine.mode` | `legacy` / `native` / `auto` | `auto` | target owner 选择策略。|
 | `orbit.watchPollIntervalMs` | number, ms | `500`, `100..10000` | Watch Webview 可见时的刷新计时基准。|
 | `orbit.timelineSampleIntervalMs` | number, ms | `0.2`, `0.1..10000` | Timeline target sampling 目标间隔。|
 | `orbit.timelineSendIntervalMs` | number, ms | `16`, `1..10000` | Timeline 向 Webview 发送更新的间隔。|
@@ -118,8 +116,6 @@ External Views 的 tracker arrays 不是 Orbit 自有 setting，但可以在目�
 | `rttLogTarget` | enum | `terminal` | `terminal`、`debugConsole` 或 `both`。|
 | `pRtLogEnabled` | boolean | `false` | P-RTLog tokenized RTT decoder 开关。|
 | `pRtLogRoot` | path | `""` | 当前为 decoder 诊断配置，不是 token 搜索目录。|
-| `nativeDebugEngineEnabled` | boolean | `true` | Native helper 开关。|
-| `nativeDebugEngineMode` | enum | `auto` | `legacy`、`native` 或 `auto`。|
 
 源码还支持 `elfPath` 作为 `program` 的兼容别名。`probe`、`interface`、`device`、`speedKHz`、`flashBeforeDebug`、`rtos` 和所有 RTT/P-RTLog/owner 字段最终由 DAP session 使用。
 
@@ -147,23 +143,22 @@ set(CMAKE_SIZE "${ARM_TOOLCHAIN_BIN_DIR}/arm-none-eabi-size.exe")
 
 ## J-Link DLL and flash
 
-调试控制使用 `JLink_x64.dll`；Native channel 在 `orbit-jlink-helper.exe` 进程中加载 DLL，Legacy channel 通过 Node `koffi` 加载 DLL。`orbit.jlinkDllPath` 非空且存在时优先使用；否则源码会按版本目录、SEGGER Ozone 目录和 `JLink_x64.dll` 进行搜索。
+调试控制使用 `JLink_x64.dll`；`orbit-jlink-helper.exe` 在独立进程中加载 DLL。`orbit.jlinkDllPath` 非空且存在时优先使用；否则源码会按版本目录、SEGGER Ozone 目录和 `JLink_x64.dll` 进行搜索。
 
 自动 flash 使用 `orbit.jlinkPath` 指向的 `JLink.exe`，并将 `device`、`interface`、`speedKHz` 写入 J-Link Commander script。flash 不是持续调试控制 owner；已有固件时可将 `flashBeforeDebug` 设为 `false`。
 
-注意：当前 Legacy `JLinkDLL.connect()` 固定选择 SWD，虽然配置 schema 接受 `JTAG`；需要 JTAG 时优先使用 Native，并把这个结论作为 source limitation 报告。
 
 ## CMSIS-DAP / DAPLink
 
 `probe: "auto"` 先用短生命周期 helper 检测 J-Link，只有 J-Link 不可用时才枚举 CMSIS-DAP；发现 helper 会在正式 owner 建立前释放。`probe: "cmsis-dap"` 启动 `out/native/win32-x64/orbit-cmsis-dap-helper.exe`，不加载 J-Link DLL。`cmsisDapTransport: "auto"` 优先 WinUSB v2 并兼容 HID v1。标准配置保持未绑定；用户明确要求选择特定设备时，才使用 serial、VID/PID 或 interface path。
 
-CMSIS-DAP owner 负责协议 framing、SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm 和内存型 RTT。它不回退到 J-Link/Legacy，也不允许 Watch、Timeline、RTT 或 Viewer 创建第二个 target owner。
+CMSIS-DAP owner 负责协议 framing、SWD/DP/AP、Cortex-M 控制、FPB、内存、Flash Algorithm 和内存型 RTT。它不回退到 J-Link，也不允许 Watch、Timeline、RTT 或 Viewer 创建第二个 target owner。
 
 默认 `flashBeforeDebug: true` 按 `flashBackend`（默认 `auto`）处理：已登记型号使用原生快速 Flash Algorithm，其余受支持 STM32（部分 F1/F4/H72x/G0/G4）在建立调试 owner 前通过随扩展提供的 OpenOCD 子进程完成独立烧录与校验（OpenOCD 进程完全退出后再建立调试 owner）；`false` 不得发出 Flash 操作。使用自定义 `cmsisDapFlashAlgorithmPath` 时，必须确认来源、许可、目标范围、RAM 布局和 ABI。
 
-## Native / Legacy owner
+## J-Link owner
 
-Native helper 路径为 source checkout 的 `out/native/win32-x64/orbit-jlink-helper.exe`。Native 与 Legacy 不能在同一 DAP session 同时持有 target。`auto` 的 fallback 发生在 Native startup/initialization 失败或已 dispose 的 Native owner loss 之后；不会 hot-switch，Native owner 丢失通常要求结束并重新启动 session。
+Native helper 路径为 `out/native/win32-x64/orbit-jlink-helper.exe`。启动失败时释放 helper 并返回错误。已连接 owner 丢失时结束会话，重新连接需开启新会话。
 
 Native scheduler 的优先级是 `control > watch > timeline > background`。step、continue、halt、reset、breakpoint、Flash 和 write 属于 control work；RTT/RTOS refresh 属于 background。不要通过第二个 owner 绕过调度。
 

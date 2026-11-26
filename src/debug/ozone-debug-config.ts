@@ -130,11 +130,16 @@ export class OzoneDebugConfigurationProvider implements vscode.DebugConfiguratio
     if (config.pRtLogRoot === undefined) {
       config.pRtLogRoot = cfg.get<string>('pRtLogRoot', '');
     }
-    if (config.nativeDebugEngineEnabled === undefined) {
-      config.nativeDebugEngineEnabled = cfg.get<boolean>('nativeDebugEngine.enabled', true);
+    if (config.jlinkDllPath === undefined) {
+      const dllPath = cfg.get<string>('jlinkDllPath', '').trim();
+      if (dllPath) config.jlinkDllPath = dllPath;
     }
-    if (config.nativeDebugEngineMode === undefined) {
-      config.nativeDebugEngineMode = cfg.get<'legacy' | 'native' | 'auto'>('nativeDebugEngine.mode', 'auto');
+
+    // Pass retired settings to the adapter only when they selected J-Link Legacy.
+    const previousEngineMode = config.nativeDebugEngineMode ?? cfg.get<string>('nativeDebugEngine.mode');
+    const previousEngineEnabled = config.nativeDebugEngineEnabled ?? cfg.get<boolean>('nativeDebugEngine.enabled');
+    if (previousEngineMode === 'legacy' || (previousEngineMode !== 'native' && previousEngineEnabled === false)) {
+      config.nativeDebugEngineMode = 'legacy';
     }
 
     return config;

@@ -65,7 +65,7 @@ export interface AutomationFlashSegment {
 /** DAP-side flash outcome: mirrors the frozen FlashReport schema. */
 export interface AutomationFlashReport {
   elfPath: string;
-  owner: 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
+  owner: 'jlink-native' | 'cmsis-dap';
   bytesProgrammed: number;
   verified: boolean;
   segments: AutomationFlashSegment[];
@@ -807,7 +807,7 @@ export interface AutomationRttRequest {
 /** Adapter-internal RTT snapshot (mirrors the frozen public RttSnapshot). */
 export interface AutomationRttSnapshot {
   state: 'stopped' | 'starting' | 'running' | 'stopping' | 'unavailable' | 'error';
-  owner: 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
+  owner: 'jlink-native' | 'cmsis-dap';
   bufferIndex: number;
   pollIntervalMs: number;
   targetName?: string;

@@ -206,6 +206,10 @@
                   { "label": "STM32H750VBT6", "body": "STM32H750VBT6" }
                 ]
               },
+              "jlinkDllPath": {
+                "type": "string",
+                "description": "J-Link DLL 路径。留空时由原生 helper 自动查找。"
+              },
               "deviceName": {
                 "type": "string",
                 "description": "Optional target device name alias used by external MCU debug views; when omitted it follows device"
@@ -397,21 +401,6 @@
                 "description": "Path to the P-RTLog toolkit root",
                 "default": ""
               },
-              "nativeDebugEngineEnabled": {
-                "type": "boolean",
-                "description": "Prefer the Native helper session path and fall back to legacy only when startup fails",
-                "default": true
-              },
-              "nativeDebugEngineMode": {
-                "type": "string",
-                "enum": [
-                  "legacy",
-                  "native",
-                  "auto"
-                ],
-                "description": "Select legacy koffi, explicit Native, or Native startup with legacy fallback; an already connected Native owner never hot-switches",
-                "default": "auto"
-              },
               "rtosSnapshotPort": {
                 "type": "object",
                 "description": "FreeRTOS 栈与运行统计条件。填写已核对的 port 来源；缺省时相关列保持不可用。",
@@ -594,21 +583,6 @@
           "default": "",
           "description": "P-RTLog 工具包根目录路径"
         },
-        "orbit.nativeDebugEngine.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "优先使用 Native Helper 会话路径，仅在启动失败时回退到 Legacy。"
-        },
-        "orbit.nativeDebugEngine.mode": {
-          "type": "string",
-          "enum": [
-            "legacy",
-            "native",
-            "auto"
-          ],
-          "default": "auto",
-          "description": "目标所有者选择：legacy 仅使用 koffi；native 失败时不回退；auto 仅在 Native 连接前启动失败时回退。"
-        },
         "orbit.watchPollIntervalMs": {
           "type": "number",
           "default": 500,
@@ -686,7 +660,6 @@
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "adm-zip": "^0.6.1",
-    "koffi": "^3.1.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
     "zod": "^4.4.3",

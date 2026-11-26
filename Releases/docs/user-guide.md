@@ -71,7 +71,7 @@ npm run typecheck
 
 ### 2.1 J-Link
 
-Orbit 通过 `orbit-jlink-helper.exe`（或备选的 `koffi` 通道）加载 `JLink_x64.dll` 与探针通信，不需要启动 OpenOCD、GDB server 或 Ozone GUI。
+Orbit 通过 `orbit-jlink-helper.exe`加载 `JLink_x64.dll` 与探针通信，不需要启动 OpenOCD、GDB server 或 Ozone GUI。
 
 当工作区设置 `orbit.jlinkDllPath` 留空时，Orbit 按以下顺序查找 `JLink_x64.dll`：
 
@@ -211,7 +211,7 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
 | `cmsisDapFlashAlgorithmPath` | path | `""` | 自定义 CMSIS-DAP Flash 算法文件（`.flm` 或 manifest）路径。 |
 | `program` | path | 自动查找 | `.elf` / `.axf` 固件路径（兼容旧别名 `elfPath`）。 |
 | `svdFile` / `svdPath` | path | 自动解析 | 外设寄存器描述文件（`.svd`）路径，留空时自动搜索或后台按需下载。 |
-| `interface` | `SWD` / `JTAG` | `"SWD"` | 调试接口。CMSIS-DAP、RMLink 与 J-Link Legacy 仅使用 SWD；JTAG 需配合 J-Link Native。 |
+| `interface` | `SWD` / `JTAG` | `"SWD"` | 调试接口。CMSIS-DAP 和 RMLink 使用 SWD。J-Link 支持 SWD 和 JTAG。 |
 | `speedKHz` | number（kHz） | `4000` | SWD / JTAG 通信时钟频率。 |
 | `flashBeforeDebug` | boolean | `true` | 启动前是否烧录固件。点击“重启”时若固件未变化则自动跳过烧录直接复位运行，固件变化后重烧并停在入口；设为 `false` 则始终跳过烧录。 |
 | `runToEntryPoint` | string / `false` | `"main"` | J-Link、CMSIS-DAP 和 RMLink 烧录后自动停靠的函数名（重启时仅固件变化后停靠）；设为 `false` 禁用。 |
@@ -228,8 +228,6 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
 | `rttLogTarget` | `terminal` / `debugConsole` / `both` | `"terminal"` | RTT 日志显示位置。 |
 | `pRtLogEnabled` | boolean | `false` | 是否启用 P-RTLog 二进制帧解码。 |
 | `pRtLogRoot` | path | `""` | P-RTLog 诊断记录用路径配置。 |
-| `nativeDebugEngineEnabled` | boolean | `true` | 是否优先使用 J-Link 原生 C++ helper。 |
-| `nativeDebugEngineMode` | `auto` / `native` / `legacy` | `"auto"` | J-Link 引擎模式：`auto` 优先原生 helper，启动失败时回退 `koffi` Legacy；`native` 与 `legacy` 分别强制使用对应模式。 |
 
 ### 3.3 固件 ELF/AXF 自动查找规则
 
@@ -267,8 +265,6 @@ CMSIS-DAP 和 RMLink 默认根据 `device` 选择烧录方式。下列芯片优�
 | `orbit.rttLogTarget` | `terminal` / `debugConsole` / `both` | `"terminal"` | 默认 RTT 显示窗口。 |
 | `orbit.pRtLogEnabled` | boolean | `false` | 默认启用 P-RTLog 解码。 |
 | `orbit.pRtLogRoot` | path | `""` | 默认 P-RTLog 路径配置。 |
-| `orbit.nativeDebugEngine.enabled` | boolean | `true` | 是否允许 J-Link 原生 helper。 |
-| `orbit.nativeDebugEngine.mode` | `auto` / `native` / `legacy` | `"auto"` | 默认 J-Link 引擎策略。 |
 | `orbit.watchPollIntervalMs` | number（`100..10000` ms） | `500` | Watch 面板可见时的轮询刷新间隔。 |
 | `orbit.timelineSampleIntervalMs` | number（`0.1..10000` ms） | `0.2` | Timeline 目标采样间隔（0.2 ms 对应目标 5 kHz；实际速率受探针和通道数限制）。 |
 | `orbit.timelineSendIntervalMs` | number（`1..10000` ms） | `16` | Timeline 向界面推送刷新的节拍。 |
@@ -424,7 +420,6 @@ Peripheral Viewer 使用 CMSIS-SVD 文件渲染外设寄存器树。Orbit 会按
 为了避免多工具同时抢占探针导致掉线或状态错乱，Orbit 严格保证**每个调试会话只持有唯一一个目标连接**：
 
 - **J-Link 原生通道**（`orbit-jlink-helper.exe`）：独立进程加载 `JLink_x64.dll`，支持源码级单步（`stepInto` / `stepOver` / `stepOut`）、批量读取和优先级调度。
-- **J-Link Legacy 通道**（`koffi`）：仅在原生通道初始化失败（或显式设为 `legacy`）时作为备用，不支持原生源码级单步。
 - **CMSIS-DAP 通道**（`orbit-cmsis-dap-helper.exe`）：独立进程处理 HID / WinUSB / TCP 通信、SWD、硬件断点（FPB）、烧录和内存型 RTT。
 - **RMLink 通道**：通过 `@rmlink/client` 与 RMLink 服务通信，复用同一条连接完成控制、烧录、订阅和 RTT。
 
@@ -487,7 +482,6 @@ Orbit 默认只自动扫描 `build/Debug`、`build/Release` 和 `build` 目录�
 确认已安装对应外部扩展，在命令面板执行 `Orbit: Enable MCU Debug Views Integration` 后重新加载窗口；使用 Peripheral Viewer 时检查 `outputs/Log/dap.log` 中的 `[svd]` 日志确认 SVD 是否加载成功。
 
 ### Q8：配置了 `interface: "JTAG"` 但依然走了 SWD
-J-Link Legacy 引擎当前固定使用 SWD；需要使用 JTAG 请确认 `orbit.nativeDebugEngine.mode` 为 `"auto"` 或 `"native"`，不要设为 `"legacy"`。
 
 ### Q9：MCP 客户端提示找不到调试实例或读写报错
 1. 确认已在 VS Code 中打开工作区、设置了 `"orbit.automation.enabled": true` 并重新加载窗口；
@@ -504,7 +498,6 @@ J-Link Legacy 引擎当前固定使用 SWD；需要使用 JTAG 请确认 `orbit.
 - **平台限制**：目前仅支持 Windows x64，暂不支持 macOS 与 Linux。
 - **烧录芯片支持范围**。J-Link 的覆盖取决于 SEGGER 器件库。CMSIS-DAP 和 RMLink 优先使用已登记型号的快速算法，其余受支持的 STM32 可由内置 OpenOCD 烧录。
 - **硬件断点数量**：J-Link 最多使用 6 个硬件断点槽位；CMSIS-DAP 根据芯片 FPB 比较器数量动态判断，槽位用满后新增断点会提示失败。
-- **单步与接口限制**：J-Link Legacy 模式不支持源码级单步（`stepInto`/`stepOver`/`stepOut`）与 JTAG 接口，建议保持默认的原生 helper 模式。
 - **采样频率**：`orbit.timelineSampleIntervalMs`（默认 `0.2 ms`）是期望周期而非硬实时保证，实际采样率取决于探针通信速率、通道数、指针深度和并发 Watch/RTT 负载。
 - **内置 RTOS 诊断范围**：目前面向单核 ARM Cortex-M FreeRTOS；SystemView 归档与导出采用 `orbit-trace-v1` 目录、`.bin` 与 `.csv`，暂不支持 `.SVDat` 导入导出。
 - **部分 DAP 高级特性未支持**：当前暂不支持条件断点（Conditional Breakpoint）、数据断点（Watchpoint）、Logpoint、反向单步（Step Back）以及反汇编视图（Disassemble）。

@@ -286,8 +286,6 @@ async function runSession(index) {
       cmsisDapPid: pid,
       cmsisDapSerial: serial,
       flashBeforeDebug: false,
-      nativeDebugEngineEnabled: true,
-      nativeDebugEngineMode: 'auto',
       loggingEnabled: true,
       clearLogsOnStart: index === 1,
       rttLogEnabled: false,

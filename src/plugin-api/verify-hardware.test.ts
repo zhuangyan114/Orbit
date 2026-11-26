@@ -52,7 +52,6 @@ describe('Orbit Automation API hardware acceptance validator', () => {
     expect(status.automated).toBe('passed');
     expect(status.mock).toBe('passed');
     expect(status['hardware.jlink-native']).toBe('unverified');
-    expect(status['hardware.jlink-legacy']).toBe('unverified');
     expect(status['hardware.cmsis-dap']).toBe('unverified');
     expect(status.allLayersPassed).toBe('false');
   });

@@ -6,7 +6,7 @@ import type {
   CmsisDapRttWriteResult,
 } from './cmsis-dap-helper-channel';
 
-export type RttCapabilityOwnerKind = 'none' | 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
+export type RttCapabilityOwnerKind = 'none' | 'jlink-native' | 'cmsis-dap';
 
 export interface RttCapabilities {
   ownerKind: RttCapabilityOwnerKind;
@@ -176,7 +176,6 @@ export function isValidRttCapabilities(data: unknown): data is RttCapabilities {
   };
   return (value.ownerKind === 'none'
     || value.ownerKind === 'jlink-native'
-    || value.ownerKind === 'jlink-legacy'
     || value.ownerKind === 'cmsis-dap')
     && validCap(value.rttStart)
     && validCap(value.rttEnumerate)

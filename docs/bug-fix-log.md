@@ -11,6 +11,15 @@
 
 ## 修改记录
 
+### 改进：移除 J-Link Legacy 调试路径
+
+- **日期** 2026-11-26。
+- **问题描述** J-Link 同时维护 Native helper 和进程内 `koffi` 两套调试路径，旧配置仍可选中 Legacy，原生连接失败后也可能进入该路径。
+- **根因分析** `SessionTargetSelector` 保留 Legacy owner 与启动回退，`OzoneBackend` 在没有 selector 时另有直接加载 DLL 的分支。配置与 VSIX 因此仍依赖 `koffi`。
+- **修改方案** 移除 Legacy owner、进程内 DLL 访问和打包依赖。J-Link 会话统一使用 Native helper，失败时释放 helper 并返回原始错误。旧 Legacy 配置启动时提示迁移，`orbit.jlinkDllPath` 继续用于探针发现和连接。
+- **涉及文件** `src/ozone-backend/session-target-channel.ts:238`、`src/ozone-backend/commander.ts:222,850`、`src/ozone-backend/cpp-jlink-channel.ts:458`、`src/debug/dap-session.ts:2268,2327`、`src/debug/ozone-debug-config.ts:133`，以及 `package.json`、`package-lock.json` 和 `.vscodeignore`。
+- **验证结果** 全量 Vitest 130 个文件、1,564 项通过、1 项跳过。类型检查、扩展与原生构建、J-Link 和 CMSIS-DAP mock、Flash Algorithm 校验均通过。重新打包的 VSIX 已确认不含 `koffi`，并通过 mock DLL 验证了启动、迁移提示、Restart、断开及 helper 缺失时的报错。未执行真机验证。
+
 ### 改进：Watch 写入切换为不停机直写，CMSIS-DAP 改用原生 8/16/32-bit MEM-AP CSW 写入
 
 - **日期**: 2026-11-22

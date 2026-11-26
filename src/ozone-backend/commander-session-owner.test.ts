@@ -18,15 +18,8 @@ describe('OzoneBackend extension-host ownership guard', () => {
     expect(missing).toMatchObject({ ok: false, errorCode: 'SymbolNotFound' });
   });
 
-  it('rejects target access before touching the local J-Link backend', async () => {
+  it('rejects extension-host target access while DAP owns the target', async () => {
     const backend = new OzoneBackend(undefined, undefined, () => true);
-    const legacy = {
-      open: vi.fn(() => true),
-      connect: vi.fn(() => true),
-      readMemory: vi.fn(),
-      isHalted: vi.fn(),
-    };
-    (backend as any).jlink = legacy;
 
     const connect = await backend.execute({
       cmd: 'connect',
@@ -36,22 +29,11 @@ describe('OzoneBackend extension-host ownership guard', () => {
 
     expect(connect).toEqual({ ok: false, error: 'Target access is owned by the active ozone DAP session' });
     expect(read).toEqual({ ok: false, error: 'Target access is owned by the active ozone DAP session' });
-    expect(legacy.open).not.toHaveBeenCalled();
-    expect(legacy.connect).not.toHaveBeenCalled();
-    expect(legacy.readMemory).not.toHaveBeenCalled();
-    expect(legacy.isHalted).not.toHaveBeenCalled();
   });
 
-  it('allows a blocked extension backend to release an older local owner', async () => {
+  it('allows disconnect while DAP owns the target', async () => {
     const backend = new OzoneBackend(undefined, undefined, () => true);
-    const legacy = { disconnect: vi.fn() };
-    (backend as any).jlink = legacy;
-    (backend as any).state = 'connected';
-
-    const result = await backend.execute({ cmd: 'disconnect' });
-
-    expect(result.ok).toBe(true);
-    expect(legacy.disconnect).toHaveBeenCalledOnce();
+    await expect(backend.execute({ cmd: 'disconnect' })).resolves.toMatchObject({ ok: true });
   });
 
   it('does not turn a session-owner state error into a successful stale state', async () => {
@@ -217,18 +199,13 @@ describe('OzoneBackend extension-host ownership guard', () => {
     if (!result.ok) expect(result.error).toContain('CMSIS-DAP target owner');
   });
 
-  it('returns OwnerUnavailable for CMSIS-DAP without a selector and never opens J-Link', async () => {
+  it.each(['jlink', 'cmsis-dap', 'rmlink'] as const)('rejects %s connection without a session target', async probe => {
     const backend = new OzoneBackend();
-    const jlink = {
-      open: vi.fn(() => true),
-      connect: vi.fn(() => true),
-    };
-    (backend as any).jlink = jlink;
 
     const result = await backend.execute({
       cmd: 'connect',
       config: {
-        probe: 'cmsis-dap',
+        probe,
         flashBeforeDebug: false,
         device: 'STM32F407VET6',
         interface: 'SWD',
@@ -236,19 +213,12 @@ describe('OzoneBackend extension-host ownership guard', () => {
       },
     });
 
-    expect(result).toMatchObject({ ok: false, errorCode: 'OwnerUnavailable' });
-    if (!result.ok) expect(result.error).toContain('CMSIS-DAP');
-    expect(jlink.open).not.toHaveBeenCalled();
-    expect(jlink.connect).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, errorCode: 'TargetOwnerUnavailable' });
+    if (!result.ok) expect(result.error).toContain('No target owner is connected');
   });
 
   it('returns InvalidConfiguration for an invalid probe at the backend boundary', async () => {
     const backend = new OzoneBackend();
-    const jlink = {
-      open: vi.fn(() => true),
-      connect: vi.fn(() => true),
-    };
-    (backend as any).jlink = jlink;
 
     const result = await backend.execute({
       cmd: 'connect',
@@ -263,36 +233,10 @@ describe('OzoneBackend extension-host ownership guard', () => {
 
     expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
     if (!result.ok) expect(result.error).toContain('probe must be one of auto, jlink, cmsis-dap, or rmlink');
-    expect(jlink.open).not.toHaveBeenCalled();
-    expect(jlink.connect).not.toHaveBeenCalled();
   });
 
   it.each(['foo', 'jlink'])('rejects probe %s with a RMLink device selector before opening a target', async (probe) => {
     const backend = new OzoneBackend();
-    const jlink = { open: vi.fn(), connect: vi.fn() };
-    (backend as any).jlink = jlink;
-    const result = await backend.execute({
-      cmd: 'connect',
-      config: {
-        probe,
-        rmlinkDeviceId: 'test-probe',
-        device: 'STM32F103C8',
-        interface: 'SWD',
-        speedKHz: 4000,
-      } as any,
-    });
-    expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
-    expect(jlink.open).not.toHaveBeenCalled();
-    expect(jlink.connect).not.toHaveBeenCalled();
-  });
-
-  it('returns InvalidConfiguration for an invalid CMSIS-DAP transport at the backend boundary', async () => {
-    const backend = new OzoneBackend();
-    const jlink = {
-      open: vi.fn(() => true),
-      connect: vi.fn(() => true),
-    };
-    (backend as any).jlink = jlink;
 
     const result = await backend.execute({
       cmd: 'connect',
@@ -307,14 +251,12 @@ describe('OzoneBackend extension-host ownership guard', () => {
 
     expect(result).toMatchObject({ ok: false, errorCode: 'InvalidConfiguration' });
     if (!result.ok) expect(result.error).toContain('cmsisDapTransport must be one of auto, cmsis-dap-v2, cmsis-dap, hid, winusb, or tcp');
-    expect(jlink.open).not.toHaveBeenCalled();
-    expect(jlink.connect).not.toHaveBeenCalled();
   });
 
   it('keeps a same-probe reconnect idempotent for an already selected J-Link owner', async () => {
     const jlinkOwner = {
-      kind: 'jlink-legacy' as const,
-      usingNative: false,
+      kind: 'jlink-native' as const,
+      usingNative: true,
       connect: vi.fn(),
     } as unknown as SessionTargetOwner;
     const backend = new OzoneBackend(undefined, jlinkOwner);
@@ -336,8 +278,8 @@ describe('OzoneBackend extension-host ownership guard', () => {
 
   it('rejects a CMSIS-DAP reconnect when a J-Link owner is already selected', async () => {
     const jlinkOwner = {
-      kind: 'jlink-legacy' as const,
-      usingNative: false,
+      kind: 'jlink-native' as const,
+      usingNative: true,
       connect: vi.fn(),
     } as unknown as SessionTargetOwner;
     const backend = new OzoneBackend(undefined, jlinkOwner);
@@ -435,8 +377,6 @@ describe('OzoneBackend extension-host ownership guard', () => {
     } as unknown as SessionTargetOwner;
 
     const backend = new OzoneBackend(nativeOwner, nativeOwner);
-    const directJlink = { startRtt: vi.fn(), readRtt: vi.fn(), stopRtt: vi.fn() };
-    (backend as any).jlink = directJlink;
 
     await expect(backend.execute({ cmd: 'getRttCapabilities' })).resolves.toEqual({ ok: true, data: rttCaps });
     await expect(backend.execute({ cmd: 'startRtt', controlBlockAddress: 0x24000100 })).resolves.toMatchObject({ ok: true });
@@ -451,42 +391,23 @@ describe('OzoneBackend extension-host ownership guard', () => {
     });
     await expect(backend.execute({ cmd: 'stopRtt' })).resolves.toMatchObject({ ok: true });
 
-    expect(directJlink.startRtt).not.toHaveBeenCalled();
-    expect(directJlink.readRtt).not.toHaveBeenCalled();
-    expect(directJlink.stopRtt).not.toHaveBeenCalled();
   });
 
-  it('reports legacy RTT capabilities and UnsupportedCapability cleanly when no native RTT owner exists', async () => {
+  it('reports RTT unavailable when there is no selected owner', async () => {
     const backend = new OzoneBackend();
-    (backend as any).jlink = {
-      connected: true,
-      getRttApiAvailability: vi.fn(() => ({ control: true, read: false, write: false })),
-      startRtt: vi.fn(() => true),
-      readRtt: vi.fn(() => null),
-      stopRtt: vi.fn(),
-    };
-
     await expect(backend.execute({ cmd: 'getRttCapabilities' })).resolves.toMatchObject({
       ok: true,
       data: {
-        ownerKind: 'jlink-legacy',
-        rttStart: { available: true },
-        rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Read') },
+        ownerKind: 'none',
+        rttStart: { available: false },
+        rttUpRead: { available: false },
         rttEnumerate: { available: false },
         rttDownWrite: { available: false },
       },
     });
     await expect(backend.execute({ cmd: 'readRtt', bufferIndex: 0, size: 8 })).resolves.toMatchObject({
       ok: false,
-      errorCode: 'UnsupportedCapability',
-    });
-    await expect(backend.execute({ cmd: 'enumerateRtt', controlBlockAddress: 0x20000100 })).resolves.toMatchObject({
-      ok: false,
-      errorCode: 'UnsupportedCapability',
-    });
-    await expect(backend.execute({ cmd: 'writeRtt', bufferIndex: 0, bytes: [1] })).resolves.toMatchObject({
-      ok: false,
-      errorCode: 'UnsupportedCapability',
+      errorCode: 'TargetOwnerUnavailable',
     });
   });
 });

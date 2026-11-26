@@ -6,7 +6,7 @@ This document freezes the public Orbit Automation API 1.0 protocol. The field-le
 
 The API exposes the 58 user-level methods in the OpenRPC catalog. It does not expose arbitrary VS Code commands, internal `OzoneCommand` values, J-Link DLL functions, or native-helper RPC. Calls drive the visible VS Code debug session. Mouse/keyboard automation, hidden sessions, a second helper, direct DLL ownership, and fallback to an extension-host target connection while an Orbit DAP session exists are prohibited.
 
-One window may have at most one Orbit-compatible session in `starting|connected|running|halted|terminating`. That session has exactly one physical owner: `jlink-native`, `jlink-legacy`, or `cmsis-dap`. All control, breakpoint, runtime, expression, memory, sampling, recording, RTT, and target diagnostics operations use that exact session and owner. Scheduler priority remains `control > watch > timeline > background`.
+One window may have at most one Orbit-compatible session in `starting|connected|running|halted|terminating`. That session has exactly one physical owner: `jlink-native` or `cmsis-dap`. All control, breakpoint, runtime, expression, memory, sampling, recording, RTT, and target diagnostics operations use that exact session and owner. Scheduler priority remains `control > watch > timeline > background`.
 
 VS Code's `vscode.debug.breakpoints` collection is authoritative. API-created breakpoints are ordinary visible user breakpoints. Watch and Timeline methods synchronize with their existing UI state. The API must not disable Watch, Timeline, variables, evaluate, RTT, Memory Viewer, or related DAP behavior to make control calls succeed.
 

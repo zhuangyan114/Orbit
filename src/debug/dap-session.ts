@@ -2265,6 +2265,7 @@ export class DapSession extends EventEmitter {
       const device = args.device || args.deviceName || 'STM32F407VG';
       const interface_ = args.interface || 'SWD';
       const speedKHz = args.speedKHz || 4000;
+      const jlinkDllPath = typeof args.jlinkDllPath === 'string' ? args.jlinkDllPath.trim() : '';
       this._rtos = args.rtos || args.defaultRtos || '';
       const elfPath = args.program || args.elfPath || '';
       const flashEnabled = targetConfig.flashBeforeDebug;
@@ -2276,6 +2277,7 @@ export class DapSession extends EventEmitter {
             device,
             interface: interface_,
             speedKHz,
+            ...(jlinkDllPath ? { dllPath: jlinkDllPath } : {}),
             probe: 'auto',
             cmsisDapTransport: targetConfig.cmsisDapTransport,
             cmsisDapSerial: targetConfig.cmsisDapSerial,
@@ -2284,10 +2286,6 @@ export class DapSession extends EventEmitter {
             cmsisDapPath: targetConfig.cmsisDapPath,
             cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
             flashBeforeDebug: targetConfig.flashBeforeDebug,
-            nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy'
-              ? args.nativeDebugEngineMode
-              : 'auto',
-            nativeDebugEngineEnabled: args.nativeDebugEngineEnabled !== false,
           },
         });
         if (!probeResult.ok) {
@@ -2325,6 +2323,13 @@ export class DapSession extends EventEmitter {
       this._device = device;
       this._interface = interface_;
       this._speedKHz = speedKHz;
+      if (resolvedProbe === 'jlink' && (args.nativeDebugEngineMode === 'legacy'
+        || (args.nativeDebugEngineMode !== 'native' && args.nativeDebugEngineEnabled === false))) {
+        this.sendEvent('output', {
+          category: 'console',
+          output: '[Orbit] J-Link Legacy 已移除，当前会话使用 Native helper。请清理旧的 nativeDebugEngine 配置。\n',
+        });
+      }
       // RMLink owns the same Cortex-M control contract through its service.
       this._probe = resolvedProbe === 'rmlink' ? 'cmsis-dap' : resolvedProbe;
       this.xrSamplingEnabled = resolvedProbe === 'cmsis-dap' && !targetConfig.rmlinkDeviceId
@@ -2373,6 +2378,7 @@ export class DapSession extends EventEmitter {
         device,
         interface: interface_,
         speedKHz,
+        ...(resolvedProbe === 'jlink' && jlinkDllPath ? { dllPath: jlinkDllPath } : {}),
         probe: resolvedProbe,
         cmsisDapTransport: targetConfig.cmsisDapTransport,
         cmsisDapSerial: targetConfig.cmsisDapSerial,
@@ -2382,10 +2388,6 @@ export class DapSession extends EventEmitter {
         cmsisDapFlashAlgorithmPath: targetConfig.cmsisDapFlashAlgorithmPath,
         cmsisDapXrSampling: this.xrSamplingEnabled,
         flashBeforeDebug: targetConfig.flashBeforeDebug,
-        nativeDebugEngineMode: args.nativeDebugEngineMode === 'native' || args.nativeDebugEngineMode === 'legacy' || args.nativeDebugEngineMode === 'auto'
-          ? args.nativeDebugEngineMode
-          : 'auto',
-        nativeDebugEngineEnabled: args.nativeDebugEngineEnabled !== false,
       };
       if (this.rmlinkDirectDebug) {
         Object.assign(connectConfig, this.rmlinkHandoff!.debugConfig, {
@@ -2468,7 +2470,7 @@ export class DapSession extends EventEmitter {
         || (connectConfig.probe === 'rmlink' ? 'rmlink-service' : '');
       let debugPath = ownerKind === 'jlink-native'
         ? 'J-Link / native C++ helper'
-        : ownerKind === 'jlink-legacy' ? 'J-Link / legacy koffi' : '未知路径';
+        : '未知路径';
       if (ownerKind === 'cmsis-dap') {
         debugPath = connectConfig.probe === 'rmlink'
           ? 'RMLink'
@@ -5683,7 +5685,6 @@ export class DapSession extends EventEmitter {
         const owner = String((perf.data as { owner?: unknown }).owner ?? '');
         if (owner.includes('cmsis-dap')) ownerKind = 'cmsis-dap';
         else if (owner.includes('jlink-native')) ownerKind = 'jlink-native';
-        else if (owner.includes('legacy')) ownerKind = 'jlink-legacy';
       }
     } catch {
       // Best-effort owner reporting; the probe remains the fallback authority.
@@ -5694,12 +5695,11 @@ export class DapSession extends EventEmitter {
     } catch {
       // Scheduler snapshot is best-effort; zero counts remain the fallback.
     }
-    if (ownerKind === 'unknown') {
-      ownerKind = this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-legacy';
+    if (ownerKind === 'unknown' && this.targetConnectionEstablished) {
+      ownerKind = this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-native';
     }
     if (ownerKind === 'cmsis-dap') transport = 'winusb';
     else if (ownerKind === 'jlink-native') transport = 'native';
-    else if (ownerKind === 'jlink-legacy') transport = 'legacy';
     connected = this.phase === 'connected';
     this.sendResponse(msg, {
       sessionGeneration: parsed.request.sessionGeneration,
@@ -6271,12 +6271,11 @@ export class DapSession extends EventEmitter {
         const owner = String((result.data as { owner?: unknown }).owner ?? '');
         if (owner.includes('cmsis-dap')) return 'cmsis-dap';
         if (owner.includes('jlink-native')) return 'jlink-native';
-        if (owner.includes('legacy')) return 'jlink-legacy';
       }
     } catch (_) {
       // Owner reporting is best-effort; the probe is the fallback authority.
     }
-    return this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-legacy';
+    return this._probe === 'cmsis-dap' ? 'cmsis-dap' : 'jlink-native';
   }
 
   private async buildFlashReport(

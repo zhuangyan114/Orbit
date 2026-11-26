@@ -127,7 +127,7 @@ async function main() {
     if (!ok(init)) throw new Error(`initialize failed: ${JSON.stringify(init.message)}`);
     const launchArgs = {
       program: elfPath, device: 'STM32F407VE', deviceName: 'STM32F407VE', interface: 'SWD', speedKHz, probe,
-      flashBeforeDebug: false, nativeDebugEngineEnabled: true, nativeDebugEngineMode: isJLink ? 'native' : 'auto',
+      flashBeforeDebug: false,
       loggingEnabled: true, clearLogsOnStart: true, rttLogEnabled,
       rttPollIntervalMs, rttReadSize,
     };

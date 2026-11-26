@@ -26,8 +26,6 @@ export const ORBIT_SETTING_KEYS = [
   'rttLogTarget',
   'pRtLogEnabled',
   'pRtLogRoot',
-  'nativeDebugEngine.enabled',
-  'nativeDebugEngine.mode',
   'watchPollIntervalMs',
   'timelineSampleIntervalMs',
   'timelineSendIntervalMs',

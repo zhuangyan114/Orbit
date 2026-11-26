@@ -10,7 +10,7 @@ description: Configure and verify an STM32 firmware workspace for Orbit for VS C
 Use this skill when the user asks to configure or validate an STM32 firmware workspace for Orbit — The Debugger for What's Next, including:
 
 - `.vscode/launch.json`, `.vscode/settings.json`, CMake, ARM GCC, ELF/AXF, or SVD setup;
-- J-Link `JLink_x64.dll`/`JLink.exe`, CMSIS-DAP/DAPLink (HID/WinUSB/TCP), RMLink (`probe: "rmlink"`), `flashBackend`（`auto` / `native` / `openocd`）, either native helper, Legacy `koffi`, or owner-selection options;
+- J-Link `JLink_x64.dll`/`JLink.exe`, CMSIS-DAP/DAPLink (HID/WinUSB/TCP), RMLink (`probe: "rmlink"`), `flashBackend`（`auto` / `native` / `openocd`）, either native helper, or probe-selection options;
 - Watch（支持运行中不停机直写）、Timeline（含 XR-DAP / RMLink 板端采样）、RTT、P-RTLog、Orbit 内置 RTOS 面板（FreeRTOS 全面板快照：Tasks + 栈水位 + runtime/CPU% + Queue/Mutex/Sem + Timers/Heap，及可选 SEGGER SystemView Trace），以及 Memory View / Peripheral Viewer 集成;
 - FreeRTOS `FreeRTOSConfig.h` / `freertos.c` USER CODE 调试钩子与 `rtosSnapshotPort` 配置;
 - the local Orbit Plugin API or MCP server setup;
@@ -44,7 +44,7 @@ Do not use this skill for:
 }
 ```
 
-省略 `probe` 等价于 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。省略 `interface`、`speedKHz`、`nativeDebugEngineMode` 分别使用 `SWD`、`4000`、`auto`。`deviceName` 自动跟随 `device`。保留非 Orbit 配置和用户额外命名的配置，不为了瘦身删除用户已有的显式变体。
+省略 `probe` 等价于 `probe: "auto"`：先检测 J-Link，再检测 CMSIS-DAP/DAPLink；两者同时连接时始终选择 J-Link。省略 `interface` 和 `speedKHz` 分别使用 `SWD` 和 `4000`。`deviceName` 自动跟随 `device`。保留非 Orbit 配置和用户额外命名的配置，不为了瘦身删除用户已有的显式变体。
 
 只有用户明确要求强制 DAPLink 时才写 `"probe": "cmsis-dap"`；强制 J-Link 时写 `"probe": "jlink"`；使用 RMLink 连接服务时写 `"probe": "rmlink"`（仅一台已配对在线设备时可省略 `rmlinkDeviceId`，多台设备时才填写 12 位 `rmlinkDeviceId`）。只有用户明确要求绑定某一只 DAPLink probe 时才加入 `cmsisDapVid`、`cmsisDapPid`、`cmsisDapSerial` 或 `cmsisDapPath`。PnP/HID 枚举发现的 VID/PID/Serial 只是诊断信息，不能自动写入 launch，也不能因为当前只连接一只设备就固定它。
 
@@ -82,24 +82,20 @@ Do not use this skill for:
 
 `program` 为空时，源码按 `build/Debug`、`build/Release`、`build` 检查第一个 `.elf` 或 `.axf`。若存在多个候选或自动路径不是 active ELF，显式写 `program`。SVD 优先使用显式 `svdFile` / `svdPath` 和 `orbit.defaultSvdFile`，否则依次查工作区、本机 CMSIS Pack、缓存，并可按需下载一个对应 STM32 系列的 Keil DFP、只提取当前芯片 SVD；需要离线固定版本时才显式写 SVD 并关闭 `orbit.svdAutoDownload`。
 
-`orbit.*` 是共享默认值。不要重复写与默认值相同的 `deviceName`、`interface`、`speedKHz`、`nativeDebugEngineMode`、`cmsisDapTransport`、`flashBeforeDebug` 或 SVD 字段。用户要求多个快捷入口时，才从同一已核实基础配置派生显式 probe/Flash 变体。
+`orbit.*` 是共享默认值。不要重复写与默认值相同的 `deviceName`、`interface`、`speedKHz`、`cmsisDapTransport`、`flashBeforeDebug` 或 SVD 字段。用户要求多个快捷入口时，才从同一已核实基础配置派生显式 probe/Flash 变体。
 
 Native owner 规则：
 
-- `nativeDebugEngineMode: "auto"`：Native helper 优先；仅在 Native 启动/初始化失败且尚未建立 owner 时允许 Legacy fallback；已连接 owner 丢失会结束当前 session；
-- `nativeDebugEngineMode: "native"`：只使用 Native，初始化失败即失败；
-- `nativeDebugEngineMode: "legacy"`：只使用 Legacy `koffi` channel；
-- `nativeDebugEngineEnabled: false` 且 mode 为 `auto`：使用 Legacy；
-- 一个 DAP session 只有一个 target owner。不能让 Native helper 和 Legacy DLL 同时控制同一个目标，也不能用 Legacy 模拟 Native source-level step。
+- J-Link 调试使用原生 helper。启动失败时释放 helper 并返回错误。连接后的 owner 丢失会结束会话。
 
 CMSIS-DAP owner 规则：
 
 - `probe: "auto"` 先检测 J-Link；检测成功即选 J-Link，只有 J-Link 不可用时才枚举 CMSIS-DAP；
-- `probe: "cmsis-dap"` 只能创建唯一的 `orbit-cmsis-dap-helper.exe` owner；不得回退 J-Link、Legacy 或第二个 helper；
+- `probe: "cmsis-dap"` 只能创建唯一的 `orbit-cmsis-dap-helper.exe` owner；不得回退 J-Link 或第二个 helper；
 - DAPLink 默认 `cmsisDapTransport: "auto"`，优先 v2 WinUSB 并兼容 v1 HID；该字段可省略；
 - 默认省略 `cmsisDapSerial`、`cmsisDapVid`、`cmsisDapPid` 和 `cmsisDapPath`。只有用户明确要求固定具体 probe 时才加入；
 - 不从 Windows 枚举、当前连接设备、验收 fixture 或示例值推断绑定。尤其不得默认写入 `C251`、`F001`、`LU_2022_8888`；
-- 当前 CMSIS-DAP 调试接口为 SWD。不要把 J-Link 的 `nativeDebugEngineMode` 当成 CMSIS-DAP transport 开关；
+- 当前 CMSIS-DAP 调试接口为 SWD。
 - `flashBeforeDebug: true` 对已登记型号使用当前 CMSIS-DAP / RMLink owner 的原生快速算法，对其余受支持 STM32 型号由内置 OpenOCD 在认领调试 owner 前完成独立烧录校验（`flashBackend` 默认 `"auto"`，可选 `"native"` / `"openocd"`）；`false` 不得触发 erase/program/verify 或 Flash-only reset；
 - owner loss 结束当前 session。Watch、Timeline、RTT 和 Viewer 失败不得创建 J-Link 或 extension-host bypass。
 

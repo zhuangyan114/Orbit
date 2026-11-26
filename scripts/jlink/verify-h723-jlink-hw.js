@@ -84,7 +84,7 @@ const evidence = {
   hardwareRequest: {
     mcu: H723.name,
     probe: 'jlink',
-    ownerExpectation: 'jlink-native (nativeDebugEngineMode=native, no fallback)',
+    ownerExpectation: 'jlink-native',
     interface: 'SWD',
     speedKHz,
     device,
@@ -323,8 +323,6 @@ async function main() {
       interface: 'SWD',
       speedKHz,
       probe: 'jlink',
-      nativeDebugEngineEnabled: true,
-      nativeDebugEngineMode: 'native',
       flashBeforeDebug,
       loggingEnabled: true,
       clearLogsOnStart: true,

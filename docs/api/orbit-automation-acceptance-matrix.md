@@ -106,7 +106,7 @@ Category: J-Link hardware
 Status: Hardware-only
 Probe: J-Link
 Methods: `orbit.session.start`, `orbit.target.pause`, `orbit.target.continue`, `orbit.target.reset`, `orbit.target.stepOver`, `orbit.target.stepInto`, `orbit.target.stepOut`, `orbit.target.stepInstruction`, `orbit.target.flash`, `orbit.breakpoints.add`, `orbit.expression.readMany`, `orbit.expression.writeMany`, `orbit.memory.read`, `orbit.memory.write`, `orbit.record.start`, `orbit.rtt.start`, `orbit.rtt.read`, `orbit.rtt.stop`, `orbit.record.stop`, `orbit.session.stop`
-Acceptance: With explicit authorization, record DLL/helper version, owner kind, target, state/PC, operation IDs and verify evidence; prove one owner, native-to-legacy fallback only after full native disposal, scheduler ordering, UI synchronization, and no claim beyond the exercised hardware scope.
+Acceptance: With explicit authorization, record DLL/helper version, owner kind, target, state/PC, operation IDs and verify evidence; prove one owner, full helper disposal on startup failure or owner loss, scheduler ordering, UI synchronization, and no claim beyond the exercised hardware scope.
 
 ### API-016: CMSIS-DAP selected-owner hardware workflow
 

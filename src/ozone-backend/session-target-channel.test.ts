@@ -1,14 +1,10 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CmsisDapTargetChannel,
-  LegacyJLinkTargetChannel,
   SessionTargetOwner,
   SessionTargetSelector,
 } from './session-target-channel';
 import { ExperimentalCppJLinkChannel } from './cpp-jlink-channel';
-import { JLinkDLL } from './jlink-dll';
 import { CmsisDapDeviceInfo, CmsisDapHelperClient } from './cmsis-dap-helper-channel';
 import type { FlashAlgorithmRunRequest } from './cmsis-dap-flasher';
 
@@ -399,13 +395,12 @@ function fakeCmsisDapHelper(overrides: Partial<CmsisDapHelperClient> = {}): Cmsi
 }
 
 function owner(
-  kind: 'jlink-native' | 'jlink-legacy',
   connect: SessionTargetOwner['connect'],
   dispose: SessionTargetOwner['dispose'] = vi.fn(async () => {}),
 ): SessionTargetOwner {
   return {
-    kind,
-    usingNative: kind === 'jlink-native',
+    kind: 'jlink-native',
+    usingNative: true,
     connect,
     disconnect: vi.fn(async () => ({
       ok: true,
@@ -420,7 +415,7 @@ function owner(
 
 describe('SessionTargetSelector owner lifecycle', () => {
   it('auto discovery selects J-Link first without constructing CMSIS-DAP', async () => {
-    const jlink = owner('jlink-native', vi.fn());
+    const jlink = owner(vi.fn());
     jlink.detectProbe = vi.fn(async () => ({
       ok: true,
       message: 'J-Link probe found',
@@ -429,7 +424,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       data: { available: true },
     }));
     const createCmsisDap = vi.fn();
-    const selector = new SessionTargetSelector(() => jlink, vi.fn(), createCmsisDap);
+    const selector = new SessionTargetSelector(() => jlink, createCmsisDap);
 
     await expect(selector.resolveProbe({
       probe: 'auto', device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000,
@@ -440,7 +435,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
   });
 
   it('auto discovery selects CMSIS-DAP only when J-Link is unavailable', async () => {
-    const jlink = owner('jlink-native', vi.fn());
+    const jlink = owner(vi.fn());
     jlink.detectProbe = vi.fn(async () => ({
       ok: true,
       message: 'no J-Link probe found',
@@ -449,7 +444,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       data: { available: false },
     }));
     const cmsisDap = {
-      ...owner('jlink-native', vi.fn()),
+      ...owner(vi.fn()),
       kind: 'cmsis-dap' as const,
       detectProbe: vi.fn(async () => ({
         ok: true,
@@ -459,7 +454,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
         data: { available: true, count: 1 },
       })),
     } as unknown as SessionTargetOwner;
-    const selector = new SessionTargetSelector(() => jlink, vi.fn(), () => cmsisDap);
+    const selector = new SessionTargetSelector(() => jlink, () => cmsisDap);
 
     await expect(selector.resolveProbe({
       probe: 'auto', device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000,
@@ -551,8 +546,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     const helper = fakeCmsisDapHelper();
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    const selector = new SessionTargetSelector(createNative, () => channel);
 
     const connected = await selector.connect({
       device: 'STM32H723VGT6',
@@ -593,7 +587,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
       expect.objectContaining({ priority: 'watch' }),
     );
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
     await selector.dispose(false);
   });
 
@@ -679,8 +672,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
     const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper({ request: request as any }) });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    const selector = new SessionTargetSelector(createNative, () => channel);
     await selector.connect({
       device: 'STM32H723VGT6',
       interface: 'SWD',
@@ -694,7 +686,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
     expect(selector.ownerKind).toBe('cmsis-dap');
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
     await expect(selector.startRtt(0x24000100)).resolves.toMatchObject({ ok: true });
     await selector.dispose(false);
   });
@@ -729,15 +720,15 @@ describe('SessionTargetSelector owner lifecycle', () => {
   });
 
   it('returns UnsupportedCapability when SessionTargetSelector owner does not support enumerateRtt', async () => {
-    const legacyLikeOwner = {
-      kind: 'jlink-legacy',
+    const nativeOwner = {
+      kind: 'jlink-native',
       usingNative: false,
-      connect: vi.fn(async () => ({ ok: true, message: 'ok', targetState: 'Halted', elapsedMs: 0, data: { channel: 'koffi' } })),
+      connect: vi.fn(async () => ({ ok: true, message: 'ok', targetState: 'Halted', elapsedMs: 0, data: { channel: 'cpp' } })),
       disconnect: vi.fn(async () => ({ ok: true, message: 'ok', targetState: 'Disconnected', elapsedMs: 0, data: {} })),
       dispose: vi.fn(async () => {}),
     } as unknown as SessionTargetOwner;
-    const selector = new SessionTargetSelector(vi.fn(), () => legacyLikeOwner);
-    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'legacy');
+    const selector = new SessionTargetSelector(() => nativeOwner);
+    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 });
 
     await expect(selector.enumerateRtt(0x20000100)).resolves.toMatchObject({
       ok: false,
@@ -748,7 +739,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
 
   it.each(['STM32H723VGT6', 'STM32F407IG', 'STM32F103C8T6'])('exposes the %s flash target and clears it on disconnect', async device => {
     const channel = new CmsisDapTargetChannel({ helperClient: fakeCmsisDapHelper() });
-    const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => channel);
+    const selector = new SessionTargetSelector(vi.fn(), () => channel);
 
     expect(channel.flashTarget).toBeNull();
     expect(selector.flashTarget).toBeNull();
@@ -811,8 +802,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     const helper = fakeCmsisDapHelper({ request: request as any });
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    const selector = new SessionTargetSelector(createNative, () => channel);
     await selector.connect({
       probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
     });
@@ -832,7 +822,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
     expect(selector.ownerKind).toBe('cmsis-dap');
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
     await selector.dispose(false);
   });
 
@@ -853,8 +842,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    const selector = new SessionTargetSelector(createNative, () => channel);
     await selector.connect({
       probe: 'cmsis-dap', device: 'STM32H723VGT6', interface: 'SWD', speedKHz: 1000,
     });
@@ -891,7 +879,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
       timeoutMs: 500,
     });
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
     await selector.dispose(false);
   });
 
@@ -960,18 +947,18 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
 
     // Selector owner without writeRtt returns UnsupportedCapability
-    const jlink = owner('jlink-native', vi.fn(async () => ({
+    const jlink = owner(vi.fn(async () => ({
       ok: true, message: 'connected', targetState: 'Halted' as const, elapsedMs: 0, data: { channel: 'cpp' as const },
     })));
     const selector = new SessionTargetSelector(() => jlink, vi.fn());
-    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'native');
+    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 });
     await expect(selector.writeRtt(0, Uint8Array.from([1]))).resolves.toMatchObject({
       ok: false,
       errorCode: 'UnsupportedCapability',
     });
   });
 
-  it('preserves writeRtt unknown-completion diagnostics and terminates cleanly on DeviceRemoved without J-Link fallback', async () => {
+  it('preserves writeRtt unknown-completion diagnostics and terminates cleanly on DeviceRemoved without creating a J-Link owner', async () => {
     const base = fakeCmsisDapHelper();
     let mode: 'unknown' | 'removed' = 'unknown';
     const helper = fakeCmsisDapHelper({
@@ -1023,9 +1010,8 @@ describe('SessionTargetSelector owner lifecycle', () => {
       }) as any,
     });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    const selector = new SessionTargetSelector(createNative, () => channel);
     await selector.connect({
       probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
     });
@@ -1068,19 +1054,17 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(selector.ownerKind).toBe('none');
     expect(helper.dispose).toHaveBeenCalledWith(false);
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
   });
 
-  it('never constructs or connects legacy when the native owner succeeds', async () => {
-    const native = owner('jlink-native', vi.fn(async () => ({
+  it('selects the native owner for J-Link', async () => {
+    const native = owner(vi.fn(async () => ({
       ok: true,
       message: 'native connected',
       targetState: 'Halted' as const,
       elapsedMs: 1,
       data: { channel: 'cpp' as const },
     })));
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(() => native, createLegacy);
+    const selector = new SessionTargetSelector(() => native);
 
     const result = await selector.connect({
       device: 'STM32F407VG',
@@ -1090,16 +1074,13 @@ describe('SessionTargetSelector owner lifecycle', () => {
 
     expect(result.ok).toBe(true);
     expect(selector.ownerKind).toBe('jlink-native');
-    expect(createLegacy).not.toHaveBeenCalled();
   });
 
-  it('waits for native disposal before constructing and connecting legacy fallback', async () => {
+  it('waits for native disposal and preserves the startup error', async () => {
     const order: string[] = [];
     let finishDispose!: () => void;
     const disposeGate = new Promise<void>(resolve => { finishDispose = resolve; });
-    const native = owner(
-      'jlink-native',
-      vi.fn(async () => ({
+    const native = owner(vi.fn(async () => ({
         ok: false,
         message: 'native connect failed',
         errorCode: 'JLinkConnectFailed',
@@ -1112,68 +1093,30 @@ describe('SessionTargetSelector owner lifecycle', () => {
         order.push('native-dispose-finished');
       }),
     );
-    const legacy = owner('jlink-legacy', vi.fn(async () => {
-      order.push('legacy-connect');
-      return {
-        ok: true,
-        message: 'legacy connected',
-        targetState: 'Halted' as const,
-        elapsedMs: 1,
-        data: { channel: 'koffi' as const },
-      };
-    }));
-    const createLegacy = vi.fn(() => {
-      order.push('legacy-constructed');
-      return legacy;
-    });
-    const selector = new SessionTargetSelector(() => native, createLegacy);
+    const createCmsisDap = vi.fn();
+    const selector = new SessionTargetSelector(() => native, createCmsisDap);
 
     const connecting = selector.connect({
       device: 'STM32F407VG',
       interface: 'SWD',
       speedKHz: 4000,
-    }, true);
+    });
     await vi.waitFor(() => expect(order).toEqual(['native-dispose-start']));
-    expect(createLegacy).not.toHaveBeenCalled();
+    expect(selector.ownerKind).toBe('none');
+    expect(createCmsisDap).not.toHaveBeenCalled();
 
     finishDispose();
     const result = await connecting;
 
-    expect(result.ok).toBe(true);
-    expect(selector.ownerKind).toBe('jlink-legacy');
-    expect(order).toEqual([
-      'native-dispose-start',
-      'native-dispose-finished',
-      'legacy-constructed',
-      'legacy-connect',
-    ]);
+    expect(result).toMatchObject({ ok: false, errorCode: 'JLinkConnectFailed', message: 'native connect failed' });
+    expect(selector.ownerKind).toBe('none');
+    expect(order).toEqual(['native-dispose-start', 'native-dispose-finished']);
+    expect(createCmsisDap).not.toHaveBeenCalled();
   });
 
-  it('uses legacy directly when native ownership is not requested', async () => {
-    const createNative = vi.fn();
-    const legacy = owner('jlink-legacy', vi.fn(async () => ({
-      ok: true,
-      message: 'legacy connected',
-      targetState: 'Halted' as const,
-      elapsedMs: 1,
-      data: { channel: 'koffi' as const },
-    })));
-    const selector = new SessionTargetSelector(createNative, () => legacy);
-
-    const result = await selector.connect({
-      device: 'STM32F407VG',
-      interface: 'SWD',
-      speedKHz: 4000,
-    }, 'legacy');
-
-    expect(result.ok).toBe(true);
-    expect(selector.ownerKind).toBe('jlink-legacy');
-    expect(createNative).not.toHaveBeenCalled();
-  });
-
-  it('does not construct a legacy owner after a connected native owner is lost', async () => {
+  it('disposes a lost native owner and leaves the selector disconnected', async () => {
     const order: string[] = [];
-    const native = owner('jlink-native', vi.fn(async () => ({
+    const native = owner(vi.fn(async () => ({
       ok: true,
       message: 'native connected',
       targetState: 'Halted' as const,
@@ -1192,60 +1135,27 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
     native.dispose = vi.fn(async () => { order.push('native-disposed'); });
 
-    const legacy = owner('jlink-legacy', vi.fn(async () => {
-      order.push('legacy-connect');
-      return {
-        ok: true,
-        message: 'legacy connected',
-        targetState: 'Halted' as const,
-        elapsedMs: 0,
-        data: { channel: 'koffi' as const },
-      };
-    }));
-    const selector = new SessionTargetSelector(() => native, () => {
-      order.push('legacy-constructed');
-      return legacy;
-    });
-    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, true);
+    const createCmsisDap = vi.fn();
+    const selector = new SessionTargetSelector(() => native, createCmsisDap);
+    await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 });
 
     const failed = await selector.halt();
     expect(failed.ok).toBe(false);
     expect(native.halt).toHaveBeenCalledOnce();
-    expect(failed.message).toContain('restart the debug session in legacy mode');
+    expect(failed.message).toContain('start a new debug session to reconnect');
     expect(order).toEqual(['native-halt', 'native-disposed']);
     expect(selector.ownerKind).toBe('none');
-    expect(legacy.connect).not.toHaveBeenCalled();
+    expect(createCmsisDap).not.toHaveBeenCalled();
 
     const next = await selector.run();
     expect(next).toMatchObject({ ok: false, errorCode: 'TargetOwnerUnavailable' });
   });
 
-  it('returns a diagnostic error without constructing legacy in explicit native mode', async () => {
-    const native = owner('jlink-native', vi.fn(async () => ({
-      ok: false,
-      message: 'helper handshake failed',
-      errorCode: 'NativeChannelUnavailable',
-      targetState: 'Error' as const,
-      elapsedMs: 1,
-    })));
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(() => native, createLegacy);
-
-    const result = await selector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'native');
-
-    expect(result).toMatchObject({ ok: false, errorCode: 'NativeInitializationFailed' });
-    expect(result.message).toContain('restart the debug session in legacy mode');
-    expect(native.dispose).toHaveBeenCalledWith(false);
-    expect(createLegacy).not.toHaveBeenCalled();
-    expect(selector.ownerKind).toBe('none');
-  });
-
-  it('routes CMSIS-DAP to its own owner and never falls back to J-Link', async () => {
+  it('routes CMSIS-DAP to its own owner and never creates a J-Link owner', async () => {
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
     const helper = fakeCmsisDapHelper();
     const cmsisDap = new CmsisDapTargetChannel({ helperClient: helper });
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => cmsisDap);
+    const selector = new SessionTargetSelector(createNative, () => cmsisDap);
 
     const result = await selector.connect({
       probe: 'cmsis-dap',
@@ -1271,7 +1181,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(helper.start).toHaveBeenCalledTimes(1);
     expect(helper.controlRequest).toHaveBeenCalledWith('getFpbInfo', { timeoutMs: 1000 });
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
     expect(selector.ownerKind).toBe('cmsis-dap');
   });
 
@@ -1317,8 +1226,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       ];
       const createCmsisDap = vi.fn(() => owners.shift()!);
       const createNative = vi.fn();
-      const createLegacy = vi.fn();
-      const selector = new SessionTargetSelector(createNative, createLegacy, createCmsisDap);
+      const selector = new SessionTargetSelector(createNative, createCmsisDap);
       const config = {
         probe: 'cmsis-dap' as const,
         device: 'STM32F407VET6',
@@ -1344,7 +1252,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
       expect(selector.ownerKind).toBe('none');
       expect(firstHelper.dispose).toHaveBeenCalledWith(false);
       expect(createNative).not.toHaveBeenCalled();
-      expect(createLegacy).not.toHaveBeenCalled();
 
       expect((await selector.connect(config)).ok).toBe(true);
       expect(secondHelper.controlRequest).toHaveBeenCalledWith('getFpbInfo', { timeoutMs: 1000 });
@@ -1385,8 +1292,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
     const createCmsisDap = vi.fn(() => channel);
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, createCmsisDap);
+    const selector = new SessionTargetSelector(createNative, createCmsisDap);
 
     expect((await selector.connect({
       probe: 'cmsis-dap',
@@ -1418,7 +1324,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(helper.dispose).toHaveBeenCalledWith(false);
     expect(createCmsisDap).toHaveBeenCalledTimes(1);
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
     await expect(channel.getState()).resolves.toMatchObject({
       ok: false,
       errorCode: 'InvalidState',
@@ -1447,8 +1352,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       dispose: vi.fn(async () => {}),
     } as unknown as SessionTargetOwner;
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => cmsisDap);
+    const selector = new SessionTargetSelector(createNative, () => cmsisDap);
 
     const connected = await selector.connect({
       probe: 'cmsis-dap',
@@ -1464,7 +1368,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(cmsisDap.connect).toHaveBeenCalledOnce();
     expect(cmsisDap.flash).toHaveBeenCalledOnce();
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
   });
 
   it('resolves flash devices through the registry before touching the helper', async () => {
@@ -1573,7 +1476,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
   it('routes CMSIS-DAP WinUSB through the same single helper owner', async () => {
     const helper = fakeCmsisDapHelper();
     const cmsisDap = new CmsisDapTargetChannel({ helperClient: helper });
-    const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => cmsisDap);
+    const selector = new SessionTargetSelector(vi.fn(), () => cmsisDap);
 
     const result = await selector.connect({
       probe: 'cmsis-dap',
@@ -1601,7 +1504,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       })),
     });
     const cmsisDap = new CmsisDapTargetChannel({ helperClient: helper });
-    const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => cmsisDap);
+    const selector = new SessionTargetSelector(vi.fn(), () => cmsisDap);
 
     const result = await selector.connect({
       probe: 'cmsis-dap',
@@ -1632,7 +1535,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
       }) as unknown as CmsisDapHelperClient['request'],
     });
     const cmsisDap = new CmsisDapTargetChannel({ helperClient: helper });
-    const selector = new SessionTargetSelector(vi.fn(), vi.fn(), () => cmsisDap);
+    const selector = new SessionTargetSelector(vi.fn(), () => cmsisDap);
 
     const result = await selector.connect({
       probe: 'cmsis-dap',
@@ -1762,10 +1665,8 @@ describe('SessionTargetSelector owner lifecycle', () => {
       }) as any,
     });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
     const selector = new SessionTargetSelector(
       createNative,
-      createLegacy,
       () => new CmsisDapTargetChannel({ helperClient: helper }),
     );
     await selector.connect({
@@ -1779,7 +1680,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
     expect(selector.ownerKind).toBe('cmsis-dap');
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
   });
 
   it('terminates a lost CMSIS-DAP startup owner without constructing a J-Link fallback', async () => {
@@ -1800,9 +1700,8 @@ describe('SessionTargetSelector owner lifecycle', () => {
       }) as any,
     });
     const createNative = vi.fn();
-    const createLegacy = vi.fn();
     const channel = new CmsisDapTargetChannel({ helperClient: helper });
-    const selector = new SessionTargetSelector(createNative, createLegacy, () => channel);
+    const selector = new SessionTargetSelector(createNative, () => channel);
     await selector.connect({
       probe: 'cmsis-dap', device: 'STM32F407VET6', interface: 'SWD', speedKHz: 1000,
     });
@@ -1818,7 +1717,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
     expect(selector.ownerKind).toBe('none');
     expect(helper.dispose).toHaveBeenCalledWith(false);
     expect(createNative).not.toHaveBeenCalled();
-    expect(createLegacy).not.toHaveBeenCalled();
   });
 
   it('routes CMSIS-DAP RAM writes through one control request on the selected owner', async () => {
@@ -2134,9 +2032,9 @@ describe('SessionTargetSelector owner lifecycle', () => {
     });
   });
 
-  it('unifies selector RTT capabilities and single-owner routing across jlink-native, jlink-legacy, and cmsis-dap', async () => {
+  it('reports matching RTT capabilities before connection and with the CMSIS-DAP owner', async () => {
     // 1. Disconnected selector reports ownerKind='none' with all capabilities unavailable
-    const disconnectedSelector = new SessionTargetSelector(vi.fn(), vi.fn());
+    const disconnectedSelector = new SessionTargetSelector(vi.fn());
     expect(disconnectedSelector.getRttCapabilities()).toMatchObject({
       ownerKind: 'none',
       rttStart: { available: false },
@@ -2145,67 +2043,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
       rttDownWrite: { available: false },
     });
 
-    // 2. Legacy J-Link owner declares per-item capabilities from actual DLL RTT APIs
-    const fullLegacyDll = {
-      connected: true,
-      state: 'halted' as const,
-      open: vi.fn(() => true),
-      connect: vi.fn(() => true),
-      disconnect: vi.fn(),
-      abandon: vi.fn(),
-      isHalted: vi.fn(() => true),
-      startRtt: vi.fn(() => true),
-      stopRtt: vi.fn(),
-      readRtt: vi.fn(() => Uint8Array.from([0x52, 0x54, 0x54])),
-      getRttApiAvailability: vi.fn(() => ({ control: true, read: true, write: false })),
-    };
-    const legacySelector = new SessionTargetSelector(
-      vi.fn(),
-      () => new LegacyJLinkTargetChannel(fullLegacyDll as any),
-    );
-    await legacySelector.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 }, 'legacy');
-    expect(legacySelector.getRttCapabilities()).toMatchObject({
-      ownerKind: 'jlink-legacy',
-      rttStart: { available: true, evidence: 'source' },
-      rttEnumerate: { available: false, reason: expect.stringContaining('Legacy'), evidence: 'source' },
-      rttUpRead: { available: true, evidence: 'source' },
-      rttDownWrite: { available: false, reason: expect.stringContaining('Legacy'), evidence: 'source' },
-    });
-    await expect(legacySelector.startRtt(0x20000100)).resolves.toMatchObject({ ok: true });
-    const legacyRead = await legacySelector.readRtt(0, 16);
-    expect(legacyRead.ok && Buffer.from(legacyRead.data!.bytes).toString('utf8')).toBe('RTT');
-    await expect(legacySelector.enumerateRtt(0x20000100)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-    await expect(legacySelector.writeRtt(0, Uint8Array.from([1]))).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-    await legacySelector.dispose(false);
-
-    // 3. Legacy J-Link DLL missing JLINK_RTTERMINAL_Control / JLINK_RTTERMINAL_Read returns UnsupportedCapability
-    const missingLegacyDll = {
-      ...fullLegacyDll,
-      getRttApiAvailability: vi.fn(() => ({ control: true, read: false, write: false })),
-    };
-    const partialLegacy = new LegacyJLinkTargetChannel(missingLegacyDll as any);
-    expect(partialLegacy.getRttCapabilities()).toMatchObject({
-      ownerKind: 'jlink-legacy',
-      rttStart: { available: true },
-      rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Read') },
-      rttEnumerate: { available: false },
-      rttDownWrite: { available: false },
-    });
-    await expect(partialLegacy.readRtt(0, 16)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-
-    const noControlDll = {
-      ...fullLegacyDll,
-      getRttApiAvailability: vi.fn(() => ({ control: false, read: false, write: false })),
-    };
-    const noControlLegacy = new LegacyJLinkTargetChannel(noControlDll as any);
-    expect(noControlLegacy.getRttCapabilities()).toMatchObject({
-      ownerKind: 'jlink-legacy',
-      rttStart: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
-      rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
-    });
-    await expect(noControlLegacy.startRtt(0x20000100)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-
-    // 4. CMSIS-DAP owner exposes matching RttCapabilities shape
     const cmsisHelper = fakeCmsisDapHelper({
       start: vi.fn(async () => ({
         ok: true,
@@ -2216,7 +2053,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
       })),
     });
     const cmsisSelector = new SessionTargetSelector(
-      vi.fn(),
       vi.fn(),
       () => new CmsisDapTargetChannel({ helperClient: cmsisHelper }),
     );
@@ -2231,7 +2067,7 @@ describe('SessionTargetSelector owner lifecycle', () => {
     await cmsisSelector.dispose(false);
   });
 
-  it('never creates a second DLL owner or falls back to legacy when jlink-native loses owner during RTT', async () => {
+  it('does not select another owner when J-Link Native is lost during RTT', async () => {
     const helper = {
       started: false,
       start: vi.fn(async () => ({
@@ -2275,13 +2111,11 @@ describe('SessionTargetSelector owner lifecycle', () => {
       dispose: vi.fn(async () => {}),
     };
     const createNative = vi.fn(() => new ExperimentalCppJLinkChannel({ helperClient: helper as any }));
-    const createLegacy = vi.fn();
     const createCmsis = vi.fn();
-    const selector = new SessionTargetSelector(createNative, createLegacy, createCmsis);
+    const selector = new SessionTargetSelector(createNative, createCmsis);
 
-    await selector.connect({ device: 'STM32H723VGT6', interface: 'SWD', speedKHz: 4000 }, 'auto');
+    await selector.connect({ device: 'STM32H723VGT6', interface: 'SWD', speedKHz: 4000 });
     expect(createNative).toHaveBeenCalledTimes(1);
-    expect(createLegacy).not.toHaveBeenCalled();
     expect(createCmsis).not.toHaveBeenCalled();
 
     const lost = await selector.writeRtt(0, Uint8Array.from([0x01, 0x02]));
@@ -2299,25 +2133,6 @@ describe('SessionTargetSelector owner lifecycle', () => {
       errorCode: 'TargetOwnerUnavailable',
     });
     expect(createNative).toHaveBeenCalledTimes(1);
-    expect(createLegacy).not.toHaveBeenCalled();
     expect(createCmsis).not.toHaveBeenCalled();
-  });
-
-  const noWriteMockDll = path.resolve(__dirname, '..', '..', 'out', 'native', 'win32-x64', 'test', 'JLink_x64_no_write.dll');
-  it.skipIf(!fs.existsSync(noWriteMockDll))('detects missing RTT exports on a real compiled JLink mock DLL in legacy koffi mode', async () => {
-    const dll = new JLinkDLL(noWriteMockDll);
-    const legacy = new LegacyJLinkTargetChannel(dll);
-    const conn = await legacy.connect({ device: 'STM32F407VG', interface: 'SWD', speedKHz: 4000 });
-    expect(conn.ok).toBe(true);
-    expect(legacy.getRttCapabilities()).toMatchObject({
-      ownerKind: 'jlink-legacy',
-      rttStart: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
-      rttUpRead: { available: false, reason: expect.stringContaining('JLINK_RTTERMINAL_Control') },
-      rttEnumerate: { available: false },
-      rttDownWrite: { available: false },
-    });
-    await expect(legacy.startRtt(0x20000100)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-    await expect(legacy.readRtt(0, 16)).resolves.toMatchObject({ ok: false, errorCode: 'UnsupportedCapability' });
-    await legacy.disconnect();
   });
 });

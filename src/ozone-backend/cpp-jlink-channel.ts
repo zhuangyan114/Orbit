@@ -165,7 +165,7 @@ export interface NativeStepExecutor {
 }
 
 export interface SessionNativeExecutor extends NativeStepExecutor {
-  connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp' | 'koffi'; dllPath?: string }>>;
+  connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp'; dllPath?: string }>>;
   dispose(graceful?: boolean): Promise<void>;
 }
 
@@ -455,7 +455,7 @@ export class ExperimentalCppJLinkChannel {
     }
   }
 
-  async connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp' | 'koffi'; dllPath?: string }>> {
+  async connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'cpp'; dllPath?: string }>> {
     try {
       if (!this.helper.started) {
         const hello = await this.helper.start();
@@ -487,7 +487,7 @@ export class ExperimentalCppJLinkChannel {
       }
       this.resetSessionCapabilities();
       await this.helper.dispose(false);
-      return this.failure(`${result.errorCode || 'NativeConnectFailed'}: ${result.message}`, 'NativeChannelUnavailable');
+      return withoutData(result);
     } catch (error) {
       return this.failNative(error instanceof Error ? error.message : String(error));
     }

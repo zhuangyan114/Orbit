@@ -19,6 +19,8 @@ describe('DapSession native executor lifecycle', () => {
       dispose: vi.fn(),
     } as unknown as OzoneBackend;
     const session = new DapSession(backend);
+    const messages: DebugProtocolMessage[] = [];
+    session.on('send', message => messages.push(message));
     const launch = (session as any).handleLaunch({
       type: 'request', seq: 1, command: 'launch',
       arguments: {
@@ -27,8 +29,9 @@ describe('DapSession native executor lifecycle', () => {
         speedKHz: 4000,
         flashBeforeDebug: false,
         rttLogEnabled: false,
-        nativeDebugEngineMode: 'native',
-        nativeDebugEngineEnabled: true,
+        nativeDebugEngineMode: 'legacy',
+        jlinkDllPath: 'custom/JLink_x64.dll',
+        loggingEnabled: false,
       },
     });
     await vi.advanceTimersByTimeAsync(250);
@@ -38,12 +41,14 @@ describe('DapSession native executor lifecycle', () => {
       .map(call => call[0])
       .filter(command => command.cmd === 'connect');
     expect(connectCalls).toHaveLength(1);
-    expect(connectCalls[0]).toMatchObject({
-      config: {
-        nativeDebugEngineMode: 'native',
-        nativeDebugEngineEnabled: true,
-      },
-    });
+    expect(connectCalls[0]).toMatchObject({ config: { probe: 'jlink', dllPath: 'custom/JLink_x64.dll' } });
+    expect(backend.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cmd: 'resolveProbe',
+      config: expect.objectContaining({ dllPath: 'custom/JLink_x64.dll' }),
+    }));
+    expect(connectCalls[0]).not.toHaveProperty('config.nativeDebugEngineMode');
+    expect(messages.filter(message => message.event === 'output'
+      && message.body?.output?.includes('J-Link Legacy'))).toHaveLength(1);
 
     await (session as any).handleDisconnect({ type: 'request', seq: 2, command: 'disconnect' });
     expect(backend.configureNativeSteps).toHaveBeenLastCalledWith(false);
@@ -89,7 +94,6 @@ describe('DapSession native executor lifecycle', () => {
     ['cmsis-dap', 'hid', 'CMSIS-DAP v1 / HID'],
     ['cmsis-dap', undefined, 'CMSIS-DAP / 未知传输'],
     ['jlink-native', undefined, 'J-Link / native C++ helper'],
-    ['jlink-legacy', undefined, 'J-Link / legacy koffi'],
   ])('prints the actual %s/%s path after auto selection', async (ownerKind, transport, expectedPath) => {
     vi.useFakeTimers();
     const probe = ownerKind === 'cmsis-dap' ? 'cmsis-dap' : 'jlink';
@@ -112,7 +116,7 @@ describe('DapSession native executor lifecycle', () => {
     session.on('send', message => messages.push(message));
     const launch = (session as any).handleLaunch({
       type: 'request', seq: 4, command: 'launch', arguments: {
-        probe: 'auto', cmsisDapTransport: 'auto', nativeDebugEngineMode: 'auto',
+        probe: 'auto', cmsisDapTransport: 'auto',
         flashBeforeDebug: false, rttLogEnabled: false, loggingEnabled: false,
       },
     });

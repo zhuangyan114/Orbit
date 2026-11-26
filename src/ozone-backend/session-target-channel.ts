@@ -52,7 +52,6 @@ import {
   flashCmsisDapElf,
   resolveFlashTarget,
 } from './cmsis-dap-flasher';
-import { JLinkDLL } from './jlink-dll';
 import { NativeSchedulerCancelledError } from './native-scheduler';
 import { log } from '../utils/logger';
 import { CmsisDapTransport, DebugProbe, DebugProbePreference, ProbeSamplingStats } from './types';
@@ -67,11 +66,10 @@ import {
 } from './rtt-contract';
 import type { CaptureSample, SubscriptionConfig } from '../../clients/rmlink/rmlink-client.mjs';
 
-export type SessionTargetOwnerKind = 'none' | 'jlink-native' | 'jlink-legacy' | 'cmsis-dap';
-export type SessionTargetMode = 'legacy' | 'native' | 'auto';
+export type SessionTargetOwnerKind = 'none' | 'jlink-native' | 'cmsis-dap';
 
 /** Physical owner channel identifiers reported by connect(). */
-export type TargetChannelKind = 'cpp' | 'koffi' | 'cmsis-dap';
+export type TargetChannelKind = 'cpp' | 'cmsis-dap';
 
 export interface TargetChannelInfo {
   channel: TargetChannelKind;
@@ -156,13 +154,10 @@ export type SessionTargetOwnerFactory = () => SessionTargetOwner;
 /** Chooses exactly one physical target owner for a debug session. */
 export class SessionTargetSelector {
   private owner: SessionTargetOwner | null = null;
-  private readonly breakpointSlots: (number | null)[] = [];
   private readonly sessionId = `target-${nextSessionId++}`;
-  private selectedMode: SessionTargetMode = 'legacy';
 
   constructor(
     private readonly createNative: SessionTargetOwnerFactory,
-    private readonly createLegacy: SessionTargetOwnerFactory,
     private readonly createCmsisDap: SessionTargetOwnerFactory = () => new CmsisDapTargetChannel(),
     private readonly createRMLink: SessionTargetOwnerFactory = () => new RMLinkTargetChannel(),
   ) {}
@@ -241,7 +236,6 @@ export class SessionTargetSelector {
 
   async connect(
     config: SessionTargetConnectConfig,
-    requestedMode: SessionTargetMode | boolean = 'auto',
   ): Promise<CppJLinkResult<TargetChannelInfo>> {
     if (this.owner) {
       return failure<TargetChannelInfo>(
@@ -270,41 +264,17 @@ export class SessionTargetSelector {
       return result;
     }
 
-    const mode = normalizeTargetMode(requestedMode);
-    this.selectedMode = mode;
-    log.dll(`target-owner session=${this.sessionId} select mode=${mode} owner=none command=connect targetConnected=false`);
-    if (mode !== 'legacy') {
-      const native = this.createNative();
-      const nativeResult = await native.connect(config);
-      if (nativeResult.ok) {
-        this.owner = native;
-        log.dll(`target-owner session=${this.sessionId} selected mode=${mode} owner=jlink-native command=connect targetConnected=true`);
-        return nativeResult;
-      }
-
-      // Process exit is part of dispose's contract. Legacy must not even be
-      // constructed until the native DLL owner has fully left the process.
-      await native.dispose(false);
-      if (mode === 'native') {
-        log.dll(`target-owner session=${this.sessionId} native initialization failed mode=${mode} owner=none command=connect code=${nativeResult.errorCode || 'NativeInitializationFailed'} targetConnected=false action=restart-in-legacy-mode`);
-        return {
-          ...nativeResult,
-          errorCode: 'NativeInitializationFailed',
-          message: `Native initialization failed: ${nativeResult.message}. The target was not connected; restart the debug session in legacy mode or select auto mode to allow startup fallback.`,
-        };
-      }
-      log.dll(`target-owner session=${this.sessionId} fallback mode=auto owner=none command=connect code=${nativeResult.errorCode || 'NativeInitializationFailed'} targetConnected=false action=create-legacy-owner`);
+    log.dll(`target-owner session=${this.sessionId} select mode=native owner=none command=connect targetConnected=false`);
+    const native = this.createNative();
+    const result = await native.connect(config);
+    if (result.ok) {
+      this.owner = native;
+      log.dll(`target-owner session=${this.sessionId} selected mode=native owner=jlink-native command=connect targetConnected=true`);
+      return result;
     }
-
-    const legacy = this.createLegacy();
-    const legacyResult = await legacy.connect(config);
-    if (legacyResult.ok) {
-      this.owner = legacy;
-      log.dll(`target-owner session=${this.sessionId} selected mode=${mode} owner=jlink-legacy command=connect targetConnected=true`);
-      return legacyResult;
-    }
-    await legacy.dispose(false);
-    return legacyResult;
+    await native.dispose(false);
+    log.dll(`target-owner session=${this.sessionId} native initialization failed owner=none command=connect code=${result.errorCode || 'NativeInitializationFailed'} targetConnected=false`);
+    return result;
   }
 
   async disconnect(): Promise<CppJLinkResult> {
@@ -368,19 +338,13 @@ export class SessionTargetSelector {
     return this.call('writeMemory', owner => owner.writeMemory(address, bytes));
   }
   async setBreakpoint(address: number, preferredSlot?: number) {
-    const result = await this.call('setBreakpoint', owner => owner.setBreakpoint(address, preferredSlot));
-    if (result.ok && result.data) this.breakpointSlots[result.data.id] = address;
-    return result;
+    return this.call('setBreakpoint', owner => owner.setBreakpoint(address, preferredSlot));
   }
   async clearBreakpoint(id: number) {
-    const result = await this.call('clearBreakpoint', owner => owner.clearBreakpoint(id));
-    if (result.ok && id >= 0 && id < this.breakpointSlots.length) this.breakpointSlots[id] = null;
-    return result;
+    return this.call('clearBreakpoint', owner => owner.clearBreakpoint(id));
   }
   async clearAllBreakpoints() {
-    const result = await this.call('clearAllBreakpoints', owner => owner.clearAllBreakpoints());
-    if (result.ok) this.breakpointSlots.fill(null);
-    return result;
+    return this.call('clearAllBreakpoints', owner => owner.clearAllBreakpoints());
   }
   getRttCapabilities(): RttCapabilities {
     if (!this.owner) {
@@ -456,14 +420,12 @@ export class SessionTargetSelector {
     if (!owner) return failure('session target owner is unavailable', 'TargetOwnerUnavailable');
     const result = await run(owner);
     if (!result.ok && result.errorCode === 'NativeOwnerLost' && owner.kind === 'jlink-native') {
-      // A native owner was already connected. Switching to koffi here would
-      // create a new physical owner in the same DAP session, so terminate it.
       this.owner = null;
       await owner.dispose(false);
-      log.dll(`target-owner session=${this.sessionId} native command failed mode=${this.selectedMode} owner=jlink-native command=${command} code=NativeOwnerLost targetConnected=true action=restart-session`);
+      log.dll(`target-owner session=${this.sessionId} native command failed mode=native owner=jlink-native command=${command} code=NativeOwnerLost targetConnected=true action=restart-session`);
       return {
         ...result,
-        message: `${result.message}. Native session was terminated; restart the debug session in legacy mode or start a new auto-mode session.`,
+        message: `${result.message}. Native session was terminated; start a new debug session to reconnect.`,
       };
     }
     if (!result.ok && result.errorCode === 'NativeOwnerLost' && owner.kind === 'cmsis-dap') {
@@ -476,202 +438,6 @@ export class SessionTargetSelector {
       };
     }
     return result;
-  }
-}
-
-function normalizeTargetMode(mode: SessionTargetMode | boolean): SessionTargetMode {
-  if (mode === true) return 'auto';
-  if (mode === false) return 'legacy';
-  return mode;
-}
-
-export class LegacyJLinkTargetChannel implements SessionTargetOwner {
-  readonly kind = 'jlink-legacy' as const;
-  readonly usingNative = false;
-
-  constructor(private readonly jlink = new JLinkDLL()) {}
-
-  async connect(config: CppJLinkConnectConfig): Promise<CppJLinkResult<{ channel: 'koffi' }>> {
-    if (!this.jlink.open() || !this.jlink.connect(config.device, config.speedKHz)) {
-      return failure('legacy J-Link connect failed', 'FallbackConnectFailed');
-    }
-    return this.success({ channel: 'koffi' }, 'legacy J-Link connected');
-  }
-
-  async disconnect() {
-    this.jlink.disconnect();
-    return success('legacy J-Link disconnected');
-  }
-
-  async halt() { return this.booleanCall(() => this.jlink.halt(), 'halt'); }
-  async run() { return this.booleanCall(() => this.jlink.run(), 'run'); }
-  async step() { return this.booleanCall(() => this.jlink.step(), 'step'); }
-  async reset() { return this.booleanCall(() => this.jlink.reset(), 'reset'); }
-  async getState() {
-    const disconnected = !this.jlink.isTargetConnected() || this.jlink.state === 'disconnected';
-    if (disconnected) this.jlink.abandon();
-    const targetLinkAlive = disconnected ? null : this.jlink.probeTargetLink();
-    if (targetLinkAlive === false) {
-      return failure<{ state: CppJLinkTargetState }>(
-        'legacy SW-DP health probe could not reach the target',
-        'TargetStateReadFailed',
-      );
-    }
-    const haltState = disconnected ? false : this.jlink.getHaltState();
-    if (haltState === null) {
-      return failure<{ state: CppJLinkTargetState }>(
-        'legacy JLINK_IsHalted could not read target state',
-        'TargetStateReadFailed',
-      );
-    }
-    const state = disconnected
-      ? 'Disconnected'
-      : haltState
-        ? 'Halted'
-        : this.jlink.state === 'running'
-          ? 'Running'
-          : 'Unknown';
-    return this.success({ state }, 'target state read');
-  }
-  async readRegister(index: number) {
-    const value = this.jlink.readRegister(index);
-    return value === null
-      ? failure<{ value: number }>('legacy register read failed', 'JLinkCallFailed')
-      : this.success({ value }, 'register read');
-  }
-  async readMemory(address: number, size: number) {
-    const bytes = this.jlink.readMemory(address, size);
-    return bytes
-      ? this.success({ bytes }, 'memory read')
-      : failure<{ bytes: Uint8Array }>('legacy memory read failed', 'JLinkCallFailed');
-  }
-  async readMemoryBatch(reads: Array<{ address: number; size: number }>) {
-    const results: Array<{ address: number; bytes: Uint8Array }> = [];
-    for (const read of reads) {
-      const bytes = this.jlink.readMemory(read.address, read.size);
-      if (!bytes) return failure<{ reads: typeof results }>('legacy memory batch read failed', 'JLinkCallFailed');
-      results.push({ address: read.address, bytes });
-    }
-    return this.success({ reads: results }, 'memory batch read');
-  }
-  async writeMemory(address: number, bytes: Uint8Array) {
-    return this.jlink.writeMemoryBytes(address, bytes)
-      ? this.success({ address, bytesWritten: bytes.length }, 'memory written')
-      : failure<{ address: number; bytesWritten: number }>('legacy memory write failed', 'JLinkCallFailed');
-  }
-  async setBreakpoint(address: number, preferredSlot?: number) {
-    const id = this.jlink.setBreakpoint(address, preferredSlot);
-    return id === null
-      ? failure<{ id: number }>('legacy set breakpoint failed', 'JLinkCallFailed')
-      : this.success({ id }, 'breakpoint set');
-  }
-  async clearBreakpoint(id: number) { return this.booleanCall(() => this.jlink.clearBreakpoint(id), 'clear breakpoint'); }
-  async clearAllBreakpoints() {
-    this.jlink.clearAllBreakpoints();
-    return this.success({}, 'all breakpoints cleared');
-  }
-  getRttCapabilities(): RttCapabilities {
-    if (!this.jlink.connected) {
-      return unavailableRttCapabilities(this.kind, 'Legacy J-Link owner is not connected');
-    }
-    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
-      ? this.jlink.getRttApiAvailability()
-      : null;
-    const startAvailable = !rttApis || rttApis.control;
-    const readAvailable = !rttApis || (rttApis.control && rttApis.read);
-    const readReason = rttApis && !rttApis.control
-      ? 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'
-      : 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Read';
-    return {
-      ownerKind: this.kind,
-      rttStart: rttCapability(startAvailable, 'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control'),
-      rttEnumerate: rttCapability(false, 'Legacy koffi J-Link owner does not support multi-channel RTT enumeration'),
-      rttUpRead: rttCapability(readAvailable, readReason),
-      rttDownWrite: rttCapability(false, 'Legacy koffi J-Link owner does not support RTT down-buffer writes'),
-      details: {
-        channel: 'koffi',
-        ...(rttApis ? { dllRttApis: rttApis } : {}),
-      },
-    };
-  }
-  async startRtt(controlBlockAddress?: number) {
-    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
-      ? this.jlink.getRttApiAvailability()
-      : null;
-    if (rttApis && !rttApis.control) {
-      return failure(
-        'Legacy J-Link DLL does not export JLINK_RTTERMINAL_Control',
-        'UnsupportedCapability',
-        { ownerKind: this.kind, capability: 'startRtt', dllRttApis: rttApis },
-      );
-    }
-    return this.booleanCall(() => this.jlink.startRtt(controlBlockAddress), 'start RTT');
-  }
-  async enumerateRtt(): Promise<CppJLinkResult<CmsisDapRttEnumResult>> {
-    return failure<CmsisDapRttEnumResult>(
-      'Legacy koffi J-Link owner does not support multi-channel RTT enumeration',
-      'UnsupportedCapability',
-      { ownerKind: this.kind, capability: 'enumerateRtt' },
-    );
-  }
-  async stopRtt() {
-    this.jlink.stopRtt();
-    return this.success({}, 'RTT stopped');
-  }
-  async readRtt(bufferIndex: number, size: number, _options?: CppJLinkReadOptions) {
-    const rttApis = typeof this.jlink.getRttApiAvailability === 'function'
-      ? this.jlink.getRttApiAvailability()
-      : null;
-    if (rttApis && (!rttApis.control || !rttApis.read)) {
-      const missing = !rttApis.control ? 'JLINK_RTTERMINAL_Control' : 'JLINK_RTTERMINAL_Read';
-      return failure<{ bytes: Uint8Array }>(
-        `Legacy J-Link DLL does not export ${missing}`,
-        'UnsupportedCapability',
-        { ownerKind: this.kind, capability: 'readRtt', dllRttApis: rttApis },
-      );
-    }
-    const bytes = this.jlink.readRtt(bufferIndex, size);
-    return bytes
-      ? this.success({ bytes }, 'RTT read')
-      : failure<{ bytes: Uint8Array }>('legacy RTT read failed', 'JLinkCallFailed');
-  }
-  async writeRtt(): Promise<CppJLinkResult<CmsisDapRttWriteResult>> {
-    return failure<CmsisDapRttWriteResult>(
-      'Legacy koffi J-Link owner does not support RTT down-buffer writes',
-      'UnsupportedCapability',
-      { ownerKind: this.kind, capability: 'writeRtt' },
-    );
-  }
-  async stepIntoInstruction(): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> { return this.nativeUnsupported(); }
-  async stepIntoSourceLine(_request: NativeStepIntoSourceLineRequest): Promise<CppJLinkResult<NativeStepIntoDiagnostics>> {
-    return this.nativeUnsupported();
-  }
-  async stepOverSourceLine(_request: NativeStepOverRequest): Promise<CppJLinkResult<NativeStepOverDiagnostics>> {
-    return this.nativeUnsupported();
-  }
-  async stepOut(_request: NativeStepOutRequest): Promise<CppJLinkResult<NativeStepOutDiagnostics>> {
-    return this.nativeUnsupported();
-  }
-  async dispose(graceful = true) {
-    if (graceful) this.jlink.disconnect();
-    else this.jlink.abandon();
-  }
-
-  private booleanCall(run: () => boolean, operation: string): CppJLinkResult {
-    return run() ? this.success({}, `${operation} completed`) : failure(`legacy ${operation} failed`, 'JLinkCallFailed');
-  }
-  private nativeUnsupported<T>(): CppJLinkResult<T> {
-    return failure('native step is unavailable on the legacy owner', 'NativeChannelUnavailable');
-  }
-  private success<T>(data: T, message: string): CppJLinkResult<T> {
-    const targetState = this.jlink.state === 'disconnected'
-      ? 'Disconnected'
-      : this.jlink.state === 'running'
-        ? 'Running'
-        : this.jlink.isHalted()
-          ? 'Halted'
-          : 'Unknown';
-    return { ok: true, data, message, targetState, elapsedMs: 0 };
   }
 }
 

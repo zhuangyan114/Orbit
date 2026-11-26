@@ -17,8 +17,8 @@ const MEASURE_RPC = 1000;
 const MEASURE_SSE = 100;
 const MEASURE_CONTROL = 100;
 
-const HARDWARE_LAYERS = ['hardware.jlink-native', 'hardware.jlink-legacy', 'hardware.cmsis-dap'];
-const PROBES = new Set(['jlink-native', 'jlink-legacy', 'cmsis-dap']);
+const HARDWARE_LAYERS = ['hardware.jlink-native', 'hardware.cmsis-dap'];
+const PROBES = new Set(['jlink-native', 'cmsis-dap']);
 const SECRET_KEYS = new Set(['token', 'authorization', 'Authorization', 'bearer', 'Bearer']);
 
 const WORKFLOW_STEPS = [
@@ -308,17 +308,15 @@ function hostInfo() {
 
 function mockWorkflow(probe) {
   const ownerKind = probe;
-  const helperPid = ownerKind === 'jlink-legacy' ? null : 4242;
   const steps = WORKFLOW_STEPS.map(step => {
     const mutating = TARGET_MUTATING_STEPS.has(step);
-    const nativeOnly = ownerKind === 'jlink-legacy' && (step === 'stepInto' || step === 'stepOver' || step === 'stepOut');
     return {
       step,
-      status: nativeOnly ? 'capability-unavailable' : 'simulated',
+      status: 'simulated',
       authorized: false,
       mutating,
       ownerKind,
-      errorCode: nativeOnly ? 'CapabilityUnavailable' : null,
+      errorCode: null,
       secondOwnerCreated: false,
     };
   });
@@ -328,14 +326,14 @@ function mockWorkflow(probe) {
     owners: {
       maxConcurrent: 1,
       kinds: [ownerKind],
-      helperPids: helperPid ? [helperPid] : [],
+      helperPids: [4242],
       afterDisconnect: 0,
     },
   };
 }
 
 function collectMockEvidence(options, performanceReport) {
-  const workflows = ['jlink-native', 'jlink-legacy', 'cmsis-dap'].map(mockWorkflow);
+  const workflows = ['jlink-native', 'cmsis-dap'].map(mockWorkflow);
   const requests = [{
     method: 'orbit.instance.describe',
     instanceId: 'mock-instance',
@@ -374,7 +372,6 @@ function collectMockEvidence(options, performanceReport) {
     notes: [
       'Mock/CI run only. Hardware layers remain unverified.',
       'Live mutation requires --authorize --probe --board.',
-      'Legacy source-level step is CapabilityUnavailable and must not spawn a second owner.',
     ],
   });
 }
@@ -528,7 +525,7 @@ async function runLive(options) {
 
   const mark = (step, status, extra = {}) => {
     workflow.push({ step, status, authorized: true, ownerKind: options.probe, ...extra });
-    console.log(`${status === 'passed' || status === 'skipped' || status === 'capability-unavailable' ? 'PASS' : 'FAIL'}  ${step}${extra.errorCode ? ` ${extra.errorCode}` : ''}`);
+    console.log(`${status === 'passed' || status === 'skipped' ? 'PASS' : 'FAIL'}  ${step}${extra.errorCode ? ` ${extra.errorCode}` : ''}`);
     if (status === 'failed') failed = true;
   };
 
@@ -571,10 +568,7 @@ async function runLive(options) {
         errorCode: code,
         authorized: true,
       });
-      const unavailable = code === 'CapabilityUnavailable' && options.probe === 'jlink-legacy'
-        && (step === 'stepInto' || step === 'stepOver' || step === 'stepOut');
-      mark(step, unavailable ? 'capability-unavailable' : 'failed', { elapsedMs, method, errorCode: code, message: error.message });
-      if (unavailable) return { errorCode: code };
+      mark(step, 'failed', { elapsedMs, method, errorCode: code, message: error.message });
       throw error;
     }
   };
@@ -806,7 +800,6 @@ async function runLive(options) {
   const liveLayer = failed ? 'failed' : 'passed';
   const hardware = {
     'hardware.jlink-native': options.probe === 'jlink-native' ? liveLayer : 'unverified',
-    'hardware.jlink-legacy': options.probe === 'jlink-legacy' ? liveLayer : 'unverified',
     'hardware.cmsis-dap': options.probe === 'cmsis-dap' ? liveLayer : 'unverified',
   };
   const evidence = redactSecrets({
@@ -858,7 +851,7 @@ function writeEvidence(filePath, evidence) {
 async function main(argv = process.argv) {
   const options = parseArgs(argv);
   if (options.help) {
-    console.log('usage: node scripts/automation-api/verify-hardware.js [--mock|--live] [--authorize] [--probe jlink-native|jlink-legacy|cmsis-dap] [--board NAME] [--flash] [--evidence PATH]');
+    console.log('usage: node scripts/automation-api/verify-hardware.js [--mock|--live] [--authorize] [--probe jlink-native|cmsis-dap] [--board NAME] [--flash] [--evidence PATH]');
     return 0;
   }
   let evidence;
@@ -874,7 +867,7 @@ async function main(argv = process.argv) {
   }
   writeEvidence(options.evidence, evidence);
   const layers = evidence.layers;
-  console.log(`Hardware acceptance (${evidence.mode}): automated=${layers.automated} mock=${layers.mock} jlink-native=${layers['hardware.jlink-native']} jlink-legacy=${layers['hardware.jlink-legacy']} cmsis-dap=${layers['hardware.cmsis-dap']}`);
+  console.log(`Hardware acceptance (${evidence.mode}): automated=${layers.automated} mock=${layers.mock} jlink-native=${layers['hardware.jlink-native']} cmsis-dap=${layers['hardware.cmsis-dap']}`);
   console.log(`RPC p95=${evidence.performance.rpcDispatch.p95?.toFixed?.(3) ?? evidence.performance.rpcDispatch.p95}ms sse p95=${evidence.performance.sseWrite.p95}ms control p95=${evidence.performance.controlOverhead.p95}ms`);
   console.log(`evidence=${path.relative(repoRoot, options.evidence)}`);
   if (layers.allLayersPassed !== 'true') {

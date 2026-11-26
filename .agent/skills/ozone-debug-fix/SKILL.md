@@ -10,14 +10,14 @@ description: 诊断、修复或验收 Ozone for VS Code 缺陷。当用户报告
 1. 在修改任何内容前对请求分类：**仅诊断**、**修复**或**验收/验证**。仅诊断不授权修改代码或日志。
 2. 阅读仓库 `AGENTS.md`，再运行 `git status --short`。保留所有既有改动。
 3. 阅读相关的最小设计文档集合与 `docs/bug-fix-log.md`。以当前源码和测试为架构事实来源；历史文档和日志只能作为证据，不能用于恢复已废弃路径。
-4. 在诊断前判定 target owner 与请求路由：native helper 或 legacy koffi；DAP 会话或 extension-host backend。在证据链中记录该判定。
+4. 在诊断前判定 target owner 与请求路由：J-Link helper、CMSIS-DAP helper 或 RMLink 服务；确认活动 DAP session。在证据链中记录该判定。
 5. 修复前先建立证据：日志、DAP trace、mock trace 或最小复现。适用时捕获 PC/地址、目标状态、操作顺序/时序、错误码或 DLL 返回码。
 6. 列出预期收益、可能回归与回退方案。实施最小且有证据支撑的修复。禁止推测性重构。
 
 ## 硬性禁止项
 
 - 不得在同一调试会话中创建第二个 J-Link owner，或从两条路径访问 DLL。
-- 不得通过 `JLINK_Close()`/open 切换 owner。必须先完整释放 native helper，再构造 legacy；保留 selector 的受控 fallback 行为。
+- 不得通过 `JLINK_Close()`/open 切换 owner。连接失败或 owner 丢失后完整释放 native helper。下一次连接由新会话建立。
 - 不得绕过活动的 `ozone` DAP 会话。`RuntimeRouter` 失败必须仍是错误，不能回落到 extension-host backend。
 - 不得手动修改 `dist/`、将 mock 验证称为硬件验证，或未经授权执行会改变 target 状态的命令。
 - 不得通过牺牲 Watch、Timeline、`evaluate`、`variables`、变量写入、RTT 或兼容 viewer 的 DAP 行为来修复 step。
@@ -43,9 +43,8 @@ description: 诊断、修复或验收 Ozone for VS Code 缺陷。当用户报告
 
 在修改代码前记录以下事实：
 
-- 是否选择 `nativeDebugEngine`，且 helper 是否连接成功？若是，helper 是唯一物理 J-Link owner；所有已选 owner 调用都经由它和 `NativeScheduler`。
-- owner 是否为 legacy？native source-level step API 必须报告不可用，不得通过第二个 owner 模拟。
-- native 启动是否失败，或是否报告 `NativeOwnerLost`？仅在此时，`SessionTargetSelector` 才可释放 native、重建 legacy 并恢复已跟踪的 breakpoint slot。
+- J-Link helper 是否连接成功？该 helper 是唯一物理 J-Link owner，目标操作经由 `NativeScheduler` 调度。
+- native 启动失败时，`SessionTargetSelector` 释放 helper 并返回错误。已连接 owner 报告 `NativeOwnerLost` 时结束会话。
 - 是否有活动的 `ozone` DAP 会话？若是，UI、plugin API 和 MCP 的 target 操作必须使用 DAP custom request；请求失败后不得回落到 extension-host backend。
 
 ## 修复规则

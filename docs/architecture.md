@@ -27,7 +27,6 @@ flowchart TD
 
     subgraph Owners["候选 Target Owner（互斥）"]
         JNative["jlink-native\nExperimentalCppJLinkChannel"]
-        JLegacy["jlink-legacy\nLegacyJLinkTargetChannel + koffi"]
         Cmsis["cmsis-dap\nCmsisDapTargetChannel"]
         RMLink["rmlink\nRMLinkTargetChannel"]
     end
@@ -60,8 +59,7 @@ flowchart TD
     Backend --> Symbols
     Session -->|"standard DAP memory / variables"| ExternalViews
 
-    Selector -->|"probe=jlink, native"| JNative --> JHelper --> JLink
-    Selector -->|"probe=jlink, legacy"| JLegacy --> JLink
+    Selector -->|"probe=jlink"| JNative --> JHelper --> JLink
     Selector -->|"probe=cmsis-dap"| Cmsis --> CHelper --> DapProbe
     Selector -->|"probe=rmlink"| RMLink --> RMService --> RMProbe
     Selector -->|"probe=auto"| ProbeDiscovery
@@ -82,13 +80,13 @@ flowchart TD
 | CMSIS-DAP helper | `native/cmsis-dap-helper/src/main.cpp` | 枚举 HID/WinUSB/TCP、CMSIS-DAP framing、SWD/DP/AP、Cortex-M 控制、内存、FPB、Flash Algorithm 和内存型 RTT |
 | RMLink 连接服务 | `src/ozone-backend/rmlink-target-channel.ts`、`clients/rmlink/` | 经 `@rmlink/client` 接入 RMLink 服务，提供 SWD 控制、缓存/页镜像烧录及板端订阅采样 |
 
-一次调试会话实际只启动所选 owner 所需的 helper。J-Link Legacy 是例外：它在 DAP Adapter 进程内由 `koffi` 加载 DLL。
+一次调试会话只启动所选 owner 所需的 helper。J-Link DLL 由 J-Link helper 加载。
 
 ## Owner 选择
 
 - `probe: "auto"` 先运行只读可用性发现：J-Link 成功即选择 J-Link；只有 J-Link 不可用时才枚举 CMSIS-DAP。两者同时连接时固定选择 J-Link。discovery helper 在正式连接前释放，不成为 target owner，也不执行 Flash。
-- `probe: "jlink"` 使用 `jlink-native` 或 `jlink-legacy`。`auto` 只允许在 native 启动/初始化失败且进程完全退出后创建 legacy；已连接 owner 丢失时不热切换。
-- `probe: "cmsis-dap"` 只创建 `cmsis-dap` owner。`cmsisDapTransport: "auto"` 优先 WinUSB v2，再选择兼容的 HID v1；不会回退到 J-Link、Legacy 或第二个 helper。`tcp` 由同一个 helper 通过 TCP（OpenOCD cmsis-dap `tcp` 帧格式）连接 `cmsisDapPath` 指定的网络探针。
+- `probe: "jlink"` 使用 `jlink-native`。启动失败后释放 helper 并返回错误。已连接 owner 丢失时结束会话，重新连接需开启新会话。
+- `probe: "cmsis-dap"` 只创建 `cmsis-dap` owner。`cmsisDapTransport: "auto"` 优先 WinUSB v2，再选择兼容的 HID v1；不会回退到 J-Link 或第二个 helper。`tcp` 由同一个 helper 通过 TCP（OpenOCD cmsis-dap `tcp` 帧格式）连接 `cmsisDapPath` 指定的网络探针。
 - `probe: "rmlink"`（或指定 `rmlinkDeviceId`）创建 `RMLinkTargetChannel` owner，不会与 J-Link 或 CMSIS-DAP helper 并存。Timeline 优先使用板端 `memory_series` 订阅并支持断线指数退避自动重连；不进入 XR-DAP 或主机轮询重复采样。
 - XR-DAP 探针端采样是默认关闭的可选功能，与 TCP 传输独立。只有 launch 配置显式设置 `cmsisDapXrSampling: true` 且实际 owner 为 CMSIS-DAP 时，`dataSamplingStart` 才创建 `ProbeTimelineSampler`（`src/debug/probe-timeline-sampler.ts`）：经 commander `startProbeSampling` → `CmsisDapTargetChannel` → helper `xrSamplingStart` 让探针定时采样，再以 timeline 优先级轮询 `xrSamplingRead`，用 `ProbeClock` 换算探针时钟；不支持或读取失败时退回主机采样。普通会话直接走原有 `readFastDataSampling`，不查询 XR INFO、不发送 XR 命令。
 - XR 已启用且正在采样期间，helper 在 `dispatch()` 入口按 `xrSamplingRoute()` 处理请求：标量读取和运行态 DHCSR 查询改用厂商 READ，其余请求先停止采样、执行后恢复；`open`/`connect`/`disconnect`/`close`/`shutdown` 结束采样。未开启 XR 时，helper 拒绝 XR RPC，也不按设备序列号自动发送 XR 停止命令。自动 RTT 文本轮询只在 XR 采样活动期间暂停。详见 [XR-DAP 隔离边界](xr-dap-isolation.md)。

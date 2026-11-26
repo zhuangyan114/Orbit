@@ -33,5 +33,4 @@ OpenOCD and its bundled components are distributed WITHOUT ANY WARRANTY; without
 
 ## 2. Node.js Dependencies and External Tools
 
-- **`koffi`** (bundled in VSIX `node_modules/koffi` and `@koromix/koffi-win32-x64`): MIT License — see `node_modules/koffi/LICENSE.txt`.
 - **External user-installed tools** (not bundled in Orbit): SEGGER J-Link Software (`JLink_x64.dll` / `JLink.exe`), RMLink Connector Service, and GNU Arm Embedded Toolchain remain subject to their respective licenses.
